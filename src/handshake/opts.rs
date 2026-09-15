@@ -40,7 +40,7 @@ pub struct HandshakeOpts {
     /// 协商后的四项基础配置。
     pub basic_opts: BasicOpts,
     // 扩展条目暂缓实现：恢复时在此加回扩展条目存放区与有效数量字段，见
-    // dev-progress-notes.md。
+    // dev-notes.md（仓库根目录）。
 }
 
 /// 基础协商结果，即四项基础协商项的最终取值。
@@ -103,33 +103,22 @@ impl BasicOpts {
     ///
     /// 当某个条目的低半字节不是本版本认识的基础键时返回该条目。按模块文档
     /// §6.4，未知与保留键必须导致握手失败。
-    pub fn from_entries<I>(
-        entries_iter: I,
-    ) -> Result<Self, NegotiationBasicEntry>
+    pub fn from_entries<I>(entries_iter: I) -> Result<Self, NegotiationBasicEntry>
     where
         I: Iterator<Item: Borrow<NegotiationBasicEntry>>,
     {
         let mut x = BasicOpts::DEFAULT;
         for entry in entries_iter {
-            let Result::Ok(key) =
-                NegotiationKey::try_from(entry.borrow().opts_key)
-            else {
+            let Result::Ok(key) = NegotiationKey::try_from(entry.borrow().opts_key) else {
                 return Result::Err(entry.borrow().clone());
             };
             let entry = entry.borrow();
             match key {
-                NegotiationKey::MaxPacketSize => {
-                    x.max_packet_size = entry.val_data
-                }
-                NegotiationKey::MaxChannelCount => {
-                    x.max_channel_count = entry.val_data
-                }
-                NegotiationKey::MaxDockChanCount => {
-                    x.max_dock_chan_count = entry.val_data
-                }
+                NegotiationKey::MaxPacketSize => x.max_packet_size = entry.val_data,
+                NegotiationKey::MaxChannelCount => x.max_channel_count = entry.val_data,
+                NegotiationKey::MaxDockChanCount => x.max_dock_chan_count = entry.val_data,
                 NegotiationKey::MaxChannelTimeout => {
-                    x.max_channel_timeout =
-                        Duration::from_secs(entry.val_data as u64)
+                    x.max_channel_timeout = Duration::from_secs(entry.val_data as u64)
                 }
                 _ => (),
             }
@@ -173,7 +162,7 @@ pub enum NegotiationKey {
     /// `value` 2 字节）与 `0x2C`（`BeU32` + CRC-32/ISO-HDLC，`value` 4 字节）；
     /// 其它取值非法。详见模块文档 §6.2。
     Checksum = 0x0C,
-    // 扩展条目暂缓实现：0x0E 暂按保留键处理，见 dev-progress-notes.md。
+    // 扩展条目暂缓实现：0x0E 暂按保留键处理，见 dev-notes.md（仓库根目录）。
     // /// 扩展消息，`value` 为「长度字段 + 负载」。
     // ExtMsg            = 0x0E,
 }
@@ -304,7 +293,7 @@ pub struct NegotiationBasicEntry {
 }
 
 // 扩展条目暂缓实现：以下类型保留备查，待扩展条目设计定稿后再恢复。
-// 相关讨论见 dev-progress-notes.md。
+// 相关讨论见 dev-notes.md（仓库根目录）。
 //
 // /// 扩展协商事项，对应线格式中的一个「长度 + 负载」条目。
 // ///

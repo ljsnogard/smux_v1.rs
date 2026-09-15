@@ -24,23 +24,27 @@
 //! [`HandshakeError::Cancelled`]；调用方必须关闭底层传输，v1 不支持断点续读。
 
 use abs_buff::{
-    Demand, TrBuffRead, TrBuffWrite,
-    buffer::{TrBuffSegmMut, TrBuffSegmView},
-    gen_may_cancel_future,
+    TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite, gen_may_cancel_future,
     x_deps::abs_cancel,
 };
-use abs_cancel::{TrCancellationToken, TrMayCancel};
+use abs_cancel::TrCancellationToken;
 
 use crate::handshake::{
-    K_ACCEPT_MAGIC, K_CONFRM_MAGIC, K_INVITE_MAGIC, K_REJECT_MAGIC,
+    HandshakeChecksum, K_ACCEPT_MAGIC, K_CONFRM_MAGIC, K_INVITE_MAGIC, K_REJECT_MAGIC,
     codec_::{
-        K_MAX_HANDSHAKE_FRAME, ParseFrameError, ParsedFrame, build_frame_,
-        complete_invite_, complete_values_, confirm_matches_, parse_frame_,
-        values_to_basic_,
+        ParsedFrame, complete_invite_, complete_values_, confirm_matches_, read_frame_,
+        values_to_basic_, write_frame_,
     },
-    error::{HandshakeError, map_read_err_, map_write_err_},
+    error::{HandshakeError, from_read_frame_err_, from_write_frame_err_},
     opts::{BasicOpts, HandshakeOpts, NegotiationBasicEntry},
 };
+
+/// 握手帧默认使用的校验算法：CRC-16/XMODEM。
+///
+/// 校验算法逐帧自声明（模块文档 §3），需要别的算法时由调用方在
+/// [`write_frame_`] 一层指定。
+const K_DEFAULT_CHECKSUM: HandshakeChecksum =
+    HandshakeChecksum::Crc16(crc::Crc::<u16>::new(&crc::CRC_16_XMODEM));
 
 /// 基础项个数。
 const K_BASIC_COUNT: usize = 4;
@@ -64,7 +68,7 @@ pub struct HandshakeEndpoint<Tx, Rx> {
 /// 握手发起方对象。
 ///
 /// 由调用方构造并持有收发通道与单帧长度上限；调用
-/// [`HandshakeAgent::initiate_handshake`] 执行完整流程。
+/// [`HandshakeAgent::invite_async`] 执行完整流程。
 pub struct HandshakeAgent<Rx, Tx> {
     rx_: Rx,
     tx_: Tx,
@@ -73,8 +77,8 @@ pub struct HandshakeAgent<Rx, Tx> {
 
 impl<Rx, Tx> HandshakeAgent<Rx, Tx>
 where
-    Rx: TrBuffRead<u8>,
-    Tx: TrBuffWrite<u8>,
+    Rx: TrBuffRead<u8> + TrBuffTryRead<u8>,
+    Tx: TrBuffWrite<u8> + TrBuffTryWrite<u8>,
 {
     /// 用收发通道与单帧长度上限构造。
     ///
@@ -108,41 +112,7 @@ where
         Tx: 'f,
         D: FnMut(&BasicOpts) -> bool + 'f,
     {
-        HandshakeInviteAsync(
-            self.rx_,
-            self.tx_,
-            invite,
-            self.max_size_,
-            decide,
-        )
-    }
-}
-
-/// 握手等待方对象。
-///
-/// 由调用方构造并持有收发通道与单帧长度上限；调用
-/// [`HandshakeListener::accept_handshake`] 执行完整流程。
-pub struct HandshakeListener<Rx, Tx> {
-    rx_: Rx,
-    tx_: Tx,
-    max_size_: usize,
-}
-
-impl<Rx, Tx> HandshakeListener<Rx, Tx>
-where
-    Rx: TrBuffRead<u8>,
-    Tx: TrBuffWrite<u8>,
-{
-    /// 用收发通道与单帧长度上限构造。
-    ///
-    /// `max_size` 表示单帧总字节数上限（含 magic 与校验尾），推荐取本端
-    /// [`BasicOpts::max_packet_size`]。
-    pub fn new(rx: Rx, tx: Tx, max_size: usize) -> Self {
-        HandshakeListener {
-            rx_: rx,
-            tx_: tx,
-            max_size_: max_size,
-        }
+        HandshakeInviteAsync(self.rx_, self.tx_, invite, self.max_size_, decide)
     }
 
     /// 执行完整的等待方握手：等待 `INVITE`、补全条件、交由 `decide` 决定、
@@ -167,84 +137,22 @@ where
     }
 }
 
-/// 从 `rx` 读满 `out.len()` 字节。
-///
-/// `out` 为空时直接返回，避免 [`Demand::exactly`] 不接受 0 的限制。
-async fn read_exact_into_<'f, R, K>(
-    rx: &'f mut R,
-    out: &'f mut [u8],
-    cancel: &'f mut K,
-) -> Result<(), R::Err>
-where
-    R: TrBuffRead<u8>,
-    K: TrCancellationToken + Clone,
-{
-    if out.is_empty() {
-        return Result::Ok(());
-    }
-    let demand = Demand::exactly(out.len());
-    let mut res = rx.read_async(&demand).may_cancel_with(cancel).await;
-    if let Option::Some(segm) = res.as_mut().pick_left() {
-        let mut offset = 0usize;
-        for slice in segm.iter_slices() {
-            let end = offset + slice.len();
-            out[offset..end].copy_from_slice(slice);
-            offset = end;
-        }
-        return Result::Ok(());
-    }
-    if let Option::Some(err) = res.pick_right() {
-        return Result::Err(err);
-    }
-    unreachable!()
-}
-
 /// 读取一个完整握手帧。
 ///
-/// 内部按 [`ParseFrameError::NeedMore`] 的提示逐字段补齐字节，因此帧不需要长度
-/// 前缀。累计帧长超过 `max_size` 或内部缓冲上限时返回
-/// [`HandshakeError::FrameTooLarge`]。
+/// 帧没有长度字段，读取由 [`read_frame_`] 顺序推进；累计帧长超过 `max_size`
+/// 时返回 [`HandshakeError::FrameTooLarge`]。
 async fn read_frame_async_<'f, R, K, WE>(
     rx: &'f mut R,
     max_size: usize,
     cancel: &'f mut K,
 ) -> Result<ParsedFrame, HandshakeError<R::Err, WE>>
 where
-    R: TrBuffRead<u8>,
+    R: TrBuffRead<u8> + TrBuffTryRead<u8>,
     K: TrCancellationToken + Clone,
 {
-    let mut buf = [0u8; K_MAX_HANDSHAKE_FRAME];
-    let mut len = 0usize;
-    loop {
-        match parse_frame_(&buf[..len], max_size) {
-            Result::Ok((frame, _consumed)) => return Result::Ok(frame),
-            Result::Err(ParseFrameError::NeedMore(need)) => {
-                let cap = core::cmp::min(max_size, K_MAX_HANDSHAKE_FRAME);
-                if need > cap {
-                    return Result::Err(HandshakeError::FrameTooLarge);
-                }
-                read_exact_into_(rx, &mut buf[len..need], cancel)
-                    .await
-                    .map_err(map_read_err_)?;
-                len = need;
-            }
-            Result::Err(ParseFrameError::InvalidMagic) => {
-                return Result::Err(HandshakeError::InvalidMagic);
-            }
-            Result::Err(ParseFrameError::UnsupportedOption) => {
-                return Result::Err(HandshakeError::UnsupportedOption);
-            }
-            Result::Err(ParseFrameError::MalformedBody) => {
-                return Result::Err(HandshakeError::MalformedBody);
-            }
-            Result::Err(ParseFrameError::FrameTooLarge) => {
-                return Result::Err(HandshakeError::FrameTooLarge);
-            }
-            Result::Err(ParseFrameError::ChecksumErr) => {
-                return Result::Err(HandshakeError::ChecksumErr);
-            }
-        }
-    }
+    read_frame_(rx, max_size, cancel)
+        .await
+        .map_err(from_read_frame_err_)
 }
 
 /// 编码并写出一个握手帧（校验尾固定 CRC-16/XMODEM）。
@@ -255,26 +163,15 @@ async fn write_frame_async_<'f, W, K, RE>(
     cancel: &'f mut K,
 ) -> Result<(), HandshakeError<RE, W::Err>>
 where
-    W: TrBuffWrite<u8>,
+    W: TrBuffWrite<u8> + TrBuffTryWrite<u8>,
     K: TrCancellationToken + Clone,
 {
-    let mut buf = [0u8; K_MAX_HANDSHAKE_FRAME];
-    let len = build_frame_(magic, values, &mut buf)
-        .ok_or(HandshakeError::FrameTooLarge)?;
-    let demand = Demand::exactly(len);
-    let mut res = tx.write_async(&demand).may_cancel_with(cancel).await;
-    if let Option::Some(segm) = res.as_mut().pick_left() {
-        let written = segm.as_segm_mut().clone_items_from_buff(&buf[..len]);
-        debug_assert_eq!(written, len);
-        return Result::Ok(());
-    }
-    if let Option::Some(err) = res.pick_right() {
-        return Result::Err(map_write_err_(err));
-    }
-    unreachable!()
+    write_frame_(tx, magic, values, K_DEFAULT_CHECKSUM, cancel)
+        .await
+        .map_err(from_write_frame_err_)
 }
 
-/// 发起方状态机实现；对外经 [`HandshakeAgent::initiate_handshake`] 使用。
+/// 发起方状态机实现；对外经 [`HandshakeAgent::invite_async`] 使用。
 #[gen_may_cancel_future(HandshakeInvite)]
 async fn handshake_invite_async_<'f, R, W, D, K>(
     mut rx: R,
@@ -285,8 +182,8 @@ async fn handshake_invite_async_<'f, R, W, D, K>(
     cancel: &'f mut K,
 ) -> Result<HandshakeEndpoint<W, R>, HandshakeError<R::Err, W::Err>>
 where
-    R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
+    R: TrBuffRead<u8> + TrBuffTryRead<u8> + 'f,
+    W: TrBuffWrite<u8> + TrBuffTryWrite<u8> + 'f,
     D: FnMut(&BasicOpts) -> bool + 'f,
     K: TrCancellationToken + Clone,
 {
@@ -322,26 +219,14 @@ where
 
     // 3. ACCEPT 必须补全全部 4 项。
     let Option::Some(accepted) = complete_values_(&frame.entries) else {
-        let _ = write_frame_async_::<W, K, R::Err>(
-            &mut tx,
-            K_REJECT_MAGIC,
-            &empty,
-            cancel,
-        )
-        .await;
+        let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
         return Result::Err(HandshakeError::Inconsistent);
     };
     let result = values_to_basic_(&accepted);
 
     // 4. 交由上层决定；拒绝则回 REJECT。
     if !decide(&result) {
-        let _ = write_frame_async_::<W, K, R::Err>(
-            &mut tx,
-            K_REJECT_MAGIC,
-            &empty,
-            cancel,
-        )
-        .await;
+        let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
         return Result::Err(HandshakeError::Rejected);
     }
 
@@ -374,8 +259,8 @@ async fn accept_handshake_async_<'f, R, W, D, K>(
     cancel: &'f mut K,
 ) -> Result<HandshakeEndpoint<W, R>, HandshakeError<R::Err, W::Err>>
 where
-    R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
+    R: TrBuffRead<u8> + TrBuffTryRead<u8> + 'f,
+    W: TrBuffWrite<u8> + TrBuffTryWrite<u8> + 'f,
     D: FnMut(&BasicOpts) -> bool + 'f,
     K: TrCancellationToken + Clone,
 {
@@ -394,13 +279,7 @@ where
 
     // 3. 交由上层决定；拒绝则回 REJECT。
     if !decide(&result) {
-        let _ = write_frame_async_::<W, K, R::Err>(
-            &mut tx,
-            K_REJECT_MAGIC,
-            &empty,
-            cancel,
-        )
-        .await;
+        let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
         return Result::Err(HandshakeError::Rejected);
     }
 
@@ -410,24 +289,12 @@ where
     // 5. 等待并校验 CONFIRM。
     let confirm = read_frame_async_(&mut rx, max_size, cancel).await?;
     if confirm.magic != K_CONFRM_MAGIC {
-        let _ = write_frame_async_::<W, K, R::Err>(
-            &mut tx,
-            K_REJECT_MAGIC,
-            &empty,
-            cancel,
-        )
-        .await;
+        let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
         return Result::Err(HandshakeError::InvalidMagic);
     }
     let consistent = confirm_matches_(&confirm.entries, &values);
     if !consistent {
-        let _ = write_frame_async_::<W, K, R::Err>(
-            &mut tx,
-            K_REJECT_MAGIC,
-            &empty,
-            cancel,
-        )
-        .await;
+        let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
         return Result::Err(HandshakeError::Inconsistent);
     }
 

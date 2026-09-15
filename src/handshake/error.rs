@@ -7,6 +7,8 @@ use core::fmt;
 
 use abs_buff::error::{ReadErrTag, TrTaggedError, WriteErrTag};
 
+use crate::handshake::codec_::WireError;
+
 /// 握手过程中的失败。
 ///
 /// # 泛型参数
@@ -64,9 +66,7 @@ impl<RE, WE> fmt::Display for HandshakeError<RE, WE> {
             HandshakeError::ChecksumErr => "握手帧校验失败",
             HandshakeError::FrameTooLarge => "握手帧超过长度上限",
             HandshakeError::MalformedBody => "握手帧条目区结构非法",
-            HandshakeError::UnsupportedOption => {
-                "握手帧包含不支持的键或校验类型"
-            }
+            HandshakeError::UnsupportedOption => "握手帧包含不支持的键或校验类型",
             HandshakeError::Inconsistent => "握手协商结果与预期不一致",
             HandshakeError::PeerClosed => "对端在握手帧中途关闭连接",
         };
@@ -79,6 +79,43 @@ where
     RE: core::error::Error,
     WE: core::error::Error,
 {
+}
+
+/// 把**读帧**失败映射为握手错误。
+///
+/// 读帧只可能产生读侧底层错误，因此写侧类型参数 `WE` 由调用方按目标类型
+/// 指定，不需要真的存在写错误。
+pub(crate) fn from_read_frame_err_<RE, WE>(err: WireError<RE, ()>) -> HandshakeError<RE, WE>
+where
+    RE: TrTaggedError<ReadErrTag>,
+{
+    match err {
+        WireError::Read(err) => map_read_err_(err),
+        WireError::Write(()) => HandshakeError::PeerClosed,
+        WireError::InvalidMagic => HandshakeError::InvalidMagic,
+        WireError::UnsupportedOption => HandshakeError::UnsupportedOption,
+        WireError::MalformedBody => HandshakeError::MalformedBody,
+        WireError::FrameTooLarge => HandshakeError::FrameTooLarge,
+        WireError::ChecksumErr => HandshakeError::ChecksumErr,
+        WireError::PeerClosed => HandshakeError::PeerClosed,
+    }
+}
+
+/// 把**写帧**失败映射为握手错误；读侧类型参数 `RE` 同上。
+pub(crate) fn from_write_frame_err_<RE, WE>(err: WireError<(), WE>) -> HandshakeError<RE, WE>
+where
+    WE: TrTaggedError<WriteErrTag>,
+{
+    match err {
+        WireError::Write(err) => map_write_err_(err),
+        WireError::Read(()) => HandshakeError::PeerClosed,
+        WireError::InvalidMagic => HandshakeError::InvalidMagic,
+        WireError::UnsupportedOption => HandshakeError::UnsupportedOption,
+        WireError::MalformedBody => HandshakeError::MalformedBody,
+        WireError::FrameTooLarge => HandshakeError::FrameTooLarge,
+        WireError::ChecksumErr => HandshakeError::ChecksumErr,
+        WireError::PeerClosed => HandshakeError::PeerClosed,
+    }
 }
 
 /// 把底层读错误映射为握手错误。
