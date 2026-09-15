@@ -38,7 +38,12 @@ pub enum HandshakeError<RE, WE> {
     /// 校验尾 CRC 不匹配。
     ChecksumErr,
 
-    /// 帧长超过 `max_size` 或内部缓冲上限。
+    /// 单个条目超过本端内部长度上限。
+    ///
+    /// v1 **没有**帧长上限（模块文档 §3、§4.4）：条目数量不设上限，因此不存在
+    /// 「整帧字节数上限」这一保护。本变体保留给「单个条目长度超过实现内部上限」
+    /// 这一情形；当前基础项是定长整数（最多 8 字节），不会触发它，扩展条目
+    /// 启用后会用到。防御无界连接由调用方的取消令牌负责（模块文档 §10）。
     FrameTooLarge,
 
     /// 条目区结构非法（重复键、基础项取值为 0、宽度越界等）。
@@ -92,10 +97,8 @@ where
     match err {
         WireError::Read(err) => map_read_err_(err),
         WireError::Write(()) => HandshakeError::PeerClosed,
-        WireError::InvalidMagic => HandshakeError::InvalidMagic,
         WireError::UnsupportedOption => HandshakeError::UnsupportedOption,
         WireError::MalformedBody => HandshakeError::MalformedBody,
-        WireError::FrameTooLarge => HandshakeError::FrameTooLarge,
         WireError::ChecksumErr => HandshakeError::ChecksumErr,
         WireError::PeerClosed => HandshakeError::PeerClosed,
     }
@@ -109,10 +112,8 @@ where
     match err {
         WireError::Write(err) => map_write_err_(err),
         WireError::Read(()) => HandshakeError::PeerClosed,
-        WireError::InvalidMagic => HandshakeError::InvalidMagic,
         WireError::UnsupportedOption => HandshakeError::UnsupportedOption,
         WireError::MalformedBody => HandshakeError::MalformedBody,
-        WireError::FrameTooLarge => HandshakeError::FrameTooLarge,
         WireError::ChecksumErr => HandshakeError::ChecksumErr,
         WireError::PeerClosed => HandshakeError::PeerClosed,
     }
