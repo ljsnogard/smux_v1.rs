@@ -1,0 +1,12 @@
+[package]
+edition = "2024"
+name = "smux_v1"
+version = "0.1.0"
+
+description = "流复用协议第一版"
+
+[dependencies]
+abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev/0.3.0" }
+abs_art-bridge = { version = "0.2.2" }
+
+crc = { version = "3.4.*" }
