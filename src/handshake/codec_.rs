@@ -39,7 +39,7 @@ use core::time::Duration;
 
 use abs_async_iter::TrAsyncIterator;
 use abs_buff::{
-    Demand, TrBuffRead, TrBuffWrite,
+    Demand, TrBuffRead, TrBuffWrite, gen_may_cancel_future,
     buffer::{TrBuffSegmMut, TrBuffSegmRef},
     x_deps::abs_cancel,
 };
@@ -250,52 +250,42 @@ impl CrcDigest {
     }
 }
 
-/// 把一个**普通 future** 适配成 [`TrMayCancel`]。
+/// 读出**下一个条目**，供 [`TrAsyncIterator::next_async`] 使用。
 ///
-/// 只用在 [`TrAsyncIterator::next_async`]：它必须返回同时实现 [`IntoFuture`] 与
-/// [`TrMayCancel`] 的类型，而这层适配交不给 `gen_may_cancel_future`——
-/// 宏会把**输出类型里除最后一个生命周期以外的所有生命周期**改写成那个「取消
-/// 借用」生命周期，于是 `Result<Option<NegotiationEntry<'s>>, _>` 会变成
-/// `...<'g>`，与 `TrAsyncIterator::Item` 必须是**固定类型**的要求冲突
-/// （实测报 E0271：`expected Result<Option<NegotiationEntry<'s>>, _>`,
-/// `found Result<Option<NegotiationEntry<'g>>, _>`）。
+/// 这是条目流的 step 函数：它被 [`gen_may_cancel_future`] 展开成同时实现
+/// [`IntoFuture`] 与 [`TrMayCancel`] 的 future 类型 [`NextEntryAsync`]。
 ///
-/// 取消由 [`FrameReader`] 内部持有的令牌在每次 `read_async` 上生效，因此适配层
-/// 本身不额外响应取消信号，只负责补齐 `may_cancel_with` 接口。
-pub(crate) struct CancelAgnostic<F>(F);
-
-impl<F> core::future::IntoFuture for CancelAgnostic<F>
+/// # 生命周期
+///
+/// - `'s`：条目对外暴露的生命周期，取**外层借用** `&'s mut FrameReader`；
+/// - `'f`：读缓冲的借用；`'r`：本次读取对 `reader` 的借用。
+///
+/// [`NegotiationEntry`] 对生命周期协变，且 `'f: 's`，所以读状态机产出的
+/// `NegotiationEntry<'f>` 可以收窄成 `NegotiationEntry<'s>`。这样协商器拿到的条目
+/// 与条目流借用同一个（较短的）生命周期，调用方在协商返回后仍能继续使用读状态机。
+///
+/// 取消由 [`FrameReader`] 内部持有的令牌在每次 `read_async` 上生效，因此这里不再
+/// 对传入的令牌做额外处理，只负责补齐 `may_cancel_with` 接口。
+#[gen_may_cancel_future(NextEntry, pub(crate))]
+async fn next_entry_async_<'s, 'f, 'r, R, K, C>(
+    reader: &'r mut FrameReader<'f, R, K>,
+    _cancel: C,
+) -> Result<Option<NegotiationEntry<'s>>, StreamEnd_>
 where
-    F: core::future::Future,
+    'f: 's,
+    R: TrBuffRead<u8> + 'f,
+    K: TrCancellationToken + 'f,
+    C: TrCancellationToken,
 {
-    type Output = F::Output;
-    type IntoFuture = F;
-
-    fn into_future(self) -> Self::IntoFuture {
-        self.0
-    }
-}
-
-impl<'a, F> TrMayCancel<'a> for CancelAgnostic<F>
-where
-    F: core::future::Future + 'a,
-{
-    type MayCancelOutput = F::Output;
-
-    type MayCancelFuture<'f, C> = CancelAgnostic<F>
-    where
-        Self: 'f,
-        'f: 'a,
-        C: 'f,
-        C: TrCancellationToken + Clone;
-
-    fn may_cancel_with<'f, C>(self, _cancel: &'f mut C) -> Self::MayCancelFuture<'f, C>
-    where
-        Self: 'f,
-        'f: 'a,
-        C: TrCancellationToken + Clone,
-    {
-        self
+    let res: Result<Option<NegotiationEntry<'s>>, WireError<R::Err, ()>> =
+        FrameReader::next_entry_async_(&mut *reader).await;
+    match res {
+        Result::Ok(item) => Result::Ok(item),
+        Result::Err(err) => {
+            // 详细原因留给调用方取回；流本身只需报告「终止」。
+            reader.last_err_ = Option::Some(err);
+            Result::Err(StreamEnd_::Failed)
+        }
     }
 }
 
@@ -324,10 +314,10 @@ where
     async fn read_async_<K>(
         &mut self,
         out: &mut [u8],
-        cancel: &mut K,
+        cancel: K,
     ) -> Result<(), WireError<R::Err, ()>>
     where
-        K: TrCancellationToken + Clone,
+        K: TrCancellationToken,
     {
         if out.is_empty() {
             return Result::Ok(());
@@ -340,7 +330,10 @@ where
             {
                 // 段只提供只读视图；消费量由 `move_items_to_buff` 提交，
                 // 段回收时游标才会前进（见 abs_buff 的消费语义）。
-                let mut read_res = self.buff_.read_async(&demand).may_cancel_with(cancel).await;
+                let mut read_res = self.buff_
+                    .read_async(&demand)
+                    .may_cancel_with(cancel.child_token())
+                    .await;
                 let segm: Option<&mut R::SegmRef<'_>> = read_res.as_mut().pick_left();
                 match segm {
                     Option::Some(segm) => {
@@ -418,7 +411,7 @@ pub(crate) struct FrameReader<'f, R: TrBuffRead<u8>, K> {
 impl<'f, R, K> FrameReader<'f, R, K>
 where
     R: TrBuffRead<u8>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     /// 读取 `magic` 与算法预告，建立一个帧读取状态机。
     ///
@@ -432,17 +425,14 @@ where
     /// 定位帧尾（模块文档 §4.1）。
     pub(crate) async fn begin_async_(
         buff: &'f mut R,
-        cancel: &mut K,
+        cancel: K,
     ) -> Result<Self, WireError<R::Err, ()>> {
         let mut cursor = FrameCursor::new_(buff);
-        // 读状态机持有令牌克隆：读路径本身仍逐次响应取消。
-        let mut token = cancel.clone();
-
         let mut magic = [0u8; 4];
-        cursor.read_async_(&mut magic, &mut token).await?;
+        cursor.read_async_(&mut magic, cancel.child_token()).await?;
 
         let mut alg = [0u8; 1];
-        cursor.read_async_(&mut alg, &mut token).await?;
+        cursor.read_async_(&mut alg, cancel.child_token()).await?;
         let alg_hdr = alg[0];
         let Option::Some(checksum) = HandshakeChecksum::try_header(alg_hdr) else {
             return Result::Err(WireError::UnsupportedOption);
@@ -455,7 +445,7 @@ where
 
         Result::Ok(FrameReader {
             cursor_: cursor,
-            cancel_: token,
+            cancel_: cancel,
             crc_: crc,
             alg_hdr_: alg_hdr,
             checksum_len_: checksum.checksum_len(),
@@ -511,7 +501,7 @@ where
 
         let mut header = [0u8; 1];
         self.cursor_
-            .read_async_(&mut header, &mut self.cancel_)
+            .read_async_(&mut header, self.cancel_.child_token())
             .await?;
         self.crc_.update_(&header);
         let byte = header[0];
@@ -532,7 +522,7 @@ where
                 let width = self.checksum_len_;
                 let mut bytes = [0u8; 4];
                 self.cursor_
-                    .read_async_(&mut bytes[..width], &mut self.cancel_)
+                    .read_async_(&mut bytes[..width], self.cancel_.child_token())
                     .await?;
                 let expect = decode_checksum_(width, &bytes[..width]);
                 // 校验一票否决：算出的值与帧尾声明的值不等即整帧失败。
@@ -559,7 +549,7 @@ where
                 let width = val_type.value_len();
                 let mut bytes = [0u8; 8];
                 self.cursor_
-                    .read_async_(&mut bytes[..width], &mut self.cancel_)
+                    .read_async_(&mut bytes[..width], self.cancel_.child_token())
                     .await?;
                 self.crc_.update_(&bytes[..width]);
 
@@ -597,36 +587,22 @@ where
 impl<'s, 'f, R, K> TrAsyncIterator for &'s mut FrameReader<'f, R, K>
 where
     R: TrBuffRead<u8> + 'f,
-    K: TrCancellationToken + Clone + 'f,
+    K: TrCancellationToken + 'f,
 {
     // 条目生命周期取**外层借用** `'s` 而不是读缓冲的 `'f`：`NegotiationEntry`
     // 对 `'f` 协变，而 `'f: 's`，因此可以把 `'f` 的条目收窄成 `'s`。这样协商器
     // 的借用与条目流借用同一个（较短的）生命周期，调用方在协商返回后仍能继续
-    // 使用读状态机。
-    // `NextAsync` 只能写成 `impl TrMayCancel<..>`：这里用不了
-    // `gen_may_cancel_future`，原因见 [`CancelAgnostic`] 的说明——宏会改写输出
-    // 类型里的 `'s`，而 `Item` 必须是固定类型。
+    // 使用读状态机。条目流的 step future 由 `gen_may_cancel_future` 生成的
+    // `NextEntryAsync` 充当，不再需要手写的适配层。
     type Item = NegotiationEntry<'s>;
     type Err = StreamEnd_;
 
-    type NextAsync<'g> = impl TrMayCancel<'g, MayCancelOutput =
-        Result<Option<NegotiationEntry<'s>>, StreamEnd_>>
+    type NextAsync<'g> = NextEntryAsync<'s, 'f, 'g, 'g, R, K>
     where
         Self: 'g;
 
     fn next_async(&mut self) -> Self::NextAsync<'_> {
-        CancelAgnostic(async move {
-            let res: Result<Option<NegotiationEntry<'s>>, WireError<R::Err, ()>> =
-                FrameReader::next_entry_async_(&mut **self).await;
-            match res {
-                Result::Ok(item) => Result::Ok(item),
-                Result::Err(err) => {
-                    // 详细原因留给调用方取回；流本身只需报告「终止」。
-                    self.last_err_ = Option::Some(err);
-                    Result::Err(StreamEnd_::Failed)
-                }
-            }
-        })
+        NextEntryAsync::new(&mut **self)
     }
 }
 
@@ -714,22 +690,22 @@ pub(super) async fn write_frame_<W, K>(
     magic: MagicField,
     values: &[Option<usize>; K_BASIC_KEY_COUNT],
     checksum: &HandshakeChecksum,
-    cancel: &mut K,
+    cancel: K,
 ) -> Result<(), WireError<(), W::Err>>
 where
     W: TrBuffWrite<u8>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let mut crc = CrcDigest::new_(checksum);
 
     // 1. magic。
-    write_all_(buff, &magic, cancel).await?;
+    write_all_(buff, &magic, cancel.child_token()).await?;
     crc.update_(&magic);
 
     // 2. 算法预告：与帧尾校验头逐位相同。
     let alg_hdr = checksum.header_byte_();
     let alg = [alg_hdr];
-    write_all_(buff, &alg, cancel).await?;
+    write_all_(buff, &alg, cancel.child_token()).await?;
     crc.update_(&alg);
 
     // 3. 条目区：逐条成形（最大 9 字节栈缓冲）后立即写出。
@@ -742,17 +718,17 @@ where
         };
         let (vl_type, entry) = encode_entry_(key, *value);
         let width = 1usize + vl_type.value_len();
-        write_all_(buff, &entry[..width], cancel).await?;
+        write_all_(buff, &entry[..width], cancel.child_token()).await?;
         crc.update_(&entry[..width]);
     }
 
     // 4. 校验头（定界符）。
-    write_all_(buff, &alg, cancel).await?;
+    write_all_(buff, &alg, cancel.child_token()).await?;
     crc.update_(&alg);
 
     // 5. crc 值。
     let (bytes, len) = checksum_bytes_(checksum, crc.finalize_());
-    write_all_(buff, &bytes[..len], cancel).await
+    write_all_(buff, &bytes[..len], cancel.child_token()).await
 }
 
 /// 写出 `bytes` 的全部内容。
@@ -762,11 +738,11 @@ where
 async fn write_all_<W, K>(
     buff: &mut W,
     bytes: &[u8],
-    cancel: &mut K,
+    cancel: K,
 ) -> Result<(), WireError<(), W::Err>>
 where
     W: TrBuffWrite<u8>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -774,7 +750,10 @@ where
         let demand = Demand::exactly(rest);
         let put;
         {
-            let mut write_res = buff.write_async(&demand).may_cancel_with(cancel).await;
+            let mut write_res = buff
+                .write_async(&demand)
+                .may_cancel_with(cancel.child_token())
+                .await;
             let segm: Option<&mut W::SegmMut<'_>> = write_res.as_mut().pick_left();
             match segm {
                 Option::Some(segm) => {
@@ -940,8 +919,8 @@ mod tests_ {
     ) -> usize {
         let capacity = buf.len();
         let mut cursor: &mut [u8] = buf;
-        let mut cancel = NonCancellableToken::new();
-        write_frame_(&mut cursor, magic, values, checksum, &mut cancel)
+        let cancel = NonCancellableToken::new();
+        write_frame_(&mut cursor, magic, values, checksum, cancel)
             .await
             .expect("写帧应当成功");
         capacity - cursor.len()
@@ -984,7 +963,7 @@ mod tests_ {
 
             let mut probe: &[u8] = &buf[..total];
             let mut reader =
-                FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+                FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
                     .await
                     .expect("magic 与算法预告应当可读");
             assert_eq!(reader.magic_(), K_INVITE_MAGIC);
@@ -1029,7 +1008,7 @@ mod tests_ {
             let total = write_into_buf_(&mut buf, K_ACCEPT_MAGIC, &values, &checksum).await;
             let mut probe: &[u8] = &buf[..total];
             let mut reader =
-                FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+                FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
                     .await
                     .expect("magic 与算法预告应当可读");
             reader.drain_async_().await.expect("整帧应当校验通过");
@@ -1055,7 +1034,7 @@ mod tests_ {
         let total = write_into_buf_(&mut buf, K_INVITE_MAGIC, &values, &checksum).await;
         buf[total - 1] ^= 0xFF;
         let mut probe: &[u8] = &buf[..total];
-        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
             .await
             .expect("magic 与算法预告应当可读");
         let res = reader.drain_async_().await;
@@ -1071,7 +1050,7 @@ mod tests_ {
         buf[..4].copy_from_slice(&K_INVITE_MAGIC);
         buf[4] = compose_header_(NegotiationKey::Checksum, NegotiationValType::BeU8);
         let mut probe: &[u8] = &buf;
-        let res = FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut()).await;
+        let res = FrameReader::begin_async_(&mut probe, NonCancellableToken::new()).await;
         assert!(matches!(res, Result::Err(WireError::UnsupportedOption)));
     }
 
@@ -1098,7 +1077,7 @@ mod tests_ {
         let trailer = total - 3;
         buf[trailer] = compose_header_(NegotiationKey::Checksum, NegotiationValType::BeU32);
         let mut probe: &[u8] = &buf[..total];
-        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
             .await
             .expect("magic 与算法预告应当可读");
         let res = reader.drain_async_().await;
@@ -1118,7 +1097,7 @@ mod tests_ {
         buf[5] = 0x05;
         buf[6] = 0x01;
         let mut probe: &[u8] = &buf[..7];
-        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
             .await
             .expect("magic 与算法预告应当可读");
         let res = reader.drain_async_().await;
@@ -1136,7 +1115,7 @@ mod tests_ {
         buf[5] = compose_header_(NegotiationKey::ExtMsg, NegotiationValType::BeU8);
         buf[6] = 0x00;
         let mut probe: &[u8] = &buf[..7];
-        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
             .await
             .expect("magic 与算法预告应当可读");
         let res = reader.drain_async_().await;
@@ -1159,7 +1138,7 @@ mod tests_ {
         let crc = HANDSHAKE_CRC16.checksum(&buf[..10]);
         buf[10..12].copy_from_slice(&crc.to_be_bytes());
         let mut probe: &[u8] = &buf[..12];
-        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
             .await
             .expect("magic 与算法预告应当可读");
         let res = reader.drain_async_().await;
@@ -1177,7 +1156,7 @@ mod tests_ {
         buf[5] = 0x00;
         buf[6] = 0x00;
         let mut probe: &[u8] = &buf[..7];
-        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
             .await
             .expect("magic 与算法预告应当可读");
         let res = reader.drain_async_().await;
@@ -1208,7 +1187,7 @@ mod tests_ {
         // 用块限制读状态机的借用范围，块结束后才能检查 `probe`。
         {
             let mut reader =
-                FrameReader::begin_async_(&mut probe, NonCancellableToken::shared_mut())
+                FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
                     .await
                     .expect("magic 与算法预告应当可读");
 

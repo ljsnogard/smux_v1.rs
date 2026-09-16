@@ -423,7 +423,7 @@
 //!   [`agent::HandshakeAgent::listen_async`] 执行等待方流程。
 //! - 协商策略由 [`agent::TrNegotiator`] 提供：条目**边读边交**给它，由它决定
 //!   接受还是立即拒绝。
-//! - 成功后交付 [`agent::HandshakeEndpoint`]：协商规格
+//! - 成功后交付 [`agent::HandshakeDelivery`]：协商规格
 //!   （[`opts::HandshakeOpts`]）与归还的一对 `Tx` / `Rx`。
 //! - 失败类型为 [`error::HandshakeError`]。
 //!

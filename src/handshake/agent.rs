@@ -6,7 +6,7 @@
 //! - [`HandshakeAgent`]：拥有收发通道。
 //! - [`HandshakeAgent::listen_async`]：同一个对象执行完整的等待方流程。
 //!
-//! 两者成功后都向调用者交付 [`HandshakeEndpoint`]：协商好的规格
+//! 两者成功后都向调用者交付 [`HandshakeDelivery`]：协商好的规格
 //! （[`HandshakeOpts`]）以及一对 `Tx` / `Rx`，供后续连接层继续使用。
 //!
 //! # 边接收边协商
@@ -92,28 +92,31 @@ pub trait TrNegotiator {
 /// 接受一切条目的协商器。
 ///
 /// 它会把条目流读到结束，因此同时充当「流式协商能跑通」的最小实现与测试替身。
-#[cfg(test)]
-pub(crate) struct AcceptAllEntry;
+pub struct AcceptAllEntries;
 
 /// `AcceptAllEntry` 的协商逻辑。
 ///
-/// 用 [`gen_may_cancel_future`] 生成可取消的 future 类型：direct `.await` 与
-/// `.may_cancel_with(token)` 两条路径由宏统一提供，不必手写 `TrMayCancel`。
-#[cfg(test)]
-#[gen_may_cancel_future(AcceptAll)]
+/// 生成条目需放宽到 `pub`：`AcceptAllEntries` 本身是公开类型，其
+/// [`TrNegotiator::ShouldAcceptAsync`] 若引用私有类型会触发 E0446。
+#[gen_may_cancel_future(AcceptAll, pub)]
 async fn accept_all_async_<'f, I, C>(
-    _this: &'f mut AcceptAllEntry,
+    _: &'f mut AcceptAllEntries,
     mut entries: I,
-    _cancel: &'f mut C,
+    cancel: C,
 ) -> bool
 where
     I: TrAsyncIterator<Item = NegotiationEntry<'f>> + 'f,
-    C: TrCancellationToken + Clone,
+    C: TrCancellationToken,
 {
     loop {
-        // abs_cancel 已把 `IntoFuture::Output` 钉到 `MayCancelOutput`，
-        // 因此这里可以直接 `.await` 得到 `Result<..>`，无需自造令牌。
-        match entries.next_async().await {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let next = entries
+            .next_async()
+            .may_cancel_with(cancel.child_token())
+            .await;
+        match next {
             Result::Ok(Option::Some(_)) => continue,
             Result::Ok(Option::None) => return true,
             Result::Err(_) => return false,
@@ -121,11 +124,10 @@ where
     }
 }
 
-#[cfg(test)]
-impl TrNegotiator for AcceptAllEntry {
+impl TrNegotiator for AcceptAllEntries {
     type Entry<'f> = NegotiationEntry<'f>;
 
-    type ShouldAcceptAsync<'f, I> = AcceptAllAsync<'f, I>
+    type ShouldAcceptAsync<'f, I> = AcceptAllAsync<'f, 'f, I>
     where
         Self: 'f,
         I: TrAsyncIterator<Item = NegotiationEntry<'f>> + 'f;
@@ -134,7 +136,7 @@ impl TrNegotiator for AcceptAllEntry {
     where
         I: TrAsyncIterator<Item = NegotiationEntry<'f>> + 'f,
     {
-        AcceptAllAsync(self, entries)
+        AcceptAllAsync::new(self, entries)
     }
 }
 
@@ -143,7 +145,7 @@ impl TrNegotiator for AcceptAllEntry {
 /// `opts` 是双方协商一致的连接规格；`tx` / `rx` 是握手期间使用的收发通道，
 /// 由本对象归还，供后续连接层继续使用。
 #[derive(Debug, Clone)]
-pub struct HandshakeEndpoint<Tx, Rx> {
+pub struct HandshakeDelivery<Tx, Rx> {
     /// 协商好的连接规格。
     pub opts: HandshakeOpts,
 
@@ -185,20 +187,26 @@ where
     /// - `negotiator` 在接收 `ACCEPT` 时被调用一次；返回 `false` 时向对端发送
     ///   `REJECT` 并立即终止（不再读完剩余条目）。
     ///
-    /// 返回的 future 输出 `Result<HandshakeEndpoint<Tx, Rx>, HandshakeError>`；
-    /// 成功后由 [`HandshakeEndpoint`] 交付协商规格与归还的收发通道。
+    /// 返回的 future 输出 `Result<HandshakeDelivery<Tx, Rx>, HandshakeError>`；
+    /// 成功后由 [`HandshakeDelivery`] 交付协商规格与归还的收发通道。
     pub fn invite_async<'f, I, D>(
         self,
         entries: I,
         negotiator: D,
-    ) -> HandshakeInviteAsync<'f, Rx, Tx, I, D>
+    ) -> HandshakeInviteAsync<'f, 'f, Rx, Tx, I, D>
     where
         Rx: 'f,
         Tx: 'f,
         I: IntoIterator<Item = NegotiationEntry<'f>> + 'f,
         D: for<'x> TrNegotiator<Entry<'x> = NegotiationEntry<'x>> + 'f,
     {
-        HandshakeInviteAsync(self.rx_, self.tx_, entries, negotiator, PhantomData)
+        HandshakeInviteAsync::new(
+            PhantomData,
+            self.rx_,
+            self.tx_,
+            entries,
+            negotiator,
+        )
     }
 
     /// 执行完整的等待方握手：等待并**边收边判** `INVITE`、补全条件、
@@ -208,18 +216,18 @@ where
     /// - `negotiator` 在接收 `INVITE` 时被调用一次；返回 `false` 时向对端发送
     ///   `REJECT` 并立即终止（不再读完剩余条目）。
     ///
-    /// 返回的 future 输出 `Result<HandshakeEndpoint<Tx, Rx>, HandshakeError>`。
+    /// 返回的 future 输出 `Result<HandshakeDelivery<Tx, Rx>, HandshakeError>`。
     pub fn listen_async<'f, D>(
         self,
         local: &'f BasicOpts,
         negotiator: D,
-    ) -> ListenHandshakeAsync<'f, Rx, Tx, D>
+    ) -> ListenHandshakeAsync<'f, 'f, Rx, Tx, D>
     where
         Rx: 'f,
         Tx: 'f,
         D: for<'x> TrNegotiator<Entry<'x> = NegotiationEntry<'x>> + 'f,
     {
-        ListenHandshakeAsync(self.rx_, self.tx_, local, negotiator)
+        ListenHandshakeAsync::new(self.rx_, self.tx_, local, negotiator)
     }
 }
 
@@ -230,11 +238,15 @@ where
 ///
 /// 取消由 `cancel` 统一施加（符合 AGENTS.md 纪律 4）；读侧的取消另由读状态机
 /// 内部持有的令牌克隆在每次 `read_async` 上生效。
-async fn negotiate_async<'m, D, I, K>(negotiator: &'m mut D, entries: I, cancel: &'m mut K) -> bool
+async fn negotiate_async<'m, D, I, K>(
+    negotiator: &'m mut D,
+    entries: I,
+    cancel: K,
+) -> bool
 where
     D: TrNegotiator,
     I: TrAsyncIterator<Item = D::Entry<'m>> + 'm,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken + 'm,
 {
     negotiator
         .should_accept_async(entries)
@@ -249,32 +261,33 @@ async fn write_frame_async_<W, K, RE>(
     tx: &mut W,
     magic: [u8; 4],
     values: &[Option<usize>; K_BASIC_KEY_COUNT],
-    cancel: &mut K,
+    cancel: K,
 ) -> Result<(), HandshakeError<RE, W::Err>>
 where
     W: TrBuffWrite<u8>,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
-    write_frame_(tx, magic, values, &K_DEFAULT_CHECKSUM, cancel)
+    write_frame_(tx, magic, values, &K_DEFAULT_CHECKSUM, cancel.child_token())
         .await
         .map_err(from_write_frame_err_)
 }
 
 /// 发起方状态机实现；对外经 [`HandshakeAgent::invite_async`] 使用。
-#[gen_may_cancel_future(HandshakeInvite)]
+#[gen_may_cancel_future(HandshakeInvite, pub)]
 async fn handshake_invite_async_<'f, R, W, I, D, K>(
+    _: PhantomData<&'f ()>,
     mut rx: R,
     mut tx: W,
     entries: I,
     mut negotiator: D,
-    cancel: &'f mut K,
-) -> Result<HandshakeEndpoint<W, R>, HandshakeError<R::Err, W::Err>>
+    cancel: K,
+) -> Result<HandshakeDelivery<W, R>, HandshakeError<R::Err, W::Err>>
 where
     R: TrBuffRead<u8> + 'f,
     W: TrBuffWrite<u8> + 'f,
     I: IntoIterator<Item = NegotiationEntry<'f>> + 'f,
     D: for<'x> TrNegotiator<Entry<'x> = NegotiationEntry<'x>> + 'f,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let empty: [Option<usize>; K_BASIC_KEY_COUNT] = [Option::None; K_BASIC_KEY_COUNT];
 
@@ -296,10 +309,16 @@ where
         seen |= bit;
         proposed[key] = Option::Some(entry.val_data);
     }
-    write_frame_async_(&mut tx, K_INVITE_MAGIC, &proposed, cancel).await?;
+    write_frame_async_(
+        &mut tx,
+        K_INVITE_MAGIC,
+        &proposed,
+        cancel.child_token(),
+    ).await?;
 
     // 2. 等待 ACCEPT：先判 magic，再**边收边判**条目。
-    let mut reader = FrameReader::begin_async_(&mut rx, &mut *cancel)
+    let mut reader = FrameReader::
+        begin_async_(&mut rx, cancel.child_token())
         .await
         .map_err(from_read_frame_err_)?;
     if reader.magic_() == K_REJECT_MAGIC {
@@ -308,7 +327,11 @@ where
     if reader.magic_() != K_ACCEPT_MAGIC {
         return Result::Err(HandshakeError::InvalidMagic);
     }
-    let accepted = negotiate_async(&mut negotiator, &mut reader, &mut *cancel).await;
+    let accepted = negotiate_async(
+        &mut negotiator,
+        &mut reader,
+        cancel.child_token(),
+    ).await;
     if !accepted {
         // 读侧失败（CRC 不匹配、保留键、对端关闭……）不能当成「本端主动拒绝」：
         // 按模块文档 §9，这类失败不得回 REJECT。
@@ -326,16 +349,17 @@ where
 
     // 3. ACCEPT 必须补全全部 4 项。
     let Option::Some(accepted_values) = complete_values_(reader.basics_()) else {
+        // 该分支随即返回，`cancel` 之后不再使用，因此直接按值移交即可。
         let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
         return Result::Err(HandshakeError::Inconsistent);
     };
     let result = values_to_basic_(&accepted_values);
 
-    // 4. 回显同一组数值作为 CONFIRM。
-    write_frame_async_(&mut tx, K_CONFRM_MAGIC, &accepted_values, cancel).await?;
+    // 4. 回显同一组数值作为 CONFIRM；下面还要读 CONFRM，故只交出子令牌。
+    write_frame_async_(&mut tx, K_CONFRM_MAGIC, &accepted_values, cancel.child_token()).await?;
 
     // 5. 等待等待方的空 CONFRM。
-    let mut done = FrameReader::begin_async_(&mut rx, &mut *cancel)
+    let mut done = FrameReader::begin_async_(&mut rx, cancel.child_token())
         .await
         .map_err(from_read_frame_err_)?;
     if done.magic_() != K_CONFRM_MAGIC {
@@ -346,7 +370,7 @@ where
         return Result::Err(HandshakeError::Inconsistent);
     }
 
-    Result::Ok(HandshakeEndpoint {
+    Result::Ok(HandshakeDelivery {
         opts: HandshakeOpts { basic_opts: result },
         tx,
         rx,
@@ -354,30 +378,30 @@ where
 }
 
 /// 等待方状态机实现；对外经 [`HandshakeAgent::listen_async`] 使用。
-#[gen_may_cancel_future(ListenHandshake)]
+#[gen_may_cancel_future(ListenHandshake, pub)]
 async fn listen_handshake_async_<'f, R, W, D, K>(
     mut rx: R,
     mut tx: W,
     local: &'f BasicOpts,
     mut negotiator: D,
-    cancel: &'f mut K,
-) -> Result<HandshakeEndpoint<W, R>, HandshakeError<R::Err, W::Err>>
+    cancel: K,
+) -> Result<HandshakeDelivery<W, R>, HandshakeError<R::Err, W::Err>>
 where
     R: TrBuffRead<u8> + 'f,
     W: TrBuffWrite<u8> + 'f,
     D: for<'x> TrNegotiator<Entry<'x> = NegotiationEntry<'x>> + 'f,
-    K: TrCancellationToken + Clone,
+    K: TrCancellationToken,
 {
     let empty: [Option<usize>; K_BASIC_KEY_COUNT] = [Option::None; K_BASIC_KEY_COUNT];
 
     // 1. 等待 INVITE，并**边收边判**。
-    let mut reader = FrameReader::begin_async_(&mut rx, &mut *cancel)
+    let mut reader = FrameReader::begin_async_(&mut rx, cancel.child_token())
         .await
         .map_err(from_read_frame_err_)?;
     if reader.magic_() != K_INVITE_MAGIC {
         return Result::Err(HandshakeError::InvalidMagic);
     }
-    let accepted = negotiate_async(&mut negotiator, &mut reader, &mut *cancel).await;
+    let accepted = negotiate_async(&mut negotiator, &mut reader, cancel.child_token()).await;
     if !accepted {
         // 读侧失败不能当成「本端主动拒绝」：按模块文档 §9，这类失败不得回 REJECT。
         if let Option::Some(err) = reader.take_error_() {
@@ -395,11 +419,11 @@ where
     let values = complete_invite_(local, reader.basics_());
     let result = values_to_basic_(&values);
 
-    // 3. 发送 ACCEPT。
-    write_frame_async_(&mut tx, K_ACCEPT_MAGIC, &values, cancel).await?;
+    // 3. 发送 ACCEPT；后面还要继续读 CONFIRM，故只交出子令牌。
+    write_frame_async_(&mut tx, K_ACCEPT_MAGIC, &values, cancel.child_token()).await?;
 
     // 4. 等待并校验 CONFIRM（协议层逐值比较，不再走协商器）。
-    let mut confirm = FrameReader::begin_async_(&mut rx, &mut *cancel)
+    let mut confirm = FrameReader::begin_async_(&mut rx, cancel.child_token())
         .await
         .map_err(from_read_frame_err_)?;
     if confirm.magic_() != K_CONFRM_MAGIC {
@@ -414,7 +438,7 @@ where
 
     // 5. 发送空 CONFRM。
     write_frame_async_(&mut tx, K_CONFRM_MAGIC, &empty, cancel).await?;
-    Result::Ok(HandshakeEndpoint {
+    Result::Ok(HandshakeDelivery {
         opts: HandshakeOpts { basic_opts: result },
         tx,
         rx,
@@ -426,7 +450,7 @@ mod tests_ {
     use core::mem::MaybeUninit;
 
     use abs_art_bridge::Runtime;
-    use abs_cancel::{NonCancellableToken, TrMayCancel};
+    use abs_cancel::NonCancellableToken;
     use abs_mm::mem_alloc::CoreAlloc;
     use buffex::circular_buff::builder::CircularBuffBuilder;
     use mm_ptr::{Owned, x_deps::abs_mm};
@@ -443,15 +467,15 @@ mod tests_ {
     }
 
     /// `CapPacketSize` 的协商逻辑；future 类型由 [`gen_may_cancel_future`] 生成。
-    #[gen_may_cancel_future(CapPacketSizeAccept)]
+    #[gen_may_cancel_future(CapPacketSizeAccept, pub)]
     async fn cap_packet_size_accept_async_<'f, I, C>(
         this: &'f mut CapPacketSize,
         mut entries: I,
-        _cancel: &'f mut C,
+        _: C,
     ) -> bool
     where
         I: TrAsyncIterator<Item = NegotiationEntry<'f>> + 'f,
-        C: TrCancellationToken + Clone,
+        C: TrCancellationToken,
     {
         loop {
             let Ok(maybe) = entries.next_async().await else {
@@ -475,7 +499,7 @@ mod tests_ {
     impl TrNegotiator for CapPacketSize {
         type Entry<'f> = NegotiationEntry<'f>;
 
-        type ShouldAcceptAsync<'f, I> = CapPacketSizeAcceptAsync<'f, I>
+        type ShouldAcceptAsync<'f, I> = CapPacketSizeAcceptAsync<'f, 'f, I>
         where
             Self: 'f,
             I: TrAsyncIterator<Item = NegotiationEntry<'f>> + 'f;
@@ -484,7 +508,7 @@ mod tests_ {
         where
             I: TrAsyncIterator<Item = NegotiationEntry<'f>> + 'f,
         {
-            CapPacketSizeAcceptAsync(self, entries)
+            CapPacketSizeAcceptAsync::new(self, entries)
         }
     }
 
@@ -534,14 +558,12 @@ mod tests_ {
 
         let a_accept = Runtime::spawn_local(async move {
             let local_opts = BasicOpts::default();
-            a.listen_async(&local_opts, AcceptAllEntry)
-                .may_cancel_with(NonCancellableToken::shared_mut())
+            a.listen_async(&local_opts, AcceptAllEntries)
                 .await
         });
         let b_invite = Runtime::spawn_local(async move {
             let proposed = BasicOpts::default();
-            b.invite_async(&proposed, AcceptAllEntry)
-                .may_cancel_with(NonCancellableToken::shared_mut())
+            b.invite_async(&proposed, AcceptAllEntries)
                 .await
         });
 
@@ -572,13 +594,12 @@ mod tests_ {
         let capacity = buf.len();
         let len = {
             let mut cursor: &mut [u8] = &mut buf;
-            let mut token = NonCancellableToken::new();
             write_frame_(
                 &mut cursor,
                 K_INVITE_MAGIC,
                 &values,
                 &K_DEFAULT_CHECKSUM,
-                &mut token,
+                NonCancellableToken::new(),
             )
             .await
             .expect("写帧应当成功");
@@ -591,10 +612,7 @@ mod tests_ {
         let mut sink = [0u8; 64];
         let agent = HandshakeAgent::new(rx, &mut sink[..]);
         let local = BasicOpts::default();
-        let res = agent
-            .listen_async(&local, AcceptAllEntry)
-            .may_cancel_with(NonCancellableToken::shared_mut())
-            .await;
+        let res = agent.listen_async(&local, AcceptAllEntries).await;
         assert!(
             matches!(res, Result::Err(HandshakeError::ChecksumErr)),
             "校验失败必须按其本身分类，而不是 Rejected"
@@ -619,14 +637,11 @@ mod tests_ {
                     seen_: 0usize,
                 },
             )
-            .may_cancel_with(NonCancellableToken::shared_mut())
             .await
         });
         let b_invite = Runtime::spawn_local(async move {
             let proposed = BasicOpts::default();
-            b.invite_async(&proposed, AcceptAllEntry)
-                .may_cancel_with(NonCancellableToken::shared_mut())
-                .await
+            b.invite_async(&proposed, AcceptAllEntries).await
         });
 
         let accepted = a_accept.await.expect("等待方任务不应 panic");
