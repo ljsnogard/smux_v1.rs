@@ -44,3 +44,11 @@ abs_buff_compio_adapt = { path = "../abs_buff_compio_adapt" }
 # `futures`，不需要为两个运行时各写一份并发代码。
 futures = "0.3.*"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+
+# 【本地联调的临时补丁，推送后必须删除】
+#
+# 帧编解码需要把 `Dock` 还原成数值，而 `abs_smux` 的 `Dock::value()` 尚未推送到
+# `dev/0.1.0`，因此暂时改用工作区内的本地副本。上游推送完成后：删除本节，并执行
+# `cargo update -p abs_smux`。详见 `dev-notes/connection-20260919-1631.md` §2。
+[patch."https://gitee.com/lino_snsalias/abs_smux.git"]
+abs_smux = { path = "../abs_smux" }

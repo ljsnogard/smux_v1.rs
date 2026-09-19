@@ -38,13 +38,10 @@
 use core::time::Duration;
 
 use abs_async_iter::TrAsyncIterator;
-use abs_buff::{
-    Demand, TrBuffRead, TrBuffWrite, gen_may_cancel_future,
-    buffer::{TrBuffSegmMut, TrBuffSegmRef},
-    x_deps::abs_cancel,
-};
-use abs_cancel::{TrCancellationToken, TrMayCancel};
+use abs_buff::{TrBuffRead, TrBuffWrite, gen_may_cancel_future, x_deps::abs_cancel};
+use abs_cancel::TrCancellationToken;
 
+use crate::wire_io_::{CursorError, ReadCursor, write_all_async_};
 use crate::handshake::{
     MagicField,
     opts::{
@@ -289,86 +286,6 @@ where
     }
 }
 
-/// 读侧游标：按块读满目标长度。
-///
-/// 底层缓冲可能一次只交付部分字节，因此这里以**块**为单位重试：每次
-/// [`TrBuffRead::read_async`] 借出的段在被回收时会把已消费量记回缓冲，
-/// 下一次重试继续往后读，直到满足目标长度或对端关闭。这里**不累计帧长**、
-/// 也**不设帧长上限**：帧长本身是无界的（见模块文档 §3）。
-struct FrameCursor<'f, R> {
-    buff_: &'f mut R,
-}
-
-impl<'f, R> FrameCursor<'f, R>
-where
-    R: TrBuffRead<u8>,
-{
-    fn new_(buff: &'f mut R) -> Self {
-        FrameCursor { buff_: buff }
-    }
-
-    /// 分多次读满 `out`。
-    ///
-    /// [`TrBuffRead::read_async`] 借出的段可能比请求的更长，这里只取需要的
-    /// 部分，多出的字节留在底层缓冲里。
-    async fn read_async_<K>(
-        &mut self,
-        out: &mut [u8],
-        cancel: K,
-    ) -> Result<(), WireError<R::Err, ()>>
-    where
-        K: TrCancellationToken,
-    {
-        if out.is_empty() {
-            return Result::Ok(());
-        }
-        let mut offset = 0usize;
-        while offset < out.len() {
-            let rest = out.len() - offset;
-            let demand = Demand::exactly(rest);
-            let got;
-            {
-                // 段只提供只读视图；消费量由 `move_items_to_buff` 提交，
-                // 段回收时游标才会前进（见 abs_buff 的消费语义）。
-                let mut read_res = self.buff_
-                    .read_async(&demand)
-                    .may_cancel_with(cancel.child_token())
-                    .await;
-                let segm: Option<&mut R::SegmRef<'_>> = read_res.as_mut().pick_left();
-                match segm {
-                    Option::Some(segm) => {
-                        let mut child = segm.as_segm_ref();
-                        // 只搬运请求的长度：段可能比请求的更长。
-                        let limit = core::cmp::min(rest, child.least_count());
-                        let dst = &mut out[offset..offset + limit];
-                        // SAFETY: `MaybeUninit<u8>` 与 `u8` 布局相同，且
-                        // `dst` 是本地独占的可写切片；`move_items_to_buff`
-                        // 只会写入其中已初始化的前缀（返回值给出长度）。
-                        let uninit = unsafe {
-                            core::slice::from_raw_parts_mut(
-                                dst.as_mut_ptr() as *mut core::mem::MaybeUninit<u8>,
-                                dst.len(),
-                            )
-                        };
-                        got = unsafe { child.move_items_to_buff(uninit) };
-                    }
-                    Option::None => {
-                        return Result::Err(match read_res.pick_right() {
-                            Option::Some(err) => WireError::Read(err),
-                            Option::None => WireError::PeerClosed,
-                        });
-                    }
-                }
-            }
-            if got == 0 {
-                return Result::Err(WireError::PeerClosed);
-            }
-            offset += got;
-        }
-        Result::Ok(())
-    }
-}
-
 /// 握手帧读取状态机。
 ///
 /// 生命周期 `'f` 是底层读缓冲的借用；[`FrameReader`] 本身**不累积整帧**：
@@ -379,7 +296,7 @@ where
 ///
 /// 因此内存占用是 O(1)（相对帧长与条目数量），条目数量不设上限也不会撑爆内存。
 pub(crate) struct FrameReader<'f, R: TrBuffRead<u8>, K> {
-    cursor_: FrameCursor<'f, R>,
+    cursor_: ReadCursor<'f, R>,
 
     /// 读侧自己的取消令牌（`K` 的克隆）。持有克隆而不是借用，读状态机才能与
     /// 「协商时把真正的令牌借给协商器」并存而不冲突。
@@ -427,7 +344,7 @@ where
         buff: &'f mut R,
         cancel: K,
     ) -> Result<Self, WireError<R::Err, ()>> {
-        let mut cursor = FrameCursor::new_(buff);
+        let mut cursor = ReadCursor::new_(buff);
         let mut magic = [0u8; 4];
         cursor.read_async_(&mut magic, cancel.child_token()).await?;
 
@@ -672,6 +589,20 @@ where
 {
 }
 
+/// 把共享字节游标（[`crate::wire_io_`]）的错误映射为握手帧错误。
+///
+/// 游标只报告「底层怎么失败的」，握手侧在这里把它翻译成自己的语义，因此
+/// [`FrameReader`] 与 [`write_frame_`] 的调用点可以继续直接使用 `?`。
+impl<RE, WE> From<CursorError<RE, WE>> for WireError<RE, WE> {
+    fn from(err: CursorError<RE, WE>) -> Self {
+        match err {
+            CursorError::Read(err) => WireError::Read(err),
+            CursorError::Write(err) => WireError::Write(err),
+            CursorError::PeerClosed => WireError::PeerClosed,
+        }
+    }
+}
+
 /// 逐字段写出一个握手帧。
 ///
 /// **不预先成形整帧**：`magic`、算法预告、各条目、校验头、`crc` 依次写出，
@@ -699,13 +630,13 @@ where
     let mut crc = CrcDigest::new_(checksum);
 
     // 1. magic。
-    write_all_(buff, &magic, cancel.child_token()).await?;
+    write_all_async_(buff, &magic, cancel.child_token()).await?;
     crc.update_(&magic);
 
     // 2. 算法预告：与帧尾校验头逐位相同。
     let alg_hdr = checksum.header_byte_();
     let alg = [alg_hdr];
-    write_all_(buff, &alg, cancel.child_token()).await?;
+    write_all_async_(buff, &alg, cancel.child_token()).await?;
     crc.update_(&alg);
 
     // 3. 条目区：逐条成形（最大 9 字节栈缓冲）后立即写出。
@@ -718,60 +649,17 @@ where
         };
         let (vl_type, entry) = encode_entry_(key, *value);
         let width = 1usize + vl_type.value_len();
-        write_all_(buff, &entry[..width], cancel.child_token()).await?;
+        write_all_async_(buff, &entry[..width], cancel.child_token()).await?;
         crc.update_(&entry[..width]);
     }
 
     // 4. 校验头（定界符）。
-    write_all_(buff, &alg, cancel.child_token()).await?;
+    write_all_async_(buff, &alg, cancel.child_token()).await?;
     crc.update_(&alg);
 
     // 5. crc 值。
     let (bytes, len) = checksum_bytes_(checksum, crc.finalize_());
-    write_all_(buff, &bytes[..len], cancel.child_token()).await
-}
-
-/// 写出 `bytes` 的全部内容。
-///
-/// 与读侧对称：借出的段可能比请求的更短，也可能更长；本函数只写入需要的前
-/// 缀，未用完的容量在段被回收时归还，因此可以安全地分多次写完。
-async fn write_all_<W, K>(
-    buff: &mut W,
-    bytes: &[u8],
-    cancel: K,
-) -> Result<(), WireError<(), W::Err>>
-where
-    W: TrBuffWrite<u8>,
-    K: TrCancellationToken,
-{
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let rest = bytes.len() - offset;
-        let demand = Demand::exactly(rest);
-        let put;
-        {
-            let mut write_res = buff
-                .write_async(&demand)
-                .may_cancel_with(cancel.child_token())
-                .await;
-            let segm: Option<&mut W::SegmMut<'_>> = write_res.as_mut().pick_left();
-            match segm {
-                Option::Some(segm) => {
-                    put = segm.as_segm_mut().clone_items_from_buff(&bytes[offset..]);
-                }
-                Option::None => {
-                    return Result::Err(match write_res.pick_right() {
-                        Option::Some(err) => WireError::Write(err),
-                        Option::None => WireError::PeerClosed,
-                    });
-                }
-            }
-        }
-        if put == 0 {
-            return Result::Err(WireError::PeerClosed);
-        }
-        offset += put;
-    }
+    write_all_async_(buff, &bytes[..len], cancel.child_token()).await?;
     Result::Ok(())
 }
 
