@@ -209,6 +209,7 @@ mod channel_;
 mod error_;
 mod frame_;
 mod session_;
+mod sync_;
 mod telegraph_;
 
 pub use channel_::{

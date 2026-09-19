@@ -178,48 +178,6 @@ where
     todo!("复用调度循环")
 }
 
-/// 读写会话共享的子流注册表（内部类型）。
-///
-/// 持有：
-///
-/// - `dock → 子流` 的映射，以及每 dock 的活动计数（受 `max_dock_chan_count` 约束）；
-/// - 连接级活动计数（受 `max_channel_count` 约束）；
-/// - 每条子流的收发窗口、关闭标志与两侧环的共享句柄；
-/// - 待决的入向建流请求队列（供 listener 取用）与控制帧队列（供写会话取用）。
-///
-/// 读会话只做「查表 + 投递」，写会话只做「查表 + 取值」，因此绝大多数操作只需
-/// **读锁**；建流 / 拆流才需要写锁。线程模型（原子或非原子）见
-/// [`crate::connection`] 模块文档 §6。
-pub(crate) struct ChannelRegistry<B, A> {
-    _mark_: core::marker::PhantomData<fn() -> (B, A)>,
-}
-
-impl<B, A> ChannelRegistry<B, A>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: TrMalloc + Clone + Send + Sync,
-{
-    /// 新建空注册表。
-    pub(crate) fn new_() -> Self {
-        todo!("建立空注册表")
-    }
-
-    /// 为 `(local_dock, remote_dock)` 保留一个子流槽位。
-    ///
-    /// # Errors
-    ///
-    /// dock 已被 telegraph 占用 → [`MuxError::DockInUse`]；超出
-    /// `max_dock_chan_count` / `max_channel_count` → 对应错误。
-    pub(crate) fn reserve_(
-        &mut self,
-        local_dock: super::Dock,
-        remote_dock: super::Dock,
-    ) -> Result<(), MuxError<(), ()>> {
-        todo!("检查配额与 dock 占用后登记子流")
-    }
-
-    /// 拆除一条子流并释放其配额。
-    pub(crate) fn release_(&mut self, local_dock: super::Dock, remote_dock: super::Dock) {
-        todo!("从注册表移除子流")
-    }
-}
+// 读写会话共享的注册表（dock / 子流索引、配额、唤醒槽、失败标志、取消令牌）已经
+// 落在 `sync_` 模块：会话只通过 `sync_::ChannelRegistry_` 访问共享状态，本模块
+// 不再自带注册表类型。
