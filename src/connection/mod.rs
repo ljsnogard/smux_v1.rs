@@ -32,16 +32,25 @@
 //! 连接状态**不放在一把大锁后面**，而是按方向切分（对应「不同业务逻辑各自竞争
 //! 读锁 / 写锁，因此各持一个 session」）：
 //!
-//! - [`ReadSession`]：独占网络读半边 `Rx`，负责**解复用**——逐帧解析后把载荷
-//!   投递到目标子流的接收环，并维护接收方向窗口；
-//! - [`WriteSession`]：独占网络写半边 `Tx`，负责**复用调度**——从各子流的发送环
-//!   取数据、切分并编帧，按优先级 / 轮转写出，并维护发送方向窗口；
+//! 连接**独占** `Rx` / `Tx`：握手完成后它们就交给 [`MuxConnection`]，**不再出现
+//! 在任何公开签名里**；其它类型要完成任何功能，只能通过 [`MuxConnection`] 的 API
+//! ——[`TrConnection`](abs_smux::conn::TrConnection) /
+//! [`TrDockBinding`](abs_smux::conn::TrDockBinding) 这套 trait；**没有任何驱动
+//! API**（收发由连接内部经 `abs_art` spawn 的任务自动推进）。
+//!
+//! 内部按方向切成两个循环（对外不可见）：
+//!
+//! - 读循环：独占 `Rx`，负责**解复用**——逐帧解析后把载荷投递到目标子流的接收环，
+//!   并维护接收方向窗口；
+//! - 写循环：独占 `Tx`，负责**复用调度**——从各子流的发送环取数据、切分并编帧，
+//!   按「控制帧优先、数据帧按对端发送窗口排序」写出，并维护发送方向窗口；
 //! - 两者之间只共享**子流注册表**（dock → 子流映射、窗口、关闭标志），因此读路径
 //!   与写路径绝大部分操作互不阻塞；只有建流 / 拆流这类稀有时刻需要碰注册表。
 //!
-//! 两个 session 各自暴露一个 `run_async` future，由**调用方**交给运行时驱动：
-//! 本 crate 不 spawn、不自旋、不依赖任何具体运行时。只驱动其中一个是允许的
-//! （例如只发不收的端点），但两者都不会自行启动。
+//! 连接在 [`MuxConnection::new`] 时接管 `Rx` / `Tx`，并**在内部经 `abs_art` spawn**
+//! 读 / 写两个循环（各自持有 `JoinHandle`），因此对外**不需要也不提供**任何驱动
+//! API：用户只使用 `abs_smux` 的 trait。本 crate 不依赖任何具体运行时，也不依赖
+//! `abs_art-bridge`——后端由最终二进制选择。
 //!
 //! ## 3. 帧线格式（sans-IO）
 //!
@@ -79,6 +88,31 @@
 //! - 线格式支持 1 / 2 / 4 字节三种宽度（由 `LocalDock` / `RemoteDock` 字段的
 //!   `val_type` 决定），由发送方按最小值选宽。
 //!
+//! ### 4.1 子流身份：dock 对即身份
+//!
+//! 一条子流的身份**就是** `(local_dock, remote_dock)` 这个有序对。协议中
+//! **不存在**双方共识的、或任何一方分配的 channel id，也**不需要**有——同一
+//! 时刻的「哪一条子流」只需**本方自己**能从 dock 对里认出来即可：
+//!
+//! - **发起方**：为每条并发子流分配一个**互不相同**的 `local_dock`（类似 TCP
+//!   的临时端口），`remote_dock` 填对端监听的 dock；
+//! - **响应方**：在自己的某个 `local_dock` 上监听，用请求帧里的 `remote_dock`
+//!   区分「这是哪一条连接」。
+//!
+//! 由此得到两条硬性约束（因为是协议身份，不是实现细节）：
+//!
+//! 1. **同一个 `(local_dock, remote_dock)` 上，同一时刻至多存在一条活动子流**。
+//!    发起方若把两条并发子流发往同一个 `remote_dock`，就必须用两个不同的
+//!    `local_dock`；否则两端都无法区分。
+//! 2. `max_dock_chan_count` 限制的是**单个 `local_dock`** 上同时活动的子流数
+//!    （响应方因此可以「一个 dock 服务多条连接」），`max_channel_count` 限制
+//!    整条连接上的总数。
+//!
+//! 之所以不引入 channel id：dock 本身已经是端口语义，再加一层 id 会让线格式、
+//! 建流状态机与两侧映射表都多一份需要同步维护的状态，而这些状态正是最容易出
+//! 错的地方。
+//!
+//! `channel` 与 `telegraph` **不得共用同一个 local_dock**（见
 //! `channel` 与 `telegraph` **不得共用同一个 local_dock**（见
 //! [`TrTelegraph`](abs_smux::conn::TrTelegraph) 的文档）；绑定期由注册表拒绝，
 //! 报 [`MuxError::DockInUse`]。
@@ -102,7 +136,7 @@
 //! - **缺省（不开启 `multi-thread`）**：面向单线程运行时（如 compio 的
 //!   `spawn_local`），连接与 session 为 `!Send`，共享注册表用非原子容器；
 //! - **开启 `multi-thread`**：面向多线程运行时，连接与 session 为 `Send + Sync`，
-//!   共享注册表用原子原语，两个 `run_async` 可以跨线程 spawn。
+//!   共享注册表用原子原语，内部读写任务经 `abs_art` 的 `SPAWN_SEND` / `SPAWN_LOCAL` 投递。
 //!
 //! 注意：`buffex` 的端类型自身要求 `Send + Sync` 的参数，因此环存储与分配器在
 //! 两种模型下都必须是 `Send + Sync`；feature 影响的是**连接对象本身**是否可跨
@@ -111,9 +145,7 @@
 //! ## 7. 生命周期与超时
 //!
 //! 子流支持**半关闭**：每个方向的结束是独立的，`is_tx_closed` / `is_rx_closed`
-//! 分别反映；对端关闭一半只影响对应方向。`max_channel_timeout` 由**调用方驱动**
-//! ——本 crate 不自带定时器，调用方把超时 / tick 作为取消令牌或独立的驱动 future
-//! 施加（与握手模块 §10 的约定一致）。
+//! 分别反映；对端关闭一半只影响对应方向。`max_channel_timeout` 的**空闲超时由连接内部用 `abs_art` 的 `TrDelay` 维持**，不再要求调用方代为计时。
 //!
 //! ## 8. 错误
 //!
@@ -134,7 +166,6 @@ pub use channel_::{
 };
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
-pub use session_::{ReadSession, WriteSession};
 pub use telegraph_::Telegraph;
 
 /// smux v1 使用的 dock 类型。

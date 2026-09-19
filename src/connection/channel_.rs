@@ -2,7 +2,7 @@
 //!
 //! 类型与 trait 的对应关系、并发模型与缓冲策略见 [`crate::connection`] 模块文档。
 //! 本文件只承载「对象与 trait 的接线」：状态机在
-//! [`ReadSession`](super::ReadSession) / [`WriteSession`](super::WriteSession)，
+//! 内部的读 / 写循环（`session_` 模块，`pub(crate)`，不对外暴露），
 //! 窗口算法在 [`crate::flow_ctrl`]，线格式在 `frame_`。
 //!
 //! # 资源 bundling：为什么要有 [`TrMuxConfig`]
@@ -79,7 +79,7 @@ pub trait TrMuxConfig {
     fn channel_capacity(&self) -> usize;
 }
 
-/// 读写两个 session 与各会话共享的连接对象。
+/// 复用连接：**独占**网络收发半边，并对外提供流复用的全部功能。
 ///
 /// 泛型参数：
 ///
@@ -87,16 +87,20 @@ pub trait TrMuxConfig {
 /// - `W`：网络写半边（握手交付的 `Tx`）；
 /// - `C`：资源策略，见 [`TrMuxConfig`]。
 ///
-/// # 共享语义
+/// # 封装边界
 ///
-/// [`TrConnection::bind_async`] 取 `&self`，因此同一个连接可以被多个业务逻辑
-/// 同时绑定到不同 dock；每个 [`DockBinding`] 是一个独立会话，读写路径互不阻塞
-/// （模块文档 §2）。线程模型由 `multi-thread` feature 决定（§6）。
+/// 握手完成后 `Rx` / `Tx` 的生命周期由本对象**完全接管**，它们不出现在任何公开
+/// 签名里；读 / 写两个循环是本对象的内部实现（见 [`crate::connection`] 模块文档
+/// §2）。`smux_v1` 里其它类型要完成任何功能，只能通过本对象的 API：
+/// [`TrConnection::bind_async`] 派生会话；收发由内部任务自动推进。
+///
+/// [`TrConnection::bind_async`] 取 `&self`，因此同一个连接可以被多个业务逻辑同时
+/// 绑定到不同 dock，读 / 写路径在内部互不争锁（模块文档 §2）。
 pub struct MuxConnection<R, W, C> {
-    /// 网络读半边，移交给 [`ReadSession`](super::ReadSession)。
+    /// 网络读半边：由本对象独占（并移交给内部读循环），不对外暴露。
     rx_: R,
 
-    /// 网络写半边，移交给 [`WriteSession`](super::WriteSession)。
+    /// 网络写半边：由本对象独占（并移交给内部写循环），不对外暴露。
     tx_: W,
 
     /// 资源策略。
@@ -112,18 +116,14 @@ where
     W: TrBuffWrite<u8>,
     C: TrMuxConfig,
 {
-    /// 由一次成功的握手交付物与资源策略构造连接。
+    /// 由一次成功的握手交付物与资源策略构造连接，接管 `Rx` / `Tx`，并**在内部
+    /// 经 `abs_art` spawn** 读 / 写两个循环（各自持有 `JoinHandle`，随连接关闭而
+    /// abort）。
     ///
-    /// 构造本身不做 IO：读 / 写 session 只是被建立，需要调用方分别驱动
-    /// [`ReadSession::run_async`](super::ReadSession::run_async) 与
-    /// [`WriteSession::run_async`](super::WriteSession::run_async)。
-    ///
-    /// # Panics
-    ///
-    /// 当 `config.channel_capacity()` 小于 `buffex` 的最小容量时，`buffex` 的构建
-    /// 器会返回错误而不是 panic；本函数不 panic。
+    /// 对外不提供任何驱动 API：用户只使用 `abs_smux` 的 trait。后端运行时由最终
+    /// 二进制经 `abs_art` 选择（本 crate 不依赖 `abs_art-bridge`）。
     pub fn new(delivery: HandshakeDelivery<W, R>, config: C) -> Self {
-        todo!("把握手交付物与资源策略绑成连接")
+        todo!("接管 Rx / Tx，建立内部读写循环与共享注册表")
     }
 }
 
@@ -134,6 +134,14 @@ where
 /// （[`TrDockBinding::open_telegraph_async`]）或向对端发起子流
 /// （[`TrDockBinding::open_channel_async`]）。不同 binding 之间只在注册表上
 /// 交集，因此可以并行持有。
+///
+/// # 身份与临时 dock
+///
+/// `(self.local_dock, remote_dock)` 即子流身份（见 [`crate::connection`] 模块
+/// 文档 §4.1）：本会话的 `local_dock` 在 [`MuxConnection::new`] 之后由
+/// [`TrConnection::bind_async`] 固定。若要在**同一时刻**向同一个 `remote_dock`
+/// 发起多条子流，就必须用**多个 local_dock 各建一个会话**——协议不提供 channel
+/// id，同一 dock 对上的两条并发子流无法区分。
 pub struct DockBinding<'f, R, W, C> {
     /// 连接对象（共享，`bind_async` 取 `&self`）。
     conn_: &'f MuxConnection<R, W, C>,
@@ -163,6 +171,10 @@ pub struct ChannelListener<'s, 'f, R, W, C> {
 /// [`TrChannelHandle::accept_async`] 接受并交付欢迎信息，或
 /// [`TrChannelHandle::reject_async`] 拒绝并说明理由。句柄本身也是
 /// [`TrChannelHalf`]，因此可以在决定之前查看两侧 dock。
+///
+/// 句柄上的 `(local_dock, remote_dock)` 就是这条待决子流的身份：响应方在自己的
+/// `local_dock` 上用 `remote_dock` 区分不同请求端的连接（见
+/// [`crate::connection`] 模块文档 §4.1）。
 pub struct ChannelHandle<'s, 'f, R, W, C> {
     /// 本端 dock。
     local_dock_: Dock,
@@ -178,7 +190,7 @@ pub struct ChannelHandle<'s, 'f, R, W, C> {
 ///
 /// 实现 `TrBuffTryWrite<u8>`，因此应用侧写数据是**非阻塞**的：环满即返回
 /// `WriteErrTag::Stuffed`，由应用决定等待还是丢弃。真正把数据推上网络的是
-/// [`WriteSession`](super::WriteSession)。
+/// 内部写循环。
 pub struct ChannelTx<H> {
     /// `buffex` 生产端半部（[`BufferedTx`] 的实例）。
     half_: H,
@@ -193,7 +205,7 @@ pub struct ChannelTx<H> {
 /// 子流接收半边：包一个 `buffex` 消费端半部。
 ///
 /// 实现 `TrBuffTryRead<u8>`；环空即返回 `ReadErrTag::Drained`。数据由
-/// [`ReadSession`](super::ReadSession) 从网络解复用后写入。
+/// 内部读循环从网络解复用后写入。
 pub struct ChannelRx<H> {
     /// `buffex` 消费端半部（[`BufferedRx`] 的实例）。
     half_: H,

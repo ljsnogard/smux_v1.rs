@@ -32,7 +32,10 @@
 //! ```
 //!
 //! - `Kind` 与 `PayloadLen` 必需；
-//! - channel 帧还需 `LocalDock` 与 `RemoteDock`；
+//! - channel 帧还需 `LocalDock` 与 `RemoteDock`：这两个字段合起来**就是**子流
+//!   身份，因此帧头**没有** channel id 字段（理由见
+//!   [`crate::connection`] 模块文档 §4.1）；接收方靠「本地 dock + 来源 dock」
+//!   定位子流。
 //! - `WindowUpdate` 只出现在 `WINDOW_UPDATE` 帧上；
 //! - 头字段顺序不承载语义，接收方必须能处理任意合法顺序（与握手 §3 一致）；
 //! - 帧总长（头 + 载荷）不得超过协商出的 `max_packet_size`。

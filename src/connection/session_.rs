@@ -28,9 +28,13 @@
 //!
 //! 循环执行：
 //!
-//! 1. 优先写出「控制帧队列」——`ACCEPT` / `REJECT` / `CLOSE` / `WINDOW_UPDATE`
-//!    / `PING` 等，避免被数据淹没；
-//! 2. 在数据帧上按**轮转**（round-robin）遍历活动子流，对每条子流：
+//! 1. **控制帧优先级更高**：先排空「控制帧队列」——`ACCEPT` / `REJECT` /
+//!    `CLOSE` / `WINDOW_UPDATE` / `PING` 等，再考虑数据帧。控制帧数量少、又
+//!    直接决定子流能否推进，让它们先走既简单又不会造成饿死；判据不确定时一律
+//!    按「控制帧优先」处理。
+//! 2. 数据帧之间按**对端发送窗口大小**排序：对端窗口越大（越愿意接收）的子流
+//!    优先级越高，先取它的数据；窗口为 0 的子流本轮直接跳过。这样慢子流不会
+//!    占住调度，也天然把带宽让给「对端还有余量」的子流。对每条子流：
 //!    1. 取其发送窗口可用的额度（[`SendWindow::reserve`](crate::flow_ctrl::SendWindow)）；
 //!    2. 从发送环借出不超过额度、且不超过 `max_packet_size` 的字节；
 //!    3. 编帧写出；写失败或对端关闭时归还额度并终止连接。
@@ -74,7 +78,7 @@ use crate::connection::MuxError;
 ///
 /// 字段与共享注册表的具体形状属于实现细节；本类型对外只暴露
 /// [`ReadSession::run_async`]。
-pub struct ReadSession<R, B, A> {
+pub(crate) struct ReadSession<R, B, A> {
     /// 网络读半边，独占。
     rx_: R,
 
@@ -95,20 +99,22 @@ where
 
     /// 驱动解复用循环，直到连接关闭或出错。
     ///
-    /// 返回的 future 支持 `.await`（不可取消）与
-    /// `.may_cancel_with(token).await`（可取消）两条路径。
+    /// 只供 [`MuxConnection`](super::MuxConnection) 内部使用：本类型是**内部实现细节**，
+    /// 由连接在 `new` 时经 `abs_art` spawn 到运行时，不对外暴露，因此方法名以 `_`
+    /// 结尾、可见性为 `pub(crate)`。
+    /// 返回的 future 支持 `.await`（不可取消）与 `.may_cancel_with(token).await`。
     ///
     /// # Errors
     ///
     /// 底层读失败、对端关闭、帧非法、流控违例等，统一为 [`MuxError`]。
-    pub fn run_async(&mut self) -> ReadRunAsync<'_, '_, R, B, A> {
+    pub(crate) fn run_async_(&mut self) -> ReadRunAsync<'_, '_, R, B, A> {
         ReadRunAsync::new(self)
     }
 }
 
 /// [`ReadSession::run_async`] 的 step 函数；future 类型由
 /// [`gen_may_cancel_future`] 生成。
-#[gen_may_cancel_future(ReadRun, pub)]
+#[gen_may_cancel_future(ReadRun, pub(crate))]
 async fn read_run_async_<'s, R, B, A, C>(
     session: &'s mut ReadSession<R, B, A>,
     _cancel: C,
@@ -125,7 +131,7 @@ where
 /// 写会话：独占网络写半边，负责复用调度。
 ///
 /// 泛型参数同 [`ReadSession`]，其中 `W` 是网络写半边（握手交付的 `Tx`）。
-pub struct WriteSession<W, B, A> {
+pub(crate) struct WriteSession<W, B, A> {
     /// 网络写半边，独占。
     tx_: W,
 
@@ -146,20 +152,19 @@ where
 
     /// 驱动复用调度循环，直到连接关闭或出错。
     ///
-    /// 返回的 future 支持 `.await`（不可取消）与
-    /// `.may_cancel_with(token).await`（可取消）两条路径。
+    /// 同 [`ReadSession::run_async_`]：内部实现细节，不对外暴露。
     ///
     /// # Errors
     ///
     /// 底层写失败、对端关闭、流控违例等，统一为 [`MuxError`]。
-    pub fn run_async(&mut self) -> WriteRunAsync<'_, '_, W, B, A> {
+    pub(crate) fn run_async_(&mut self) -> WriteRunAsync<'_, '_, W, B, A> {
         WriteRunAsync::new(self)
     }
 }
 
 /// [`WriteSession::run_async`] 的 step 函数；future 类型由
 /// [`gen_may_cancel_future`] 生成。
-#[gen_may_cancel_future(WriteRun, pub)]
+#[gen_may_cancel_future(WriteRun, pub(crate))]
 async fn write_run_async_<'s, W, B, A, C>(
     session: &'s mut WriteSession<W, B, A>,
     _cancel: C,

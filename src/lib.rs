@@ -9,6 +9,7 @@ pub mod flow_ctrl;
 pub mod handshake;
 
 pub mod x_deps {
+    pub use abs_art;
     pub use abs_async_iter;
     pub use abs_buff;
     pub use abs_smux;

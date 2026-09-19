@@ -51,11 +51,6 @@
 //! 表达，调用方应当终止该子流（并可按需终止整条连接）。本端自己算错、
 //! 溢出等属于内部错误，用 [`FlowCtrlError::Overflow`] 表达。
 
-// 本模块目前是**骨架**：类型、方法签名与文档已定稿，方法体统一为 `todo!()`。
-// 因此「字段未被读取」「参数未被使用」属于预期内的过渡状态。实现落地后必须
-// 移除本行的 `allow`（见 `dev-notes/` 的待办）。
-#![allow(dead_code, unused_variables)]
-
 /// 以**字节**为单位的信用量。
 ///
 /// 窗口计数统一用 `u32`：单条子流的窗口不可能超过
@@ -112,15 +107,20 @@ impl DefaultPolicy {
 
 impl TrFlowCtrlPolicy for DefaultPolicy {
     fn initial_window(&self, ring_capacity: usize) -> Credit {
-        todo!("由接收环容量推导初始窗口")
+        // 环容量是 `usize`、窗口是 `u32`：超出即**饱和**为上界，不做截断（截断会
+        // 得到一个错误的小窗口）。
+        ring_capacity.min(Credit::MAX as usize) as Credit
     }
 
     fn update_threshold(&self, window: Credit) -> Credit {
-        todo!("按当前窗口推导回补阈值")
+        // 半窗，但不小于 1：阈值为 0 会让每次消费都产生一个控制帧。
+        (window / 2u32).max(1u32)
     }
 
     fn max_window(&self) -> Credit {
-        todo!("返回窗口绝对上限")
+        // 取 `u32::MAX` 的一半：远大于任何真实环容量，又给增量累加留出余量，
+        // 使 `available_ + delta` 不会轻易溢出。
+        Credit::MAX / 2u32
     }
 }
 
@@ -192,12 +192,14 @@ impl SendWindow {
     /// 获批的字节在真正写出前就已经从窗口扣除，写失败时用
     /// [`SendWindow::refund`] 归还。
     pub fn reserve(&mut self, want: Credit) -> Credit {
-        todo!("在 available_ 内预扣额度")
+        let granted = want.min(self.available_);
+        self.available_ -= granted;
+        granted
     }
 
     /// 归还之前 [`SendWindow::reserve`] 预扣、但最终未写出的额度。
     pub fn refund(&mut self, amount: Credit) {
-        todo!("归还预扣额度")
+        self.available_ = self.available_.saturating_add(amount).min(self.max_);
     }
 
     /// 收到对端的窗口更新，把发送窗口调大。
@@ -207,7 +209,15 @@ impl SendWindow {
     /// 增量导致窗口超过上限时返回 [`FlowCtrlError::Overflow`]（本端实现防御，
     /// 正常对端不会触发）。
     pub fn on_update(&mut self, update: WindowUpdate) -> Result<(), FlowCtrlError> {
-        todo!("按增量回补并钳制到 max_")
+        let grown = self
+            .available_
+            .checked_add(update.delta())
+            .ok_or(FlowCtrlError::Overflow)?;
+        if grown > self.max_ {
+            return Result::Err(FlowCtrlError::Overflow);
+        }
+        self.available_ = grown;
+        Result::Ok(())
     }
 }
 
@@ -229,10 +239,10 @@ pub struct RecvWindow {
     /// 窗口上限。
     max_: Credit,
 
-    /// 已计入对端额度、但应用尚未消费的字节数（在途）。
-    in_flight_: Credit,
+    /// 当前**尚未用掉**的接收额度：对端还可以再发送这么多字节。
+    available_: Credit,
 
-    /// 应用已消费、但尚未公告的字节数。
+    /// 应用已消费、但尚未公告的字节数（回补来源）。
     consumed_pending_: Credit,
 }
 
@@ -243,7 +253,7 @@ impl RecvWindow {
             capacity_: capacity,
             threshold_: threshold,
             max_: max,
-            in_flight_: 0u32,
+            available_: capacity,
             consumed_pending_: 0u32,
         }
     }
@@ -254,8 +264,8 @@ impl RecvWindow {
     }
 
     /// 当前还允许对端发送的字节数（仅用于诊断与测试，不作为唯一判据）。
-    pub fn available(&self) -> Credit {
-        todo!("capacity_ 减去在途字节")
+    pub const fn available(&self) -> Credit {
+        self.available_
     }
 
     /// 对端又发来 `amount` 字节，计入在途。
@@ -264,12 +274,19 @@ impl RecvWindow {
     ///
     /// 超过已公告额度时返回 [`FlowCtrlError::PeerViolation`]。
     pub fn on_data(&mut self, amount: Credit) -> Result<(), FlowCtrlError> {
-        todo!("扣减入向配额并检测违例")
+        // 额度不足即对端发超了本端公告的窗口——协议违例，不是「丢弃即可」。
+        let rest = self
+            .available_
+            .checked_sub(amount)
+            .ok_or(FlowCtrlError::PeerViolation)?;
+        self.available_ = rest;
+        Result::Ok(())
     }
 
     /// 应用又消费（取走）了 `amount` 字节，窗口相应可以回补。
     pub fn on_consumed(&mut self, amount: Credit) {
-        todo!("累计待公告量")
+        // 消费量只会把额度还回来；累计量以 `max_` 封顶，避免长期不公告时无意义地增长。
+        self.consumed_pending_ = self.consumed_pending_.saturating_add(amount).min(self.max_);
     }
 
     /// 若已攒够阈值则产出待公告的窗口更新，否则返回 `None`。
@@ -277,12 +294,29 @@ impl RecvWindow {
     /// 取走后累计量清零；调用方应当把产出的更新交给写会话编进
     /// `WINDOW_UPDATE` 控制帧。
     pub fn take_update(&mut self) -> Option<WindowUpdate> {
-        todo!("按阈值产出并清空待公告量")
+        if !self.has_pending_update() {
+            return Option::None;
+        }
+        // 增量不能把窗口推过上限；没公告完的部分留到下一次。
+        let room = self.max_.saturating_sub(self.available_);
+        let delta = self.consumed_pending_.min(room);
+        if delta == 0u32 {
+            // 窗口已经在上限：本次没有可公告的空间。必须清空累计量，否则
+            // `has_pending_update` 会永远为真。
+            self.consumed_pending_ = 0u32;
+            return Option::None;
+        }
+        self.consumed_pending_ -= delta;
+        self.available_ = self.available_.saturating_add(delta);
+        Option::Some(WindowUpdate::new(delta))
     }
 
     /// 是否已经攒够阈值、应当公告窗口更新。
-    pub fn has_pending_update(&self) -> bool {
-        todo!("判断待公告量是否越过阈值")
+    pub const fn has_pending_update(&self) -> bool {
+        // 攒够阈值就公告；此外**额度耗尽**时必须公告，哪怕不足阈值——否则应用只
+        // 消费了少量字节、对端却因为额度为 0 永久停发，形成死锁。
+        self.consumed_pending_ > 0u32
+            && (self.consumed_pending_ >= self.threshold_ || self.available_ == 0u32)
     }
 }
 
@@ -305,7 +339,14 @@ impl FlowCtrl {
     where
         P: TrFlowCtrlPolicy,
     {
-        todo!("按策略建立双向窗口")
+        let initial = policy.initial_window(ring_capacity);
+        // 上限必须不低于初窗，否则初窗一建出来就越界。
+        let max = policy.max_window().max(initial);
+        let threshold = policy.update_threshold(initial).max(1u32);
+        FlowCtrl {
+            send_: SendWindow::new_(initial, max),
+            recv_: RecvWindow::new_(initial, threshold, max),
+        }
     }
 
     /// 发送窗口（`Tx` 侧使用）。
@@ -355,4 +396,138 @@ impl core::fmt::Display for FlowCtrlError {
 impl core::error::Error for FlowCtrlError {}
 
 #[cfg(test)]
-mod tests_ {}
+mod tests_ {
+    use super::*;
+
+    /// 测试缺省策略把环容量直接翻译成初始窗口，并在超出 `u32` 时饱和。
+    /// - 手段：对容量 0、4096 与 `usize::MAX` 调用
+    ///   [`DefaultPolicy::initial_window`]。
+    /// - 判断：小于 `u32::MAX` 的容量原样返回；`usize::MAX` 饱和为 `u32::MAX`
+    ///   （不截断成错误的小窗口）。
+    #[test]
+    fn default_policy_initial_window_tracks_capacity() {
+        let p = DefaultPolicy::new();
+        assert_eq!(p.initial_window(0usize), 0u32);
+        assert_eq!(p.initial_window(4096usize), 4096u32);
+        assert_eq!(p.initial_window(usize::MAX), Credit::MAX);
+    }
+
+    /// 测试缺省策略的阈值与上限取值。
+    /// - 手段：对 0 / 1 / 8 / 4096 求阈值，并读取上限。
+    /// - 判断：阈值为「半窗且不小于 1」，上限恰好是 `u32::MAX / 2`。
+    #[test]
+    fn default_policy_threshold_and_cap() {
+        let p = DefaultPolicy::new();
+        assert_eq!(p.update_threshold(0u32), 1u32);
+        assert_eq!(p.update_threshold(1u32), 1u32);
+        assert_eq!(p.update_threshold(8u32), 4u32);
+        assert_eq!(p.update_threshold(4096u32), 2048u32);
+        assert_eq!(p.max_window(), Credit::MAX / 2u32);
+    }
+
+    /// 测试发送窗口的预扣、部分获批、用尽与归还。
+    /// - 手段：初窗 10，先 [`SendWindow::reserve`]`(4)`，再 `reserve(100)`，
+    ///   最后 `refund(3)`。
+    /// - 判断：两次获批分别为 4 与 6；用尽后 [`SendWindow::is_exhausted`] 为真；
+    ///   归还后可用量为 3。
+    #[test]
+    fn send_window_reserve_exhaust_and_refund() {
+        let mut w = SendWindow::new_(10u32, 1024u32);
+        assert_eq!(w.reserve(4u32), 4u32);
+        assert_eq!(w.available(), 6u32);
+        assert!(!w.is_exhausted());
+        assert_eq!(w.reserve(100u32), 6u32);
+        assert_eq!(w.available(), 0u32);
+        assert!(w.is_exhausted());
+        w.refund(3u32);
+        assert_eq!(w.available(), 3u32);
+    }
+
+    /// 测试发送窗口拒绝会把窗口推过上限的更新，也拒绝溢出。
+    /// - 手段：初窗 10、上限 12；依次 [`SendWindow::on_update`] `+1`、`+5`、
+    ///   `u32::MAX`。
+    /// - 判断：`+1` 成功且可用量 11；`+5` 与 `u32::MAX` 都返回
+    ///   `Err(FlowCtrlError::Overflow)`，且可用量保持 11。
+    #[test]
+    fn send_window_rejects_update_beyond_cap() {
+        let mut w = SendWindow::new_(10u32, 12u32);
+        assert!(w.on_update(WindowUpdate::new(1u32)).is_ok());
+        assert_eq!(w.available(), 11u32);
+        assert_eq!(
+            w.on_update(WindowUpdate::new(5u32)),
+            Result::Err(FlowCtrlError::Overflow)
+        );
+        assert_eq!(
+            w.on_update(WindowUpdate::new(Credit::MAX)),
+            Result::Err(FlowCtrlError::Overflow)
+        );
+        assert_eq!(w.available(), 11u32);
+    }
+
+    /// 测试接收窗口把超额数据判为对端违例。
+    /// - 手段：容量 8 的接收窗口先 [`RecvWindow::on_data`]`(8)`（刚好用尽），
+    ///   再 `on_data(1)`。
+    /// - 判断：第一次 `Ok` 且可用量 0；第二次返回
+    ///   `Err(FlowCtrlError::PeerViolation)`，且可用量保持 0（不产生负额度）。
+    #[test]
+    fn recv_window_flags_peer_violation() {
+        let mut w = RecvWindow::new_(8u32, 4u32, 64u32);
+        assert!(w.on_data(8u32).is_ok());
+        assert_eq!(w.available(), 0u32);
+        assert_eq!(
+            w.on_data(1u32),
+            Result::Err(FlowCtrlError::PeerViolation)
+        );
+        assert_eq!(w.available(), 0u32);
+    }
+
+    /// 测试接收窗口在消费攒够阈值时产出一次窗口更新并恢复额度。
+    /// - 手段：容量 8、阈值 4；收满 8 后消费 4，再 [`RecvWindow::take_update`]。
+    /// - 判断：未消费时无更新；消费后产出增量 4 的更新，可用量回到 4，且再次
+    ///   调用返回 `None`（累计量已清空）。
+    #[test]
+    fn recv_window_emits_update_at_threshold() {
+        let mut w = RecvWindow::new_(8u32, 4u32, 64u32);
+        assert!(w.on_data(8u32).is_ok());
+        assert!(!w.has_pending_update());
+        w.on_consumed(4u32);
+        assert!(w.has_pending_update());
+        let update = w.take_update().expect("攒够阈值应当产出窗口更新");
+        assert_eq!(update.delta(), 4u32);
+        assert_eq!(w.available(), 4u32);
+        assert!(!w.has_pending_update());
+        assert!(w.take_update().is_none());
+    }
+
+    /// 测试额度耗尽时即使不足阈值也必须公告，避免对端永久停发。
+    /// - 手段：容量 8、阈值 8（直接构造）；收满 8 后只消费 1。
+    /// - 判断：[`RecvWindow::has_pending_update`] 为真，`take_update` 返回增量 1，
+    ///   可用量回到 1——证明「额度为 0」本身就会触发公告。
+    #[test]
+    fn recv_window_emits_when_exhausted_below_threshold() {
+        let mut w = RecvWindow::new_(8u32, 8u32, 64u32);
+        assert!(w.on_data(8u32).is_ok());
+        assert!(!w.has_pending_update());
+        w.on_consumed(1u32);
+        assert!(w.has_pending_update());
+        assert_eq!(w.take_update().map(|u| u.delta()), Option::Some(1u32));
+        assert_eq!(w.available(), 1u32);
+        assert!(!w.has_pending_update());
+    }
+
+    /// 测试 [`FlowCtrl::new`] 同时接好收发两个方向。
+    /// - 手段：以环容量 100 使用缺省策略构造，然后读取两个方向并在接收方向收满。
+    /// - 判断：发送窗口可用量与接收窗口容量都是 100；收满 100 后再收 1 字节返回
+    ///   `Err(FlowCtrlError::PeerViolation)`——说明接收方向也接上了。
+    #[test]
+    fn flow_ctrl_new_wires_both_directions() {
+        let mut ctrl = FlowCtrl::new(&DefaultPolicy::new(), 100usize);
+        assert_eq!(ctrl.send_window().available(), 100u32);
+        assert_eq!(ctrl.recv_window().capacity(), 100u32);
+        assert!(ctrl.recv_window_mut().on_data(100u32).is_ok());
+        assert_eq!(
+            ctrl.recv_window_mut().on_data(1u32),
+            Result::Err(FlowCtrlError::PeerViolation)
+        );
+    }
+}

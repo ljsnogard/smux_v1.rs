@@ -6,6 +6,7 @@ version = "0.1.0"
 description = "流复用协议第一版"
 
 [dependencies]
+abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
 abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev/0.3.0" }
 abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
@@ -29,5 +30,17 @@ multi-thread = []
 # 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在
 # dev-dependencies 中出现（`buffex` 已是正式依赖，不在此重复）。
 abs_art-bridge = { version = "0.2.2", default-features = false, features = ["backend-compio"] }
-compio = { version = "0.19.*", features = ["fs", "macros", "time"] }
+compio = { version = "0.19.*", features = ["fs", "macros", "time", "net", "runtime"] }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1.3" }
+
+# 集成冒烟测试（tests/）用两个运行时各跑一遍同一场景，且都跑真实 UNIX socket：
+# - 两个运行时都用「调用方驱动的泵 + 全被动 buffex 环」搬运 socket 数据；
+# - tokio 侧用 `abs_buff_tokio_adapt` 的设备适配，compio 侧用
+#   `abs_buff_compio_adapt` 的设备适配（原因与三处阻塞点见 dev-notes §9）。
+abs_buff_tokio_adapt = { path = "../abs_buff_tokio_adapt" }
+abs_buff_compio_adapt = { path = "../abs_buff_compio_adapt" }
+
+# 场景并发用与运行时无关的组合子（join! / join_all / select），因此只需要
+# `futures`，不需要为两个运行时各写一份并发代码。
+futures = "0.3.*"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
