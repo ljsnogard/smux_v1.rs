@@ -36,16 +36,16 @@ use super::channel_::SessionMark_;
 /// 由 [`TrDockBinding::open_telegraph_async`](abs_smux::conn::TrDockBinding::open_telegraph_async)
 /// 在某个 binding 上建立；端点存活期间该 local_dock 被独占，不能再被 channel
 /// 使用（反之亦然）。
-pub struct Telegraph<'s, 'f, R, W, C> {
+pub struct Telegraph<'s, 'f, R, W, C, Rt> {
     /// 本端 dock。
     local_dock_: Dock,
 
     /// 借用关系与连接泛型的占位；语义同
     /// [`ChannelListener`](super::ChannelListener)。
-    _mark_: SessionMark_<'s, 'f, R, W, C>,
+    _mark_: SessionMark_<'s, 'f, R, W, C, Rt>,
 }
 
-impl<'s, 'f, R, W, C> TrTelegraph for Telegraph<'s, 'f, R, W, C>
+impl<'s, 'f, R, W, C, Rt> TrTelegraph for Telegraph<'s, 'f, R, W, C, Rt>
 where
     R: TrBuffRead<u8> + 'f,
     W: TrBuffWrite<u8> + 'f,
@@ -56,13 +56,13 @@ where
     type Err = MuxError<R::Err, W::Err>;
 
     type SendAsync<'a, M>
-        = MuxSendAsync<'a, 's, 'f, 'a, R, W, C, M>
+        = MuxSendAsync<'a, 's, 'f, 'a, R, W, C, Rt, M>
     where
         Self: 'a,
         M: 'a + TrBuffRead<Self::Data>;
 
     type RecvAsync<'a, M>
-        = MuxRecvAsync<'a, 's, 'f, 'a, R, W, C, M>
+        = MuxRecvAsync<'a, 's, 'f, 'a, R, W, C, Rt, M>
     where
         Self: 'a,
         M: 'a + TrBuffWrite<Self::Data>;
@@ -99,8 +99,8 @@ where
 /// 返回值为**实际写出**的字节数；若 `packet` 短于 `max_packet_size`，就是它的
 /// 全部长度。
 #[gen_may_cancel_future(MuxSend, pub)]
-async fn mux_send_async_<'a, 's, 'f, R, W, C, M, K>(
-    telegraph: &'a mut Telegraph<'s, 'f, R, W, C>,
+async fn mux_send_async_<'a, 's, 'f, R, W, C, Rt, M, K>(
+    telegraph: &'a mut Telegraph<'s, 'f, R, W, C, Rt>,
     remote_dock: Dock,
     packet: &'a mut M,
     _cancel: K,
@@ -120,8 +120,8 @@ where
 ///
 /// 返回值为写入 `buffer` 的字节数。
 #[gen_may_cancel_future(MuxRecv, pub)]
-async fn mux_recv_async_<'a, 's, 'f, R, W, C, M, K>(
-    telegraph: &'a mut Telegraph<'s, 'f, R, W, C>,
+async fn mux_recv_async_<'a, 's, 'f, R, W, C, Rt, M, K>(
+    telegraph: &'a mut Telegraph<'s, 'f, R, W, C, Rt>,
     remote_dock: Dock,
     buffer: &'a mut M,
     _cancel: K,

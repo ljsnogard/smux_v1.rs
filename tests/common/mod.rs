@@ -79,6 +79,16 @@ use smux_v1::{
     },
 };
 
+/// 连接层要求的运行时 bound：与 `smux_v1` 的 `multi-thread` feature 保持一致。
+///
+/// 缺省（单线程）下 `MuxConnection::new` 要求 `Rt: TrSpawnLocal`，开启
+/// `multi-thread` 后要求 `Rt: TrSpawnSend`。两个测试目标传入的具体运行时都同时
+/// 具备这两种能力，因此同一份场景代码在两种 feature 配置下都能编译。
+#[cfg(not(feature = "multi-thread"))]
+pub use abs_art::TrSpawnLocal as TrSmokeRuntime;
+#[cfg(feature = "multi-thread")]
+pub use abs_art::TrSpawnSend as TrSmokeRuntime;
+
 /// 每个端点监听的 dock 数量（dock 取值 `1..=16`）。
 pub const K_DOCK_COUNT: u32 = 16;
 
@@ -265,7 +275,7 @@ where
 ///
 /// 四个泵与场景用 `select` 并发推进（同一任务内轮询，不要求任何类型 `Send`）；
 /// 场景完成即丢弃泵 future，从而结束对设备（及其借用的 socket 半边）的借用。
-pub async fn run_socket_scenario_<IA, OA, IB, OB>(
+pub async fn run_socket_scenario_<IA, OA, IB, OB, Rt>(
     input_a: IA,
     output_a: OA,
     input_b: IB,
@@ -275,6 +285,7 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB>(
     OA: TrOutput<u8>,
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
+    Rt: TrSmokeRuntime,
 {
     // 每端两个环：一个承载「socket → smux」（Rx），一个承载「smux → socket」（Tx）。
     let (a_rx_ring_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE).await;
@@ -282,7 +293,7 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB>(
     let (b_rx_ring_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE).await;
     let (b_tx, b_tx_ring_rx) = make_passive_ring_(K_NET_BUFFER_SIZE).await;
 
-    let scenario_fut = run_smoke_scenario_(a_rx, a_tx, b_rx, b_tx);
+    let scenario_fut = run_smoke_scenario_::<_, _, _, _, Rt>(a_rx, a_tx, b_rx, b_tx);
     let pumps_fut = async {
         futures::join!(
             pump_input_(input_a, a_rx_ring_tx),
@@ -413,11 +424,12 @@ where
 ///   `&mut self`、其 future 在整个生命周期内独占该 binding；
 /// - 两组任务用 `join_all` + `join!` 并发推进，从而两侧的 open 与 accept 互为
 ///   对方的前置条件而不会互相等待。
-pub async fn drive_side_<R, W, C>(conn: &MuxConnection<R, W, C>)
+pub async fn drive_side_<R, W, C, Rt>(conn: &MuxConnection<R, W, C, Rt>)
 where
     R: TrBuffRead<u8>,
     W: TrBuffWrite<u8>,
     C: TrMuxConfig,
+    Rt: TrSmokeRuntime,
 {
     let conn_ref = &conn;
 
@@ -502,15 +514,16 @@ where
 }
 
 /// 同时驱动连接的两端（每端各自并发推进 open / accept）。
-pub async fn drive_both_sides_<RA, WA, RB, WB, C>(
-    conn_a: &MuxConnection<RA, WA, C>,
-    conn_b: &MuxConnection<RB, WB, C>,
+pub async fn drive_both_sides_<RA, WA, RB, WB, C, Rt>(
+    conn_a: &MuxConnection<RA, WA, C, Rt>,
+    conn_b: &MuxConnection<RB, WB, C, Rt>,
 ) where
     RA: TrBuffRead<u8>,
     WA: TrBuffWrite<u8>,
     RB: TrBuffRead<u8>,
     WB: TrBuffWrite<u8>,
     C: TrMuxConfig,
+    Rt: TrSmokeRuntime,
 {
     futures::join!(drive_side_(conn_a), drive_side_(conn_b));
 }
@@ -524,7 +537,7 @@ pub async fn drive_both_sides_<RA, WA, RB, WB, C>(
 ///
 /// 握手失败、任意一次 open / accept / 读写失败，或读写会话在场景完成前退出时
 /// panic——本函数是测试专用，失败即测试失败。
-pub async fn run_smoke_scenario_<RA, WA, RB, WB>(
+pub async fn run_smoke_scenario_<RA, WA, RB, WB, Rt>(
     rx_a: RA,
     tx_a: WA,
     rx_b: RB,
@@ -534,6 +547,7 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB>(
     WA: TrBuffWrite<u8>,
     RB: TrBuffRead<u8>,
     WB: TrBuffWrite<u8>,
+    Rt: TrSmokeRuntime,
 {
     // 1. 握手：A 端发起、B 端等待，两侧并发推进。
     let invite_opts = BasicOpts::default();
@@ -549,8 +563,9 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB>(
 
     // 2. 由交付物建立复用连接：`Rx` / `Tx` 由 `MuxConnection` 接管，
     //    读 / 写循环在其内部经 `abs_art` spawn，这里不再需要手动驱动。
-    let conn_a = MuxConnection::new(delivery_a, SmokeMuxConfig);
-    let conn_b = MuxConnection::new(delivery_b, SmokeMuxConfig);
+    //    `Rt` 由测试目标给出（tokio / compio 各自的 `Runtime`）。
+    let conn_a = MuxConnection::<RA, WA, SmokeMuxConfig, Rt>::new(delivery_a, SmokeMuxConfig);
+    let conn_b = MuxConnection::<RB, WB, SmokeMuxConfig, Rt>::new(delivery_b, SmokeMuxConfig);
 
     // 3. 推进业务面（open / accept / 读写）；收发由内部任务自动进行。
     drive_both_sides_(&conn_a, &conn_b).await;

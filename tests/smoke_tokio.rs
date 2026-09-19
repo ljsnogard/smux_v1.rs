@@ -11,6 +11,15 @@ use abs_buff_tokio_adapt::{ReadAsInput, WriteAsOutput};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
+/// 连接层使用的运行时标记类型。
+///
+/// 同时声明 `SPAWN_SEND` 与 `SPAWN_LOCAL` 两种能力：缺省（单线程）配置下
+/// `MuxConnection::new` 要求 `Rt: TrSpawnLocal`，开启 `multi-thread` 后要求
+/// `Rt: TrSpawnSend`；两种都声明，同一份测试才能在两种 feature 配置下都通过
+/// 编译检查。
+type SmokeRt =
+    abs_art_tokio::Runtime<{ abs_art_tokio::SPAWN_SEND | abs_art_tokio::SPAWN_LOCAL }>;
+
 /// 编译期断言：tokio socket 的两个半边经设备级适配后，分别满足
 /// [`common::run_socket_scenario_`] 对输入 / 输出设备的契约
 /// （`TrInput<u8>` / `TrOutput<u8>`）。函数体刻意不执行，只为让这条接线在类型
@@ -45,7 +54,7 @@ fn assert_socket_adapters_fit_(
 ///
 /// 说明：连接层当前是 `todo!()` 骨架，因此本测试被标记为 `#[ignore]`，默认
 /// `cargo test` 不会执行；实现落地后移除该属性。`cargo test -- --ignored`
-/// 会在 `MuxConnection::split` 处以 `not yet implemented` panic——这正说明测试
+/// 会在 `MuxConnection::new` 处以 `not yet implemented` panic——这正说明测试
 /// 已经编译、并成功跑过了运行时接线与握手。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "连接层尚未实现（todo!），实现落地后移除本属性"]
@@ -54,7 +63,7 @@ async fn mux_smoke_tokio_multi_thread_() {
     let (mut a_read, mut a_write) = stream_a.into_split();
     let (mut b_read, mut b_write) = stream_b.into_split();
 
-    common::run_socket_scenario_(
+    common::run_socket_scenario_::<_, _, _, _, SmokeRt>(
         ReadAsInput::new(&mut a_read),
         WriteAsOutput::new(&mut a_write),
         ReadAsInput::new(&mut b_read),

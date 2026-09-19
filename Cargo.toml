@@ -40,15 +40,14 @@ mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1
 abs_buff_tokio_adapt = { path = "../abs_buff_tokio_adapt" }
 abs_buff_compio_adapt = { path = "../abs_buff_compio_adapt" }
 
+# 连接层内部经 `abs_art` spawn 读 / 写循环，因此冒烟测试必须给出具体的运行时
+# 标记类型（`MuxConnection<.., Rt>`）：tokio 版用 `abs_art_tokio::Runtime`，
+# compio 版用 `abs_art_compio::Runtime`。两者从与 `abs_art` 同一个 git 源取，
+# 保证 `TrSpawnLocal` / `TrSpawnSend` 是同一套 trait。
+abs_art-tokio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+
 # 场景并发用与运行时无关的组合子（join! / join_all / select），因此只需要
 # `futures`，不需要为两个运行时各写一份并发代码。
 futures = "0.3.*"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
-
-# 【本地联调的临时补丁，推送后必须删除】
-#
-# 帧编解码需要把 `Dock` 还原成数值，而 `abs_smux` 的 `Dock::value()` 尚未推送到
-# `dev/0.1.0`，因此暂时改用工作区内的本地副本。上游推送完成后：删除本节，并执行
-# `cargo update -p abs_smux`。详见 `dev-notes/connection-20260919-1631.md` §2。
-[patch."https://gitee.com/lino_snsalias/abs_smux.git"]
-abs_smux = { path = "../abs_smux" }

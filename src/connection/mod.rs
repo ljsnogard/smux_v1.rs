@@ -48,9 +48,24 @@
 //!   与写路径绝大部分操作互不阻塞；只有建流 / 拆流这类稀有时刻需要碰注册表。
 //!
 //! 连接在 [`MuxConnection::new`] 时接管 `Rx` / `Tx`，并**在内部经 `abs_art` spawn**
-//! 读 / 写两个循环（各自持有 `JoinHandle`），因此对外**不需要也不提供**任何驱动
-//! API：用户只使用 `abs_smux` 的 trait。本 crate 不依赖任何具体运行时，也不依赖
-//! `abs_art-bridge`——后端由最终二进制选择。
+//! 读 / 写两个循环，因此对外**不需要也不提供**任何驱动 API：用户只使用
+//! `abs_smux` 的 trait。本 crate 不依赖任何具体运行时，也不依赖
+//! `abs_art-bridge`——后端由最终二进制选择，连接只带上运行时的**类型参数**
+//! `Rt`（见 §6）。
+//!
+//! ### 2.1 两个循环的收尾方式：取消令牌 + 当场 detach
+//!
+//! **不靠句柄停任务。** `abs_art` 的 [`TrJoinHandle`](abs_art::TrJoinHandle)
+//! **没有 `abort`**，只有 `detach` 与「可 await 的 join」；更麻烦的是三个后端对
+//! 「drop 句柄」的语义并不一致——tokio 视作 detach（任务继续跑），compio 与 smol
+//! 视作取消。依赖句柄的 drop / abort 会让同一份代码在不同后端上有不同的关闭语义。
+//!
+//! 因此收尾统一走**共享的取消令牌 + 「连接已失败」标志**：`new` 在 spawn 后立即
+//! `detach()` 句柄，循环在**每个 await 点**（读 / 写 / park 都经
+//! `may_cancel_with(令牌)`）检查令牌与失败标志并自行退出；连接 `Drop` 时置位即可。
+//! 句柄因此不必存成字段，`Rt` 的关联类型 `JoinHandle` 也不必出现在任何类型签名里。
+//! 顺带的好处是：设备 / 网络错误可以由同一个失败标志回传给被动端，避免被动端
+//! 空等一个已经死掉的循环。
 //!
 //! ## 3. 帧线格式（sans-IO）
 //!
@@ -153,18 +168,26 @@
 //! 容量策略同样由调用方注入（见 [`crate::flow_ctrl::TrFlowCtrlPolicy`] 与
 //! [`MuxConnection::new`] 的参数）。本 crate 不隐式分配、不隐藏内存预算。
 //!
-//! ## 6. 线程模型
+//! ## 6. 线程模型与运行时参数 `Rt`
 //!
-//! 由 cargo feature 决定（见 `Cargo.toml` 的 `[features]`）：
+//! 连接带上运行时的**类型参数** `Rt`（`MuxConnection<R, W, C, Rt>`）：内部两个
+//! 循环经 `abs_art` spawn，所以必须知道用哪个运行时。`Rt` 是纯类型——`abs_art`
+//! 的 spawn 是无 `self` 的关联函数，连接不持有运行时的值；后端由最终二进制选择
+//! （`abs_art-tokio::Runtime<{..}>` / `abs_art-compio::Runtime<{..}>`），本 crate
+//! 内部不出现任何后端名，也不依赖 `abs_art-bridge`。它必须是**结构体**上的参数
+//! 而非只做 `new` 的方法级泛型，否则内部循环的句柄类型无处可写。
 //!
-//! - **缺省（不开启 `multi-thread`）**：面向单线程运行时（如 compio 的
-//!   `spawn_local`），连接与 session 为 `!Send`，共享注册表用非原子容器；
-//! - **开启 `multi-thread`**：面向多线程运行时，连接与 session 为 `Send + Sync`，
-//!   共享注册表用原子原语，内部读写任务经 `abs_art` 的 `SPAWN_SEND` / `SPAWN_LOCAL` 投递。
+//! bound 由 cargo feature 二选一（见 `Cargo.toml` 的 `[features]`）：
+//!
+//! - **缺省（不开启 `multi-thread`）**：`Rt: TrSpawnLocal`，面向单线程运行时
+//!   （compio 首要目标），连接与 session 为 `!Send`，共享注册表用非原子容器，
+//!   循环经 `Rt::spawn_local` 投递；
+//! - **开启 `multi-thread`**：`Rt: TrSpawnSend`，面向多线程运行时，连接与 session
+//!   为 `Send + Sync`，共享注册表用原子原语，循环经 `Rt::spawn` 投递。
 //!
 //! 注意：`buffex` 的端类型自身要求 `Send + Sync` 的参数，因此环存储与分配器在
 //! 两种模型下都必须是 `Send + Sync`；feature 影响的是**连接对象本身**是否可跨
-//! 线程共享，以及共享注册表用什么原语保护。
+//! 线程共享、共享注册表用什么原语保护，以及循环往哪个队列投递。
 //!
 //! ## 7. 生命周期与超时
 //!

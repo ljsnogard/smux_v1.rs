@@ -9,9 +9,21 @@
 //!
 //! 「环存储类型 `B`、分配器 `A`、流控策略 `P`」三者在整个连接里是**同一组**，
 //! 且总是成对出现。若把它们作为三个独立泛型参数写进每个公开类型，签名会迅速
-//! 膨胀；因此把它们打包成 [`TrMuxConfig`]，公开类型只需要 `MuxConnection<R, W, C>`
-//! 三个参数。这也是「调用方注入分配器 / 策略」的落点：实现 [`TrMuxConfig`] 即可
-//! 换掉整套内存与窗口预算。
+//! 膨胀；因此把它们打包成 [`TrMuxConfig`]，公开类型只需要 `MuxConnection<R, W, C, Rt>`
+//! 四个参数（`Rt` 是运行时类型，见后文）。这也是「调用方注入分配器 / 策略」的
+//! 落点：实现 [`TrMuxConfig`] 即可换掉整套内存与窗口预算。
+//!
+//! # 运行时参数 `Rt`
+//!
+//! `MuxConnection` 内部经 [`abs_art`] spawn 读 / 写两个循环，因此需要知道用哪个
+//! 运行时。`Rt` 是**纯类型**参数：`abs_art` 的 spawn 是无 `self` 的关联函数，
+//! 连接不持有运行时的值。bound 按 feature 切换——缺省（单线程、compio 首要）
+//! 要求 `Rt: TrSpawnLocal`，开启 `multi-thread` 后要求 `Rt: TrSpawnSend`；
+//! 具体后端由最终二进制选择（本 crate 不出现任何后端名，也不依赖
+//! `abs_art-bridge`）。
+//!
+//! 泛型参数必须落在**结构体**上而不是只做 `new` 的方法级泛型：内部循环的句柄
+//! 类型要能出现在字段类型里（见 dev-notes 的「方案 A」）。
 
 // 本模块目前是**骨架**：类型、签名与文档已定稿，方法体统一为 `todo!()`。
 // 实现落地后必须移除本行的 `allow`（见 `dev-notes/` 的待办）。
@@ -27,6 +39,10 @@ use abs_buff::{
     Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
     x_deps::{abs_cancel, anylr},
 };
+#[cfg(feature = "multi-thread")]
+use abs_art::TrSpawnSend;
+#[cfg(not(feature = "multi-thread"))]
+use abs_art::TrSpawnLocal;
 use abs_cancel::TrCancellationToken;
 use abs_buff::gen_may_cancel_future;
 use abs_smux::conn::{
@@ -46,8 +62,8 @@ use crate::handshake::opts::HandshakeOpts;
 /// `&'s &'f ()` 把 `'f: 's` 编码进类型本身：这些类型都派生自「借用了连接的
 /// 会话」，因此连接借用的生命周期必须覆盖类型自身。用类型别名而非裸
 /// `PhantomData<...>`，既避免 `clippy::type_complexity`，也让三处占位语义一致。
-pub(crate) type SessionMark_<'s, 'f, R, W, C> =
-    PhantomData<(&'s &'f (), fn() -> (R, W, C))>;
+pub(crate) type SessionMark_<'s, 'f, R, W, C, Rt> =
+    PhantomData<(&'s &'f (), fn() -> (R, W, C, Rt))>;
 
 /// 复用连接的资源策略：环存储、分配器与流控策略。
 ///
@@ -85,7 +101,9 @@ pub trait TrMuxConfig {
 ///
 /// - `R`：网络读半边（握手交付的 `Rx`）；
 /// - `W`：网络写半边（握手交付的 `Tx`）；
-/// - `C`：资源策略，见 [`TrMuxConfig`]。
+/// - `C`：资源策略，见 [`TrMuxConfig`]；
+/// - `Rt`：运行时类型（见模块文档「运行时参数 `Rt`」）。它必须是**结构体**上的
+///   类型参数：内部循环的句柄类型要能出现在字段类型里。
 ///
 /// # 封装边界
 ///
@@ -96,7 +114,7 @@ pub trait TrMuxConfig {
 ///
 /// [`TrConnection::bind_async`] 取 `&self`，因此同一个连接可以被多个业务逻辑同时
 /// 绑定到不同 dock，读 / 写路径在内部互不争锁（模块文档 §2）。
-pub struct MuxConnection<R, W, C> {
+pub struct MuxConnection<R, W, C, Rt> {
     /// 网络读半边：由本对象独占（并移交给内部读循环），不对外暴露。
     rx_: R,
 
@@ -108,20 +126,55 @@ pub struct MuxConnection<R, W, C> {
 
     /// 握手协商结果（连接级配额）。
     opts_: HandshakeOpts,
+
+    /// 运行时类型的占位：连接只需要运行时的**类型**，不需要它的值（`abs_art` 的
+    /// spawn 是无 `self` 的关联函数，`Rt` 通常是零大小标记类型）。真正的取消令牌
+    /// 与共享注册表随 `sync_` 落地，见 dev-notes 的「方案 A」。
+    rt_: PhantomData<fn() -> Rt>,
 }
 
-impl<R, W, C> MuxConnection<R, W, C>
+/// 单线程版本（缺省，compio 首要）：内部循环经 `Rt::spawn_local` 投递，因此要求
+/// `Rt: TrSpawnLocal`。
+#[cfg(not(feature = "multi-thread"))]
+impl<R, W, C, Rt> MuxConnection<R, W, C, Rt>
 where
     R: TrBuffRead<u8>,
     W: TrBuffWrite<u8>,
     C: TrMuxConfig,
+    Rt: TrSpawnLocal,
 {
     /// 由一次成功的握手交付物与资源策略构造连接，接管 `Rx` / `Tx`，并**在内部
-    /// 经 `abs_art` spawn** 读 / 写两个循环（各自持有 `JoinHandle`，随连接关闭而
-    /// abort）。
+    /// 经 `abs_art` spawn** 读 / 写两个循环（排空控制帧后按对端发送窗口调度数据
+    /// 帧，见 [`crate::connection`] 模块文档 §2）。
+    ///
+    /// # 循环的收尾方式
+    ///
+    /// 不靠句柄停任务：[`TrJoinHandle`](abs_art::TrJoinHandle) **没有 `abort`**，
+    /// 而且三个后端对「drop 句柄」的语义并不一致（tokio 视作 detach、compio /
+    /// smol 视作取消）。因此收尾统一走**取消令牌 + 「连接已失败」标志**：
+    /// spawn 后立即 `detach()` 句柄，循环在每个 await 点检查令牌与失败标志自行
+    /// 退出；连接 `Drop` 时置位即可。句柄因此不需要存成字段，`Rt::JoinHandle`
+    /// 也不必出现在任何类型签名里。
     ///
     /// 对外不提供任何驱动 API：用户只使用 `abs_smux` 的 trait。后端运行时由最终
     /// 二进制经 `abs_art` 选择（本 crate 不依赖 `abs_art-bridge`）。
+    pub fn new(delivery: HandshakeDelivery<W, R>, config: C) -> Self {
+        todo!("接管 Rx / Tx，建立内部读写循环与共享注册表")
+    }
+}
+
+/// 多线程版本（开启 `multi-thread`）：语义与单线程版本**完全一致**，唯一区别是
+/// 内部循环经 `Rt::spawn` 投递（可跨线程），因此 bound 换成 `Rt: TrSpawnSend`。
+#[cfg(feature = "multi-thread")]
+impl<R, W, C, Rt> MuxConnection<R, W, C, Rt>
+where
+    R: TrBuffRead<u8>,
+    W: TrBuffWrite<u8>,
+    C: TrMuxConfig,
+    Rt: TrSpawnSend,
+{
+    /// 与缺省配置下的同名方法语义相同（含「取消令牌 + 当场 detach」的收尾方式），
+    /// 只是本配置下要求 `Rt: TrSpawnSend`。
     pub fn new(delivery: HandshakeDelivery<W, R>, config: C) -> Self {
         todo!("接管 Rx / Tx，建立内部读写循环与共享注册表")
     }
@@ -142,9 +195,9 @@ where
 /// [`TrConnection::bind_async`] 固定。若要在**同一时刻**向同一个 `remote_dock`
 /// 发起多条子流，就必须用**多个 local_dock 各建一个会话**——协议不提供 channel
 /// id，同一 dock 对上的两条并发子流无法区分。
-pub struct DockBinding<'f, R, W, C> {
+pub struct DockBinding<'f, R, W, C, Rt> {
     /// 连接对象（共享，`bind_async` 取 `&self`）。
-    conn_: &'f MuxConnection<R, W, C>,
+    conn_: &'f MuxConnection<R, W, C, Rt>,
 
     /// 本会话绑定的 local_dock。
     local_dock_: Dock,
@@ -155,14 +208,14 @@ pub struct DockBinding<'f, R, W, C> {
 /// [`TrChannelListener::income_async`] 每次返回一个**待决句柄**
 /// [`ChannelHandle`]；调用方决定 accept 还是 reject，之后该 dock 才能继续接受
 /// 下一个请求（同一 dock 的请求串行化，便于用户侧实现「排队 / 限流」）。
-pub struct ChannelListener<'s, 'f, R, W, C> {
+pub struct ChannelListener<'s, 'f, R, W, C, Rt> {
     /// 监听的 local_dock。
     local_dock_: Dock,
 
     /// 借用关系与连接泛型的占位；`&'s &'f ()` 同时编码了 `'f: 's`——监听器派生自
     /// 借用了连接的会话，因此连接借用的生命周期必须覆盖监听器自身。真实共享句柄
     /// 见 [`crate::connection`] 模块文档。
-    _mark_: SessionMark_<'s, 'f, R, W, C>,
+    _mark_: SessionMark_<'s, 'f, R, W, C, Rt>,
 }
 
 /// 一个入向建流请求的待决句柄。
@@ -175,7 +228,7 @@ pub struct ChannelListener<'s, 'f, R, W, C> {
 /// 句柄上的 `(local_dock, remote_dock)` 就是这条待决子流的身份：响应方在自己的
 /// `local_dock` 上用 `remote_dock` 区分不同请求端的连接（见
 /// [`crate::connection`] 模块文档 §4.1）。
-pub struct ChannelHandle<'s, 'f, R, W, C> {
+pub struct ChannelHandle<'s, 'f, R, W, C, Rt> {
     /// 本端 dock。
     local_dock_: Dock,
 
@@ -183,7 +236,7 @@ pub struct ChannelHandle<'s, 'f, R, W, C> {
     remote_dock_: Dock,
 
     /// 借用关系与连接泛型的占位；语义同 [`ChannelListener`]。
-    _mark_: SessionMark_<'s, 'f, R, W, C>,
+    _mark_: SessionMark_<'s, 'f, R, W, C, Rt>,
 }
 
 /// 子流发送半边：包一个 `buffex` 生产端半部。
@@ -221,7 +274,7 @@ pub struct ChannelRx<H> {
 // TrConnection
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-impl<R, W, C> TrConnection for MuxConnection<R, W, C>
+impl<R, W, C, Rt> TrConnection for MuxConnection<R, W, C, Rt>
 where
     R: TrBuffRead<u8>,
     W: TrBuffWrite<u8>,
@@ -232,12 +285,12 @@ where
     type Err = MuxError<R::Err, W::Err>;
 
     type DockBinding<'f>
-        = DockBinding<'f, R, W, C>
+        = DockBinding<'f, R, W, C, Rt>
     where
         Self: 'f;
 
     type BindAsync<'f>
-        = MuxBindAsync<'f, 'f, R, W, C>
+        = MuxBindAsync<'f, 'f, R, W, C, Rt>
     where
         Self: 'f;
 
@@ -248,11 +301,11 @@ where
 
 /// [`TrConnection::bind_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxBind, pub)]
-async fn mux_bind_async_<'f, R, W, C, K>(
-    conn: &'f MuxConnection<R, W, C>,
+async fn mux_bind_async_<'f, R, W, C, Rt, K>(
+    conn: &'f MuxConnection<R, W, C, Rt>,
     local_dock: Dock,
     _cancel: K,
-) -> Result<DockBinding<'f, R, W, C>, MuxError<R::Err, W::Err>>
+) -> Result<DockBinding<'f, R, W, C, Rt>, MuxError<R::Err, W::Err>>
 where
     R: TrBuffRead<u8> + 'f,
     W: TrBuffWrite<u8> + 'f,
@@ -266,7 +319,7 @@ where
 // TrDockBinding
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-impl<'f, R, W, C> TrDockBinding for DockBinding<'f, R, W, C>
+impl<'f, R, W, C, Rt> TrDockBinding for DockBinding<'f, R, W, C, Rt>
 where
     R: TrBuffRead<u8> + 'f,
     W: TrBuffWrite<u8> + 'f,
@@ -277,22 +330,22 @@ where
     type Err = MuxError<R::Err, W::Err>;
 
     type Listener<'s>
-        = ChannelListener<'s, 'f, R, W, C>
+        = ChannelListener<'s, 'f, R, W, C, Rt>
     where
         Self: 's;
 
     type ListenAsync<'s>
-        = MuxListenAsync<'s, 'f, 's, R, W, C>
+        = MuxListenAsync<'s, 'f, 's, R, W, C, Rt>
     where
         Self: 's;
 
     type Telegraph<'s>
-        = super::Telegraph<'s, 'f, R, W, C>
+        = super::Telegraph<'s, 'f, R, W, C, Rt>
     where
         Self: 's;
 
     type OpenTelegraphAsync<'s>
-        = MuxOpenTelegraphAsync<'s, 'f, 's, R, W, C>
+        = MuxOpenTelegraphAsync<'s, 'f, 's, R, W, C, Rt>
     where
         Self: 's;
 
@@ -300,7 +353,7 @@ where
     type Rx = ChannelRx<BufferedRx<C::Buff, C::Alloc>>;
 
     type OpenChannelAsync<'s, M>
-        = MuxOpenChannelAsync<'s, 'f, 's, R, W, C, M>
+        = MuxOpenChannelAsync<'s, 'f, 's, R, W, C, Rt, M>
     where
         Self: 's,
         M: 's + TrBuffRead<Self::Data>;
@@ -331,10 +384,10 @@ where
 
 /// [`TrDockBinding::listen_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxListen, pub)]
-async fn mux_listen_async_<'s, 'f, R, W, C, K>(
-    binding: &'s mut DockBinding<'f, R, W, C>,
+async fn mux_listen_async_<'s, 'f, R, W, C, Rt, K>(
+    binding: &'s mut DockBinding<'f, R, W, C, Rt>,
     _cancel: K,
-) -> Result<ChannelListener<'s, 'f, R, W, C>, MuxError<R::Err, W::Err>>
+) -> Result<ChannelListener<'s, 'f, R, W, C, Rt>, MuxError<R::Err, W::Err>>
 where
     'f: 's,
     R: TrBuffRead<u8> + 'f,
@@ -347,10 +400,10 @@ where
 
 /// [`TrDockBinding::open_telegraph_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxOpenTelegraph, pub)]
-async fn mux_open_telegraph_async_<'s, 'f, R, W, C, K>(
-    binding: &'s mut DockBinding<'f, R, W, C>,
+async fn mux_open_telegraph_async_<'s, 'f, R, W, C, Rt, K>(
+    binding: &'s mut DockBinding<'f, R, W, C, Rt>,
     _cancel: K,
-) -> Result<super::Telegraph<'s, 'f, R, W, C>, MuxError<R::Err, W::Err>>
+) -> Result<super::Telegraph<'s, 'f, R, W, C, Rt>, MuxError<R::Err, W::Err>>
 where
     'f: 's,
     R: TrBuffRead<u8> + 'f,
@@ -366,8 +419,8 @@ where
 /// `message` 是随 `OPEN` 帧附带的开场消息；由于关联类型已泛型于它
 /// （`OpenChannelAsync<'s, M>`），future 可以直接持有该缓冲。
 #[gen_may_cancel_future(MuxOpenChannel, pub)]
-async fn mux_open_channel_async_<'s, 'f, R, W, C, M, K>(
-    binding: &'s mut DockBinding<'f, R, W, C>,
+async fn mux_open_channel_async_<'s, 'f, R, W, C, Rt, M, K>(
+    binding: &'s mut DockBinding<'f, R, W, C, Rt>,
     remote_dock: Dock,
     message: &'s mut M,
     _cancel: K,
@@ -393,7 +446,7 @@ where
 // TrChannelListener
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-impl<'s, 'f, R, W, C> TrChannelListener for ChannelListener<'s, 'f, R, W, C>
+impl<'s, 'f, R, W, C, Rt> TrChannelListener for ChannelListener<'s, 'f, R, W, C, Rt>
 where
     R: TrBuffRead<u8> + 'f,
     W: TrBuffWrite<u8> + 'f,
@@ -403,10 +456,10 @@ where
     type Dock = Dock;
     type Err = MuxError<R::Err, W::Err>;
 
-    type ChannelHandle = ChannelHandle<'s, 'f, R, W, C>;
+    type ChannelHandle = ChannelHandle<'s, 'f, R, W, C, Rt>;
 
     type IncomeAsync<'i>
-        = MuxIncomeAsync<'i, 's, 'f, 'i, R, W, C>
+        = MuxIncomeAsync<'i, 's, 'f, 'i, R, W, C, Rt>
     where
         Self: 'i;
 
@@ -421,10 +474,10 @@ where
 
 /// [`TrChannelListener::income_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxIncome, pub)]
-async fn mux_income_async_<'i, 's, 'f, R, W, C, K>(
-    listener: &'i mut ChannelListener<'s, 'f, R, W, C>,
+async fn mux_income_async_<'i, 's, 'f, R, W, C, Rt, K>(
+    listener: &'i mut ChannelListener<'s, 'f, R, W, C, Rt>,
     _cancel: K,
-) -> Result<ChannelHandle<'s, 'f, R, W, C>, MuxError<R::Err, W::Err>>
+) -> Result<ChannelHandle<'s, 'f, R, W, C, Rt>, MuxError<R::Err, W::Err>>
 where
     'f: 's,
     R: TrBuffRead<u8> + 'f,
@@ -439,7 +492,7 @@ where
 // TrChannelHandle
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-impl<'s, 'f, R, W, C> TrChannelHandle for ChannelHandle<'s, 'f, R, W, C>
+impl<'s, 'f, R, W, C, Rt> TrChannelHandle for ChannelHandle<'s, 'f, R, W, C, Rt>
 where
     R: TrBuffRead<u8> + 'f,
     W: TrBuffWrite<u8> + 'f,
@@ -451,13 +504,13 @@ where
     type Rx = ChannelRx<BufferedRx<C::Buff, C::Alloc>>;
 
     type AcceptAsync<'a, Wb>
-        = MuxAcceptAsync<'a, 's, 'f, 'a, R, W, C, Wb>
+        = MuxAcceptAsync<'a, 's, 'f, 'a, R, W, C, Rt, Wb>
     where
         Self: 'a,
         Wb: 'a + TrBuffWrite;
 
     type RejectAsync<'a, Rb>
-        = MuxRejectAsync<'a, 's, 'f, 'a, R, W, C, Rb>
+        = MuxRejectAsync<'a, 's, 'f, 'a, R, W, C, Rt, Rb>
     where
         Self: 'a,
         Rb: 'a + TrBuffRead;
@@ -477,7 +530,7 @@ where
     }
 }
 
-impl<'s, 'f, R, W, C> TrChannelHalf for ChannelHandle<'s, 'f, R, W, C> {
+impl<'s, 'f, R, W, C, Rt> TrChannelHalf for ChannelHandle<'s, 'f, R, W, C, Rt> {
     type Data = u8;
     type Dock = Dock;
 
@@ -500,8 +553,8 @@ impl<'s, 'f, R, W, C> TrChannelHalf for ChannelHandle<'s, 'f, R, W, C> {
 
 /// [`TrChannelHandle::accept_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxAccept, pub)]
-async fn mux_accept_async_<'a, 's, 'f, R, W, C, Wb, K>(
-    handle: &'a mut ChannelHandle<'s, 'f, R, W, C>,
+async fn mux_accept_async_<'a, 's, 'f, R, W, C, Rt, Wb, K>(
+    handle: &'a mut ChannelHandle<'s, 'f, R, W, C, Rt>,
     welcome: &'a mut Wb,
     _cancel: K,
 ) -> Result<
@@ -524,8 +577,8 @@ where
 
 /// [`TrChannelHandle::reject_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxReject, pub)]
-async fn mux_reject_async_<'a, 's, 'f, R, W, C, Rb, K>(
-    handle: &'a mut ChannelHandle<'s, 'f, R, W, C>,
+async fn mux_reject_async_<'a, 's, 'f, R, W, C, Rt, Rb, K>(
+    handle: &'a mut ChannelHandle<'s, 'f, R, W, C, Rt>,
     reason: &'a mut Rb,
     _cancel: K,
 ) -> Result<usize, MuxError<R::Err, W::Err>>

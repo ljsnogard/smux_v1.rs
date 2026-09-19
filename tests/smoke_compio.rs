@@ -32,6 +32,16 @@ fn assert_compio_adapters_fit_(read: &mut UnixStream, write: &mut UnixStream) {
     assert_output_(WriteAsOutput::new(write));
 }
 
+/// 连接层使用的运行时标记类型。
+///
+/// 同时声明 `SPAWN_SEND` 与 `SPAWN_LOCAL` 两种能力：缺省（单线程）配置下
+/// `MuxConnection::new` 要求 `Rt: TrSpawnLocal`，开启 `multi-thread` 后要求
+/// `Rt: TrSpawnSend`；两种都声明，同一份测试才能在两种 feature 配置下都通过
+/// 编译检查。compio 的运行时是线程本地的，因此实际执行路径始终是 `spawn_local`
+/// 语义（见 `abs_art-compio` 的 `spawn_send` 模块文档）。
+type SmokeRt =
+    abs_art_compio::Runtime<{ abs_art_compio::SPAWN_SEND | abs_art_compio::SPAWN_LOCAL }>;
+
 /// 测试目标：compio 运行时下，smux v1 的「握手 → 拆连接 → 16 dock × 1024 子流
 /// 收发」整条链路的冒烟级端到端行为，且传输是真实的 UNIX domain socket。
 ///
@@ -50,7 +60,7 @@ fn assert_compio_adapters_fit_(read: &mut UnixStream, write: &mut UnixStream) {
 ///   期望载荷逐字节相等；任何一次失败都会让场景 panic 从而测试失败。
 ///
 /// 说明：连接层当前是 `todo!()` 骨架，因此本测试被标记为 `#[ignore]`；实现落地
-/// 后移除。`cargo test -- --ignored` 会在 `MuxConnection::split` 处以
+/// 后移除。`cargo test -- --ignored` 会在 `MuxConnection::new` 处以
 /// `not yet implemented` panic——这正说明测试已经编译、并成功跑过了运行时接线
 /// 与握手。
 #[compio::test]
@@ -63,7 +73,7 @@ async fn mux_smoke_compio_() {
     let (mut a_read, mut a_write) = stream_a.into_split();
     let (mut b_read, mut b_write) = stream_b.into_split();
 
-    common::run_socket_scenario_(
+    common::run_socket_scenario_::<_, _, _, _, SmokeRt>(
         ReadAsInput::new(&mut a_read),
         WriteAsOutput::new(&mut a_write),
         ReadAsInput::new(&mut b_read),
