@@ -8,13 +8,26 @@ description = "流复用协议第一版"
 [dependencies]
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
 abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev/0.3.0" }
+abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
+
+# 复用子流与协议帧的缓冲区一律使用 `buffex::circular_buff`，因此它是正式依赖
+# 而非测试专用依赖（`no_std` 成立；缺省分配器由 `buffex` 重导出）。
+buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
 
 crc = { version = "3.4.*" }
 
+[features]
+# 线程模型开关，二选一；详见 `src/connection/mod.rs` 的「线程模型」一节。
+#
+# - 不开启（缺省）：连接为 `!Send`，面向单线程运行时（如 compio 的
+#   `spawn_local`），共享状态用非原子容器；
+# - 开启 `multi-thread`：连接为 `Send + Sync`，面向多线程运行时，共享状态用
+#   原子原语，读写 session 可跨线程 spawn。
+multi-thread = []
+
 [dev-dependencies]
-# 测试在 compio 上运行（目标 3），因此运行时桥接、环形缓冲与内存分配器都只
-# 在 dev-dependencies 中出现。
+# 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在
+# dev-dependencies 中出现（`buffex` 已是正式依赖，不在此重复）。
 abs_art-bridge = { version = "0.2.2", default-features = false, features = ["backend-compio"] }
-buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
 compio = { version = "0.19.*", features = ["fs", "macros", "time"] }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1.3" }
