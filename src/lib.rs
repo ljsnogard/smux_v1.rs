@@ -1,7 +1,7 @@
 #![feature(impl_trait_in_assoc_type)]
 #![no_std]
 
-#[cfg(test)]
+#[cfg(any(test, feature = "asyncband"))]
 extern crate std;
 
 pub mod connection;

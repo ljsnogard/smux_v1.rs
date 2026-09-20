@@ -17,6 +17,15 @@ buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3
 
 crc = { version = "3.4.*" }
 
+[dependencies.asyncband]
+# 上行通知通道（多生产者 → 单消费者）的候选实现之一，见
+# `src/connection/signal_.rs` 与 dev-notes §11.4.1。它是 **std-only**（`mpsc`
+# 内部包 `std::sync::mpsc`），因此只作为可选依赖：默认构建仍保持 `#![no_std]`。
+version = "0.7.*"
+default-features = false
+features = ["mpsc"]
+optional = true
+
 [features]
 # 线程模型开关，二选一；详见 `src/connection/mod.rs` 的「线程模型」一节。
 #
@@ -25,6 +34,10 @@ crc = { version = "3.4.*" }
 # - 开启 `multi-thread`：连接为 `Send + Sync`，面向多线程运行时，共享状态用
 #   原子原语，读写 session 可跨线程 spawn。
 multi-thread = []
+
+# 上行通知通道改用 `asyncband::mpsc`（std-only）。不开启时用 `signal_` 里自带的
+# 定容环实现（`no_std`、走调用方注入的分配器）。两者实现同一组内部 trait，便于对比。
+asyncband = ["dep:asyncband"]
 
 [dev-dependencies]
 # 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在

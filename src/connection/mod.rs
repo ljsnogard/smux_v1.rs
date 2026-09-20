@@ -279,6 +279,7 @@ mod channel_;
 mod error_;
 mod frame_;
 mod session_;
+mod signal_;
 mod sync_;
 mod telegraph_;
 
