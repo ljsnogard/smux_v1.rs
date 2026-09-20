@@ -102,6 +102,16 @@ pub trait TrFlowCtrlPolicy {
     /// 发送窗口在收到对端通告时不得超过它（对端同样受本端实现约束，这里做一次
     /// 防御性钳制）。
     fn max_window(&self) -> Credit;
+
+    /// 本端通告里累计已收量的 **epoch 规格**：累计量涨到它之前就要重置一次。
+    ///
+    /// 累计量在线格式上允许 2 / 4 / 8 字节（见
+    /// [`crate::connection::FieldId::RecvTotal`]）。选 2 字节的 epoch
+    /// （`u16::MAX`）让控制帧最紧凑、但重置最频繁；选 8 字节
+    /// （`u64::MAX`）实际上永不重置。重置本身通过带
+    /// [`crate::connection::flags::K_TOTAL_RESET`] 的通告宣告，携带**重置前**的
+    /// 累计量，对端据此 rebase。
+    fn recv_total_epoch(&self) -> RecvTotal;
 }
 
 /// 缺省流控策略；各项取值的推导见 [`TrFlowCtrlPolicy`] 的方法文档。
@@ -151,6 +161,11 @@ impl TrFlowCtrlPolicy for DefaultPolicy {
         // 取 `u32::MAX` 的一半：远大于任何真实环容量，又留出余量。
         Credit::MAX / 2u32
     }
+
+    fn recv_total_epoch(&self) -> RecvTotal {
+        // 4 字节规格：`R` 在 `u32` 范围内都不必重置，同时字段很少需要用到 8 字节。
+        u32::MAX as RecvTotal
+    }
 }
 
 /// 一份**窗口通告**：截至累计已收 `recv_total` 字节时，本端还能再收 `window` 字节。
@@ -186,14 +201,28 @@ impl TrFlowCtrlPolicy for DefaultPolicy {
 pub struct WindowReport {
     recv_total_: RecvTotal,
     window_: Credit,
+    reset_: bool,
 }
 
 impl WindowReport {
-    /// 以「累计已收字节数 + 当前接收窗口」构造；构造方是**接收侧**。
+    /// 以「累计已收字节数 + 当前接收窗口」构造（普通通告）；构造方是**接收侧**。
     pub const fn new(recv_total: RecvTotal, window: Credit) -> Self {
         WindowReport {
             recv_total_: recv_total,
             window_: window,
+            reset_: false,
+        }
+    }
+
+    /// 构造**重置变体**：`pre_reset_total` 是重置**之前**的累计已收量（绝对总量），
+    /// 收到它的一方据此 rebase，其后的通告里累计量从 `0` 重新计数。
+    ///
+    /// 本端在累计量即将超出 [`TrFlowCtrlPolicy::recv_total_epoch`] 时发它。
+    pub const fn new_reset(pre_reset_total: RecvTotal, window: Credit) -> Self {
+        WindowReport {
+            recv_total_: pre_reset_total,
+            window_: window,
+            reset_: true,
         }
     }
 
@@ -206,6 +235,11 @@ impl WindowReport {
     pub const fn window(&self) -> Credit {
         self.window_
     }
+
+    /// 是否为重置变体：是则 [`WindowReport::recv_total`] 是**重置前**的绝对累计量。
+    pub const fn is_reset(&self) -> bool {
+        self.reset_
+    }
 }
 
 /// 发送窗口：本端在子流的某个方向上**还能发送**多少字节。
@@ -216,8 +250,12 @@ pub struct SendWindow {
     /// 累计**已发送**字节数（`S`）。
     sent_: RecvTotal,
 
-    /// 最近一次收到的通告 `(R₀, W₀)`；`None` 表示尚未收到（对端的 `OPEN` 还没到）。
+    /// 最近一次收到的通告折算成**绝对**累计已收量后的快照 `(R₀, W₀)`；`None` 表示
+    /// 尚未收到（对端的 `OPEN` 还没到）。
     reported_: Option<(RecvTotal, Credit)>,
+
+    /// 对端累计量的当前 epoch 起点（绝对总量）：对端每次宣告重置时更新。
+    peer_epoch_base_: RecvTotal,
 
     /// 上限，用于对通告做防御性钳制。
     max_: Credit,
@@ -230,6 +268,7 @@ impl SendWindow {
         SendWindow {
             sent_: 0u64,
             reported_: Option::None,
+            peer_epoch_base_: 0u64,
             max_: max,
         }
     }
@@ -268,25 +307,44 @@ impl SendWindow {
 
     /// 收到对端的窗口通告。
     ///
-    /// 过期或重复的通告（`R` 不比已记录的更大）被忽略，因此**幂等**：保活 `PULSE`
-    /// 可以放心地重复携带同一份快照。
+    /// 重置变体（[`WindowReport::is_reset`]）会先把对端的 epoch 起点推进到它携带的
+    /// 「重置前累计量」，因此两种变体都能折算成同一个**绝对**累计已收量再比较。
+    /// 过期或重复的通告（折算后的 `R` 不比已记录的更大）被忽略，因此**幂等**：保活
+    /// `PULSE` 可以放心地重复携带同一份快照。
     ///
     /// # Errors
     ///
     /// 通告的窗口超过本端上限时返回 [`FlowCtrlError::Overflow`]（本端实现防御，
     /// 正常对端不会触发）。
     pub fn on_report(&mut self, report: WindowReport) -> Result<(), FlowCtrlError> {
+        // 折算成绝对累计已收量：重置变体携带的就是「重置前」的绝对总量。
+        let reset = report.is_reset();
+        let absolute = if reset {
+            report.recv_total()
+        } else {
+            self.peer_epoch_base_.saturating_add(report.recv_total())
+        };
+
         if let Option::Some((r0, _)) = self.reported_
-            && report.recv_total() <= r0
+            && absolute <= r0
         {
-            // 旧快照：不覆盖，也不报错。
+            // 旧快照：不覆盖、不推进 epoch 起点，也不报错。
             return Result::Ok(());
         }
         if report.window() > self.max_ {
             return Result::Err(FlowCtrlError::Overflow);
         }
-        self.reported_ = Option::Some((report.recv_total(), report.window()));
+        if reset {
+            // epoch 起点只在通告被接受后推进。
+            self.peer_epoch_base_ = report.recv_total();
+        }
+        self.reported_ = Option::Some((absolute, report.window()));
         Result::Ok(())
+    }
+
+    /// 对端累计量的当前 epoch 起点（绝对总量；诊断用）。
+    pub const fn peer_epoch_base(&self) -> RecvTotal {
+        self.peer_epoch_base_
     }
 }
 
@@ -318,6 +376,12 @@ pub struct RecvWindow {
 
     /// 自上次通告以来收到的数据帧数（频率限制用）。
     frames_since_report_: usize,
+
+    /// 当前 epoch 的起点（绝对累计量）：每次重置后推进到当时的累计已收量。
+    epoch_base_: RecvTotal,
+
+    /// 本端累计量的 epoch 规格：涨到它就重置。
+    epoch_limit_: RecvTotal,
 }
 
 impl RecvWindow {
@@ -334,6 +398,8 @@ impl RecvWindow {
             consumed_: 0u64,
             reported_: Option::None,
             frames_since_report_: 0usize,
+            epoch_base_: 0u64,
+            epoch_limit_: policy.recv_total_epoch(),
         }
     }
 
@@ -349,9 +415,19 @@ impl RecvWindow {
         self.capacity_.saturating_sub(buffered)
     }
 
-    /// 累计已收字节数（`R`）。
+    /// **绝对**累计已收字节数（自子流建立以来的总量）。
     pub const fn recv_total(&self) -> RecvTotal {
         self.received_
+    }
+
+    /// 当前 epoch 内、将要写进线格式的累计已收量（= 绝对量 − epoch 起点）。
+    pub const fn encoded_recv_total(&self) -> RecvTotal {
+        self.received_.saturating_sub(self.epoch_base_)
+    }
+
+    /// 累计量是否已经涨到当前 epoch 规格，必须在下次通告里宣告重置。
+    pub const fn reset_due(&self) -> bool {
+        self.encoded_recv_total() >= self.epoch_limit_
     }
 
     /// 累计已消费字节数（`C`）。
@@ -409,6 +485,10 @@ impl RecvWindow {
         let Option::Some((_, last)) = self.reported_ else {
             return true;
         };
+        // 重置是**编码前提**（窄规格要放不下了），不受频率限制约束。
+        if self.reset_due() {
+            return true;
+        }
         if self.frames_since_report_ < policy.min_frames_between_reports() {
             return false;
         }
@@ -428,14 +508,24 @@ impl RecvWindow {
         false
     }
 
-    /// 生成一份通告快照 `(R, W)`，并把它记为「已通告」（此后越权判定以它为准、
-    /// 帧计数清零）。
+    /// 生成一份通告快照并把它记为「已通告」（此后越权判定以它为准、帧计数清零）。
+    ///
+    /// 若累计量已经涨到当前 epoch 规格（[`RecvWindow::reset_due`]），这里会自动产出
+    /// **重置变体**：携带重置前的绝对累计量并把 epoch 起点推进到它，其后的通告里
+    /// 累计量从 `0` 重新计数。
     ///
     /// 保活 `PULSE` 无条件用它取当前窗口；按阈值通告则由
     /// [`RecvWindow::should_report`] 先判断。
     pub fn report(&mut self) -> WindowReport {
-        let report = WindowReport::new(self.received_, self.window());
-        self.reported_ = Option::Some((report.recv_total(), report.window()));
+        let report = if self.reset_due() {
+            let reset = WindowReport::new_reset(self.received_, self.window());
+            self.epoch_base_ = self.received_;
+            reset
+        } else {
+            WindowReport::new(self.encoded_recv_total(), self.window())
+        };
+        // 越权判定始终按**绝对**量记账：通告发出时对端最多能发到「当前已收 + W」。
+        self.reported_ = Option::Some((self.received_, report.window()));
         self.frames_since_report_ = 0usize;
         report
     }
@@ -763,5 +853,127 @@ mod tests_ {
         assert_eq!(w.reported_window(), Option::Some(4096u32));
         assert_eq!(w.recv_total(), 0u64);
         assert!(!w.should_report(&p));
+    }
+}
+
+#[cfg(test)]
+mod reset_tests_ {
+    use super::*;
+
+    /// 2 字节 epoch 的策略：累计量涨到 `u16::MAX` 就重置，用于验证重置路径。
+    struct TinyEpochPolicy;
+
+    impl TrFlowCtrlPolicy for TinyEpochPolicy {
+        fn initial_window(&self, ring_capacity: usize) -> Credit {
+            ring_capacity.min(Credit::MAX as usize) as Credit
+        }
+
+        fn shrink_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT] {
+            [initial / 2u32, initial / 4u32, 0u32]
+        }
+
+        fn expand_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT] {
+            [initial / 2u32, initial / 4u32 * 3u32, initial]
+        }
+
+        fn min_frames_between_reports(&self) -> usize {
+            4usize
+        }
+
+        fn max_window(&self) -> Credit {
+            Credit::MAX / 2u32
+        }
+
+        fn recv_total_epoch(&self) -> RecvTotal {
+            8u64
+        }
+    }
+
+    /// 测试累计量涨到 epoch 规格时产出重置变体，且携带的是**重置前**的绝对量。
+    /// - 手段：用 2 字节 epoch 策略（阈值为 8）建立接收窗口，通告一次后收 9 字节。
+    /// - 判断：`reset_due` 为真；`should_report` 为真（不受频率限制）；`report()`
+    ///   返回重置变体，其 `recv_total()` 是重置前的绝对量 9；重置后
+    ///   `encoded_recv_total()` 归零，而绝对量仍是 9。
+    #[test]
+    fn recv_window_reset_carries_pre_reset_total() {
+        let p = TinyEpochPolicy;
+        let mut w = RecvWindow::new_(&p, 4096usize);
+        assert!(!w.reset_due());
+        w.report();
+
+        for _ in 0..4 {
+            w.on_data(3u32).expect("在额度内");
+        }
+        assert_eq!(w.recv_total(), 12u64);
+        assert!(w.reset_due(), "已经超过 epoch 规格 8");
+
+        // 频率限制已满足，但即使没满足，重置也必须能发出去。
+        let report = w.report();
+        assert!(report.is_reset(), "应当产出重置变体");
+        assert_eq!(report.recv_total(), 12u64, "携带重置前的绝对累计量");
+        assert_eq!(report.window(), 4096u32 - 12u32);
+
+        assert_eq!(w.recv_total(), 12u64, "绝对量继续单调");
+        assert_eq!(w.encoded_recv_total(), 0u64, "新 epoch 从 0 起算");
+        assert!(!w.reset_due());
+
+        // 之后的普通通告携带的是 epoch 内的小值。
+        for _ in 0..4 {
+            w.on_data(1u32).expect("在额度内");
+        }
+        let next = w.report();
+        assert!(!next.is_reset());
+        assert_eq!(next.recv_total(), 4u64, "epoch 内累计量");
+    }
+
+    /// 测试重置不受频率限制影响（频率限制只约束阈值通告）。
+    /// - 手段：2 字节 epoch 策略下通告一次，收 1 个数据帧就把累计量推过规格。
+    /// - 判断：帧数远小于 `min_frames_between_reports` 时 `should_report` 仍为真，
+    ///   且 `report()` 产出重置变体。
+    #[test]
+    fn reset_bypasses_report_rate_limit() {
+        let p = TinyEpochPolicy;
+        let mut w = RecvWindow::new_(&p, 64usize);
+        w.report();
+
+        w.on_data(9u32).expect("在额度内");
+        assert_eq!(w.recv_total(), 9u64);
+        assert!(
+            w.should_report(&p),
+            "重置是编码前提，不受最小帧间隔约束"
+        );
+        assert!(w.report().is_reset());
+    }
+
+    /// 测试发送窗口在收到重置变体后按「重置前累计量」rebase。
+    /// - 手段：接通告 `(0, 100)`、预扣 30；再收重置变体 `(30, 50)`；随后预扣 10
+    ///   并收普通通告 `(5, 40)`（epoch 内 5 → 绝对 35）。
+    /// - 判断：重置后可用 = 50（在途 0）；普通通告后可用 = 40 − (40 − 35) = 35。
+    #[test]
+    fn send_window_rebases_on_reset_report() {
+        let mut w = SendWindow::new_(1024u32);
+        w.on_report(WindowReport::new(0u64, 100u32)).expect("通告");
+        assert_eq!(w.reserve(30u32), 30u32);
+        assert_eq!(w.available(), 70u32);
+
+        w.on_report(WindowReport::new_reset(30u64, 50u32))
+            .expect("重置变体");
+        assert_eq!(w.peer_epoch_base(), 30u64);
+        assert_eq!(w.available(), 50u32, "在途为 30 − 30 = 0");
+
+        assert_eq!(w.reserve(10u32), 10u32);
+        assert_eq!(w.available(), 40u32);
+        w.on_report(WindowReport::new(5u64, 40u32))
+            .expect("epoch 内的普通通告");
+        assert_eq!(
+            w.available(),
+            35u32,
+            "绝对已收 = 30 + 5 = 35，在途 = 40 − 35 = 5"
+        );
+
+        // 重置变体之后，比它更旧的重置快照被忽略。
+        w.on_report(WindowReport::new_reset(10u64, 999u32))
+            .expect("更旧的重置快照不是错误");
+        assert_eq!(w.peer_epoch_base(), 30u64, "epoch 起点不回退");
     }
 }

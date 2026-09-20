@@ -127,6 +127,11 @@ pub enum FieldId {
     /// 发送方据此算 `可用 = W − (已发 − R)`，精确扣掉在途数据；缺了它，只凭
     /// [`FieldId::RecvWindow`] 会把在途量重复计入而越权（推导见
     /// [`crate::flow_ctrl::WindowReport`]）。
+    ///
+    /// 宽度**允许 2 / 4 / 8 字节三种规格**（发送方取能容纳该值的最小者）：小值编成
+    /// 2 字节让控制帧保持紧凑；`R` 涨到当前规格放不下时，由发送方按
+    /// [`TrFlowCtrlPolicy::recv_total_epoch`](crate::flow_ctrl::TrFlowCtrlPolicy::recv_total_epoch)
+    /// 的约定**重置累计量**并发一帧带 [`flags::K_TOTAL_RESET`] 的通告（见该常量）。
     RecvTotal = 0x04,
 
     /// 拒绝原因码，只在 `REJECT` 帧上出现；当前只校验、不保存（见模块文档）。
@@ -164,10 +169,13 @@ impl FieldId {
                 val_type,
                 FieldValType::BeU8 | FieldValType::BeU16 | FieldValType::BeU32
             ),
-            FieldId::PayloadLen
-            | FieldId::RecvWindow
-            | FieldId::RecvTotal
-            | FieldId::ReasonCode => true,
+            // 累计已收量只允许 2 / 4 / 8 字节三种规格：1 字节太小（一次突发就要重置），
+            // 3 字节没有对应累加类型。
+            FieldId::RecvTotal => matches!(
+                val_type,
+                FieldValType::BeU16 | FieldValType::BeU32 | FieldValType::BeU64
+            ),
+            FieldId::PayloadLen | FieldId::RecvWindow | FieldId::ReasonCode => true,
         }
     }
 }
@@ -242,7 +250,7 @@ impl From<FrameKind> for u8 {
 
 /// 帧标志位定义（帧首字节的高 4 位，见模块文档）。
 ///
-/// 4 位恰好用满，没有空闲位留给后续扩展。
+/// 4 位恰好用满：`FIN` / `RESET` / `ACK` / `TOTAL_RESET`。
 pub mod flags {
     /// 本方向不再发送数据（半关闭）。
     pub const K_FIN: u8 = 0b0000_0001;
@@ -250,15 +258,19 @@ pub mod flags {
     /// 立即终止子流，丢弃未交付数据。
     pub const K_RESET: u8 = 0b0000_0010;
 
-    /// 应答标记（`ACCEPT` / `PONG` 等）。
+    /// 应答标记（`ACCEPT` 等）。
     pub const K_ACK: u8 = 0b0000_0100;
 
-    /// 本帧不含载荷，仅承载控制信息。
+    /// **窗口通告的变体**：累计已收量已经重置。
     ///
-    /// 与必需的 `PayloadLen == 0` **语义重复**：该位当前只是一个提示，接收方不
-    /// 校验它与 `PayloadLen` 是否一致。保留编号而不删除，是为了将来若需要新的
-    /// 标志位，能明确知道这一位可以被回收。
-    pub const K_NO_PAYLOAD: u8 = 0b0000_1000;
+    /// 本帧携带的 [`FieldId::RecvTotal`] 是**重置前**的累计量（即上一个 epoch 的
+    /// 总量），收到它的一方据此把本端的发送计数 rebase 过来，之后的通告里
+    /// `RecvTotal` 从 `0` 重新计数。这样窄规格（2 / 4 字节）的累计量可以在快要放
+    /// 不下时干净地重新开始，而不必改用更宽的字段。
+    ///
+    /// 只允许出现在携带窗口通告的帧上（[`FrameKind::Pulse`] /
+    /// [`FrameKind::WindowUpdate`]）；`OPEN` 时还没有 epoch，带上即非法。
+    pub const K_TOTAL_RESET: u8 = 0b0000_1000;
 }
 
 /// 一个已解析的帧头。
@@ -322,6 +334,13 @@ impl FrameHeader {
     /// 是否带 `RESET` 标志。
     pub const fn is_reset(&self) -> bool {
         self.flags_ & flags::K_RESET != 0
+    }
+
+    /// 本帧是否为「累计已收量已重置」的窗口通告变体
+    /// （见 [`flags::K_TOTAL_RESET`]）：此时
+    /// [`FrameHeader::recv_total`] 携带的是**重置前**的累计量。
+    pub const fn is_total_reset(&self) -> bool {
+        self.flags_ & flags::K_TOTAL_RESET != 0
     }
 }
 
@@ -537,6 +556,13 @@ where
         return Result::Err(MuxError::MalformedFrame);
     }
 
+    // `TOTAL_RESET` 只对窗口通告有意义，且 OPEN 时还没有 epoch。
+    if flags & flags::K_TOTAL_RESET != 0
+        && !matches!(kind, FrameKind::Pulse | FrameKind::WindowUpdate)
+    {
+        return Result::Err(MuxError::MalformedFrame);
+    }
+
     Result::Ok(FrameHeader {
         kind_: kind,
         flags_: flags,
@@ -600,6 +626,8 @@ pub(crate) const fn requires_window_report_(kind: FrameKind) -> bool {
 ///   `RecvWindow`），或其余帧带上了窗口通告 → [`MuxError::MalformedFrame`]
 ///   （都属调用方构造了自相矛盾的帧头）；
 /// - dock 取了保留值（`wildcard` / `unspecified`）→ [`MuxError::ReservedDock`]；
+/// - 把 [`flags::K_TOTAL_RESET`] 用在 `PULSE` / `WINDOW_UPDATE` 之外的帧上
+///   → [`MuxError::MalformedFrame`]；
 /// - 底层写失败 → [`MuxError::Tx`]。
 pub(crate) async fn write_header_async_<W, C>(
     tx: &mut W,
@@ -610,6 +638,13 @@ where
     W: TrBuffWrite<u8>,
     C: TrCancellationToken,
 {
+    // `TOTAL_RESET` 只对窗口通告有意义，且 OPEN 时还没有 epoch。
+    if header.flags_ & flags::K_TOTAL_RESET != 0
+        && !matches!(header.kind_, FrameKind::Pulse | FrameKind::WindowUpdate)
+    {
+        return Result::Err(MuxError::MalformedFrame);
+    }
+
     let head = compose_frame_head_(header.kind_, header.flags_);
     write_all_async_(tx, &[head], cancel.child_token())
         .await
@@ -860,8 +895,10 @@ mod tests_ {
             Option::Some(ErrKind::MalformedFrame)
         );
 
-        // 读侧：DATA 帧却带上了窗口通告（0x04 头 + 1 字节值 1）。
-        let wrong_kind = [0x05u8, 0x00, 0x01, 0x01, 0x02, 0x04, 0x01, 0x02, 0x00];
+        // 读侧：DATA 帧却带上了窗口通告（0x14 = BeU16 | RecvTotal，值为 1）。
+        let wrong_kind = [
+            0x05u8, 0x00, 0x01, 0x01, 0x02, 0x14, 0x00, 0x01, 0x02, 0x00,
+        ];
         assert_eq!(
             read_err_(&wrong_kind).await,
             Option::Some(ErrKind::MalformedFrame)
@@ -877,7 +914,7 @@ mod tests_ {
     ///   [`MuxError::MalformedFrame`]。
     #[compio::test]
     async fn pulse_is_substream_scoped_and_carries_window() {
-        let mut header = header_(FrameKind::Pulse, flags::K_NO_PAYLOAD);
+        let mut header = header_(FrameKind::Pulse, 0u8);
         header.local_dock_ = Dock::new(1u32);
         header.remote_dock_ = Dock::new(2u32);
         header.recv_window_ = Option::Some(4096u32);
@@ -887,7 +924,7 @@ mod tests_ {
         let total = write_header_into_buf_(&mut buf, &header).await;
         assert_eq!(
             &buf[..total],
-            &[0x88u8, 0x00, 0x01, 0x01, 0x02, 0x04, 0x00, 0x13, 0x10, 0x00, 0x02, 0x00]
+            &[0x08u8, 0x00, 0x01, 0x01, 0x02, 0x14, 0x00, 0x00, 0x13, 0x10, 0x00, 0x02, 0x00]
         );
 
         let parsed = read_header_from_buf_(&buf[..total])
@@ -900,14 +937,14 @@ mod tests_ {
         assert_eq!(parsed.recv_total(), Option::Some(0u64));
 
         // 读侧：缺 dock 对 → 结构非法。
-        let without_docks = [0x88u8, 0x12, 0x10, 0x00, 0x02, 0x00];
+        let without_docks = [0x08u8, 0x12, 0x10, 0x00, 0x02, 0x00];
         assert_eq!(
             read_err_(&without_docks).await,
             Option::Some(ErrKind::MalformedFrame)
         );
 
         // 读侧：完全缺窗口通告（dock 对齐全，直接以 PayloadLen 收尾）。
-        let without_report = [0x88u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00];
+        let without_report = [0x08u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00];
         assert_eq!(
             read_err_(&without_report).await,
             Option::Some(ErrKind::MalformedFrame)
@@ -915,7 +952,7 @@ mod tests_ {
 
         // 读侧：只带窗口值、缺累计已收字节数。
         let without_total = [
-            0x88u8, 0x00, 0x01, 0x01, 0x02, 0x13, 0x10, 0x00, 0x02, 0x00,
+            0x08u8, 0x00, 0x01, 0x01, 0x02, 0x13, 0x10, 0x00, 0x02, 0x00,
         ];
         assert_eq!(
             read_err_(&without_total).await,
@@ -1009,6 +1046,81 @@ mod tests_ {
         header.local_dock_ = Dock::new(1u32);
         header.remote_dock_ = Dock::wildcard();
         assert_eq!(write_header_err_(&header).await, ErrKind::ReservedDock);
+    }
+
+    /// 测试 `RecvTotal` 只接受 2 / 4 / 8 字节三种规格，并按值取最小者。
+    /// - 手段：`PULSE` 帧里把 `RecvTotal` 分别写成 0（`BeU16`）、70000（`BeU32`）、
+    ///   `u32::MAX + 1`（`BeU64`），检查该字段的自描述头字节；再单独喂一个用
+    ///   `BeU8` 编码 `RecvTotal` 的帧。
+    /// - 判断：三种值分别编成 `0x14` / `0x34` / `0x44`；`BeU8` 编码报
+    ///   [`MuxError::UnsupportedField`]。
+    #[compio::test]
+    async fn recv_total_accepts_two_four_eight_byte_widths() {
+        let cases = [
+            (0u64, 0x14u8),
+            (70_000u64, 0x34u8),
+            (u32::MAX as u64 + 1u64, 0x44u8),
+        ];
+        for (value, expect_header) in cases {
+            let mut header = header_(FrameKind::Pulse, 0u8);
+            header.recv_window_ = Option::Some(64u32);
+            header.recv_total_ = Option::Some(value);
+
+            let mut buf = [0u8; 64];
+            let total = write_header_into_buf_(&mut buf, &header).await;
+            // 第 0 字节是帧首，其后依次是 LocalDock / RemoteDock，然后才是 RecvTotal。
+            assert_eq!(buf[5], expect_header, "RecvTotal 的宽度规格不对");
+            let parsed = read_header_from_buf_(&buf[..total])
+                .await
+                .expect("读回 PULSE 应当成功");
+            assert_eq!(parsed.recv_total(), Option::Some(value));
+        }
+
+        // `BeU8` 编码的 RecvTotal（0x04）非法：累计量的最小规格是 2 字节。
+        let one_byte_total = [0x08u8, 0x00, 0x01, 0x01, 0x02, 0x04, 0x00, 0x13, 0x00, 0x40, 0x02, 0x00];
+        assert_eq!(
+            read_err_(&one_byte_total).await,
+            Option::Some(ErrKind::UnsupportedField)
+        );
+    }
+
+    /// 测试「累计量已重置」变体：`TOTAL_RESET` 标记往返，且只允许出现在保活 /
+    /// 窗口更新帧上。
+    /// - 手段：写一个带 `K_TOTAL_RESET` 的 `WINDOW_UPDATE` 帧并读回；再把同一标记
+    ///   放到 `OPEN` 与 `DATA` 帧上。
+    /// - 判断：读回的 `is_total_reset()` 为真且累计量是重置前的值；两种非法组合都报
+    ///   [`MuxError::MalformedFrame`]。
+    #[compio::test]
+    async fn total_reset_flag_is_a_window_report_variant() {
+        let mut header = header_(FrameKind::WindowUpdate, flags::K_TOTAL_RESET);
+        header.local_dock_ = Dock::new(4u32);
+        header.remote_dock_ = Dock::new(6u32);
+        header.recv_window_ = Option::Some(1024u32);
+        header.recv_total_ = Option::Some(65_536u64);
+
+        let mut buf = [0u8; 64];
+        let total = write_header_into_buf_(&mut buf, &header).await;
+        let parsed = read_header_from_buf_(&buf[..total])
+            .await
+            .expect("读回重置变体应当成功");
+        assert!(parsed.is_total_reset());
+        assert_eq!(parsed.recv_total(), Option::Some(65_536u64));
+
+        // OPEN 时还没有 epoch：带上重置标记非法。
+        let mut open = header_(FrameKind::Open, flags::K_TOTAL_RESET);
+        open.recv_window_ = Option::Some(1024u32);
+        open.recv_total_ = Option::Some(0u64);
+        assert_eq!(write_header_err_(&open).await, ErrKind::MalformedFrame);
+
+        // DATA 帧本来就不带窗口通告，更不该有重置标记。
+        let on_data = [
+            0x85u8, // 帧首：TOTAL_RESET(8) << 4 | DATA(5)
+            0x00, 0x01, 0x01, 0x02, 0x02, 0x00,
+        ];
+        assert_eq!(
+            read_err_(&on_data).await,
+            Option::Some(ErrKind::MalformedFrame)
+        );
     }
 
     /// 测试保留的 `kind` 与保留的字段标识都被拒绝。
@@ -1146,7 +1258,7 @@ mod tests_ {
             0x13, 0x00, 0x05, // RecvWindow = 5（BeU16 编码）
             0x01, 0x02, // RemoteDock = 2
             0x00, 0x01, // LocalDock = 1
-            0x04, 0x09, // RecvTotal = 9（BeU8 编码）
+            0x14, 0x00, 0x09, // RecvTotal = 9（BeU16 编码）
             0x02, 0x00, // PayloadLen = 0
         ];
         let parsed = read_header_from_buf_(&shuffled)

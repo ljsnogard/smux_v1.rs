@@ -123,8 +123,10 @@
 //! 两个 dock 还**不得取保留值**（见 §4）。接收窗口通告由
 //! [`FieldId::RecvTotal`]（累计已收字节数 `R`）与 [`FieldId::RecvWindow`]（窗口值
 //! `W`）**两个字段成对**表达，只在 `OPEN` / `PULSE` / `WINDOW_UPDATE` 三种帧上出现
-//! 且必需，其余帧禁止携带；`ReasonCode` 只在 `REJECT` 帧上出现。字段的完整约束见
-//! 私有模块 `frame_`。
+//! 且必需，其余帧禁止携带；`ReasonCode` 只在 `REJECT` 帧上出现。其中 `RecvTotal`
+//! 允许 **2 / 4 / 8 字节**三种宽度（发送方取最小者），并在累计量将超出当前规格时由
+//! [`flags::K_TOTAL_RESET`] 变体宣告「累计量已重置」（携带重置前的绝对量）。字段的
+//! 完整约束见私有模块 `frame_`。
 //!
 //! 帧总长受协商出的 `max_packet_size` 约束（超限即 [`MuxError::FrameTooLarge`]），
 //! 该检查由中心循环的读路径完成：帧长上限来自 [`BasicOpts`](crate::handshake::opts::BasicOpts)，
