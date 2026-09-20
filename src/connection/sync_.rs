@@ -316,14 +316,20 @@ where
 /// 由 API 面再映射回 [`MuxError`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailKind_ {
-    /// 底层传输失败（读或写）。原载荷丢失，映射回 [`MuxError::PeerClosed`]。
-    Transport,
+    /// 底层传输失败（读或写）。原载荷丢失，但**方向**保留。
+    Transport { write: bool },
 
-    /// 对端在帧中途关闭连接。
+    /// 对端主动关闭连接 / 子流。
     PeerClosed,
 
     /// 子流 / 连接已关闭。
     Closed,
+
+    /// 子流空闲超时（保活无应答）。
+    IdleTimeout,
+
+    /// dock 是保留取值（`wildcard` / `unspecified`），不能作为子流 dock。
+    ReservedDock,
 
     /// 帧结构非法。
     MalformedFrame,
@@ -359,15 +365,19 @@ pub(crate) enum FailKind_ {
 impl FailKind_ {
     /// 从循环侧的 [`MuxError`] 取出可共享的那部分。
     ///
-    /// `Rx` / `Tx` 携带的底层错误值无法保存，统一投影为
-    /// [`FailKind_::Transport`]（映射回去时是 [`MuxError::PeerClosed`]：对 API
-    /// 使用者而言「连接已不可用」是同一个事实）。
+    /// `Rx` / `Tx` 携带的底层错误值无法保存，投影为 [`FailKind_::Transport`]；
+    /// **方向**（读 / 写）保留，因此「网络错误中断」与「对端主动关闭」在 API 面
+    /// 是两种不同的错误。
     pub(crate) fn of_<RE, WE>(err: &MuxError<RE, WE>) -> Self {
         match err {
-            MuxError::Rx(_) | MuxError::Tx(_) => FailKind_::Transport,
+            MuxError::Rx(_) => FailKind_::Transport { write: false },
+            MuxError::Tx(_) => FailKind_::Transport { write: true },
+            MuxError::Transport { write } => FailKind_::Transport { write: *write },
             MuxError::Cancelled => FailKind_::Cancelled,
             MuxError::PeerClosed => FailKind_::PeerClosed,
             MuxError::Closed => FailKind_::Closed,
+            MuxError::IdleTimeout => FailKind_::IdleTimeout,
+            MuxError::ReservedDock => FailKind_::ReservedDock,
             MuxError::MalformedFrame => FailKind_::MalformedFrame,
             MuxError::UnsupportedField => FailKind_::UnsupportedField,
             MuxError::FrameTooLarge => FailKind_::FrameTooLarge,
@@ -383,9 +393,11 @@ impl FailKind_ {
     /// 映射回 API 面使用的 [`MuxError`]。`FailKind_` 是 `Copy`，按值取。
     pub(crate) fn into_mux_error_<RE, WE>(self) -> MuxError<RE, WE> {
         match self {
-            FailKind_::Transport => MuxError::PeerClosed,
+            FailKind_::Transport { write } => MuxError::Transport { write },
             FailKind_::PeerClosed => MuxError::PeerClosed,
             FailKind_::Closed => MuxError::Closed,
+            FailKind_::IdleTimeout => MuxError::IdleTimeout,
+            FailKind_::ReservedDock => MuxError::ReservedDock,
             FailKind_::MalformedFrame => MuxError::MalformedFrame,
             FailKind_::UnsupportedField => MuxError::UnsupportedField,
             FailKind_::FrameTooLarge => MuxError::FrameTooLarge,
@@ -976,22 +988,26 @@ mod tests_ {
         );
     }
 
-    /// 测试底层读写错误被投影为「传输失败」，且映射回 `PeerClosed`。
-    /// - 手段：对 `Rx(())` / `Tx(())` 取 `FailKind_`，再映射回 `MuxError`。
-    /// - 判断：两者都是 `FailKind_::Transport`；映射结果是 `MuxError::PeerClosed`
-    ///   （载荷丢失是已知取舍，见 `FailKind_::of_` 文档）。
+    /// 测试底层读写错误被投影为「传输失败」，并保留方向、与「对端主动关闭」区分。
+    /// - 手段：对 `Rx(())` / `Tx(())` 取 `FailKind_` 再映射回 `MuxError`；另取
+    ///   `PeerClosed` 作对照。
+    /// - 判断：读错误映射为 `Transport { write: false }`、写错误映射为
+    ///   `Transport { write: true }`；两者都不等于 `PeerClosed`。
     #[test]
-    fn transport_failure_projects_to_peer_closed() {
+    fn transport_failure_keeps_direction_and_differs_from_peer_close() {
         let read = FailKind_::of_(&MuxError::<(), ()>::Rx(()));
         let write = FailKind_::of_(&MuxError::<(), ()>::Tx(()));
-        assert_eq!(read, FailKind_::Transport);
-        assert_eq!(write, FailKind_::Transport);
+        assert_eq!(read, FailKind_::Transport { write: false });
+        assert_eq!(write, FailKind_::Transport { write: true });
 
-        let mapped: MuxError<(), ()> = read.into_mux_error_();
-        assert!(
-            matches!(mapped, MuxError::PeerClosed),
-            "传输失败映射回 API 面应当是 PeerClosed"
-        );
+        let mapped_read: MuxError<(), ()> = read.into_mux_error_();
+        let mapped_write: MuxError<(), ()> = write.into_mux_error_();
+        assert!(matches!(mapped_read, MuxError::Transport { write: false }));
+        assert!(matches!(mapped_write, MuxError::Transport { write: true }));
+
+        let peer = FailKind_::of_(&MuxError::<(), ()>::PeerClosed);
+        assert_eq!(peer, FailKind_::PeerClosed);
+        assert_ne!(peer, read, "对端主动关闭与传输中断必须是不同的失败原因");
     }
 
     /// 测试 dock 级与连接级配额各自生效、释放后可重新登记。

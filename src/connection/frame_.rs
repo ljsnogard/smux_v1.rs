@@ -60,8 +60,7 @@
 //!   channel id 字段（理由见 [`crate::connection`] 模块文档 §4.1）；接收方靠
 //!   「本地 dock + 来源 dock」定位子流。**本版本的每一种帧都是子流作用域**，
 //!   因此这对字段在所有帧上都必需——包括保活帧 `PING` / `PONG`
-//!   （保活是为了维持**某条**子流并通告它的接收窗口，见 [`FrameKind::Ping`]）；
-//! - `WindowUpdate` 只出现在 `WINDOW_UPDATE` 帧上，且是该帧的必需字段；
+//!   （保活是为了维持**某条**子流并通告它的接收窗口，见 [`FrameKind::Pulse`]）；
 //! - `ReasonCode` 只允许出现在 `REJECT` 帧上。当前实现只**校验**它（取值必须能
 //!   装进 `u8`），不把它存进 [`FrameHeader`]：`abs_smux` 的
 //!   `reject_async(reason)` 把拒绝理由当作**载荷**传递，因此这个数值字段目前没有
@@ -76,6 +75,8 @@
 
 use abs_buff::{TrBuffRead, TrBuffWrite, x_deps::abs_cancel};
 use abs_cancel::TrCancellationToken;
+
+use abs_smux::conn::TrDock;
 
 use crate::connection::{Dock, MuxError};
 use crate::flow_ctrl::Credit;
@@ -115,9 +116,12 @@ pub enum FieldId {
     /// 载荷字节数。必需，且必须是最后一个头字段；`0` 表示无载荷。
     PayloadLen = 0x02,
 
-    /// 接收窗口增量，只在 `WINDOW_UPDATE` 帧上出现，类型见
-    /// [`crate::flow_ctrl::WindowUpdate`]。
-    WindowUpdate = 0x03,
+    /// **接收窗口通告**：发送方当前的接收窗口大小（绝对值）。
+    ///
+    /// 在 `OPEN` / `PULSE` / `WINDOW_UPDATE` 三种帧上**必需**，其余帧上**禁止**
+    /// 出现。窗口的记法与精度由 [`crate::flow_ctrl`] 定义（绝对值化见 dev-notes
+    /// §11.2）。
+    RecvWindow = 0x03,
 
     /// 拒绝原因码，只在 `REJECT` 帧上出现；当前只校验、不保存（见模块文档）。
     ReasonCode = 0x04,
@@ -130,7 +134,7 @@ impl FieldId {
             0x00 => Option::Some(FieldId::LocalDock),
             0x01 => Option::Some(FieldId::RemoteDock),
             0x02 => Option::Some(FieldId::PayloadLen),
-            0x03 => Option::Some(FieldId::WindowUpdate),
+            0x03 => Option::Some(FieldId::RecvWindow),
             0x04 => Option::Some(FieldId::ReasonCode),
             _ => Option::None,
         }
@@ -153,7 +157,7 @@ impl FieldId {
                 val_type,
                 FieldValType::BeU8 | FieldValType::BeU16 | FieldValType::BeU32
             ),
-            FieldId::PayloadLen | FieldId::WindowUpdate | FieldId::ReasonCode => true,
+            FieldId::PayloadLen | FieldId::RecvWindow | FieldId::ReasonCode => true,
         }
     }
 }
@@ -163,9 +167,17 @@ impl FieldId {
 #[repr(u8)]
 pub enum FrameKind {
     /// 发起方请求建立子流，载荷为随帧附带的「开场消息」。
+    ///
+    /// **双方都会发送 `OPEN`**：主动方发出的 `OPEN` 带自己的开场消息；被动方收到后
+    /// 也回一条 `OPEN`（载荷为空）以通告自己的接收窗口。两条 `OPEN` 都必需携带发送
+    /// 方的接收窗口，这样两侧才能用**同一个状态机**处理建流（见
+    /// [`crate::connection`] 模块文档 §4.2）。
     Open = 0x01,
 
-    /// 等待方同意建立子流，载荷为欢迎信息。
+    /// 被动方在回完 `OPEN` 之后发送，载荷为欢迎信息。
+    ///
+    /// 只有被动方发送 `ACCEPT`；接收窗口已经由它自己的那条 `OPEN` 通告过，因此本帧
+    /// 不再需要窗口字段。
     Accept = 0x02,
 
     /// 任一方拒绝建立子流，载荷可携带理由。
@@ -183,13 +195,14 @@ pub enum FrameKind {
     /// 接收窗口更新。
     WindowUpdate = 0x07,
 
-    /// 保活探测（子流作用域）。该子流闲置接近 `max_channel_timeout` 时由本方发出；
-    /// 载荷为该发送方**当前接收窗口的绝对值**（窗口语义见 `crate::flow_ctrl`）。
-    Ping = 0x08,
-
-    /// 保活应答（子流作用域）：接收方以自己的接收窗口绝对值回一条，双方据此刷新
-    /// 对端窗口与该子流的活跃时间。
-    Pong = 0x09,
+    /// 保活 / 接收窗口通告（子流作用域）。
+    ///
+    /// 该子流闲置接近 `max_channel_timeout` 时由本方发出，载荷为发送方**当前接收
+    /// 窗口**。收到的一方**只**借它刷新对端窗口与该子流的活跃时间，**不立即回**
+    /// ——两个方向各自按自己的空闲计时发 `PULSE`，否则两条 `PULSE` 会互相触发成
+    /// 死循环。这也正是只用一种帧（而不是 `PING` / `PONG` 两种）的原因：没有
+    /// 「请求 / 应答」之分，双方的处理栈完全同一份。
+    Pulse = 0x08,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -205,8 +218,7 @@ impl TryFrom<u8> for FrameKind {
             0x05 => Result::Ok(FrameKind::Data),
             0x06 => Result::Ok(FrameKind::Datagram),
             0x07 => Result::Ok(FrameKind::WindowUpdate),
-            0x08 => Result::Ok(FrameKind::Ping),
-            0x09 => Result::Ok(FrameKind::Pong),
+            0x08 => Result::Ok(FrameKind::Pulse),
             other => Result::Err(other),
         }
     }
@@ -251,7 +263,7 @@ pub struct FrameHeader {
     local_dock_: Dock,
     remote_dock_: Dock,
     payload_len_: usize,
-    window_update_: Option<Credit>,
+    recv_window_: Option<Credit>,
 }
 
 impl FrameHeader {
@@ -280,9 +292,9 @@ impl FrameHeader {
         self.payload_len_
     }
 
-    /// 接收窗口增量（仅 `WINDOW_UPDATE` 帧为 `Some`）。
-    pub const fn window_update(&self) -> Option<Credit> {
-        self.window_update_
+    /// 接收窗口通告（仅 `OPEN` / `PULSE` / `WINDOW_UPDATE` 帧为 `Some`）。
+    pub const fn recv_window(&self) -> Option<Credit> {
+        self.recv_window_
     }
 
     /// 是否带 `FIN` 标志。
@@ -425,7 +437,7 @@ where
     // 2. 自描述字段序列，直到 `PayloadLen` 收尾。
     let mut local_dock: Option<Dock> = Option::None;
     let mut remote_dock: Option<Dock> = Option::None;
-    let mut window_update: Option<Credit> = Option::None;
+    let mut recv_window: Option<Credit> = Option::None;
     let mut reason_seen = false;
 
     let payload_len = loop {
@@ -454,23 +466,19 @@ where
                 if local_dock.is_some() {
                     return Result::Err(MuxError::MalformedFrame);
                 }
-                local_dock = Option::Some(Dock::new(
-                    dock_value_(value).ok_or(MuxError::MalformedFrame)?,
-                ));
+                local_dock = Option::Some(decode_dock_(value).map_err(map_dock_decode_)?);
             }
             FieldId::RemoteDock => {
                 if remote_dock.is_some() {
                     return Result::Err(MuxError::MalformedFrame);
                 }
-                remote_dock = Option::Some(Dock::new(
-                    dock_value_(value).ok_or(MuxError::MalformedFrame)?,
-                ));
+                remote_dock = Option::Some(decode_dock_(value).map_err(map_dock_decode_)?);
             }
-            FieldId::WindowUpdate => {
-                if window_update.is_some() {
+            FieldId::RecvWindow => {
+                if recv_window.is_some() {
                     return Result::Err(MuxError::MalformedFrame);
                 }
-                window_update =
+                recv_window =
                     Option::Some(Credit::try_from(value).map_err(|_| MuxError::MalformedFrame)?);
             }
             FieldId::ReasonCode => {
@@ -493,17 +501,12 @@ where
         _ => return Result::Err(MuxError::MalformedFrame),
     };
 
-    match kind {
-        FrameKind::WindowUpdate => {
-            if window_update.is_none() {
-                return Result::Err(MuxError::MalformedFrame);
-            }
+    // `RecvWindow` 只在 OPEN / PULSE / WINDOW_UPDATE 上出现且必需。
+    match (requires_recv_window_(kind), recv_window) {
+        (true, Option::None) | (false, Option::Some(_)) => {
+            return Result::Err(MuxError::MalformedFrame);
         }
-        _ => {
-            if window_update.is_some() {
-                return Result::Err(MuxError::MalformedFrame);
-            }
-        }
+        _ => {}
     }
 
     if reason_seen && kind != FrameKind::Reject {
@@ -516,28 +519,61 @@ where
         local_dock_: local_dock,
         remote_dock_: remote_dock,
         payload_len_: payload_len,
-        window_update_: window_update,
+        recv_window_: recv_window,
     })
 }
 
-/// 把 dock 字段的数值收窄为 `Dock<u32>` 的承载类型。
+/// dock 字段解析失败的原因（载荷无关，便于调用点映射到自己的错误类型）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockDecode_ {
+    /// 数值超出 `u32`：结构非法。
+    TooLarge,
+
+    /// 取了保留值（`wildcard` / `unspecified`）。
+    Reserved,
+}
+
+/// 把 dock 字段的数值收窄为 `Dock<u32>`，并拒绝**保留值**。
 ///
-/// 超出 `u32` 的取值属于结构非法，由调用方映射为 [`MuxError::MalformedFrame`]。
-fn dock_value_(value: usize) -> Option<u32> {
-    u32::try_from(value).ok()
+/// `wildcard`（全 1）与 `unspecified`（全 0）由双方共同保留，不能作为子流 dock，
+/// 因此线上出现即 [`MuxError::ReservedDock`]。
+fn decode_dock_(value: usize) -> Result<Dock, DockDecode_> {
+    let raw = u32::try_from(value).map_err(|_| DockDecode_::TooLarge)?;
+    let dock = Dock::new(raw);
+    if dock.is_special() {
+        return Result::Err(DockDecode_::Reserved);
+    }
+    Result::Ok(dock)
+}
+
+/// 把 [`DockDecode_`] 映射为帧层错误。
+fn map_dock_decode_<RE, WE>(err: DockDecode_) -> MuxError<RE, WE> {
+    match err {
+        DockDecode_::TooLarge => MuxError::MalformedFrame,
+        DockDecode_::Reserved => MuxError::ReservedDock,
+    }
+}
+
+/// 该帧种类是否必需携带接收窗口通告（`RecvWindow` 字段）。
+pub(crate) const fn requires_recv_window_(kind: FrameKind) -> bool {
+    matches!(
+        kind,
+        FrameKind::Open | FrameKind::Pulse | FrameKind::WindowUpdate
+    )
 }
 
 /// 把一个帧头写成「帧首字节 + 自描述字段序列」。
 ///
 /// 只写头，不写载荷；调用方随后把载荷字节直接拼上。字段按固定顺序写出
-/// （`LocalDock` → `RemoteDock` → `WindowUpdate` → `PayloadLen`），因此
+/// （`LocalDock` → `RemoteDock` → `RecvWindow` → `PayloadLen`），因此
 /// `PayloadLen` 天然收尾（模块文档 §帧形状）。
 ///
 /// # Errors
 ///
 /// - 字段宽度越界（例如 dock 超过 `u32::MAX`）→ [`MuxError::UnsupportedField`]；
-/// - `WINDOW_UPDATE` 帧缺少窗口增量，或非 `WINDOW_UPDATE` 帧带上了窗口增量
+/// - `OPEN` / `PULSE` / `WINDOW_UPDATE` 缺少窗口通告，或其余帧带上了窗口通告
 ///   → [`MuxError::MalformedFrame`]（都属调用方构造了自相矛盾的帧头）；
+/// - dock 取了保留值（`wildcard` / `unspecified`）→ [`MuxError::ReservedDock`]；
 /// - 底层写失败 → [`MuxError::Tx`]。
 pub(crate) async fn write_header_async_<W, C>(
     tx: &mut W,
@@ -553,28 +589,30 @@ where
         .await
         .map_err(map_cursor_err_)?;
 
-    // 所有帧都是子流作用域：dock 对一律写出（`PING` / `PONG` 也不例外）。
-    let local = usize::try_from(header.local_dock_.value())
-        .map_err(|_| MuxError::UnsupportedField)?;
+    // 所有帧都是子流作用域：dock 对一律写出（保活帧 `PULSE` 也不例外）。
+    let (local_dock, remote_dock) = (header.local_dock_, header.remote_dock_);
+    if local_dock.is_special() || remote_dock.is_special() {
+        return Result::Err(MuxError::ReservedDock);
+    }
+    let local = usize::try_from(local_dock.value()).map_err(|_| MuxError::UnsupportedField)?;
     write_field_async_(tx, FieldId::LocalDock, local, cancel.child_token()).await?;
-    let remote = usize::try_from(header.remote_dock_.value())
-        .map_err(|_| MuxError::UnsupportedField)?;
+    let remote = usize::try_from(remote_dock.value()).map_err(|_| MuxError::UnsupportedField)?;
     write_field_async_(tx, FieldId::RemoteDock, remote, cancel.child_token()).await?;
 
-    match (header.kind_, header.window_update_) {
-        (FrameKind::WindowUpdate, Option::Some(update)) => {
+    match (requires_recv_window_(header.kind_), header.recv_window_) {
+        (true, Option::Some(window)) => {
             write_field_async_(
                 tx,
-                FieldId::WindowUpdate,
-                usize::try_from(update).map_err(|_| MuxError::UnsupportedField)?,
+                FieldId::RecvWindow,
+                usize::try_from(window).map_err(|_| MuxError::UnsupportedField)?,
                 cancel.child_token(),
             )
             .await?;
         }
-        (FrameKind::WindowUpdate, Option::None) | (_, Option::Some(_)) => {
+        (true, Option::None) | (false, Option::Some(_)) => {
             return Result::Err(MuxError::MalformedFrame);
         }
-        (_, Option::None) => {}
+        (false, Option::None) => {}
     }
 
     write_field_async_(tx, FieldId::PayloadLen, header.payload_len_, cancel.child_token()).await
@@ -591,6 +629,7 @@ mod tests_ {
     enum ErrKind {
         UnsupportedField,
         MalformedFrame,
+        ReservedDock,
         PeerClosed,
         Rx,
     }
@@ -602,23 +641,26 @@ mod tests_ {
         match err {
             MuxError::UnsupportedField => ErrKind::UnsupportedField,
             MuxError::MalformedFrame => ErrKind::MalformedFrame,
+            MuxError::ReservedDock => ErrKind::ReservedDock,
             MuxError::PeerClosed => ErrKind::PeerClosed,
             MuxError::Rx(_) => ErrKind::Rx,
             other => panic!("测试未覆盖的错误种类：{other}"),
         }
     }
 
-    /// 构造一个只填了种类与标志的帧头；dock 为 `unspecified`、载荷长度为 0。
+    /// 构造一个只填了种类与标志的帧头；dock 取一对**合法**取值、载荷长度为 0。
     /// - 手段：直接写字面量（测试与被测模块同处一个模块，可访问私有字段）。
     /// - 判断：返回的帧头即「最小可用帧头」，供各用例按需改写字段。
+    ///   注意 dock 不能取 `unspecified` / `wildcard`——那是保留值，写侧会直接拒绝
+    ///   （见 `reserved_docks_are_rejected_both_ways`）。
     fn header_(kind: FrameKind, flags: u8) -> FrameHeader {
         FrameHeader {
             kind_: kind,
             flags_: flags,
-            local_dock_: Dock::unspecified(),
-            remote_dock_: Dock::unspecified(),
+            local_dock_: Dock::new(1u32),
+            remote_dock_: Dock::new(2u32),
             payload_len_: 0usize,
-            window_update_: Option::None,
+            recv_window_: Option::None,
         }
     }
 
@@ -710,14 +752,16 @@ mod tests_ {
         assert_eq!(parsed.local_dock(), Dock::new(3u32));
         assert_eq!(parsed.remote_dock(), Dock::new(0x0102u32));
         assert_eq!(parsed.payload_len(), 1024usize);
-        assert_eq!(parsed.window_update(), Option::None);
+        assert_eq!(parsed.recv_window(), Option::None);
     }
 
     /// 测试 dock 的宽度边界：按数值大小在 1 / 2 / 4 字节间选宽，且能原值往返。
-    /// - 手段：对 `0xFF` / `0x100` / `0xFFFF` / `0x1_0000` / `u32::MAX` 各写一个
+    /// - 手段：对 `0xFF` / `0x100` / `0xFFFF` / `0x1_0000` / `0xFFFF_FFFE` 各写一个
     ///   `DATAGRAM` 帧头，直接检查紧跟帧首的 `LocalDock` 头字节里的 `val_type`。
     /// - 判断：宽度分别为 `BeU8` / `BeU16` / `BeU16` / `BeU32` / `BeU32`；
     ///   解析回来的 dock 数值与写入值相等。
+    ///   （`u32::MAX` 是保留的 `wildcard`，故用 `u32::MAX - 1` 覆盖 4 字节宽度；
+    ///   保留值的拒绝见 `reserved_docks_are_rejected_both_ways`。）
     #[compio::test]
     async fn dock_widths_follow_value_magnitude() {
         let cases = [
@@ -725,7 +769,7 @@ mod tests_ {
             (0x0100u32, FieldValType::BeU16),
             (0xFFFFu32, FieldValType::BeU16),
             (0x0001_0000u32, FieldValType::BeU32),
-            (u32::MAX, FieldValType::BeU32),
+            (0xFFFF_FFFEu32, FieldValType::BeU32),
         ];
         for (value, expect) in cases {
             let mut header = header_(FrameKind::Datagram, 0u8);
@@ -753,14 +797,14 @@ mod tests_ {
         let mut header = header_(FrameKind::WindowUpdate, 0u8);
         header.local_dock_ = Dock::new(7u32);
         header.remote_dock_ = Dock::new(9u32);
-        header.window_update_ = Option::Some(4096u32);
+        header.recv_window_ = Option::Some(4096u32);
 
         let mut buf = [0u8; 64];
         let total = write_header_into_buf_(&mut buf, &header).await;
         let parsed = read_header_from_buf_(&buf[..total])
             .await
             .expect("读回窗口更新帧应当成功");
-        assert_eq!(parsed.window_update(), Option::Some(4096u32));
+        assert_eq!(parsed.recv_window(), Option::Some(4096u32));
         assert_eq!(parsed.local_dock(), Dock::new(7u32));
         assert_eq!(parsed.remote_dock(), Dock::new(9u32));
 
@@ -789,38 +833,133 @@ mod tests_ {
         );
     }
 
-    /// 测试保活帧 `PING` / `PONG` 同样是子流作用域（必须带 dock 对）。
-    /// - 手段：写一个 dock 对为 `(1, 2)` 的 `PING` 帧头并逐字节比对；再把「缺 dock
-    ///   对的 `PING`」交给读侧。
-    /// - 判断：写出恰为 `88 00 01 01 02 02 00`（帧首 = `NO_PAYLOAD << 4 | PING`，
-    ///   随后 `LocalDock=1`、`RemoteDock=2`、`PayloadLen=0`）；解析结果的 dock 对与
-    ///   写入一致；缺 dock 对的 `PING` 报 [`MuxError::MalformedFrame`]。
+    /// 测试保活帧 `PULSE` 是子流作用域，且必须携带接收窗口通告。
+    /// - 手段：写一个 dock 对为 `(1, 2)`、接收窗口为 4096 的 `PULSE` 帧头并逐字节
+    ///   比对；再把「缺 dock 对」与「缺窗口字段」两种 `PULSE` 交给读侧。
+    /// - 判断：写出恰为 `88 00 01 01 02 02 12 10 00`（帧首 = `NO_PAYLOAD << 4 |
+    ///   PULSE`，随后 `LocalDock=1`、`RemoteDock=2`、`RecvWindow=4096`（`BeU16`）、
+    ///   `PayloadLen=0`）；解析结果与写入一致；两种畸形输入都报
+    ///   [`MuxError::MalformedFrame`]。
     #[compio::test]
-    async fn ping_and_pong_are_substream_scoped() {
-        let mut header = header_(FrameKind::Ping, flags::K_NO_PAYLOAD);
+    async fn pulse_is_substream_scoped_and_carries_window() {
+        let mut header = header_(FrameKind::Pulse, flags::K_NO_PAYLOAD);
         header.local_dock_ = Dock::new(1u32);
         header.remote_dock_ = Dock::new(2u32);
+        header.recv_window_ = Option::Some(4096u32);
 
         let mut buf = [0u8; 64];
         let total = write_header_into_buf_(&mut buf, &header).await;
         assert_eq!(
             &buf[..total],
-            &[0x88u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00]
+            &[0x88u8, 0x00, 0x01, 0x01, 0x02, 0x13, 0x10, 0x00, 0x02, 0x00]
         );
 
         let parsed = read_header_from_buf_(&buf[..total])
             .await
-            .expect("读回 PING 帧应当成功");
-        assert_eq!(parsed.kind(), FrameKind::Ping);
+            .expect("读回 PULSE 帧应当成功");
+        assert_eq!(parsed.kind(), FrameKind::Pulse);
         assert_eq!(parsed.local_dock(), Dock::new(1u32));
         assert_eq!(parsed.remote_dock(), Dock::new(2u32));
+        assert_eq!(parsed.recv_window(), Option::Some(4096u32));
 
-        // 读侧：保活帧缺 dock 对 → 结构非法。
-        let without_docks = [0x08u8, 0x02, 0x00];
+        // 读侧：缺 dock 对 → 结构非法。
+        let without_docks = [0x88u8, 0x12, 0x10, 0x00, 0x02, 0x00];
         assert_eq!(
             read_err_(&without_docks).await,
             Option::Some(ErrKind::MalformedFrame)
         );
+
+        // 读侧：缺接收窗口字段（dock 对齐全，直接以 PayloadLen 收尾）。
+        let without_window = [0x88u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00];
+        assert_eq!(
+            read_err_(&without_window).await,
+            Option::Some(ErrKind::MalformedFrame)
+        );
+
+        // 写侧：PULSE 却没有窗口通告。
+        let mut missing = header_(FrameKind::Pulse, 0u8);
+        missing.local_dock_ = Dock::new(1u32);
+        missing.remote_dock_ = Dock::new(2u32);
+        assert_eq!(
+            write_header_err_(&missing).await,
+            ErrKind::MalformedFrame
+        );
+    }
+
+    /// 测试建流用的 `OPEN` 必须携带接收窗口通告，而 `ACCEPT` 不得携带。
+    /// - 手段：写一个带窗口的 `OPEN` 并读回；再分别构造「无窗口的 `OPEN`」与
+    ///   「带窗口的 `ACCEPT`」。
+    /// - 判断：正常 `OPEN` 往返后 dock 对与窗口都一致；两种自相矛盾的帧头都报
+    ///   [`MuxError::MalformedFrame`]（`ACCEPT` 的接收窗口已由被动方自己的
+    ///   `OPEN` 通告过）。
+    #[compio::test]
+    async fn open_carries_window_but_accept_does_not() {
+        let mut open = header_(FrameKind::Open, 0u8);
+        open.local_dock_ = Dock::new(3u32);
+        open.remote_dock_ = Dock::new(7u32);
+        open.recv_window_ = Option::Some(2048u32);
+        open.payload_len_ = 4usize;
+
+        let mut buf = [0u8; 64];
+        let total = write_header_into_buf_(&mut buf, &open).await;
+        let parsed = read_header_from_buf_(&buf[..total])
+            .await
+            .expect("读回 OPEN 帧应当成功");
+        assert_eq!(parsed.kind(), FrameKind::Open);
+        assert_eq!(parsed.recv_window(), Option::Some(2048u32));
+        assert_eq!(parsed.payload_len(), 4usize);
+
+        // 写侧：OPEN 缺窗口。
+        let mut open_no_window = header_(FrameKind::Open, 0u8);
+        open_no_window.local_dock_ = Dock::new(3u32);
+        open_no_window.remote_dock_ = Dock::new(7u32);
+        assert_eq!(
+            write_header_err_(&open_no_window).await,
+            ErrKind::MalformedFrame
+        );
+
+        // 写侧：ACCEPT 带窗口（多余）。
+        let mut accept_with_window = header_(FrameKind::Accept, 0u8);
+        accept_with_window.local_dock_ = Dock::new(7u32);
+        accept_with_window.remote_dock_ = Dock::new(3u32);
+        accept_with_window.recv_window_ = Option::Some(2048u32);
+        assert_eq!(
+            write_header_err_(&accept_with_window).await,
+            ErrKind::MalformedFrame
+        );
+    }
+
+    /// 测试 `wildcard` 与 `unspecified` 两个保留 dock 不能作为子流 dock。
+    /// - 手段：在 `DATA` 帧里分别把 `LocalDock` 写成 `0`（`unspecified`）与
+    ///   `u32::MAX`（`wildcard`）；再用写侧构造同样取保留值的帧头。
+    /// - 判断：读侧的两种输入都报 [`MuxError::ReservedDock`]；写侧也拒绝。
+    #[compio::test]
+    async fn reserved_docks_are_rejected_both_ways() {
+        // unspecified = 0：0x00 是 LocalDock 的字段头，值为 1 字节 0x00。
+        let unspecified = [0x05u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x00];
+        assert_eq!(
+            read_err_(&unspecified).await,
+            Option::Some(ErrKind::ReservedDock)
+        );
+
+        // wildcard = u32::MAX：LocalDock 用 4 字节编码（0x30 | 0x00）。
+        let wildcard = [
+            0x05u8, 0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x02, 0x02, 0x00,
+        ];
+        assert_eq!(
+            read_err_(&wildcard).await,
+            Option::Some(ErrKind::ReservedDock)
+        );
+
+        // 写侧：dock 取保留值同样拒绝。
+        let mut header = header_(FrameKind::Data, 0u8);
+        header.local_dock_ = Dock::unspecified();
+        header.remote_dock_ = Dock::new(2u32);
+        assert_eq!(write_header_err_(&header).await, ErrKind::ReservedDock);
+
+        header.local_dock_ = Dock::new(1u32);
+        header.remote_dock_ = Dock::wildcard();
+        assert_eq!(write_header_err_(&header).await, ErrKind::ReservedDock);
     }
 
     /// 测试保留的 `kind` 与保留的字段标识都被拒绝。
@@ -963,7 +1102,7 @@ mod tests_ {
         let parsed = read_header_from_buf_(&shuffled)
             .await
             .expect("任意字段顺序都应当能解析");
-        assert_eq!(parsed.window_update(), Option::Some(5u32));
+        assert_eq!(parsed.recv_window(), Option::Some(5u32));
         assert_eq!(parsed.local_dock(), Dock::new(1u32));
         assert_eq!(parsed.remote_dock(), Dock::new(2u32));
     }
