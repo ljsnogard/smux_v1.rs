@@ -79,7 +79,7 @@ use abs_cancel::TrCancellationToken;
 use abs_smux::conn::TrDock;
 
 use crate::connection::{Dock, MuxError};
-use crate::flow_ctrl::Credit;
+use crate::flow_ctrl::{Credit, RecvTotal};
 use crate::handshake::opts::NegotiationValType as FieldValType;
 use crate::wire_io_::{CursorError, ReadCursor, write_all_async_};
 
@@ -116,15 +116,21 @@ pub enum FieldId {
     /// 载荷字节数。必需，且必须是最后一个头字段；`0` 表示无载荷。
     PayloadLen = 0x02,
 
-    /// **接收窗口通告**：发送方当前的接收窗口大小（绝对值）。
+    /// **接收窗口通告（窗口值）**：发送方当前的接收窗口大小（`W`，绝对值）。
     ///
-    /// 在 `OPEN` / `PULSE` / `WINDOW_UPDATE` 三种帧上**必需**，其余帧上**禁止**
-    /// 出现。窗口的记法与精度由 [`crate::flow_ctrl`] 定义（绝对值化见 dev-notes
-    /// §11.2）。
+    /// 与 [`FieldId::RecvTotal`] 一起，在 `OPEN` / `PULSE` / `WINDOW_UPDATE` 三种帧上
+    /// **必需**，其余帧上**禁止**出现。两者必须成对出现。
     RecvWindow = 0x03,
 
+    /// **接收窗口通告（累计已收字节数）**：本通告对应的累计已收字节数（`R`）。
+    ///
+    /// 发送方据此算 `可用 = W − (已发 − R)`，精确扣掉在途数据；缺了它，只凭
+    /// [`FieldId::RecvWindow`] 会把在途量重复计入而越权（推导见
+    /// [`crate::flow_ctrl::WindowReport`]）。
+    RecvTotal = 0x04,
+
     /// 拒绝原因码，只在 `REJECT` 帧上出现；当前只校验、不保存（见模块文档）。
-    ReasonCode = 0x04,
+    ReasonCode = 0x05,
 }
 
 impl FieldId {
@@ -135,7 +141,8 @@ impl FieldId {
             0x01 => Option::Some(FieldId::RemoteDock),
             0x02 => Option::Some(FieldId::PayloadLen),
             0x03 => Option::Some(FieldId::RecvWindow),
-            0x04 => Option::Some(FieldId::ReasonCode),
+            0x04 => Option::Some(FieldId::RecvTotal),
+            0x05 => Option::Some(FieldId::ReasonCode),
             _ => Option::None,
         }
     }
@@ -157,7 +164,10 @@ impl FieldId {
                 val_type,
                 FieldValType::BeU8 | FieldValType::BeU16 | FieldValType::BeU32
             ),
-            FieldId::PayloadLen | FieldId::RecvWindow | FieldId::ReasonCode => true,
+            FieldId::PayloadLen
+            | FieldId::RecvWindow
+            | FieldId::RecvTotal
+            | FieldId::ReasonCode => true,
         }
     }
 }
@@ -264,6 +274,7 @@ pub struct FrameHeader {
     remote_dock_: Dock,
     payload_len_: usize,
     recv_window_: Option<Credit>,
+    recv_total_: Option<RecvTotal>,
 }
 
 impl FrameHeader {
@@ -292,9 +303,15 @@ impl FrameHeader {
         self.payload_len_
     }
 
-    /// 接收窗口通告（仅 `OPEN` / `PULSE` / `WINDOW_UPDATE` 帧为 `Some`）。
+    /// 接收窗口通告的窗口值 `W`（仅 `OPEN` / `PULSE` / `WINDOW_UPDATE` 帧为
+    /// `Some`，且必定与 [`FrameHeader::recv_total`] 同时为 `Some`）。
     pub const fn recv_window(&self) -> Option<Credit> {
         self.recv_window_
+    }
+
+    /// 接收窗口通告对应的累计已收字节数 `R`，与 [`FrameHeader::recv_window`] 成对。
+    pub const fn recv_total(&self) -> Option<RecvTotal> {
+        self.recv_total_
     }
 
     /// 是否带 `FIN` 标志。
@@ -438,6 +455,7 @@ where
     let mut local_dock: Option<Dock> = Option::None;
     let mut remote_dock: Option<Dock> = Option::None;
     let mut recv_window: Option<Credit> = Option::None;
+    let mut recv_total: Option<RecvTotal> = Option::None;
     let mut reason_seen = false;
 
     let payload_len = loop {
@@ -481,6 +499,13 @@ where
                 recv_window =
                     Option::Some(Credit::try_from(value).map_err(|_| MuxError::MalformedFrame)?);
             }
+            FieldId::RecvTotal => {
+                if recv_total.is_some() {
+                    return Result::Err(MuxError::MalformedFrame);
+                }
+                // 累计字节数是 `u64`：`usize` 只有 32 位时也容得下 `u32` 以上的取值。
+                recv_total = Option::Some(value as RecvTotal);
+            }
             FieldId::ReasonCode => {
                 if reason_seen {
                     return Result::Err(MuxError::MalformedFrame);
@@ -501,12 +526,11 @@ where
         _ => return Result::Err(MuxError::MalformedFrame),
     };
 
-    // `RecvWindow` 只在 OPEN / PULSE / WINDOW_UPDATE 上出现且必需。
-    match (requires_recv_window_(kind), recv_window) {
-        (true, Option::None) | (false, Option::Some(_)) => {
-            return Result::Err(MuxError::MalformedFrame);
-        }
-        _ => {}
+    // 窗口通告（`RecvWindow` + `RecvTotal` 两个字段）只在 OPEN / PULSE /
+    // WINDOW_UPDATE 上出现，且必须成对齐全；其余帧上一律禁止。
+    match (requires_window_report_(kind), recv_window, recv_total) {
+        (true, Option::Some(_), Option::Some(_)) | (false, Option::None, Option::None) => {}
+        _ => return Result::Err(MuxError::MalformedFrame),
     }
 
     if reason_seen && kind != FrameKind::Reject {
@@ -520,6 +544,7 @@ where
         remote_dock_: remote_dock,
         payload_len_: payload_len,
         recv_window_: recv_window,
+        recv_total_: recv_total,
     })
 }
 
@@ -554,8 +579,8 @@ fn map_dock_decode_<RE, WE>(err: DockDecode_) -> MuxError<RE, WE> {
     }
 }
 
-/// 该帧种类是否必需携带接收窗口通告（`RecvWindow` 字段）。
-pub(crate) const fn requires_recv_window_(kind: FrameKind) -> bool {
+/// 该帧种类是否必需携带接收窗口通告（`RecvWindow` + `RecvTotal` 两个字段）。
+pub(crate) const fn requires_window_report_(kind: FrameKind) -> bool {
     matches!(
         kind,
         FrameKind::Open | FrameKind::Pulse | FrameKind::WindowUpdate
@@ -565,14 +590,15 @@ pub(crate) const fn requires_recv_window_(kind: FrameKind) -> bool {
 /// 把一个帧头写成「帧首字节 + 自描述字段序列」。
 ///
 /// 只写头，不写载荷；调用方随后把载荷字节直接拼上。字段按固定顺序写出
-/// （`LocalDock` → `RemoteDock` → `RecvWindow` → `PayloadLen`），因此
+/// （`LocalDock` → `RemoteDock` → `RecvTotal` → `RecvWindow` → `PayloadLen`），因此
 /// `PayloadLen` 天然收尾（模块文档 §帧形状）。
 ///
 /// # Errors
 ///
 /// - 字段宽度越界（例如 dock 超过 `u32::MAX`）→ [`MuxError::UnsupportedField`]；
-/// - `OPEN` / `PULSE` / `WINDOW_UPDATE` 缺少窗口通告，或其余帧带上了窗口通告
-///   → [`MuxError::MalformedFrame`]（都属调用方构造了自相矛盾的帧头）；
+/// - `OPEN` / `PULSE` / `WINDOW_UPDATE` 缺少窗口通告的任一半（`RecvTotal` /
+///   `RecvWindow`），或其余帧带上了窗口通告 → [`MuxError::MalformedFrame`]
+///   （都属调用方构造了自相矛盾的帧头）；
 /// - dock 取了保留值（`wildcard` / `unspecified`）→ [`MuxError::ReservedDock`]；
 /// - 底层写失败 → [`MuxError::Tx`]。
 pub(crate) async fn write_header_async_<W, C>(
@@ -599,8 +625,15 @@ where
     let remote = usize::try_from(remote_dock.value()).map_err(|_| MuxError::UnsupportedField)?;
     write_field_async_(tx, FieldId::RemoteDock, remote, cancel.child_token()).await?;
 
-    match (requires_recv_window_(header.kind_), header.recv_window_) {
-        (true, Option::Some(window)) => {
+    match (
+        requires_window_report_(header.kind_),
+        header.recv_window_,
+        header.recv_total_,
+    ) {
+        (true, Option::Some(window), Option::Some(total)) => {
+            // 先累计字节数（`R`）后窗口值（`W`），与模块文档的字段顺序一致。
+            let total = usize::try_from(total).map_err(|_| MuxError::UnsupportedField)?;
+            write_field_async_(tx, FieldId::RecvTotal, total, cancel.child_token()).await?;
             write_field_async_(
                 tx,
                 FieldId::RecvWindow,
@@ -609,10 +642,9 @@ where
             )
             .await?;
         }
-        (true, Option::None) | (false, Option::Some(_)) => {
-            return Result::Err(MuxError::MalformedFrame);
-        }
-        (false, Option::None) => {}
+        (false, Option::None, Option::None) => {}
+        // 缺一个、多一个、或出现在不该出现的帧上：都是自相矛盾的帧头。
+        _ => return Result::Err(MuxError::MalformedFrame),
     }
 
     write_field_async_(tx, FieldId::PayloadLen, header.payload_len_, cancel.child_token()).await
@@ -661,6 +693,7 @@ mod tests_ {
             remote_dock_: Dock::new(2u32),
             payload_len_: 0usize,
             recv_window_: Option::None,
+            recv_total_: Option::None,
         }
     }
 
@@ -787,17 +820,18 @@ mod tests_ {
         }
     }
 
-    /// 测试 `WINDOW_UPDATE` 帧的往返与「窗口字段必需」两条约束。
+    /// 测试 `WINDOW_UPDATE` 帧的往返与「窗口通告两字段必需」两条约束。
     /// - 手段：带增量 4096 的 `WINDOW_UPDATE` 帧头往返；再分别用「写侧缺增量」
     ///   「读侧缺字段」「非 `WINDOW_UPDATE` 帧带增量」三种畸形输入触发校验。
     /// - 判断：正常帧的增量与 dock 对原值返回；三种畸形输入都报
     ///   [`MuxError::MalformedFrame`]。
     #[compio::test]
-    async fn window_update_frame_requires_delta_field() {
+    async fn window_update_frame_requires_window_report() {
         let mut header = header_(FrameKind::WindowUpdate, 0u8);
         header.local_dock_ = Dock::new(7u32);
         header.remote_dock_ = Dock::new(9u32);
         header.recv_window_ = Option::Some(4096u32);
+        header.recv_total_ = Option::Some(8192u64);
 
         let mut buf = [0u8; 64];
         let total = write_header_into_buf_(&mut buf, &header).await;
@@ -805,10 +839,11 @@ mod tests_ {
             .await
             .expect("读回窗口更新帧应当成功");
         assert_eq!(parsed.recv_window(), Option::Some(4096u32));
+        assert_eq!(parsed.recv_total(), Option::Some(8192u64));
         assert_eq!(parsed.local_dock(), Dock::new(7u32));
         assert_eq!(parsed.remote_dock(), Dock::new(9u32));
 
-        // 写侧：WINDOW_UPDATE 却没有增量。
+        // 写侧：WINDOW_UPDATE 却没有窗口通告。
         let mut missing = header_(FrameKind::WindowUpdate, 0u8);
         missing.local_dock_ = Dock::new(7u32);
         missing.remote_dock_ = Dock::new(9u32);
@@ -817,7 +852,7 @@ mod tests_ {
             ErrKind::MalformedFrame
         );
 
-        // 读侧：帧首声明 WINDOW_UPDATE，但字段序列里没有 WindowUpdate。
+        // 读侧：帧首声明 WINDOW_UPDATE，但字段序列里完全没有窗口通告。
         // 载荷长度字段（0x02 0x00）直接收尾。
         let without_field = [0x07u8, 0x00, 0x07, 0x01, 0x09, 0x02, 0x00];
         assert_eq!(
@@ -825,8 +860,8 @@ mod tests_ {
             Option::Some(ErrKind::MalformedFrame)
         );
 
-        // 读侧：DATA 帧却带上了 WindowUpdate 字段（0x03 头 + 1 字节值 1）。
-        let wrong_kind = [0x05u8, 0x00, 0x01, 0x01, 0x02, 0x03, 0x01, 0x02, 0x00];
+        // 读侧：DATA 帧却带上了窗口通告（0x04 头 + 1 字节值 1）。
+        let wrong_kind = [0x05u8, 0x00, 0x01, 0x01, 0x02, 0x04, 0x01, 0x02, 0x00];
         assert_eq!(
             read_err_(&wrong_kind).await,
             Option::Some(ErrKind::MalformedFrame)
@@ -846,12 +881,13 @@ mod tests_ {
         header.local_dock_ = Dock::new(1u32);
         header.remote_dock_ = Dock::new(2u32);
         header.recv_window_ = Option::Some(4096u32);
+        header.recv_total_ = Option::Some(0u64);
 
         let mut buf = [0u8; 64];
         let total = write_header_into_buf_(&mut buf, &header).await;
         assert_eq!(
             &buf[..total],
-            &[0x88u8, 0x00, 0x01, 0x01, 0x02, 0x13, 0x10, 0x00, 0x02, 0x00]
+            &[0x88u8, 0x00, 0x01, 0x01, 0x02, 0x04, 0x00, 0x13, 0x10, 0x00, 0x02, 0x00]
         );
 
         let parsed = read_header_from_buf_(&buf[..total])
@@ -861,6 +897,7 @@ mod tests_ {
         assert_eq!(parsed.local_dock(), Dock::new(1u32));
         assert_eq!(parsed.remote_dock(), Dock::new(2u32));
         assert_eq!(parsed.recv_window(), Option::Some(4096u32));
+        assert_eq!(parsed.recv_total(), Option::Some(0u64));
 
         // 读侧：缺 dock 对 → 结构非法。
         let without_docks = [0x88u8, 0x12, 0x10, 0x00, 0x02, 0x00];
@@ -869,10 +906,19 @@ mod tests_ {
             Option::Some(ErrKind::MalformedFrame)
         );
 
-        // 读侧：缺接收窗口字段（dock 对齐全，直接以 PayloadLen 收尾）。
-        let without_window = [0x88u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00];
+        // 读侧：完全缺窗口通告（dock 对齐全，直接以 PayloadLen 收尾）。
+        let without_report = [0x88u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00];
         assert_eq!(
-            read_err_(&without_window).await,
+            read_err_(&without_report).await,
+            Option::Some(ErrKind::MalformedFrame)
+        );
+
+        // 读侧：只带窗口值、缺累计已收字节数。
+        let without_total = [
+            0x88u8, 0x00, 0x01, 0x01, 0x02, 0x13, 0x10, 0x00, 0x02, 0x00,
+        ];
+        assert_eq!(
+            read_err_(&without_total).await,
             Option::Some(ErrKind::MalformedFrame)
         );
 
@@ -898,6 +944,7 @@ mod tests_ {
         open.local_dock_ = Dock::new(3u32);
         open.remote_dock_ = Dock::new(7u32);
         open.recv_window_ = Option::Some(2048u32);
+        open.recv_total_ = Option::Some(7u64);
         open.payload_len_ = 4usize;
 
         let mut buf = [0u8; 64];
@@ -907,6 +954,7 @@ mod tests_ {
             .expect("读回 OPEN 帧应当成功");
         assert_eq!(parsed.kind(), FrameKind::Open);
         assert_eq!(parsed.recv_window(), Option::Some(2048u32));
+        assert_eq!(parsed.recv_total(), Option::Some(7u64));
         assert_eq!(parsed.payload_len(), 4usize);
 
         // 写侧：OPEN 缺窗口。
@@ -923,6 +971,7 @@ mod tests_ {
         accept_with_window.local_dock_ = Dock::new(7u32);
         accept_with_window.remote_dock_ = Dock::new(3u32);
         accept_with_window.recv_window_ = Option::Some(2048u32);
+        accept_with_window.recv_total_ = Option::Some(0u64);
         assert_eq!(
             write_header_err_(&accept_with_window).await,
             ErrKind::MalformedFrame
@@ -963,7 +1012,7 @@ mod tests_ {
     }
 
     /// 测试保留的 `kind` 与保留的字段标识都被拒绝。
-    /// - 手段：帧首分别取 `0x00`（保留）与 `0x0A`（保留），以及字段标识 `0x05`
+    /// - 手段：帧首分别取 `0x00`（保留）与 `0x0A`（保留），以及字段标识 `0x06`
     ///   （保留）。
     /// - 判断：三种输入都报 [`MuxError::UnsupportedField`]。
     #[compio::test]
@@ -976,8 +1025,8 @@ mod tests_ {
             );
         }
 
-        // 保留字段标识：DATA 帧首之后的 0x05 表示 field_id = 5。
-        let reserved_field = [0x05u8, 0x05, 0x00, 0x02, 0x00];
+        // 保留字段标识：DATA 帧首之后的 0x06 表示 field_id = 6（未分配）。
+        let reserved_field = [0x05u8, 0x06, 0x00, 0x02, 0x00];
         assert_eq!(
             read_err_(&reserved_field).await,
             Option::Some(ErrKind::UnsupportedField)
@@ -1053,7 +1102,7 @@ mod tests_ {
             0x03u8, // 帧首：REJECT
             0x00, 0x01, // LocalDock = 1
             0x01, 0x02, // RemoteDock = 2
-            0x04, 0x07, // ReasonCode = 7
+            0x05, 0x07, // ReasonCode = 7
             0x02, 0x00, // PayloadLen = 0
         ];
         let parsed = read_header_from_buf_(&reject_with_reason)
@@ -1065,7 +1114,7 @@ mod tests_ {
             0x03u8, // 帧首：REJECT
             0x00, 0x01, // LocalDock = 1
             0x01, 0x02, // RemoteDock = 2
-            0x14, 0x01, 0x00, // ReasonCode = 0x0100（BeU16）
+            0x15, 0x01, 0x00, // ReasonCode = 0x0100（BeU16）
             0x02, 0x00, // PayloadLen = 0
         ];
         assert_eq!(
@@ -1077,7 +1126,7 @@ mod tests_ {
             0x05u8, // 帧首：DATA
             0x00, 0x01, // LocalDock = 1
             0x01, 0x02, // RemoteDock = 2
-            0x04, 0x07, // ReasonCode = 7
+            0x05, 0x07, // ReasonCode = 7
             0x02, 0x00, // PayloadLen = 0
         ];
         assert_eq!(
@@ -1094,9 +1143,10 @@ mod tests_ {
     async fn field_order_before_payload_len_is_free() {
         let shuffled = [
             0x07u8, // 帧首：WINDOW_UPDATE
-            0x13, 0x00, 0x05, // WindowUpdate = 5（BeU16 编码）
+            0x13, 0x00, 0x05, // RecvWindow = 5（BeU16 编码）
             0x01, 0x02, // RemoteDock = 2
             0x00, 0x01, // LocalDock = 1
+            0x04, 0x09, // RecvTotal = 9（BeU8 编码）
             0x02, 0x00, // PayloadLen = 0
         ];
         let parsed = read_header_from_buf_(&shuffled)

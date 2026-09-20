@@ -1,8 +1,8 @@
 //! # 流控（flow control）
 //!
-//! 本模块实现**与 IO 无关**的字节信用窗口算法，供 [`crate::connection`] 的读写
-//! 会话与子流两侧调用。它不碰任何缓冲、网络或异步原语，因此可以单独测试，
-//! 也可以被将来别的复用协议复用。
+//! 本模块实现**与 IO 无关**的字节窗口算法，供 [`crate::connection`] 的中心循环与子流
+//! 两侧调用。它不碰任何缓冲、网络或异步原语，因此可以单独测试，也可以被将来别的
+//! 复用协议复用。
 //!
 //! ## 为什么需要它
 //!
@@ -12,80 +12,95 @@
 //! 各自维护一个窗口：
 //!
 //! - **接收窗口**（[`RecvWindow`]）：本端承诺还能接收多少字节。它只由两个事件
-//!   驱动——「对端又发来 N 字节」与「应用又消费了 N 字节」；后者让窗口可以
-//!   重新变大，并通过 [`WindowUpdate`] 公告给对端。
-//! - **发送窗口**（[`SendWindow`]）：本端还能向对端发送多少字节。它只由两个
-//!   事件驱动——「本端又发了 N 字节」与「收到对端的窗口更新 N 字节」。
+//!   驱动——「对端又发来 N 字节」与「应用又消费了 N 字节」；后者让窗口可以重新变大，
+//!   并由连接层择机通告给对端。
+//! - **发送窗口**（[`SendWindow`]）：本端还能向对端发送多少字节。它由两个事件驱动
+//!   ——「本端又发了 N 字节」与「收到对端的窗口通告」。
 //!
-//! 两个窗口是**独立**的：一条子流的 `Tx` 与 `Rx` 可以分别阻塞，互不影响，也
-//! 不影响别的子流。这正是「各业务逻辑各持自己的 session」在数据面上的体现。
+//! 两个窗口是**独立**的：一条子流的 `Tx` 与 `Rx` 可以分别阻塞，互不影响，也不
+//! 影响别的子流。
 //!
-//! ## 方案：字节信用 + 阈值回补
+//! ## 方案：绝对量快照 `(R, W)` + 阈值通告
 //!
-//! 采用**字节信用窗口**（QUIC / HTTP-2 `MAX_STREAM_DATA` 风格），而非 TCP 式
-//! 累积确认：
-//!
-//! 1. 子流建立时，两端**互相通告**自己的接收窗口：主动方在 `OPEN` 里带上，被动方在
-//!    自己那条 `OPEN` 里带上（建流三步见 [`crate::connection`] 模块文档 §4.2）。
-//!    窗口因此以对端通告的值为准，不再假定「两端用同一条规则算出相同初窗」；
-//!    本端实际能收多少，仍由本端接收环的容量决定。
+//! 1. 子流建立时两端**互相通告**接收窗口：主动方在 `OPEN` 里带上，被动方在自己那条
+//!    `OPEN` 里带上（建流三步见 [`crate::connection`] 模块文档 §4.2）。窗口以对端
+//!    通告的值为准；本端实际能收多少仍由本端接收环的容量决定。
 //! 2. 发送方在可用额度内切分数据帧；窗口用尽即**阻塞该子流**（不是丢弃、不是报错）。
-//! 3. 接收方每消费一定字节就又有可公告的窗口，公告的**触发时机**由连接层掌握
-//!    （应用读过接收环后经上行通知通道提示，见 [`crate::connection`] 模块文档 §2.1），
-//!    因此天然合批，控制帧数量不会随消费次数线性增长。
-//! 4. 公告**绝对值化**（`OPEN` / `PULSE` / `WINDOW_UPDATE` 共用一个字段：见
-//!    [`crate::connection::FieldId::RecvWindow`]）已经定稿在 `dev-notes` §11.2；
-//!    本模块当前仍是**增量**形态（[`WindowUpdate`] 表示增量），会随 §11.6 第 3 步
-//!    一起改。绝对上限由 [`TrFlowCtrlPolicy::max_window`] 钳制，防止两端来回加码
-//!    导致窗口无限增长。
-//!
-//! 之所以不用累积确认：复用层没有重传语义（底层字节流已经可靠有序），
-//! 只需要「背压 + 回补」，累积序号反而要额外维护序号空间与乱序处理。
+//! 3. 通告是**绝对量快照** `(R, W)`：`R` 是通告发出时的累计已收字节数，`W` 是当时的
+//!    剩余窗口。发送方据此算 `可用 = W − (已发 − R)`，从而精确扣掉在途数据；只发 `W`
+//!    会把在途量重复计入（推导见 [`WindowReport`]）。
+//! 4. 通告**什么时候发**由阈值 + 频率限制决定（[`RecvWindow::should_report`]）：
+//!    建流时一次（通告最大窗口），此后**收缩**跌破 `1/2` / `1/4` / `0`、**扩张**升过
+//!    `1/2` / `3/4` / 满时各发一次；两次通告之间至少隔若干个数据帧，避免窗口在阈值
+//!    附近抖动时反复发同一条事件。因为通告是快照，**延迟通告不会导致越权**。
+//! 5. 绝对上限由 [`TrFlowCtrlPolicy::max_window`] 钳制，防止两端来回加码导致窗口
+//!    无限增长。
 //!
 //! ## 与帧的关系
 //!
-//! [`WindowUpdate`] 是窗口公告的**当前（增量）**形态，最终会被绝对值形态取代
-//! （见上一条）；线格式见 `connection::frame_` 的 [`FieldId::RecvWindow`]。
-//! 本模块只负责窗口记账，不关心公告被编进哪个帧、什么时候真正写出去。
-//!
-//! [`FieldId::RecvWindow`]: crate::connection::FieldId::RecvWindow
+//! 通告作为 `OPEN` / `PULSE` / `WINDOW_UPDATE` 的字段出现（线格式上是
+//! `RecvTotal` + `RecvWindow` 两个字段，见 `connection::frame_`）。本模块只负责窗口
+//! 记账与「该不该发」的判断，不关心它被编进哪个帧、什么时候真正写出去。
 //!
 //! ## 违例处理
 //!
-//! 对端在窗口之外继续发数据属于**协议违例**，由 [`FlowCtrlError::PeerViolation`]
-//! 表达，调用方应当终止该子流（并可按需终止整条连接）。本端自己算错、
-//! 溢出等属于内部错误，用 [`FlowCtrlError::Overflow`] 表达。
+//! 对端在**已通告**额度之外继续发数据属于**协议违例**，由
+//! [`FlowCtrlError::PeerViolation`] 表达，调用方应当终止该子流（并可按需终止整条
+//! 连接）。本端自己算错、溢出等属于内部错误，用 [`FlowCtrlError::Overflow`] 表达。
 
-/// 以**字节**为单位的信用量。
+/// 以**字节**为单位的信用量（窗口大小）。
 ///
-/// 窗口计数统一用 `u32`：单条子流的窗口不可能超过
-/// [`TrFlowCtrlPolicy::max_window`] 的量级，而 `u32` 足以覆盖
+/// 窗口计数用 `u32`：单条子流的窗口不可能超过 [`TrFlowCtrlPolicy::max_window`]
+/// 的量级，而 `u32` 足以覆盖
 /// [`crate::handshake::opts::BasicOpts::DEFAULT`] 中的 `max_packet_size`。
-/// 与 `usize` 的换算在调用方完成：环容量是 `usize`，公告到线格式时收窄为
+/// 与 `usize` 的换算在调用方完成：环容量是 `usize`，通告到线格式时收窄为
 /// `u32`，收窄失败按 [`FlowCtrlError::Overflow`] 处理。
 pub type Credit = u32;
 
-/// 流控策略：把「缓冲能力」翻译成窗口参数。
+/// **累计**字节数（已经收到 / 已经发出去的总量）。
+///
+/// 通告必须携带「窗口对应的累计已收字节数」，否则发送方无法扣掉在途数据——推导
+/// 见 [`WindowReport`]。累计量单调不减，用 `u64` 以免在长寿命子流上回绕。
+pub type RecvTotal = u64;
+
+/// 通告水位的档位数（收缩侧与扩张侧各一档）。
+pub const K_REPORT_LEVEL_COUNT: usize = 3;
+
+/// 流控策略：把「缓冲能力」翻译成窗口参数与通告时机。
 ///
 /// 策略由调用方注入（见 [`crate::connection`] 的分配器 / 策略注入约定），
-/// 因此同一份流控算法可以配不同的内存预算。缺省实现见 [`DefaultPolicy`]。
+/// 因此同一份流控算法可以配不同的内存预算与通告频率。缺省实现见 [`DefaultPolicy`]。
 pub trait TrFlowCtrlPolicy {
-    /// 由接收环容量推导**初始窗口**。
+    /// 由接收环容量推导**初始（也是最大）接收窗口**。
     ///
-    /// 缺省策略取「环容量」本身：本端最多愿意缓存这么多字节，正好等于缓冲
-    /// 能力，既不会浪费内存，也不会让对端过早阻塞。返回值必须是正数。
+    /// 建流时 `OPEN` 通告的就是它；缺省策略取「环容量」本身：本端最多愿意缓存
+    /// 这么多字节，正好等于缓冲能力。推荐实现里这个值应当**截断到 `Credit`**，
+    /// 因为它同时决定后续通告的上界。
     fn initial_window(&self, ring_capacity: usize) -> Credit;
 
-    /// 已消费字节攒到多少时回发一次窗口更新。
+    /// **收缩方向**的通告水位（相对初始窗口而言的绝对值），按任意顺序返回。
     ///
-    /// 缺省策略取当前窗口的一半：太小会让控制帧过密，太大则回补滞后、
-    /// 发送方可能出现不必要的空档。
-    fn update_threshold(&self, window: Credit) -> Credit;
+    /// 本端接收窗口 `W` 跌破其中任一水位（含恰好落在水位上）、且该水位严格低于
+    /// 「上次通告值」时发一次通告。水位列里带 `0` 是为了表达「窗口降到 0」这个
+    /// 触发点。缺省为 `[1/2, 1/4, 0]`。
+    fn shrink_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT];
+
+    /// **扩张方向**的通告水位，语义与 [`TrFlowCtrlPolicy::shrink_levels`] 对称。
+    ///
+    /// 缺省为 `[1/2, 3/4, 初始值]`。
+    fn expand_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT];
+
+    /// 两次通告之间**至少**要经过多少个数据帧；`0` 表示不做频率限制。
+    ///
+    /// 目的是避免窗口在阈值附近来回抖动时反复发同一条事件。因为通告携带的是
+    /// 「截至某累计已收字节数的窗口」快照，**延迟通告不会导致越权**（发送方按上一次
+    /// 通告算出的额度本身就受限于那次的真实窗口），所以这里可以放心限制频率。
+    fn min_frames_between_reports(&self) -> usize;
 
     /// 窗口的**绝对上限**。
     ///
-    /// 接收窗口在回补时不得超过它；发送窗口在收到对端的窗口更新时也不得
-    /// 超过它（对端同样受本端实现约束，这里做一次防御性钳制）。
+    /// 发送窗口在收到对端通告时不得超过它（对端同样受本端实现约束，这里做一次
+    /// 防御性钳制）。
     fn max_window(&self) -> Credit;
 }
 
@@ -108,6 +123,9 @@ impl DefaultPolicy {
     pub const fn new() -> Self {
         DefaultPolicy
     }
+
+    /// 缺省的最小通告间隔（数据帧数）。
+    pub const K_MIN_FRAMES_BETWEEN_REPORTS: usize = 4;
 }
 
 impl TrFlowCtrlPolicy for DefaultPolicy {
@@ -117,78 +135,119 @@ impl TrFlowCtrlPolicy for DefaultPolicy {
         ring_capacity.min(Credit::MAX as usize) as Credit
     }
 
-    fn update_threshold(&self, window: Credit) -> Credit {
-        // 半窗，但不小于 1：阈值为 0 会让每次消费都产生一个控制帧。
-        (window / 2u32).max(1u32)
+    fn shrink_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT] {
+        [initial / 2u32, initial / 4u32, 0u32]
+    }
+
+    fn expand_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT] {
+        [initial / 2u32, initial / 4u32 * 3u32, initial]
+    }
+
+    fn min_frames_between_reports(&self) -> usize {
+        Self::K_MIN_FRAMES_BETWEEN_REPORTS
     }
 
     fn max_window(&self) -> Credit {
-        // 取 `u32::MAX` 的一半：远大于任何真实环容量，又给增量累加留出余量，
-        // 使 `available_ + delta` 不会轻易溢出。
+        // 取 `u32::MAX` 的一半：远大于任何真实环容量，又留出余量。
         Credit::MAX / 2u32
     }
 }
 
-/// 待公告的**接收窗口增量**。
+/// 一份**窗口通告**：截至累计已收 `recv_total` 字节时，本端还能再收 `window` 字节。
 ///
-/// 作为 `WINDOW_UPDATE` 控制帧的载荷发送；发送之后由
-/// [`RecvWindow::take_update`] 取走并清空。增量为 0 时**不应**产生更新，
-/// 因此本类型只在增量非 0 时被构造。
+/// # 为什么必须带上「累计已收字节数」
+///
+/// 设本端容量 `cap`、累计已消费 `C`、累计已收 `R`，则本端物理剩余
+///
+/// ```text
+/// W = cap − (R − C)
+/// ```
+///
+/// 对端在途字节数是 `已发 S − 已收 R`。对端**正确的可用额度**应为
+///
+/// ```text
+/// 可用 = cap + C − S = W − (S − R)
+/// ```
+///
+/// 也就是说：只发 `W` 时，对端只能取「可用 = W」，会把已经在途、本端还没计入 `R`
+/// 的那 `S − R` 个字节重复算一遍，于是越权发送、接收环可能溢出。带上 `R` 才能精确
+/// 扣掉在途量——这也是 TCP 的窗口通告必须和 ACK 一起发的原因。
 ///
 /// # Examples
 ///
 /// ```
-/// use smux_v1::flow_ctrl::WindowUpdate;
+/// use smux_v1::flow_ctrl::WindowReport;
 ///
-/// let update = WindowUpdate::new(1024u32);
-/// assert_eq!(update.delta(), 1024u32);
+/// let report = WindowReport::new(1024, 4096);
+/// assert_eq!(report.recv_total(), 1024);
+/// assert_eq!(report.window(), 4096);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowUpdate {
-    delta_: Credit,
+pub struct WindowReport {
+    recv_total_: RecvTotal,
+    window_: Credit,
 }
 
-impl WindowUpdate {
-    /// 以增量构造。
-    pub const fn new(delta: Credit) -> Self {
-        WindowUpdate { delta_: delta }
+impl WindowReport {
+    /// 以「累计已收字节数 + 当前接收窗口」构造；构造方是**接收侧**。
+    pub const fn new(recv_total: RecvTotal, window: Credit) -> Self {
+        WindowReport {
+            recv_total_: recv_total,
+            window_: window,
+        }
     }
 
-    /// 本更新公告的字节数。
-    pub const fn delta(&self) -> Credit {
-        self.delta_
+    /// 本通告对应的累计已收字节数（`R`）。
+    pub const fn recv_total(&self) -> RecvTotal {
+        self.recv_total_
+    }
+
+    /// 截至上述累计已收字节数时，本端还能再收的字节数（`W`）。
+    pub const fn window(&self) -> Credit {
+        self.window_
     }
 }
 
-/// 发送窗口：本端在子流某个方向上**还能发送**的字节数。
+/// 发送窗口：本端在子流的某个方向上**还能发送**多少字节。
 ///
-/// 只暴露「查询剩余」「预扣」「回补」三类操作，窗口的加减全部集中在这里，
-/// 避免散落在帧调度代码里。
+/// 只暴露「查询剩余」「预扣」「归还」「接收通告」四类操作，窗口的加减全部集中
+/// 在这里，避免散落在帧调度代码里。
 pub struct SendWindow {
-    /// 当前剩余可发送字节数。
-    available_: Credit,
+    /// 累计**已发送**字节数（`S`）。
+    sent_: RecvTotal,
 
-    /// 上限，用于对窗口更新做防御性钳制。
+    /// 最近一次收到的通告 `(R₀, W₀)`；`None` 表示尚未收到（对端的 `OPEN` 还没到）。
+    reported_: Option<(RecvTotal, Credit)>,
+
+    /// 上限，用于对通告做防御性钳制。
     max_: Credit,
 }
 
 impl SendWindow {
-    /// 以初始信用与上限构造；只供 `connection` 建立子流时使用。
-    pub(crate) const fn new_(initial: Credit, max: Credit) -> Self {
+    /// 以「对端窗口上限」构造；**初始可用额度为 0**，要等收到对端那条 `OPEN`
+    /// 携带的通告才生效——建流三步保证数据帧不会早于它。
+    pub(crate) const fn new_(max: Credit) -> Self {
         SendWindow {
-            available_: initial,
+            sent_: 0u64,
+            reported_: Option::None,
             max_: max,
         }
     }
 
-    /// 剩余可发送字节数。
-    pub const fn available(&self) -> Credit {
-        self.available_
+    /// 剩余可发送字节数：`W₀ − (S − R₀)`，下钳 `0`。
+    pub fn available(&self) -> Credit {
+        let Option::Some((r0, w0)) = self.reported_ else {
+            return 0u32;
+        };
+        let inflight = self.sent_.saturating_sub(r0);
+        // 在途量理论上不会超过一个窗口（`u32` 量级）；超出即视为额度耗尽。
+        let inflight = Credit::try_from(inflight).unwrap_or(Credit::MAX);
+        w0.saturating_sub(inflight)
     }
 
     /// 窗口是否已经用尽（发送方应当阻塞该子流，而不是报错）。
-    pub const fn is_exhausted(&self) -> bool {
-        self.available_ == 0u32
+    pub fn is_exhausted(&self) -> bool {
+        self.available() == 0u32
     }
 
     /// 预扣 `want` 字节，返回本次**实际获批**的字节数（`0..=want`）。
@@ -197,131 +256,188 @@ impl SendWindow {
     /// 获批的字节在真正写出前就已经从窗口扣除，写失败时用
     /// [`SendWindow::refund`] 归还。
     pub fn reserve(&mut self, want: Credit) -> Credit {
-        let granted = want.min(self.available_);
-        self.available_ -= granted;
+        let granted = want.min(self.available());
+        self.sent_ = self.sent_.saturating_add(granted as u64);
         granted
     }
 
     /// 归还之前 [`SendWindow::reserve`] 预扣、但最终未写出的额度。
     pub fn refund(&mut self, amount: Credit) {
-        self.available_ = self.available_.saturating_add(amount).min(self.max_);
+        self.sent_ = self.sent_.saturating_sub(amount as u64);
     }
 
-    /// 收到对端的窗口更新，把发送窗口调大。
+    /// 收到对端的窗口通告。
+    ///
+    /// 过期或重复的通告（`R` 不比已记录的更大）被忽略，因此**幂等**：保活 `PULSE`
+    /// 可以放心地重复携带同一份快照。
     ///
     /// # Errors
     ///
-    /// 增量导致窗口超过上限时返回 [`FlowCtrlError::Overflow`]（本端实现防御，
+    /// 通告的窗口超过本端上限时返回 [`FlowCtrlError::Overflow`]（本端实现防御，
     /// 正常对端不会触发）。
-    pub fn on_update(&mut self, update: WindowUpdate) -> Result<(), FlowCtrlError> {
-        let grown = self
-            .available_
-            .checked_add(update.delta())
-            .ok_or(FlowCtrlError::Overflow)?;
-        if grown > self.max_ {
+    pub fn on_report(&mut self, report: WindowReport) -> Result<(), FlowCtrlError> {
+        if let Option::Some((r0, _)) = self.reported_
+            && report.recv_total() <= r0
+        {
+            // 旧快照：不覆盖，也不报错。
+            return Result::Ok(());
+        }
+        if report.window() > self.max_ {
             return Result::Err(FlowCtrlError::Overflow);
         }
-        self.available_ = grown;
+        self.reported_ = Option::Some((report.recv_total(), report.window()));
         Result::Ok(())
     }
 }
 
-/// 接收窗口：本端**还愿意接收**的字节数，以及「已消费、待公告」的累计量。
+/// 接收窗口：本端**还愿意接收**多少字节，以及通告所需的状态。
 ///
-/// 它同时承担两个职责：
+/// 三个量各自累积：累计已收 `R`、累计已消费 `C`、以及最近一次通告出去的快照
+/// `(R₀, W₀)`。当前可通告的窗口是物理剩余
 ///
-/// 1. 作为**入向配额**：读路径每收到 N 字节就 [`RecvWindow::on_data`]，
-///    越过配额即对端违例；
-/// 2. 作为**回补来源**：应用每消费 N 字节就 [`RecvWindow::on_consumed`]，
-///    累计量越过阈值后由 [`RecvWindow::take_update`] 产出一次公告。
+/// ```text
+/// W = cap − (R − C)
+/// ```
+///
+/// 而越权判定用的是**已通告**的额度：对端最多只能发到 `R₀ + W₀`。
 pub struct RecvWindow {
-    /// 本端承诺的最大可接收字节数（初始窗口）。
+    /// 接收窗口容量（由策略从环容量推导，同时也是本端通告的上界）。
     capacity_: Credit,
 
-    /// 回补阈值。
-    threshold_: Credit,
+    /// 初始窗口；阈值水位按它计算。
+    initial_: Credit,
 
-    /// 窗口上限。
-    max_: Credit,
+    /// 累计已收字节数（`R`）。
+    received_: RecvTotal,
 
-    /// 当前**尚未用掉**的接收额度：对端还可以再发送这么多字节。
-    available_: Credit,
+    /// 累计已消费（交给应用）字节数（`C`）。
+    consumed_: RecvTotal,
 
-    /// 应用已消费、但尚未公告的字节数（回补来源）。
-    consumed_pending_: Credit,
+    /// 最近一次通告的快照 `(R₀, W₀)`；`None` 表示还没通告过。
+    reported_: Option<(RecvTotal, Credit)>,
+
+    /// 自上次通告以来收到的数据帧数（频率限制用）。
+    frames_since_report_: usize,
 }
 
 impl RecvWindow {
-    /// 以策略算出的参数构造；只供 `connection` 建立子流时使用。
-    pub(crate) const fn new_(capacity: Credit, threshold: Credit, max: Credit) -> Self {
+    /// 以策略算出的参数构造。
+    pub(crate) fn new_<P>(policy: &P, ring_capacity: usize) -> Self
+    where
+        P: TrFlowCtrlPolicy,
+    {
+        let initial = policy.initial_window(ring_capacity);
         RecvWindow {
-            capacity_: capacity,
-            threshold_: threshold,
-            max_: max,
-            available_: capacity,
-            consumed_pending_: 0u32,
+            capacity_: initial,
+            initial_: initial,
+            received_: 0u64,
+            consumed_: 0u64,
+            reported_: Option::None,
+            frames_since_report_: 0usize,
         }
     }
 
-    /// 本端承诺的最大可接收字节数。
+    /// 本端承诺的最大可接收字节数（初始窗口 = `OPEN` 通告的值）。
     pub const fn capacity(&self) -> Credit {
         self.capacity_
     }
 
-    /// 当前还允许对端发送的字节数（仅用于诊断与测试，不作为唯一判据）。
-    pub const fn available(&self) -> Credit {
-        self.available_
+    /// 当前可通告的接收窗口 `W`（物理剩余）。
+    pub fn window(&self) -> Credit {
+        let buffered = self.received_.saturating_sub(self.consumed_);
+        let buffered = Credit::try_from(buffered).unwrap_or(Credit::MAX);
+        self.capacity_.saturating_sub(buffered)
     }
 
-    /// 对端又发来 `amount` 字节，计入在途。
+    /// 累计已收字节数（`R`）。
+    pub const fn recv_total(&self) -> RecvTotal {
+        self.received_
+    }
+
+    /// 累计已消费字节数（`C`）。
+    pub const fn consumed_total(&self) -> RecvTotal {
+        self.consumed_
+    }
+
+    /// 最近一次通告出去的窗口（诊断用）。
+    pub const fn reported_window(&self) -> Option<Credit> {
+        match self.reported_ {
+            Option::Some((_, w)) => Option::Some(w),
+            Option::None => Option::None,
+        }
+    }
+
+    /// 对端又发来 `amount` 字节（一次调用 = 一个数据帧），计入在途并推进帧计数。
     ///
     /// # Errors
     ///
-    /// 超过已公告额度时返回 [`FlowCtrlError::PeerViolation`]。
+    /// 超过**已通告**额度（`R₀ + W₀`）时返回 [`FlowCtrlError::PeerViolation`]——
+    /// 这是协议违例，不是「丢弃即可」。
     pub fn on_data(&mut self, amount: Credit) -> Result<(), FlowCtrlError> {
-        // 额度不足即对端发超了本端公告的窗口——协议违例，不是「丢弃即可」。
-        let rest = self
-            .available_
-            .checked_sub(amount)
-            .ok_or(FlowCtrlError::PeerViolation)?;
-        self.available_ = rest;
+        self.frames_since_report_ = self.frames_since_report_.saturating_add(1);
+        let authorized = match self.reported_ {
+            Option::Some((r0, w0)) => r0.saturating_add(w0 as u64),
+            // 还没通告过任何窗口：对端本来就不该发数据。
+            Option::None => 0u64,
+        };
+        let next = self.received_.saturating_add(amount as u64);
+        if next > authorized {
+            return Result::Err(FlowCtrlError::PeerViolation);
+        }
+        self.received_ = next;
         Result::Ok(())
     }
 
-    /// 应用又消费（取走）了 `amount` 字节，窗口相应可以回补。
+    /// 应用又消费（取走）了 `amount` 字节，窗口相应变大。
     pub fn on_consumed(&mut self, amount: Credit) {
-        // 消费量只会把额度还回来；累计量以 `max_` 封顶，避免长期不公告时无意义地增长。
-        self.consumed_pending_ = self.consumed_pending_.saturating_add(amount).min(self.max_);
+        self.consumed_ = self.consumed_.saturating_add(amount as u64);
     }
 
-    /// 若已攒够阈值则产出待公告的窗口更新，否则返回 `None`。
+    /// 是否应当按策略通告当前窗口。
     ///
-    /// 取走后累计量清零；调用方应当把产出的更新交给写路径编进
-    /// `WINDOW_UPDATE` 控制帧。
-    pub fn take_update(&mut self) -> Option<WindowUpdate> {
-        if !self.has_pending_update() {
-            return Option::None;
+    /// 判据：**上次通告值**与当前值之间跨过了某个方向对应的水位
+    /// （收缩看 [`TrFlowCtrlPolicy::shrink_levels`]，扩张看
+    /// [`TrFlowCtrlPolicy::expand_levels`]），**且**自上次通告以来的数据帧数已达
+    /// [`TrFlowCtrlPolicy::min_frames_between_reports`]。从未通告过时总是为真
+    /// （建流时的那次通告）。
+    ///
+    /// 这里只做判断、不改状态；真正通告用 [`RecvWindow::report`]。
+    pub fn should_report<P>(&self, policy: &P) -> bool
+    where
+        P: TrFlowCtrlPolicy,
+    {
+        let Option::Some((_, last)) = self.reported_ else {
+            return true;
+        };
+        if self.frames_since_report_ < policy.min_frames_between_reports() {
+            return false;
         }
-        // 增量不能把窗口推过上限；没公告完的部分留到下一次。
-        let room = self.max_.saturating_sub(self.available_);
-        let delta = self.consumed_pending_.min(room);
-        if delta == 0u32 {
-            // 窗口已经在上限：本次没有可公告的空间。必须清空累计量，否则
-            // `has_pending_update` 会永远为真。
-            self.consumed_pending_ = 0u32;
-            return Option::None;
+        let current = self.window();
+        if current < last {
+            return policy
+                .shrink_levels(self.initial_)
+                .iter()
+                .any(|level| current <= *level && *level < last);
         }
-        self.consumed_pending_ -= delta;
-        self.available_ = self.available_.saturating_add(delta);
-        Option::Some(WindowUpdate::new(delta))
+        if current > last {
+            return policy
+                .expand_levels(self.initial_)
+                .iter()
+                .any(|level| current >= *level && *level > last);
+        }
+        false
     }
 
-    /// 是否已经攒够阈值、应当公告窗口更新。
-    pub const fn has_pending_update(&self) -> bool {
-        // 攒够阈值就公告；此外**额度耗尽**时必须公告，哪怕不足阈值——否则应用只
-        // 消费了少量字节、对端却因为额度为 0 永久停发，形成死锁。
-        self.consumed_pending_ > 0u32
-            && (self.consumed_pending_ >= self.threshold_ || self.available_ == 0u32)
+    /// 生成一份通告快照 `(R, W)`，并把它记为「已通告」（此后越权判定以它为准、
+    /// 帧计数清零）。
+    ///
+    /// 保活 `PULSE` 无条件用它取当前窗口；按阈值通告则由
+    /// [`RecvWindow::should_report`] 先判断。
+    pub fn report(&mut self) -> WindowReport {
+        let report = WindowReport::new(self.received_, self.window());
+        self.reported_ = Option::Some((report.recv_total(), report.window()));
+        self.frames_since_report_ = 0usize;
+        report
     }
 }
 
@@ -337,20 +453,16 @@ pub struct FlowCtrl {
 impl FlowCtrl {
     /// 按策略与接收环容量为一条子流建立双向窗口。
     ///
-    /// `ring_capacity` 是**本端接收环**的容量，初始窗口由
-    /// [`TrFlowCtrlPolicy::initial_window`] 从它推导；发送窗口的初始值取同一条
-    /// 规则（两端规则一致，因此不必在帧里交换窗口大小）。
+    /// 接收侧的初始窗口由 `OPEN` 通告出去；发送侧**此时还没有额度**，要等收到对端
+    /// 那条 `OPEN` 里的通告（[`WindowReport`]）才生效。
     pub fn new<P>(policy: &P, ring_capacity: usize) -> Self
     where
         P: TrFlowCtrlPolicy,
     {
-        let initial = policy.initial_window(ring_capacity);
-        // 上限必须不低于初窗，否则初窗一建出来就越界。
-        let max = policy.max_window().max(initial);
-        let threshold = policy.update_threshold(initial).max(1u32);
+        let max = policy.max_window();
         FlowCtrl {
-            send_: SendWindow::new_(initial, max),
-            recv_: RecvWindow::new_(initial, threshold, max),
+            send_: SendWindow::new_(max),
+            recv_: RecvWindow::new_(policy, ring_capacity),
         }
     }
 
@@ -378,7 +490,7 @@ impl FlowCtrl {
 /// 流控失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowCtrlError {
-    /// 对端发送的数据超过了本端公告的接收窗口。
+    /// 对端发送的数据超过了本端**已通告**的接收窗口。
     ///
     /// 属于协议违例：调用方应当终止该子流，并可按需终止整条连接。
     PeerViolation,
@@ -392,7 +504,7 @@ pub enum FlowCtrlError {
 impl core::fmt::Display for FlowCtrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FlowCtrlError::PeerViolation => f.write_str("对端发送数据超过已公告的接收窗口"),
+            FlowCtrlError::PeerViolation => f.write_str("对端发送数据超过已通告的接收窗口"),
             FlowCtrlError::Overflow => f.write_str("流控窗口计数溢出"),
         }
     }
@@ -404,40 +516,188 @@ impl core::error::Error for FlowCtrlError {}
 mod tests_ {
     use super::*;
 
-    /// 测试缺省策略把环容量直接翻译成初始窗口，并在超出 `u32` 时饱和。
-    /// - 手段：对容量 0、4096 与 `usize::MAX` 调用
-    ///   [`DefaultPolicy::initial_window`]。
-    /// - 判断：小于 `u32::MAX` 的容量原样返回；`usize::MAX` 饱和为 `u32::MAX`
-    ///   （不截断成错误的小窗口）。
+    /// 缺省策略：初始窗口跟随环容量（超出 `u32` 时饱和），水位为 1/2、1/4、0 与
+    /// 1/2、3/4、满，频率限制为 4 个数据帧。
+    /// - 手段：对容量 0 / 4096 / `usize::MAX` 求初窗，并对初窗 4096 求两组水位。
+    /// - 判断：初窗分别饱和为 0 / 4096 / `u32::MAX`；水位与频率限制与设计一致。
     #[test]
-    fn default_policy_initial_window_tracks_capacity() {
+    fn default_policy_window_and_levels() {
         let p = DefaultPolicy::new();
         assert_eq!(p.initial_window(0usize), 0u32);
         assert_eq!(p.initial_window(4096usize), 4096u32);
         assert_eq!(p.initial_window(usize::MAX), Credit::MAX);
-    }
 
-    /// 测试缺省策略的阈值与上限取值。
-    /// - 手段：对 0 / 1 / 8 / 4096 求阈值，并读取上限。
-    /// - 判断：阈值为「半窗且不小于 1」，上限恰好是 `u32::MAX / 2`。
-    #[test]
-    fn default_policy_threshold_and_cap() {
-        let p = DefaultPolicy::new();
-        assert_eq!(p.update_threshold(0u32), 1u32);
-        assert_eq!(p.update_threshold(1u32), 1u32);
-        assert_eq!(p.update_threshold(8u32), 4u32);
-        assert_eq!(p.update_threshold(4096u32), 2048u32);
+        assert_eq!(p.shrink_levels(4096u32), [2048u32, 1024u32, 0u32]);
+        assert_eq!(p.expand_levels(4096u32), [2048u32, 3072u32, 4096u32]);
+        assert_eq!(p.min_frames_between_reports(), 4usize);
         assert_eq!(p.max_window(), Credit::MAX / 2u32);
     }
 
+    /// 测试「建流时先通告一次」以及收缩 / 扩张两侧的阈值触发点。
+    /// - 手段：初窗 4096；先 `report()` 一次（模拟 `OPEN` 通告）。随后按
+    ///   「收 4 个数据帧」为一批推进窗口，逐档检查 `should_report`：
+    ///   5696 - 2400 = 1696（跌破 1/2）→ 再收 800 → 896（跌破 1/4）→ 再收到 0；
+    ///   然后应用消费使窗口升过 1/2、超过 3/4、回到满。
+    /// - 判断：每次跨过水位时 `should_report` 为真；未跨水位（如从 4096 只降到
+    ///   3000）时为假；`report()` 之后再次判断为假（已通告同一值）。
+    #[test]
+    fn recv_window_reports_on_threshold_crossings() {
+        let p = DefaultPolicy::new();
+        let mut w = RecvWindow::new_(&p, 4096usize);
+        assert!(w.should_report(&p), "还没通告过：必须先通告一次");
+        let first = w.report();
+        assert_eq!(first.recv_total(), 0u64);
+        assert_eq!(first.window(), 4096u32, "开场通告的是最大接收窗口");
+        assert!(!w.should_report(&p), "刚通告过同一值：不该重复发");
+
+        // 只降到 3000（未跨 1/2=2048）：不触发。
+        for _ in 0..4 {
+            w.on_data(274u32).expect("在额度内");
+        }
+        assert_eq!(w.window(), 4096u32 - 4u32 * 274u32);
+        assert!(!w.should_report(&p), "没有跨过任何水位");
+
+        // 继续降到 1696（跌破 1/2）：触发。
+        for _ in 0..4 {
+            w.on_data(326u32).expect("在额度内");
+        }
+        assert_eq!(w.window(), 1696u32);
+        assert!(w.should_report(&p), "跌破 1/2 应当通告");
+        w.report();
+
+        // 降到 896（跌破 1/4=1024）：触发。
+        for _ in 0..4 {
+            w.on_data(200u32).expect("在额度内");
+        }
+        assert_eq!(w.window(), 896u32);
+        assert!(w.should_report(&p), "跌破 1/4 应当通告");
+        w.report();
+
+        // 降到 0：触发（水位列里的 0 专门表达这个点）。
+        for _ in 0..4 {
+            w.on_data(100u32).expect("在额度内");
+        }
+        assert_eq!(w.window(), 496u32);
+        for _ in 0..4 {
+            w.on_data(124u32).expect("在额度内");
+        }
+        assert_eq!(w.window(), 0u32);
+        assert!(w.should_report(&p), "窗口降到 0 应当通告");
+        w.report();
+
+        // 扩张：消费 2100 → 窗口 2100（升过 1/2=2048）：触发。
+        for _ in 0..4 {
+            w.on_data(0u32).expect("零字节也算一个数据帧");
+        }
+        w.on_consumed(2100u32);
+        assert_eq!(w.window(), 2100u32);
+        assert!(w.should_report(&p), "升过 1/2 应当通告");
+        w.report();
+
+        // 扩张到 3200（超过 3/4=3072）：触发。
+        for _ in 0..4 {
+            w.on_data(0u32).expect("零字节也算一个数据帧");
+        }
+        w.on_consumed(1100u32);
+        assert_eq!(w.window(), 3200u32);
+        assert!(w.should_report(&p), "升过 3/4 应当通告");
+        w.report();
+
+        // 回到满：触发。
+        for _ in 0..4 {
+            w.on_data(0u32).expect("零字节也算一个数据帧");
+        }
+        w.on_consumed(896u32);
+        assert_eq!(w.window(), 4096u32);
+        assert!(w.should_report(&p), "回到满应当通告");
+    }
+
+    /// 测试频率限制：跨过水位但数据帧数不够时不发，攒够帧数后补发。
+    /// - 手段：初窗 4096，先 `report()`；随后 3 个数据帧就把窗口压到 1/2 以下。
+    /// - 判断：第 3 帧后 `should_report` 仍为假（未达 4 帧）；第 4 帧后为真。
+    #[test]
+    fn recv_window_rate_limits_reports() {
+        let p = DefaultPolicy::new();
+        let mut w = RecvWindow::new_(&p, 4096usize);
+        w.report();
+
+        w.on_data(1400u32).expect("在额度内");
+        assert_eq!(w.window(), 2696u32, "还没跌破 1/2");
+
+        w.on_data(1400u32).expect("在额度内");
+        assert!(w.window() < 2048u32, "已经跌破 1/2");
+        assert!(!w.should_report(&p), "不足最小帧数：先攒着");
+
+        w.on_data(0u32).expect("第 3 帧");
+        assert!(!w.should_report(&p), "第 3 帧仍不够");
+
+        w.on_data(0u32).expect("第 4 帧");
+        assert!(
+            w.should_report(&p),
+            "攒够帧数后应当补发（水位条件一直成立）"
+        );
+    }
+
+    /// 测试「未通告」与「超出已通告额度」都判为对端违例。
+    /// - 手段：新建接收窗口（尚未通告）时 `on_data(1)`；`report()` 出 `(0, 4096)`
+    ///   后再 `on_data(4097)`。
+    /// - 判断：两次都返回 [`FlowCtrlError::PeerViolation`]，且已收字节数不前进。
+    #[test]
+    fn recv_window_flags_peer_violation() {
+        let p = DefaultPolicy::new();
+        let mut w = RecvWindow::new_(&p, 4096usize);
+
+        assert_eq!(
+            w.on_data(1u32),
+            Result::Err(FlowCtrlError::PeerViolation),
+            "还没通告过窗口，对端不该发数据"
+        );
+        assert_eq!(w.recv_total(), 0u64);
+
+        let report = w.report();
+        assert_eq!(report.window(), 4096u32);
+        assert!(w.on_data(4096u32).is_ok(), "刚好用满已通告额度是合法的");
+        assert_eq!(w.recv_total(), 4096u64);
+        assert_eq!(
+            w.on_data(1u32),
+            Result::Err(FlowCtrlError::PeerViolation)
+        );
+        assert_eq!(w.recv_total(), 4096u64, "违例不应推进已收计数");
+    }
+
+    /// 测试发送窗口按 `可用 = W₀ − (S − R₀)` 计算，并忽略过期通告。
+    /// - 手段：初窗 100（`(0, 100)`）→ 预扣 30 → 收到新通告 `(30, 50)` → 再喂一份
+    ///   过期的 `(10, 999)`。
+    /// - 判断：预扣后可用 70；新通告后可用 50（在途被精确扣掉）；过期通告不生效。
+    #[test]
+    fn send_window_subtracts_inflight_and_ignores_stale_reports() {
+        let mut w = SendWindow::new_(1024u32);
+        assert_eq!(w.available(), 0u32, "未收到对端 OPEN 通告前没有额度");
+        assert!(w.is_exhausted());
+
+        w.on_report(WindowReport::new(0u64, 100u32))
+            .expect("通告在上限内");
+        assert_eq!(w.available(), 100u32);
+
+        assert_eq!(w.reserve(30u32), 30u32);
+        assert_eq!(w.available(), 70u32, "已发送 30 字节");
+
+        w.on_report(WindowReport::new(30u64, 50u32))
+            .expect("新通告");
+        assert_eq!(w.available(), 50u32, "在途为 30−30=0，可用即通告值");
+
+        w.on_report(WindowReport::new(10u64, 999u32))
+            .expect("过期通告不是错误");
+        assert_eq!(w.available(), 50u32, "过期通告不覆盖较新的快照");
+    }
+
     /// 测试发送窗口的预扣、部分获批、用尽与归还。
-    /// - 手段：初窗 10，先 [`SendWindow::reserve`]`(4)`，再 `reserve(100)`，
-    ///   最后 `refund(3)`。
-    /// - 判断：两次获批分别为 4 与 6；用尽后 [`SendWindow::is_exhausted`] 为真；
-    ///   归还后可用量为 3。
+    /// - 手段：通告 `(0, 10)` 后依次 `reserve(4)`、`reserve(100)`、`refund(3)`。
+    /// - 判断：两次获批分别为 4 与 6；用尽后 `is_exhausted` 为真；归还后可用 3。
     #[test]
     fn send_window_reserve_exhaust_and_refund() {
-        let mut w = SendWindow::new_(10u32, 1024u32);
+        let mut w = SendWindow::new_(1024u32);
+        w.on_report(WindowReport::new(0u64, 10u32)).expect("通告");
         assert_eq!(w.reserve(4u32), 4u32);
         assert_eq!(w.available(), 6u32);
         assert!(!w.is_exhausted());
@@ -448,91 +708,60 @@ mod tests_ {
         assert_eq!(w.available(), 3u32);
     }
 
-    /// 测试发送窗口拒绝会把窗口推过上限的更新，也拒绝溢出。
-    /// - 手段：初窗 10、上限 12；依次 [`SendWindow::on_update`] `+1`、`+5`、
-    ///   `u32::MAX`。
-    /// - 判断：`+1` 成功且可用量 11；`+5` 与 `u32::MAX` 都返回
-    ///   `Err(FlowCtrlError::Overflow)`，且可用量保持 11。
+    /// 测试对端通告超过本端上限时判为溢出。
+    /// - 手段：上限收窄到 12，先接受 `(0, 12)`，再喂 `(1, 13)`。
+    /// - 判断：第二次返回 [`FlowCtrlError::Overflow`]，且原快照仍然生效。
     #[test]
-    fn send_window_rejects_update_beyond_cap() {
-        let mut w = SendWindow::new_(10u32, 12u32);
-        assert!(w.on_update(WindowUpdate::new(1u32)).is_ok());
-        assert_eq!(w.available(), 11u32);
+    fn send_window_rejects_report_beyond_cap() {
+        let mut w = SendWindow::new_(12u32);
+        w.on_report(WindowReport::new(0u64, 12u32)).expect("刚好到上限");
+        assert_eq!(w.available(), 12u32);
         assert_eq!(
-            w.on_update(WindowUpdate::new(5u32)),
+            w.on_report(WindowReport::new(1u64, 13u32)),
             Result::Err(FlowCtrlError::Overflow)
         );
-        assert_eq!(
-            w.on_update(WindowUpdate::new(Credit::MAX)),
-            Result::Err(FlowCtrlError::Overflow)
-        );
-        assert_eq!(w.available(), 11u32);
+        assert_eq!(w.available(), 12u32, "被拒的通告不改状态");
     }
 
-    /// 测试接收窗口把超额数据判为对端违例。
-    /// - 手段：容量 8 的接收窗口先 [`RecvWindow::on_data`]`(8)`（刚好用尽），
-    ///   再 `on_data(1)`。
-    /// - 判断：第一次 `Ok` 且可用量 0；第二次返回
-    ///   `Err(FlowCtrlError::PeerViolation)`，且可用量保持 0（不产生负额度）。
-    #[test]
-    fn recv_window_flags_peer_violation() {
-        let mut w = RecvWindow::new_(8u32, 4u32, 64u32);
-        assert!(w.on_data(8u32).is_ok());
-        assert_eq!(w.available(), 0u32);
-        assert_eq!(
-            w.on_data(1u32),
-            Result::Err(FlowCtrlError::PeerViolation)
-        );
-        assert_eq!(w.available(), 0u32);
-    }
-
-    /// 测试接收窗口在消费攒够阈值时产出一次窗口更新并恢复额度。
-    /// - 手段：容量 8、阈值 4；收满 8 后消费 4，再 [`RecvWindow::take_update`]。
-    /// - 判断：未消费时无更新；消费后产出增量 4 的更新，可用量回到 4，且再次
-    ///   调用返回 `None`（累计量已清空）。
-    #[test]
-    fn recv_window_emits_update_at_threshold() {
-        let mut w = RecvWindow::new_(8u32, 4u32, 64u32);
-        assert!(w.on_data(8u32).is_ok());
-        assert!(!w.has_pending_update());
-        w.on_consumed(4u32);
-        assert!(w.has_pending_update());
-        let update = w.take_update().expect("攒够阈值应当产出窗口更新");
-        assert_eq!(update.delta(), 4u32);
-        assert_eq!(w.available(), 4u32);
-        assert!(!w.has_pending_update());
-        assert!(w.take_update().is_none());
-    }
-
-    /// 测试额度耗尽时即使不足阈值也必须公告，避免对端永久停发。
-    /// - 手段：容量 8、阈值 8（直接构造）；收满 8 后只消费 1。
-    /// - 判断：[`RecvWindow::has_pending_update`] 为真，`take_update` 返回增量 1，
-    ///   可用量回到 1——证明「额度为 0」本身就会触发公告。
-    #[test]
-    fn recv_window_emits_when_exhausted_below_threshold() {
-        let mut w = RecvWindow::new_(8u32, 8u32, 64u32);
-        assert!(w.on_data(8u32).is_ok());
-        assert!(!w.has_pending_update());
-        w.on_consumed(1u32);
-        assert!(w.has_pending_update());
-        assert_eq!(w.take_update().map(|u| u.delta()), Option::Some(1u32));
-        assert_eq!(w.available(), 1u32);
-        assert!(!w.has_pending_update());
-    }
-
-    /// 测试 [`FlowCtrl::new`] 同时接好收发两个方向。
-    /// - 手段：以环容量 100 使用缺省策略构造，然后读取两个方向并在接收方向收满。
-    /// - 判断：发送窗口可用量与接收窗口容量都是 100；收满 100 后再收 1 字节返回
-    ///   `Err(FlowCtrlError::PeerViolation)`——说明接收方向也接上了。
+    /// 测试 [`FlowCtrl::new`] 同时接好收发两个方向：接收侧立即可通告初窗，发送侧在
+    /// 收到对端通告前没有额度。
+    /// - 手段：以环容量 100 使用缺省策略构造，读取两个方向；随后喂一份通告。
+    /// - 判断：接收容量与窗口都是 100、发送可用为 0；喂 `(0, 40)` 后发送可用 40；
+    ///   接收方向收满 100 后再收 1 字节返回 `PeerViolation`。
     #[test]
     fn flow_ctrl_new_wires_both_directions() {
-        let mut ctrl = FlowCtrl::new(&DefaultPolicy::new(), 100usize);
-        assert_eq!(ctrl.send_window().available(), 100u32);
+        let p = DefaultPolicy::new();
+        let mut ctrl = FlowCtrl::new(&p, 100usize);
         assert_eq!(ctrl.recv_window().capacity(), 100u32);
+        assert_eq!(ctrl.recv_window().window(), 100u32);
+        assert_eq!(ctrl.send_window().available(), 0u32);
+
+        ctrl.send_window_mut()
+            .on_report(WindowReport::new(0u64, 40u32))
+            .expect("通告");
+        assert_eq!(ctrl.send_window().available(), 40u32);
+
+        ctrl.recv_window_mut().report();
         assert!(ctrl.recv_window_mut().on_data(100u32).is_ok());
         assert_eq!(
             ctrl.recv_window_mut().on_data(1u32),
             Result::Err(FlowCtrlError::PeerViolation)
         );
+    }
+
+    /// 测试 `report()` 是幂等的快照：重复调用取到同一个值，且会清零帧计数。
+    /// - 手段：初窗 4096 上连续 `report()` 两次，并在中间读 `reported_window`。
+    /// - 判断：两次快照都是 `(0, 4096)`；`reported_window` 为 `Some(4096)`；
+    ///   第一次 `report` 后的 `should_report` 为假。
+    #[test]
+    fn report_is_idempotent_snapshot() {
+        let p = DefaultPolicy::new();
+        let mut w = RecvWindow::new_(&p, 4096usize);
+        let a = w.report();
+        let b = w.report();
+        assert_eq!(a, b);
+        assert_eq!(w.reported_window(), Option::Some(4096u32));
+        assert_eq!(w.recv_total(), 0u64);
+        assert!(!w.should_report(&p));
     }
 }
