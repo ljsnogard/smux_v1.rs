@@ -2,7 +2,7 @@
 //!
 //! 类型与 trait 的对应关系、并发模型与缓冲策略见 [`crate::connection`] 模块文档。
 //! 本文件只承载「对象与 trait 的接线」：状态机在
-//! 内部的读 / 写循环（`session_` 模块，`pub(crate)`，不对外暴露），
+//! 内部中心循环（`session_` 模块，`pub(crate)`，不对外暴露），
 //! 窗口算法在 [`crate::flow_ctrl`]，线格式在 `frame_`。
 //!
 //! # 资源 bundling：为什么要有 [`TrMuxConfig`]
@@ -32,10 +32,10 @@
 //! `is_consumer_closed`）：
 //!
 //! - 每条子流两个方向各一条环。发送环的应用端是 [`ChannelTx`]（生产端），另一端
-//!   由写会话持有；接收环的会话端是生产端，应用端是 [`ChannelRx`]（消费端）；
+//!   由中心循环的写路径持有；接收环的会话端是生产端，应用端是 [`ChannelRx`]（消费端）；
 //! - `ChannelTx::is_tx_closed()` 因此是「应用端已关闭发送环的生产端」——丢弃
 //!   [`ChannelTx`] 即置位（`buffex` 在半部 drop 时提交该事件）；而
-//!   `ChannelTx::is_rx_closed()` 是「写会话已关闭发送环的消费端」，即会话已经
+//!   `ChannelTx::is_rx_closed()` 是「中心循环已关闭发送环的消费端」，即连接已经
 //!   拆掉这条子流；
 //! - 接收方向对称：`ChannelRx::is_tx_closed()` 表示会话（生产端）已关闭接收环，
 //!   即对端不再发送（EOF）；`ChannelRx::is_rx_closed()` 表示应用端（消费端）
@@ -285,7 +285,7 @@ pub struct ChannelTx<H> {
 impl<H> ChannelTx<H> {
     /// 由 `buffex` 生产端半部与 dock 对构造。
     ///
-    /// 只供连接内部（读 / 写会话、建流路径）与单元测试使用：对外部使用者而言，
+    /// 只供连接内部（中心循环、建流路径）与单元测试使用：对外部使用者而言，
     /// 这两个半边只应由 `abs_smux` 的 trait 产出。
     pub(crate) fn new_(half: H, local_dock: Dock, remote_dock: Dock) -> Self {
         ChannelTx {
@@ -677,8 +677,8 @@ where
         self.half_.is_producer_closed()
     }
 
-    /// 接收方向是否已关闭：环的消费端（由读写会话持有）已关闭，即整条子流已被
-    /// 会话拆掉。
+    /// 接收方向是否已关闭：环的消费端（由中心循环持有）已关闭，即整条子流已被
+    /// 连接拆掉。
     fn is_rx_closed(&self) -> bool {
         self.half_.is_consumer_closed()
     }
@@ -745,8 +745,8 @@ where
         self.remote_dock_
     }
 
-    /// 发送方向是否已关闭：环的生产端（由读写会话持有）已关闭，即对端不再发送
-    /// （EOF）或整条子流已被会话拆掉。
+    /// 发送方向是否已关闭：环的生产端（由中心循环持有）已关闭，即对端不再发送
+    /// （EOF）或整条子流已被连接拆掉。
     fn is_tx_closed(&self) -> bool {
         self.half_.is_producer_closed()
     }

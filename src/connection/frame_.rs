@@ -58,20 +58,19 @@
 //! - 其余字段的顺序不承载语义，接收方必须能处理任意合法顺序（与握手 §3 一致）；
 //! - `LocalDock` / `RemoteDock` 这两个字段合起来**就是**子流身份，因此帧头没有
 //!   channel id 字段（理由见 [`crate::connection`] 模块文档 §4.1）；接收方靠
-//!   「本地 dock + 来源 dock」定位子流。除 `PING` / `PONG` 这两个连接级帧外，
-//!   所有帧都必须带这对字段（`WINDOW_UPDATE` 也要，否则写会话无法知道该更新属于
-//!   哪条子流）；`PING` / `PONG` 则**不得**带，解析结果里两个 dock 都是
-//!   [`Dock::unspecified`]（`0` 是保留的特殊值，不是合法子流 dock）；
+//!   「本地 dock + 来源 dock」定位子流。**本版本的每一种帧都是子流作用域**，
+//!   因此这对字段在所有帧上都必需——包括保活帧 `PING` / `PONG`
+//!   （保活是为了维持**某条**子流并通告它的接收窗口，见 [`FrameKind::Ping`]）；
 //! - `WindowUpdate` 只出现在 `WINDOW_UPDATE` 帧上，且是该帧的必需字段；
 //! - `ReasonCode` 只允许出现在 `REJECT` 帧上。当前实现只**校验**它（取值必须能
 //!   装进 `u8`），不把它存进 [`FrameHeader`]：`abs_smux` 的
 //!   `reject_async(reason)` 把拒绝理由当作**载荷**传递，因此这个数值字段目前没有
 //!   消费者，发送侧也不产出它；
-//! - 帧总长（头 + 载荷）不得超过协商出的 `max_packet_size`。校验由读会话完成
+//! - 帧总长（头 + 载荷）不得超过协商出的 `max_packet_size`。校验由中心循环的读路径完成
 //!   （帧长上限来自 [`BasicOpts`](crate::handshake::opts::BasicOpts)，而本模块的
 //!   编解码入口只管子结构），超限即 [`MuxError::FrameTooLarge`]。
 
-// 本模块的实现尚未被读写会话调用（会话落地见 `dev-notes/` 的置顶计划第 5 步），
+// 本模块的实现尚未被中心循环调用（循环落地见 `dev-notes/` §11.6 第 6 步），
 // 因此这里保留 `dead_code` 允许；**第 5 步完成后必须移除本行**。
 #![allow(dead_code)]
 
@@ -107,10 +106,10 @@ pub const K_VAL_TYPE_MASK: u8 = 0x70;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FieldId {
-    /// 本端子流端点 dock。除 `PING` / `PONG` 外的帧必需。
+    /// 本端子流端点 dock。所有帧必需（本版本的帧都是子流作用域）。
     LocalDock = 0x00,
 
-    /// 对端子流端点 dock。除 `PING` / `PONG` 外的帧必需。
+    /// 对端子流端点 dock。所有帧必需（本版本的帧都是子流作用域）。
     RemoteDock = 0x01,
 
     /// 载荷字节数。必需，且必须是最后一个头字段；`0` 表示无载荷。
@@ -184,21 +183,13 @@ pub enum FrameKind {
     /// 接收窗口更新。
     WindowUpdate = 0x07,
 
-    /// 保活探测（连接级，不带 dock 对）。
+    /// 保活探测（子流作用域）。该子流闲置接近 `max_channel_timeout` 时由本方发出；
+    /// 载荷为该发送方**当前接收窗口的绝对值**（窗口语义见 `crate::flow_ctrl`）。
     Ping = 0x08,
 
-    /// 保活应答（连接级，不带 dock 对）。
+    /// 保活应答（子流作用域）：接收方以自己的接收窗口绝对值回一条，双方据此刷新
+    /// 对端窗口与该子流的活跃时间。
     Pong = 0x09,
-}
-
-impl FrameKind {
-    /// 本种类是否携带 `LocalDock` / `RemoteDock` 字段。
-    ///
-    /// 只有 `PING` / `PONG` 是连接级帧，其余都是子流作用域（含
-    /// `WINDOW_UPDATE`，见模块文档）。
-    pub const fn carries_docks_(&self) -> bool {
-        !matches!(self, FrameKind::Ping | FrameKind::Pong)
-    }
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -274,16 +265,12 @@ impl FrameHeader {
         self.flags_
     }
 
-    /// 本端 dock。
-    ///
-    /// 连接级帧（[`FrameKind::Ping`] / [`FrameKind::Pong`]）不带 dock 字段，此时
-    /// 返回 [`Dock::unspecified`]。
+    /// 本端 dock（所有帧都带，见模块文档）。
     pub const fn local_dock(&self) -> Dock {
         self.local_dock_
     }
 
-    /// 对端 dock；连接级帧返回 [`Dock::unspecified`]，语义同
-    /// [`FrameHeader::local_dock`]。
+    /// 对端 dock，语义同 [`FrameHeader::local_dock`]。
     pub const fn remote_dock(&self) -> Dock {
         self.remote_dock_
     }
@@ -500,15 +487,10 @@ where
         }
     };
 
-    // 3. 字段与 `Kind` 的组合校验。
-    let (local_dock, remote_dock) = match (kind.carries_docks_(), local_dock, remote_dock) {
-        (true, Option::Some(local), Option::Some(remote)) => (local, remote),
-        (true, _, _) => return Result::Err(MuxError::MalformedFrame),
-        // 连接级帧：两个 dock 都不得出现，统一归一为 `unspecified`。
-        (false, Option::None, Option::None) => {
-            (Dock::unspecified(), Dock::unspecified())
-        }
-        (false, _, _) => return Result::Err(MuxError::MalformedFrame),
+    // 3. 字段与 `Kind` 的组合校验：本版本的帧都是子流作用域，dock 对一律必需。
+    let (local_dock, remote_dock) = match (local_dock, remote_dock) {
+        (Option::Some(local), Option::Some(remote)) => (local, remote),
+        _ => return Result::Err(MuxError::MalformedFrame),
     };
 
     match kind {
@@ -571,14 +553,13 @@ where
         .await
         .map_err(map_cursor_err_)?;
 
-    if header.kind_.carries_docks_() {
-        let local = usize::try_from(header.local_dock_.value())
-            .map_err(|_| MuxError::UnsupportedField)?;
-        write_field_async_(tx, FieldId::LocalDock, local, cancel.child_token()).await?;
-        let remote = usize::try_from(header.remote_dock_.value())
-            .map_err(|_| MuxError::UnsupportedField)?;
-        write_field_async_(tx, FieldId::RemoteDock, remote, cancel.child_token()).await?;
-    }
+    // 所有帧都是子流作用域：dock 对一律写出（`PING` / `PONG` 也不例外）。
+    let local = usize::try_from(header.local_dock_.value())
+        .map_err(|_| MuxError::UnsupportedField)?;
+    write_field_async_(tx, FieldId::LocalDock, local, cancel.child_token()).await?;
+    let remote = usize::try_from(header.remote_dock_.value())
+        .map_err(|_| MuxError::UnsupportedField)?;
+    write_field_async_(tx, FieldId::RemoteDock, remote, cancel.child_token()).await?;
 
     match (header.kind_, header.window_update_) {
         (FrameKind::WindowUpdate, Option::Some(update)) => {
@@ -808,31 +789,36 @@ mod tests_ {
         );
     }
 
-    /// 测试连接级帧（`PING` / `PONG`）不带 dock 对。
-    /// - 手段：写一个 `PING` 帧头并逐字节比对；再把「带 dock 对的 `PING`」交给
-    ///   读侧。
-    /// - 判断：写出恰为 `88 02 00`（帧首 = `NO_PAYLOAD << 4 | PING`，随后是载荷
-    ///   长度字段与值 0）；解析结果的
-    ///   两个 dock 都是 `unspecified`；带 dock 对的 `PING` 报
-    ///   [`MuxError::MalformedFrame`]。
+    /// 测试保活帧 `PING` / `PONG` 同样是子流作用域（必须带 dock 对）。
+    /// - 手段：写一个 dock 对为 `(1, 2)` 的 `PING` 帧头并逐字节比对；再把「缺 dock
+    ///   对的 `PING`」交给读侧。
+    /// - 判断：写出恰为 `88 00 01 01 02 02 00`（帧首 = `NO_PAYLOAD << 4 | PING`，
+    ///   随后 `LocalDock=1`、`RemoteDock=2`、`PayloadLen=0`）；解析结果的 dock 对与
+    ///   写入一致；缺 dock 对的 `PING` 报 [`MuxError::MalformedFrame`]。
     #[compio::test]
-    async fn ping_and_pong_carry_no_dock_pair() {
-        let header = header_(FrameKind::Ping, flags::K_NO_PAYLOAD);
+    async fn ping_and_pong_are_substream_scoped() {
+        let mut header = header_(FrameKind::Ping, flags::K_NO_PAYLOAD);
+        header.local_dock_ = Dock::new(1u32);
+        header.remote_dock_ = Dock::new(2u32);
+
         let mut buf = [0u8; 64];
         let total = write_header_into_buf_(&mut buf, &header).await;
-        assert_eq!(&buf[..total], &[0x88u8, 0x02, 0x00]);
+        assert_eq!(
+            &buf[..total],
+            &[0x88u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00]
+        );
 
         let parsed = read_header_from_buf_(&buf[..total])
             .await
             .expect("读回 PING 帧应当成功");
         assert_eq!(parsed.kind(), FrameKind::Ping);
-        assert_eq!(parsed.local_dock(), Dock::unspecified());
-        assert_eq!(parsed.remote_dock(), Dock::unspecified());
+        assert_eq!(parsed.local_dock(), Dock::new(1u32));
+        assert_eq!(parsed.remote_dock(), Dock::new(2u32));
 
-        // 读侧：PING 却带了 dock 对（LocalDock=1、RemoteDock=2）。
-        let with_docks = [0x08u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00];
+        // 读侧：保活帧缺 dock 对 → 结构非法。
+        let without_docks = [0x08u8, 0x02, 0x00];
         assert_eq!(
-            read_err_(&with_docks).await,
+            read_err_(&without_docks).await,
             Option::Some(ErrKind::MalformedFrame)
         );
     }

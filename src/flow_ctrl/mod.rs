@@ -225,7 +225,7 @@ impl SendWindow {
 ///
 /// 它同时承担两个职责：
 ///
-/// 1. 作为**入向配额**：读会话每收到 N 字节就 [`RecvWindow::on_data`]，
+/// 1. 作为**入向配额**：读路径每收到 N 字节就 [`RecvWindow::on_data`]，
 ///    越过配额即对端违例；
 /// 2. 作为**回补来源**：应用每消费 N 字节就 [`RecvWindow::on_consumed`]，
 ///    累计量越过阈值后由 [`RecvWindow::take_update`] 产出一次公告。
@@ -291,7 +291,7 @@ impl RecvWindow {
 
     /// 若已攒够阈值则产出待公告的窗口更新，否则返回 `None`。
     ///
-    /// 取走后累计量清零；调用方应当把产出的更新交给写会话编进
+    /// 取走后累计量清零；调用方应当把产出的更新交给写路径编进
     /// `WINDOW_UPDATE` 控制帧。
     pub fn take_update(&mut self) -> Option<WindowUpdate> {
         if !self.has_pending_update() {
