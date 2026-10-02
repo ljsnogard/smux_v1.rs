@@ -13,12 +13,11 @@
 //!   两个方向是否已发过 `FIN`、最近活跃时间；
 //! - 对端 `OPEN` 里带过来的窗口通告（被动方在 `accept` 时才建环，需要先把它存住）。
 //!
-//! 所有访问都经 [`SyncCell_`] 的短闭包：**闭包内不得 `await`**，也不得重入。
+//! 所有访问都经 `atomic_sync` **抢占式自旋读写锁**的短闭包：**闭包内不得
+//! `await`**，也不得重入。该锁没有内部堆分配，可内联进 [`Shared`]。
 
 // 本模块的入口尚未被读写循环与 API 面调用（接线进行中），因此保留 `dead_code`
 // 允许；**接线完成后必须移除本行**。
-#![allow(dead_code)]
-
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
@@ -26,6 +25,7 @@ use core::{
 };
 use std::time::Instant;
 
+use atomic_sync::rwlock::preemptive::SpinningRwLockOwned;
 use buffex::x_deps::abs_buff;
 use abs_buff::x_deps::abs_cancel::TrCancellationToken;
 use mm_ptr::Shared;
@@ -33,9 +33,10 @@ use mm_ptr::Shared;
 use crate::{
     connection::{
         error_::MuxError,
-        sync_::{ChannelRegistry_, SyncCell_, WakerSlot_},
+        mux_connection::ChannelRegistry_,
+        sync_::{WakerSlot_, on_lock_contended_},
     },
-    flow_ctrl::{FlowCtrl, WindowReport},
+    flow_ctrl::FlowCtrl,
 };
 
 /// 建流三步的进展。
@@ -101,17 +102,11 @@ pub(crate) struct ChannelState_ {
 
     /// 最近一次与本子流相关的收发活动时间（保活只记录，本轮不判定超时）。
     active_: Instant,
-
-    /// 被动方在建流阶段收到的对端窗口通告；`accept` 建 `FlowCtrl` 时应用。
-    peer_report_: Option<WindowReport>,
 }
 
 impl ChannelState_ {
     /// 以建流已知的量构造。
-    pub(crate) fn new_(
-        flow: FlowCtrl,
-        peer_report: Option<WindowReport>,
-    ) -> Self {
+    pub(crate) fn new_(flow: FlowCtrl) -> Self {
         ChannelState_ {
             flow_: flow,
             establish_: Establish_::default(),
@@ -124,7 +119,6 @@ impl ChannelState_ {
             peer_reset_: false,
             released_: false,
             active_: Instant::now(),
-            peer_report_: peer_report,
         }
     }
 
@@ -213,7 +207,7 @@ impl ChannelState_ {
     }
 }
 
-/// 一条子流的共享句柄：`Shared<SyncCell_<ChannelState_>>`。
+/// 一条子流的共享句柄：`Shared<SpinningRwLock<ChannelState_>>`。
 ///
 /// 参与方有三处：应用侧半边（发事件、读关闭态）、读循环与写循环（各自持有同一
 /// 句柄，经事件通道移交）、以及注册表节点。三者都只 clone 这个句柄。
@@ -221,7 +215,7 @@ pub(crate) struct ChannelOwner_<A>
 where
     A: AllocatorClone,
 {
-    inner_: Shared<SyncCell_<ChannelState_>, A>,
+    inner_: Shared<SpinningRwLockOwned<ChannelState_>, A>,
 }
 
 impl<A> Clone for ChannelOwner_<A>
@@ -242,18 +236,32 @@ where
     /// 以调用方注入的分配器建立一条子流的共享状态。
     pub(crate) fn new_(state: ChannelState_, alloc: A) -> Self {
         ChannelOwner_ {
-            inner_: Shared::new(SyncCell_::new_(state), alloc),
+            inner_: Shared::new(SpinningRwLockOwned::new_owned(state), alloc),
         }
     }
 
-    /// 持共享借用执行 `f`（闭包内不得 `await`）。
+    /// 持读锁执行 `f`（闭包内不得 `await`、不得重入）。
     pub(crate) fn with_<R>(&self, f: impl FnOnce(&ChannelState_) -> R) -> R {
-        self.inner_.with_(f)
+        let mut session = self.inner_.acquire_session();
+        let guard = loop {
+            match session.try_read() {
+                Result::Ok(guard) => break guard,
+                Result::Err(_) => on_lock_contended_(),
+            }
+        };
+        f(&guard)
     }
 
-    /// 持可变借用执行 `f`（闭包内不得 `await`）。
+    /// 持写锁执行 `f`（闭包内不得 `await`、不得重入）。
     pub(crate) fn with_mut_<R>(&self, f: impl FnOnce(&mut ChannelState_) -> R) -> R {
-        self.inner_.with_mut_(f)
+        let mut session = self.inner_.acquire_session();
+        let mut guard = loop {
+            match session.try_write() {
+                Result::Ok(guard) => break guard,
+                Result::Err(_) => on_lock_contended_(),
+            }
+        };
+        f(&mut guard)
     }
 }
 
@@ -305,7 +313,7 @@ mod tests_ {
     fn make_owner_() -> ChannelOwner_<CoreAlloc> {
         let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
         ChannelOwner_::new_(
-            ChannelState_::new_(flow, Option::None),
+            ChannelState_::new_(flow),
             CoreAlloc,
         )
     }

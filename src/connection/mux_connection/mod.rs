@@ -4,7 +4,11 @@
 //! `session_`，各会话对象（binding / listener / handle / 半部）在各自子模块。
 
 mod conn_;
+mod registry_;
 
 pub use conn_::{
     MuxConnection,
+};
+pub(crate) use registry_::{
+    ChannelRegistry_,
 };

@@ -30,11 +30,12 @@ use crate::{
         Dock, MuxError, TrMuxConfig,
         dock_binding::DockBinding,
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
-        sync_::ChannelRegistry_,
         types_::MuxMark_,
     },
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
 };
+
+use super::registry_::ChannelRegistry_;
 
 /// 复用连接：**独占**网络收发半边，并对外提供流复用的全部功能。
 ///

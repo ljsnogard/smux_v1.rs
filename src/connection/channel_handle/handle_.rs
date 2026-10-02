@@ -187,7 +187,7 @@ where
         conn.reg_().release_channel_(local, remote);
         return Result::Err(MuxError::FlowCtrl(err));
     }
-    let owner = ChannelOwner_::new_(ChannelState_::new_(flow, Option::None), alloc);
+    let owner = ChannelOwner_::new_(ChannelState_::new_(flow), alloc);
     conn.reg_().attach_owner_(local, remote, owner.clone());
     let _ = conn.w_events_().try_send_event_(WriteEvent_::Attach {
         local_dock: local,

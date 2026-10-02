@@ -234,7 +234,7 @@ where
     // 记下即将在 `OPEN` 里通告的那份窗口快照：`RecvWindow` 的越权判定以「最近一次
     // 通告」为准，不记录的话对端的第一帧就会被误判为 `PeerViolation`。
     flow.recv_window_mut().report();
-    let owner = ChannelOwner_::new_(ChannelState_::new_(flow, Option::None), alloc);
+    let owner = ChannelOwner_::new_(ChannelState_::new_(flow), alloc);
     conn.reg_().attach_owner_(local, remote_dock, owner.clone());
     let _ = conn.w_events_().try_send_event_(WriteEvent_::Attach {
         local_dock: local,

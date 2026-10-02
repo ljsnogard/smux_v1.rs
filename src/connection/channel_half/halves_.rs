@@ -505,7 +505,7 @@ mod tests_ {
     fn make_halves_() -> (TestTx, TestRx) {
         let (half_tx, half_rx) = make_test_channel_(64usize);
         let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
-        let owner = ChannelOwner_::new_(ChannelState_::new_(flow, Option::None), CoreAlloc);
+        let owner = ChannelOwner_::new_(ChannelState_::new_(flow), CoreAlloc);
         let (events, _events_rx) = event_channel_::<WriteEvent_<TestBuff, CoreAlloc>>();
         let local = Dock::new(3u32);
         let remote = Dock::new(7u32);

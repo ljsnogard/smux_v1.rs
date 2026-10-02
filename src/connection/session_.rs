@@ -71,13 +71,13 @@ use crate::{
     connection::{
         Dock, FrameHeader, FrameKind, MuxError, flags,
         frame_::read_header_async_,
+        mux_connection::ChannelRegistry_,
         owner_::ChannelOwner_,
         ring_::{BufferedRx, BufferedTx},
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteEvent_,
         },
-        sync_::ChannelRegistry_,
     },
     flow_ctrl::{Credit, RecvTotal, ReportThresholds_, WindowReport},
     wire_io_::{CursorError, ReadCursor, write_all_async_},

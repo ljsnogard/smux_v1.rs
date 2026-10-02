@@ -71,7 +71,6 @@
 
 // 本模块的实现尚未被中心循环调用（循环落地见 `dev-notes/` §11.6 第 6 步），
 // 因此这里保留 `dead_code` 允许；**第 5 步完成后必须移除本行**。
-#![allow(dead_code)]
 
 use abs_buff::{TrBuffRead, TrBuffWrite, x_deps::abs_cancel};
 use abs_cancel::TrCancellationToken;
@@ -98,6 +97,10 @@ pub const K_FLAGS_SHIFT: u32 = 4;
 pub const K_FIELD_ID_MASK: u8 = 0x0F;
 
 /// `val_type` 的掩码（高 3 位，bit 7 保留）。
+///
+/// 协议常量：当前解码按 `FieldId` 直接匹配宽度，不需要掩码；保留它是为了让
+/// 「bit 7 保留」这条线格式约定在代码里有单一出处（模块文档 §引用它）。
+#[allow(dead_code)]
 pub const K_VAL_TYPE_MASK: u8 = 0x70;
 
 /// 头字段标识，占自描述字段字节的低 4 位。

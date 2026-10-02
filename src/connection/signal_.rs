@@ -30,7 +30,9 @@
 //! 写端进读循环。若只用一条通道，两个循环会互相取走对方的 `Attach` 事件。因此按
 //! 消费者拆成两条。
 
-#![allow(dead_code)] // 接线（第 5、6 步）完成后必须移除本行。
+// 多线程配置下 `MuxConnection::new` 仍是 `todo!()`（见 dev-notes），事件通道
+// 整块暂时不可达，因此**仅在该配置下**允许 dead_code；缺省配置不放开。
+#![cfg_attr(feature = "multi-thread", allow(dead_code))]
 
 use core::{
     alloc::AllocatorClone,
