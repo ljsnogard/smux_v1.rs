@@ -19,15 +19,6 @@ mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2
 crc = { version = "3.4.*" }
 flume = { version = "0.12.*" }
 
-[features]
-# 线程模型开关，二选一；详见 `src/connection/mod.rs` 的「线程模型」一节。
-#
-# - 不开启（缺省）：连接为 `!Send`，面向单线程运行时（如 compio 的
-#   `spawn_local`），共享状态用非原子容器；
-# - 开启 `multi-thread`：连接为 `Send + Sync`，面向多线程运行时，共享状态用
-#   原子原语，读写 session 可跨线程 spawn。
-multi-thread = []
-
 [dev-dependencies]
 # 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在
 # dev-dependencies 中出现（`buffex` 已是正式依赖，不在此重复）。
@@ -41,10 +32,10 @@ compio = { version = "0.19.*", features = ["fs", "macros", "time", "net", "runti
 buffex_tokio_adapt = { path = "../buffex_tokio_adapt" }
 buffex_compio_adapt = { path = "../buffex_compio_adapt" }
 
-# 连接层内部经 `abs_art` spawn 读 / 写循环，因此冒烟测试必须给出具体的运行时
-# 标记类型（`MuxConnection<.., Rt>`）：tokio 版用 `abs_art_tokio::Runtime`，
-# compio 版用 `abs_art_compio::Runtime`。两者从与 `abs_art` 同一个 git 源取，
-# 保证 `TrSpawnLocal` / `TrSpawnSend` 是同一套 trait。
+# 连接层经 `abs_art` 的**值化本地作用域**（`TrLocalScope`）投递读 / 写循环，
+# 因此冒烟测试要给出具体的后端作用域值：tokio 版用 `abs_art_tokio::LocalScope`，
+# compio 版用 `abs_art_compio::LocalScope`。两者从与 `abs_art` 同一个 git 源取，
+# 保证两边用的是同一个 `TrLocalScope` trait。
 abs_art-tokio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
 abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
 

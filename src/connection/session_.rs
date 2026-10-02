@@ -1,7 +1,7 @@
 //! 连接内部的**读循环**与**写循环**。
 //!
-//! 本模块是 `abs_art` spawn 出来的两个 `'static` 任务的全部实现。结构见
-//! [`crate::connection`] 模块文档 §2，落地裁决见
+//! 本模块是经 `abs_art` 的本地作用域 spawn 出来的两个 `'static` 任务的全部实现。
+//! 结构见 [`crate::connection`] 模块文档 §2，落地裁决见
 //! `dev-notes/connection-20261002-0548.md` §5（Q3 双循环 / Q4 唤醒 / Q5 流控 /
 //! Q7 半部移交）。
 //!
@@ -12,6 +12,19 @@
 //! 网络 Rx --解复用--> 读循环 --写端(移交)--> 接收环 --读--> 应用
 //! ```
 //!
+//! # 循环不持有连接核心
+//!
+//! 两个循环只拿 [`LoopShared_`]——注册表句柄 + 三个标量——**不持有
+//! [`MuxCore`](super::mux_connection::core_) 的强引用**（因此也不持有
+//! [`MuxConnection`](super::MuxConnection)）。
+//!
+//! 这不是随手的选择：若循环持有核心，核心将永远无法析构，其 `Drop` 里的取消令牌
+//! 永远不会触发，两个任务与整个连接状态会永久泄漏。现在的形状是——最后一个
+//! **应用面**对象（连接、四个句柄、两个半部之一）被丢弃 ⇒ 核心析构 ⇒ 取消两个
+//! 令牌 ⇒ 循环在下一个 await 点退出。因此两个循环的 **park 点必须都能被取消令牌
+//! 唤醒**：读循环经 `may_cancel_with`，写循环的每处 park 都与
+//! `cancellation()` 竞争（见下）。
+//!
 //! # 半部为什么是「移交」而不是共享
 //!
 //! `buffex` 的段借用绑定在环半部上，半部若藏在共享单元的锁后面，段就不能跨
@@ -19,22 +32,19 @@
 //! 的两个半部交给对应循环，循环把它们放进**本地表**（`BTreeMap`，节点用调用方
 //! 注入的分配器分配），此后可以自由在这些半部上 park / await。
 //!
-//! > **目标形状（本轮确定，迁移中）**：移交的**载体**由事件通道改为「句柄直接持有
-//! > 连接智能指针 + 同步需求调用」——水位变化不再投消息，而是调 `MuxCore` 上的
-//! > `note_tx_ready_` / `note_rx_consumed_`（见 `dev-notes` §17.3、§17.5）。循环
-//! > 的 park 也随之改为「登记等待者 + 复检需求」。
-//!
 //! # 两个循环各自的 park 点
 //!
 //! - 读循环：`read_header_async_`（网络读）与「接收环满时的 `write_async`」；
+//!   两者都经 `may_cancel_with` 挂在取消令牌上，因此连接被丢弃时能立刻退出。
 //!   事件队列只在其醒来后**非阻塞排空**——`Attach` 必然先于对端的数据帧到达
 //!   （建流方先发 `Attach` 事件、后发 `OPEN`），所以「先排空事件、再派发帧」即可
 //!   保证不丢；
 //! - 写循环：无数据可发时优先 park 在**最近一次收到 `TxReady` 的那条发送环**上
 //!   （Q4 裁决的兜底，覆盖「应用还没提交就发了事件」的竞态），否则 park 在事件
-//!   通道上。**这个 park 必须同时与事件通道竞争**：只 park 在环上会让别的子流
-//!   刚入队的事件（例如某条子流的 `TxClosed`）一直排在后面，多子流下就是死锁。
-//!   实现见 `write_loop_async_` 第 2 步里的 `poll_fn`。
+//!   通道上。**这两个 park 都必须同时与事件通道 / 取消令牌竞争**：只 park 在环上
+//!   会让别的子流刚入队的事件（例如某条子流的 `TxClosed`）一直排在后面，多子流下
+//!   就是死锁；不与取消令牌竞争则连接被丢弃后循环无法退出。实现见
+//!   `write_loop_async_` 第 2、3 步里的 `poll_fn`。
 //!
 //! 另有一条容易踩的约束：循环里**借出环数据一律用非阻塞的 `try_read`**
 //! （`drain_one_`）。`read_async` 在空环上会 park，一旦在「排空数据」这一步 park，
@@ -44,16 +54,11 @@
 //!
 //! 「通知在进入写路径时发出、真正提交在段 drop 时」这个时间差由上面的兜底覆盖：
 //! 写循环 park 到刚通知的那条环，用环自身的提交唤醒补上。残留漏洞（两条环都通知
-//! 且都不提交时，先通知的那条可能永远不被轮询）见 dev-notes §6.5.1，属**已知限制**。
+//! 且都不提交时，先通知的那条可能永远不被轮询）见 dev-notes §5.1，属**已知限制**。
 //!
 //! # 拆流
 //!
 //! 每个方向独立收尾，两个方向都收尾后释放注册表条目（`ChannelState_::is_done_`）。
-
-// 多线程配置下 `MuxConnection::new` 仍是 `todo!()`（见 dev-notes），读写循环整块
-// 暂时不可达，因此**仅在该配置下**允许 dead_code；缺省（单线程）配置不放开，
-// 保持零告警。多线程驱动落地后请连同本行一起移除。
-#![cfg_attr(feature = "multi-thread", allow(dead_code))]
 
 use core::{
     alloc::AllocatorClone,
@@ -72,6 +77,7 @@ use abs_buff::{
 };
 use abs_cancel::{TrCancellationToken, TrMayCancel};
 use buffex::x_deps::abs_buff;
+use mm_ptr::Owned;
 
 use crate::{
     connection::{
@@ -95,9 +101,11 @@ use crate::{
 /// 段而让其他子流等太久（公平性，见 `connection-20260919-1631.md` §5.2）。
 const K_MAX_DATA_CHUNK: usize = 16usize * 1024usize;
 
-/// 两个循环共享的、与调用方配置无关的量。
+/// 两个循环共享的、与调用方配置无关的量，也是**循环持有的全部连接状态**。
 ///
-/// 连接建立时把策略展开成 [`ReportThresholds_`]，此后循环不再需要 `C` / `P`。
+/// 它由建连路径从核心展开而来：注册表句柄 + 三个标量。注意它**不含核心引用**
+/// （模块文档「循环不持有连接核心」），因此核心可以在最后一个应用面对象被丢弃时
+/// 正常析构并触发收尾。
 #[derive(Clone)]
 pub(crate) struct LoopShared_<A>
 where
@@ -184,6 +192,50 @@ where
     let waker = owner.with_mut_(|state| state.take_establish_waker_());
     if let Option::Some(waker) = waker {
         waker.wake();
+    }
+}
+
+/// 在「取消令牌触发」与「给定 future 完成」之间竞争：取消先到返回 `None`。
+///
+/// # 为什么循环需要它
+///
+/// `may_cancel_with` 只是把令牌交给内层 future（内层在被 poll 时才检查
+/// `is_cancelled`），**是否在取消时唤醒 park 中的 future 取决于那一层的实现**：
+/// 例如 `buffex` 的环半部会把 `cancellation()` 存进自己的 park 状态、并在取消时
+/// 唤醒，而一个只做转发的传输适配层不会。循环的收尾不能建立在这条隐含契约上——
+/// 一旦某一层的 park 不被唤醒，循环就再也看不到取消令牌，任务与传输永久泄漏。
+///
+/// 因此循环把**每一次可能长期 park 的 await**（网络读、网络写、环写满）都放到
+/// 这里，与 `cancellation()`（它保证登记 waker）竞争：「丢弃连接即关闭连接」由此
+/// 与传输的实现细节无关。
+async fn race_cancel_<F, K>(cancel: &K, fut: F) -> Option<F::Output>
+where
+    F: core::future::Future,
+    K: TrCancellationToken,
+{
+    let mut fut = core::pin::pin!(fut);
+    let mut cancelled = core::pin::pin!(cancel.child_token().cancellation());
+    poll_fn(|cx| {
+        if core::future::Future::poll(cancelled.as_mut(), cx).is_ready() {
+            return Poll::Ready(Option::None);
+        }
+        core::future::Future::poll(fut.as_mut(), cx).map(Option::Some)
+    })
+    .await
+}
+
+/// 循环侧的连接级失败处理：**取消导致的收尾不算失败**。
+///
+/// 连接被丢弃时 [`MuxCore::drop`](super::mux_connection::core_::MuxCore) 触发取消
+/// 令牌，循环在 await 点上以「取消错误」的形式收到通知并退出——那是正常关闭，
+/// 不应在注册表上留下失败标志（否则收尾路径会伪造出一个假的连接级失败）。
+fn fail_loop_<A, RE, WE, K>(shared: &LoopShared_<A>, cancel: &K, err: &MuxError<RE, WE>)
+where
+    A: AllocatorClone + Send + Sync,
+    K: TrCancellationToken,
+{
+    if !cancel.is_cancelled() {
+        shared.reg_.mark_failed_(err);
     }
 }
 
@@ -304,14 +356,15 @@ fn send_open_<B, A>(
 
 /// 读循环：解复用网络帧、投递载荷、推进建流状态机。
 ///
-/// `scratch` 是连接建立时分配一次的载荷暂存（长度 = `max_packet_size`）。
+/// `scratch` 是连接建立时分配一次的载荷暂存（长度 = `max_packet_size`，由调用方
+/// 注入的分配器分配）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_loop_async_<R, B, A, K>(
     mut rx: R,
     shared: LoopShared_<A>,
     mut events: EventReceiver_<ReadEvent_<B, A>>,
     events_tx: EventSender_<WriteEvent_<B, A>>,
-    mut scratch: Vec<u8>,
+    mut scratch: Owned<[u8], A>,
     cancel: K,
 ) where
     R: TrBuffRead<u8>,
@@ -328,11 +381,17 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
         // 1. 先把挂起的 Attach / Release 排空。
         drain_read_events_(&mut events, &mut table);
 
-        // 2. 读一个帧头（park 在网络读上）。
-        let header = match read_header_async_(&mut rx, cancel.child_token()).await {
-            Result::Ok(header) => header,
-            Result::Err(err) => {
-                shared.reg_.mark_failed_(&err);
+        // 2. 读一个帧头（park 在网络读上，并与取消令牌竞争）。
+        let header = match race_cancel_(
+            &cancel,
+            read_header_async_(&mut rx, cancel.child_token()),
+        )
+        .await
+        {
+            Option::None => return,
+            Option::Some(Result::Ok(header)) => header,
+            Option::Some(Result::Err(err)) => {
+                fail_loop_(&shared, &cancel, &err);
                 return;
             }
         };
@@ -344,19 +403,23 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
         // 4. 载荷长度校验。
         let len = header.payload_len();
         if len > shared.max_packet_size_ || len > scratch.len() {
-            shared
-                .reg_
-                .mark_failed_(&MuxError::<R::Err, ()>::FrameTooLarge);
+            fail_loop_(&shared, &cancel, &MuxError::<R::Err, ()>::FrameTooLarge);
             return;
         }
         if len > 0 {
             let mut cursor = ReadCursor::new_(&mut rx);
-            if let Result::Err(err) = cursor
-                .read_async_(&mut scratch[..len], cancel.child_token())
-                .await
+            match race_cancel_(
+                &cancel,
+                cursor.read_async_(&mut scratch[..len], cancel.child_token()),
+            )
+            .await
             {
-                shared.reg_.mark_failed_(&map_cursor_err_(err));
-                return;
+                Option::None => return,
+                Option::Some(Result::Ok(())) => {}
+                Option::Some(Result::Err(err)) => {
+                    fail_loop_(&shared, &cancel, &map_cursor_err_(err));
+                    return;
+                }
             }
         }
         let payload = &scratch[..len];
@@ -380,9 +443,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     if shared.reg_.is_wait_close_(local, remote) {
                         continue;
                     }
-                    shared
-                        .reg_
-                        .mark_failed_(&MuxError::<R::Err, ()>::MalformedFrame);
+                    fail_loop_(&shared, &cancel, &MuxError::<R::Err, ()>::MalformedFrame);
                     return;
                 };
                 entry.owner_.with_mut_(|state| {
@@ -392,26 +453,30 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     .owner_
                     .with_mut_(|state| state.flow_mut_().recv_window_mut().on_data(amount));
                 if let Result::Err(err) = counted {
-                    shared
-                        .reg_
-                        .mark_failed_(&MuxError::<R::Err, ()>::FlowCtrl(err));
+                    fail_loop_(&shared, &cancel, &MuxError::<R::Err, ()>::FlowCtrl(err));
                     return;
                 }
-                if let Result::Err(err) =
-                    write_into_ring_(&mut entry.writer_, payload, cancel.child_token()).await
+                match race_cancel_(
+                    &cancel,
+                    write_into_ring_(&mut entry.writer_, payload, cancel.child_token()),
+                )
+                .await
                 {
-                    shared
-                        .reg_
-                        .mark_failed_(&MuxError::<R::Err, ()>::Transport { write: true });
-                    let _ = err;
-                    return;
+                    Option::None => return,
+                    Option::Some(Result::Ok(())) => {}
+                    Option::Some(Result::Err(_err)) => {
+                        fail_loop_(
+                            &shared,
+                            &cancel,
+                            &MuxError::<R::Err, ()>::Transport { write: true },
+                        );
+                        return;
+                    }
                 }
             }
             FrameKind::Open => {
                 let Some(report) = window_report_of_(&header) else {
-                    shared
-                        .reg_
-                        .mark_failed_(&MuxError::<R::Err, ()>::MalformedFrame);
+                    fail_loop_(&shared, &cancel, &MuxError::<R::Err, ()>::MalformedFrame);
                     return;
                 };
                 if let Option::Some(entry) = table.get_mut(&pair) {
@@ -579,8 +644,14 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
     let mut table: WriteTable_<B, A> = BTreeMap::new_in(shared.reg_.allocator_());
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
     // 循环独占的载荷暂存：把环段的字节搬进来（**搬出即消费**，见 `drain_one_`），
-    // 再写上网。整条连接只分配一次。
-    let mut scratch: Vec<u8> = vec![0u8; K_MAX_DATA_CHUNK];
+    // 再写上网。整条连接只分配一次，且走调用方注入的分配器（`mm_ptr::Owned`）。
+    let mut scratch: Owned<[u8], A> = Owned::new_slice(
+        K_MAX_DATA_CHUNK,
+        |_idx, slot| {
+            slot.write(0u8);
+        },
+        shared.reg_.allocator_(),
+    );
 
     loop {
         if cancel.is_cancelled() {
@@ -594,31 +665,44 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
         // 的 `OPEN`）就会排在一条正在 park 的循环后面，形成死锁。单线程运行时下
         // 「检查队列」与「登记 park」之间没有 `await`，因此不存在竞态。
         if let Option::Some(event) = events.try_take_event_() {
-            if let Result::Err(err) = handle_write_event_(
-                event,
-                &mut tx,
-                &mut table,
-                &mut scratch,
-                &shared,
-                &read_events,
+            match race_cancel_(
                 &cancel,
-                &mut last_ready,
+                handle_write_event_(
+                    event,
+                    &mut tx,
+                    &mut table,
+                    &mut scratch,
+                    &shared,
+                    &read_events,
+                    &cancel,
+                    &mut last_ready,
+                ),
             )
             .await
             {
-                shared.reg_.mark_failed_(&err);
-                return;
+                Option::None => return,
+                Option::Some(Result::Ok(())) => {}
+                Option::Some(Result::Err(err)) => {
+                    fail_loop_(&shared, &cancel, &err);
+                    return;
+                }
             }
             continue;
         }
 
         // 1. 尽量把各子流的数据发出去（一次一段），直到没有可发的。
         loop {
-            match drain_once_(&mut tx, &mut table, &mut scratch, &cancel).await {
-                Result::Ok(true) => continue,
-                Result::Ok(false) => break,
-                Result::Err(err) => {
-                    shared.reg_.mark_failed_(&err);
+            match race_cancel_(
+                &cancel,
+                drain_once_(&mut tx, &mut table, &mut scratch, &cancel),
+            )
+            .await
+            {
+                Option::None => return,
+                Option::Some(Result::Ok(true)) => continue,
+                Option::Some(Result::Ok(false)) => break,
+                Option::Some(Result::Err(err)) => {
+                    fail_loop_(&shared, &cancel, &err);
                     return;
                 }
             }
@@ -627,9 +711,10 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
         // 2. 没有可发数据：若「最近通知过的那条发送环」就是目标，就 park 在它上面
         //    （Q4 裁决的兜底：应用可能在提交之前就发出了事件）。
         //
-        //    **必须同时轮询事件通道**：只 park 在环上会让「别的子流刚入队的事件」
-        //    一直排在一个睡着的循环后面（多子流下就是死锁——某条环的发送方在等对端
-        //    的 FIN，而它的 FIN 事件排在队列里没人处理）。
+        //    **必须同时轮询事件通道与取消令牌**：只 park 在环上会让「别的子流刚入队
+        //    的事件」一直排在一个睡着的循环后面（多子流下就是死锁——某条环的发送方
+        //    在等对端的 FIN，而它的 FIN 事件排在队列里没人处理）；不轮询取消令牌则
+        //    连接被丢弃后循环无法退出（见模块文档「循环不持有连接核心」）。
         if let Option::Some(pair) = last_ready {
             // 这个块把 `entry`（借自 `table`）与事件通道的竞争限制在内部，
             // 出块后 `table` 的可变借用结束，才能交给 `handle_write_event_`。
@@ -645,9 +730,15 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
                     .reader_
                     .read_async(&demand)
                     .may_cancel_with(cancel.child_token());
+                let cancel_fut = cancel.child_token().cancellation();
                 let mut ring_fut = core::pin::pin!(ring_fut);
                 let mut event_fut = core::pin::pin!(events.take_event_async_());
+                let mut cancel_fut = core::pin::pin!(cancel_fut);
                 poll_fn(|cx| {
+                    // 取消令牌优先：连接已收尾，直接退出。
+                    if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
+                        return Poll::Ready(false);
+                    }
                     match core::future::Future::poll(event_fut.as_mut(), cx) {
                         Poll::Ready(Option::Some(event)) => {
                             taken = Option::Some(event);
@@ -671,20 +762,27 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
                 return;
             }
             if let Option::Some(event) = taken {
-                if let Result::Err(err) = handle_write_event_(
-                    event,
-                    &mut tx,
-                    &mut table,
-                    &mut scratch,
-                    &shared,
-                    &read_events,
+                match race_cancel_(
                     &cancel,
-                    &mut last_ready,
+                    handle_write_event_(
+                        event,
+                        &mut tx,
+                        &mut table,
+                        &mut scratch,
+                        &shared,
+                        &read_events,
+                        &cancel,
+                        &mut last_ready,
+                    ),
                 )
                 .await
                 {
-                    shared.reg_.mark_failed_(&err);
-                    return;
+                    Option::None => return,
+                    Option::Some(Result::Ok(())) => {}
+                    Option::Some(Result::Err(err)) => {
+                        fail_loop_(&shared, &cancel, &err);
+                        return;
+                    }
                 }
                 continue;
             }
@@ -696,24 +794,44 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
             continue;
         }
 
-        // 3. 否则 park 在事件通道上。
-        let Option::Some(event) = events.take_event_async_().await else {
+        // 3. 否则 park 在事件通道上（同样与取消令牌竞争：核心析构时事件发送端也会
+        //    随之消失，但不能把退出时机寄托在「发送端都死了」这个间接条件上）。
+        let event = {
+            let cancel_fut = cancel.child_token().cancellation();
+            let mut event_fut = core::pin::pin!(events.take_event_async_());
+            let mut cancel_fut = core::pin::pin!(cancel_fut);
+            poll_fn(|cx| {
+                if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
+                    return Poll::Ready(Option::None);
+                }
+                core::future::Future::poll(event_fut.as_mut(), cx)
+            })
+            .await
+        };
+        let Option::Some(event) = event else {
             return;
         };
-        if let Result::Err(err) = handle_write_event_(
-            event,
-            &mut tx,
-            &mut table,
-            &mut scratch,
-            &shared,
-            &read_events,
+        match race_cancel_(
             &cancel,
-            &mut last_ready,
+            handle_write_event_(
+                event,
+                &mut tx,
+                &mut table,
+                &mut scratch,
+                &shared,
+                &read_events,
+                &cancel,
+                &mut last_ready,
+            ),
         )
         .await
         {
-            shared.reg_.mark_failed_(&err);
-            return;
+            Option::None => return,
+            Option::Some(Result::Ok(())) => {}
+            Option::Some(Result::Err(err)) => {
+                fail_loop_(&shared, &cancel, &err);
+                return;
+            }
         }
     }
 }
@@ -724,7 +842,7 @@ async fn handle_write_event_<W, B, A, K>(
     event: WriteEvent_<B, A>,
     tx: &mut W,
     table: &mut WriteTable_<B, A>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut Owned<[u8], A>,
     shared: &LoopShared_<A>,
     read_events: &EventSender_<ReadEvent_<B, A>>,
     cancel: &K,
@@ -923,7 +1041,7 @@ where
 async fn flush_entry_<W, B, A, K>(
     tx: &mut W,
     table: &mut WriteTable_<B, A>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut Owned<[u8], A>,
     pair: (Dock, Dock),
     cancel: &K,
 ) -> Result<(), MuxError<(), W::Err>>
@@ -945,7 +1063,7 @@ where
 async fn drain_once_<W, B, A, K>(
     tx: &mut W,
     table: &mut WriteTable_<B, A>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut Owned<[u8], A>,
     cancel: &K,
 ) -> Result<bool, MuxError<(), W::Err>>
 where
@@ -981,7 +1099,7 @@ where
 async fn drain_one_<W, B, A, K>(
     tx: &mut W,
     table: &mut WriteTable_<B, A>,
-    scratch: &mut Vec<u8>,
+    scratch: &mut Owned<[u8], A>,
     pair: (Dock, Dock),
     cancel: &K,
 ) -> Result<bool, MuxError<(), W::Err>>
@@ -1021,6 +1139,11 @@ where
     if take == 0 {
         return Result::Ok(false);
     }
+    if take > scratch.len() {
+        // `no_more_than(want)` 保证段长不超过暂存（`want <= K_MAX_DATA_CHUNK`）；
+        // 走到这里说明上游的 demand 语义变了。
+        return Result::Err(MuxError::MalformedFrame);
+    }
 
     // 预扣窗口（`take <= available`，因此必定足额）。
     let granted = owner.with_mut_(|state| state.flow_mut_().send_window_mut().reserve(take as Credit));
@@ -1042,19 +1165,19 @@ where
     // 把段的字节**搬出**到循环暂存里：`move_items_to_buff` 会推进段的已消费量，
     // 段的 drop 才会把消费提交回环。**不能用 `iter_slices()` 只读不消费**——那样
     // 环的读指针不前进，同一段数据会被反复取出、反复上线。
-    scratch.resize(take, 0u8);
     let moved = {
         let mut child = segm.as_segm_ref();
+        let dst = &mut scratch[..take];
         // SAFETY: `MaybeUninit<u8>` 与 `u8` 布局相同（同尺寸、同对齐、无 niche）；
-        // `scratch[..take]` 是本循环独占的可写区间，`move_items_to_buff` 只写入其中
-        // 已初始化的前缀并返回写入长度，因此既不会读到未初始化内存，也不会越界。
-        let dst = unsafe {
+        // `dst` 是本循环独占的可写区间，`move_items_to_buff` 只写入其中已初始化的
+        // 前缀并返回写入长度，因此既不会读到未初始化内存，也不会越界。
+        let uninit = unsafe {
             core::slice::from_raw_parts_mut(
-                scratch.as_mut_ptr() as *mut MaybeUninit<u8>,
-                take,
+                dst.as_mut_ptr() as *mut MaybeUninit<u8>,
+                dst.len(),
             )
         };
-        unsafe { child.move_items_to_buff(dst) }
+        unsafe { child.move_items_to_buff(uninit) }
     };
     if moved != take {
         // 段长度与搬出量应当一致；不一致说明上游语义变了。

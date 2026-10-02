@@ -79,10 +79,6 @@
 //! 不需要第 4 张业务表：[`channel_range_`] 给出的开区间恰好覆盖某个
 //! `local_dock` 下的全部具体子流。
 
-// 多线程配置下 `MuxConnection::new` 仍是 `todo!()`（见 dev-notes），注册表整块
-// 暂时不可达，因此**仅在该配置下**允许 dead_code；缺省（单线程）配置不放开。
-#![cfg_attr(feature = "multi-thread", allow(dead_code))]
-
 use core::{
     alloc::AllocatorClone,
     ops::Bound,
@@ -925,11 +921,9 @@ where
     /// 持读锁执行 `f`（临界区不得 `await`、不得重入）。
     fn with_<R>(&self, f: impl FnOnce(&RegistryInner_<A>) -> R) -> R {
         let mut session = self.inner_.acquire_session();
-        let guard = loop {
-            match session.try_read() {
-                Result::Ok(guard) => break guard,
-                Result::Err(_) => on_lock_contended_(),
-            }
+        let guard = match session.try_read() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => on_lock_contended_(),
         };
         f(&guard)
     }
@@ -937,11 +931,9 @@ where
     /// 持写锁执行 `f`（临界区不得 `await`、不得重入）。
     fn with_mut_<R>(&self, f: impl FnOnce(&mut RegistryInner_<A>) -> R) -> R {
         let mut session = self.inner_.acquire_session();
-        let mut guard = loop {
-            match session.try_write() {
-                Result::Ok(guard) => break guard,
-                Result::Err(_) => on_lock_contended_(),
-            }
+        let mut guard = match session.try_write() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => on_lock_contended_(),
         };
         f(&mut guard)
     }

@@ -3,9 +3,8 @@
 //! 环半部**不在这里**：会话侧的两个半部在注册时**移交给对应的循环本地持有**，
 //! 因此它们不会藏在共享实体的锁后面，循环可以自由在这些半部上 park / await。
 //!
-//! > **目标形状（本轮确定，迁移中）**：移交的**载体**由事件通道改为「句柄直接持有
-//! > 连接智能指针 + 同步需求调用」，本模块自身的职责不变（见 `dev-notes` §17.5）。
-//!
+//! 移交的载体仍是事件通道（`WriteEvent_::Attach` / `ReadEvent_::Attach`）；把
+//! 水位通知改成「句柄直接调核心」只是**待实测的候选**，见模块文档 §2.3。
 //! 于是本模块只承载那些**两个循环与 API 面都要看**的标量状态：
 //!
 //! - [`FlowCtrl`]：收发双向窗口（读循环记「已收」，写循环记「已通告 / 已消费」，
@@ -245,11 +244,9 @@ where
     /// 持读锁执行 `f`（闭包内不得 `await`、不得重入）。
     pub(crate) fn with_<R>(&self, f: impl FnOnce(&ChannelState_) -> R) -> R {
         let mut session = self.inner_.acquire_session();
-        let guard = loop {
-            match session.try_read() {
-                Result::Ok(guard) => break guard,
-                Result::Err(_) => on_lock_contended_(),
-            }
+        let guard = match session.try_read() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => on_lock_contended_(),
         };
         f(&guard)
     }
@@ -257,11 +254,9 @@ where
     /// 持写锁执行 `f`（闭包内不得 `await`、不得重入）。
     pub(crate) fn with_mut_<R>(&self, f: impl FnOnce(&mut ChannelState_) -> R) -> R {
         let mut session = self.inner_.acquire_session();
-        let mut guard = loop {
-            match session.try_write() {
-                Result::Ok(guard) => break guard,
-                Result::Err(_) => on_lock_contended_(),
-            }
+        let mut guard = match session.try_write() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => on_lock_contended_(),
         };
         f(&mut guard)
     }

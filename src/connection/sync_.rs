@@ -22,8 +22,8 @@
 //!   「不隐式分配」的纪律；每条子流的 `ChannelOwner_` 也在 `owner_` 里用它。
 //!
 //! 两者都只取同步快路径（`try_read` / `try_write`），因此**闭包内不得 `await`、
-//! 不得重入**：取不到锁时，单线程配置下按「重入 bug」直接 panic，多线程配置下
-//! 才自旋等待（见 [`on_lock_contended_`]）。
+//! 不得重入**：连接与全部句柄都是单线程对象，取不到锁只可能是重入，因此直接
+//! panic（见 [`on_lock_contended_`]）。
 //!
 //! # 唤醒
 //!
@@ -63,11 +63,8 @@ use crate::{
 /// 单线程配置下「取不到锁」必然是**临界区重入**这一代码 bug（没有别的执行者），
 /// 因此直接 panic——与旧 `RefCell` 单元一致，便于尽早暴露；多线程配置下则可能
 /// 只是另一线程短暂持锁，自旋等待即可。
-pub(crate) fn on_lock_contended_() {
-    #[cfg(not(feature = "multi-thread"))]
+pub(crate) fn on_lock_contended_() -> ! {
     panic!("共享状态的临界区不可重入");
-    #[cfg(feature = "multi-thread")]
-    core::hint::spin_loop();
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -150,11 +147,9 @@ where
     /// 持读锁执行 `f`（临界区不得 `await`、不得重入）。
     fn with_<R>(&self, f: impl FnOnce(&CancelInner_) -> R) -> R {
         let mut session = self.inner_.acquire_session();
-        let guard = loop {
-            match session.try_read() {
-                Result::Ok(guard) => break guard,
-                Result::Err(_) => on_lock_contended_(),
-            }
+        let guard = match session.try_read() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => on_lock_contended_(),
         };
         f(&guard)
     }
@@ -162,11 +157,9 @@ where
     /// 持写锁执行 `f`（临界区不得 `await`、不得重入）。
     fn with_mut_<R>(&self, f: impl FnOnce(&mut CancelInner_) -> R) -> R {
         let mut session = self.inner_.acquire_session();
-        let mut guard = loop {
-            match session.try_write() {
-                Result::Ok(guard) => break guard,
-                Result::Err(_) => on_lock_contended_(),
-            }
+        let mut guard = match session.try_write() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => on_lock_contended_(),
         };
         f(&mut guard)
     }

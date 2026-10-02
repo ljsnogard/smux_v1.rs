@@ -70,7 +70,7 @@ use core::mem::MaybeUninit;
 use buffex::{
     ring::Ring,
     x_deps::abs_buff::{
-        Demand, TrBuffRead, TrBuffWrite,
+        Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
         buffer::{TrBuffSegmMut, TrBuffSegmRef, TrBuffSegmView},
         error::{ReadErrTag, TrTaggedError},
         io::{TrInput, TrOutput},
@@ -89,15 +89,19 @@ use smux_v1::{
     },
 };
 
-/// 连接层要求的运行时 bound：与 `smux_v1` 的 `multi-thread` feature 保持一致。
+/// 连接层要求的 bound：**值化的本地作用域**（`abs_art::TrLocalScope`）。
 ///
-/// 缺省（单线程）下 `MuxConnection::new` 要求 `Rt: TrSpawnLocal`，开启
-/// `multi-thread` 后要求 `Rt: TrSpawnSend`。两个测试目标传入的具体运行时都同时
-/// 具备这两种能力，因此同一份场景代码在两种 feature 配置下都能编译。
-#[cfg(not(feature = "multi-thread"))]
-pub use abs_art::TrSpawnLocal as TrSmokeRuntime;
-#[cfg(feature = "multi-thread")]
-pub use abs_art::TrSpawnSend as TrSmokeRuntime;
+/// 场景函数一律把作用域值作为第一个参数（`scope: &S`）并原样转发给
+/// [`MuxConnection::new`]；两个测试目标各自给出具体后端的作用域值
+/// （tokio / compio 各自的 `LocalScope`）。契约是「谁取得作用域，谁负责驱动」：
+/// tokio 用 `scope.run_until(..)` 包住整段使用期，compio 由运行时自己驱动。
+pub use abs_art::TrLocalScope as TrSmokeScope;
+
+/// 一端连接对象的类型：策略固定为 [`SmokeMuxConfig`]，作用域与两个错误载荷类型由
+/// 调用方给出（错误载荷取自传输半部——收发半边本身已从公开类型上消失，但连接对外
+/// 的错误类型仍如实带上它们）。
+pub type SmokeConn<R, W, S> =
+    MuxConnection<SmokeMuxConfig, S, <R as TrBuffTryRead<u8>>::Err, <W as TrBuffTryWrite<u8>>::Err>;
 
 /// 每个端点监听的 dock 数量（dock 取值 `1..=16`）。
 pub const K_DOCK_COUNT: u32 = 16;
@@ -289,7 +293,8 @@ where
 ///
 /// 四个泵与场景用 `select` 并发推进（同一任务内轮询，不要求任何类型 `Send`）；
 /// 场景完成即丢弃泵 future，从而结束对设备（及其借用的 socket 半边）的借用。
-pub async fn run_socket_scenario_<IA, OA, IB, OB, Rt>(
+pub async fn run_socket_scenario_<IA, OA, IB, OB, S>(
+    scope: &S,
     input_a: IA,
     output_a: OA,
     input_b: IB,
@@ -299,17 +304,18 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB, Rt>(
     OA: TrOutput<u8>,
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
-    Rt: TrSmokeRuntime,
+    S: TrSmokeScope + Clone,
 {
     run_socket_scenario_with_(input_a, output_a, input_b, output_b, |a_rx, a_tx, b_rx, b_tx| {
-        run_smoke_scenario_::<_, _, _, _, Rt>(a_rx, a_tx, b_rx, b_tx)
+        run_smoke_scenario_::<_, _, _, _, S>(scope, a_rx, a_tx, b_rx, b_tx)
     })
     .await
 }
 
 /// 与 [`run_socket_scenario_`] 相同的传输装配，但跑**本轮验收用的小场景**
 /// （2 dock × 各 2 条 channel，双向收发 + 半关闭），见 [`run_small_mux_scenario_`]。
-pub async fn run_small_socket_scenario_<IA, OA, IB, OB, Rt>(
+pub async fn run_small_socket_scenario_<IA, OA, IB, OB, S>(
+    scope: &S,
     input_a: IA,
     output_a: OA,
     input_b: IB,
@@ -319,7 +325,7 @@ pub async fn run_small_socket_scenario_<IA, OA, IB, OB, Rt>(
     OA: TrOutput<u8>,
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
-    Rt: TrSmokeRuntime,
+    S: TrSmokeScope + Clone,
 {
     run_socket_scenario_with_(
         input_a,
@@ -327,7 +333,7 @@ pub async fn run_small_socket_scenario_<IA, OA, IB, OB, Rt>(
         input_b,
         output_b,
         |a_rx, a_tx, b_rx, b_tx| {
-            run_small_mux_scenario_::<_, _, _, _, Rt>(a_rx, a_tx, b_rx, b_tx)
+            run_small_mux_scenario_::<_, _, _, _, S>(scope, a_rx, a_tx, b_rx, b_tx)
         },
     )
     .await
@@ -395,19 +401,21 @@ async fn run_socket_scenario_with_<IA, OA, IB, OB, F, Fut>(
 /// # Panics
 ///
 /// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
-pub async fn run_small_mux_scenario_<RA, WA, RB, WB, Rt>(
+pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S>(
+    scope: &S,
     rx_a: RA,
     tx_a: WA,
     rx_b: RB,
     tx_b: WB,
 ) where
-    RA: TrBuffRead<u8> + Send + 'static,
-    WA: TrBuffWrite<u8> + Send + 'static,
-    RB: TrBuffRead<u8> + Send + 'static,
-    WB: TrBuffWrite<u8> + Send + 'static,
-    Rt: TrSmokeRuntime,
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: TrSmokeScope + Clone,
 {
-    run_mux_scenario_::<_, _, _, _, Rt>(
+    run_mux_scenario_::<_, _, _, _, S>(
+        scope,
         rx_a,
         tx_a,
         rx_b,
@@ -423,7 +431,8 @@ pub async fn run_small_mux_scenario_<RA, WA, RB, WB, Rt>(
 /// 这是全部场景的唯一实现：握手 → 建两个 [`MuxConnection`]（内部各自 spawn 读 / 写
 /// 循环）→ 两端并发跑「`dock_count` 个 dock × 每个 `per_dock` 条子流」的双向收发与
 /// 半关闭（[`drive_side_`]）。1024 条的冒烟场景只是它的 `16 × 64` 特例。
-async fn run_mux_scenario_<RA, WA, RB, WB, Rt>(
+async fn run_mux_scenario_<RA, WA, RB, WB, S>(
+    scope: &S,
     rx_a: RA,
     tx_a: WA,
     rx_b: RB,
@@ -431,13 +440,13 @@ async fn run_mux_scenario_<RA, WA, RB, WB, Rt>(
     dock_count: u32,
     per_dock: usize,
 ) where
-    RA: TrBuffRead<u8> + Send + 'static,
-    WA: TrBuffWrite<u8> + Send + 'static,
-    RB: TrBuffRead<u8> + Send + 'static,
-    WB: TrBuffWrite<u8> + Send + 'static,
-    Rt: TrSmokeRuntime,
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: TrSmokeScope + Clone,
 {
-    let (conn_a, conn_b) = connect_pair_::<RA, WA, RB, WB, Rt>(rx_a, tx_a, rx_b, tx_b).await;
+    let (conn_a, conn_b) = connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
 
     futures::join!(
         drive_side_(&conn_a, 0u32, dock_count, per_dock),
@@ -449,22 +458,21 @@ async fn run_mux_scenario_<RA, WA, RB, WB, Rt>(
 ///
 /// 抽出来给「收发场景」与「绑定独占性场景」共用，保证两者走的是**同一套**
 /// 连接建立路径。
-async fn connect_pair_<RA, WA, RB, WB, Rt>(
+async fn connect_pair_<RA, WA, RB, WB, S>(
+    scope: &S,
     rx_a: RA,
     tx_a: WA,
     rx_b: RB,
     tx_b: WB,
-) -> (
-    MuxConnection<RA, WA, SmokeMuxConfig, Rt>,
-    MuxConnection<RB, WB, SmokeMuxConfig, Rt>,
-)
+) -> (SmokeConn<RA, WA, S>, SmokeConn<RB, WB, S>)
 where
-    // 连接内部把 Rx / Tx 移交给 `'static` 的读写循环（`abs_art` 的 spawn 要求）。
-    RA: TrBuffRead<u8> + Send + 'static,
-    WA: TrBuffWrite<u8> + Send + 'static,
-    RB: TrBuffRead<u8> + Send + 'static,
-    WB: TrBuffWrite<u8> + Send + 'static,
-    Rt: TrSmokeRuntime,
+    // 连接把 Rx / Tx 移交给 `'static` 的读写循环（`spawn_local` 要求 `'static`；
+    // 本地投递**不要求** `Send`，因此 `!Send` 的传输也能直接当 `Rx` / `Tx`）。
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: TrSmokeScope + Clone,
 {
     let invite_opts = BasicOpts::default();
     let listen_opts = BasicOpts::default();
@@ -475,8 +483,8 @@ where
     let delivery_b = accepted.expect("等待方握手应当成功");
 
     (
-        MuxConnection::<RA, WA, SmokeMuxConfig, Rt>::new(delivery_a, SmokeMuxConfig),
-        MuxConnection::<RB, WB, SmokeMuxConfig, Rt>::new(delivery_b, SmokeMuxConfig),
+        MuxConnection::new(scope, delivery_a, SmokeMuxConfig),
+        MuxConnection::new(scope, delivery_b, SmokeMuxConfig),
     )
 }
 
@@ -491,19 +499,20 @@ where
 /// 握手失败、绑定出现的错误类型不是 `DockInUse`、或解绑后重绑失败都会 panic。
 ///
 /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
-pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, Rt>(
+pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
+    scope: &S,
     rx_a: RA,
     tx_a: WA,
     rx_b: RB,
     tx_b: WB,
 ) where
-    RA: TrBuffRead<u8> + Send + 'static,
-    WA: TrBuffWrite<u8> + Send + 'static,
-    RB: TrBuffRead<u8> + Send + 'static,
-    WB: TrBuffWrite<u8> + Send + 'static,
-    Rt: TrSmokeRuntime,
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: TrSmokeScope + Clone,
 {
-    let (conn_a, conn_b) = connect_pair_::<RA, WA, RB, WB, Rt>(rx_a, tx_a, rx_b, tx_b).await;
+    let (conn_a, conn_b) = connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
     let dock = Dock::new(0x2000u32);
@@ -560,16 +569,15 @@ pub const K_SMALL_CHANNELS_PER_DOCK: usize = 2;
 /// # Panics
 ///
 /// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
-async fn drive_side_<R, W, C, Rt>(
-    conn: &MuxConnection<R, W, C, Rt>,
+async fn drive_side_<C, S, RE, WE>(
+    conn: &MuxConnection<C, S, RE, WE>,
     side: u32,
     dock_count: u32,
     per_dock: usize,
 ) where
-    R: TrBuffRead<u8>,
-    W: TrBuffWrite<u8>,
     C: TrMuxConfig,
-    Rt: TrSmokeRuntime,
+    RE: core::error::Error,
+    WE: core::error::Error,
 {
     let conn_ref = conn;
 
@@ -815,21 +823,23 @@ where
 ///
 /// 握手失败、任意一次 open / accept / 读写 / 半关闭校验失败，或读写会话在场景完成
 /// 前退出时 panic——本函数是测试专用，失败即测试失败。
-pub async fn run_smoke_scenario_<RA, WA, RB, WB, Rt>(
+pub async fn run_smoke_scenario_<RA, WA, RB, WB, S>(
+    scope: &S,
     rx_a: RA,
     tx_a: WA,
     rx_b: RB,
     tx_b: WB,
 ) where
-    // 连接内部把 Rx / Tx 移交给 `'static` 的读写循环（`abs_art` 的 spawn 要求）；
-    // `Send` 是 `multi-thread` 配置下 `Rt::spawn` 的要求（测试用的环半部本就 `Send`）。
-    RA: TrBuffRead<u8> + Send + 'static,
-    WA: TrBuffWrite<u8> + Send + 'static,
-    RB: TrBuffRead<u8> + Send + 'static,
-    WB: TrBuffWrite<u8> + Send + 'static,
-    Rt: TrSmokeRuntime,
+    // 连接把 Rx / Tx 移交给 `'static` 的读写循环（`spawn_local` 要求 `'static`；
+    // 本地投递不要求 `Send`）。
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: TrSmokeScope + Clone,
 {
-    run_mux_scenario_::<_, _, _, _, Rt>(
+    run_mux_scenario_::<_, _, _, _, S>(
+        scope,
         rx_a,
         tx_a,
         rx_b,

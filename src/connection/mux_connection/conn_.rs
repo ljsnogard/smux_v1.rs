@@ -1,136 +1,116 @@
-#[cfg(not(feature = "multi-thread"))]
 use core::marker::PhantomData;
 
 use abs_buff::{
-    TrBuffRead, TrBuffWrite,
+    TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
     gen_may_cancel_future,
     x_deps::abs_cancel,
 };
-#[cfg(feature = "multi-thread")]
-use abs_art::TrSpawnSend;
-// `TrJoinHandle` 只被单线程 `new` 的文档链接引用，因此只在缺省配置下导入。
-#[cfg(not(feature = "multi-thread"))]
-use abs_art::{TrJoinHandle, TrSpawnLocal};
-
+use abs_art::{TrJoinHandle, TrLocalScope};
 use abs_cancel::TrCancellationToken;
 use abs_smux::conn::{TrConnection, TrDock};
 use buffex::x_deps::abs_buff;
-
-// 建连驱动（单线程配置）专用：多线程配置下 `new` 仍是 `todo!()`（见 dev-notes），
-// 这些名字在该配置下不可达，因此按 feature 收窄导入范围，保持两种配置都零告警。
-#[cfg(not(feature = "multi-thread"))]
-use crate::connection::session_::{LoopShared_, read_loop_async_, write_loop_async_};
-#[cfg(not(feature = "multi-thread"))]
-use crate::connection::signal_::event_channel_;
-#[cfg(not(feature = "multi-thread"))]
-use crate::flow_ctrl::{ReportThresholds_, TrFlowCtrlPolicy};
+use mm_ptr::{Owned, Shared};
 
 use crate::{
     connection::{
         Dock, MuxError, TrMuxConfig,
         dock_binding::DockBinding,
-        signal_::{EventSender_, ReadEvent_, WriteEvent_},
-        types_::MuxMark_,
+        session_::{LoopShared_, read_loop_async_, write_loop_async_},
+        signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
     },
+    flow_ctrl::{ReportThresholds_, TrFlowCtrlPolicy},
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
 };
 
-use super::registry_::ChannelRegistry_;
+use super::{core_::MuxCore, registry_::ChannelRegistry_};
 
-/// 复用连接：**独占**网络收发半边，并对外提供流复用的全部功能。
+/// 复用连接：**对一个 `MuxCore` 的智能指针的薄封装**，同时实现
+/// [`TrConnection`]。
 ///
 /// 泛型参数：
 ///
-/// - `R`：网络读半边（握手交付的 `Rx`）；
-/// - `W`：网络写半边（握手交付的 `Tx`）；
 /// - `C`：资源策略，见 [`TrMuxConfig`]；
-/// - `Rt`：运行时类型（见模块文档「运行时参数 `Rt`」）。它必须是**结构体**上的
-///   类型参数：内部循环的句柄类型要能出现在字段类型里。
+/// - `S`：调用方注入的本地作用域类型（`abs_art::TrLocalScope` 的实现值，
+///   tokio 的 `LocalScope` / compio 的 `LocalScope`）；
+/// - `RE` / `WE`：网络读 / 写半边的**错误类型**。收发半边本身（`R` / `W`）在
+///   [`MuxConnection::new`] 里被移进循环，此后不出现在任何签名里；但连接对外的
+///   错误类型 [`MuxError<RE, WE>`] 仍然如实带上它们，类型形状不因封装而降级。
+///   注意底层错误**值**只在循环那一侧存在，连接级失败经共享状态回传时只保留
+///   方向（[`MuxError::Transport`]），因此 API 面实际不会产出 `Rx` / `Tx` 两个
+///   带载荷变体。
 ///
-/// # 封装边界
+/// # 为什么是智能指针
 ///
-/// 握手完成后 `Rx` / `Tx` 的生命周期由本对象**完全接管**，它们不出现在任何公开
-/// 签名里；读 / 写两个循环是本对象的内部实现（见 [`crate::connection`] 模块文档
-/// §2）。`smux_v1` 里其它类型要完成任何功能，只能通过本对象的 API：
-/// [`TrConnection::bind_async`] 派生会话；收发由内部任务自动推进。
+/// `Clone` 一份就是多一个强引用（分配走调用方注入的分配器），因此它可以被任意
+/// 分发：存进结构体、传进函数、跨层持有。会话侧的四个句柄
+/// （[`DockBinding`] / [`ChannelListener`](crate::connection::ChannelListener) /
+/// [`ChannelHandle`](crate::connection::ChannelHandle) /
+/// [`Telegraph`](crate::connection::Telegraph)）与两个 channel 半部同样各自持有
+/// 一份克隆，而不是借用上层对象——这是本架构的全部要点：**把「谁借用谁」换成
+/// 「谁持有谁的一份指针」**。「绑定 → 监听 → 接流 → 业务」因此可以拆到不同函数、
+/// 不同结构体里表达，不再被生命周期参数绑成一串。
 ///
-/// [`TrConnection::bind_async`] 取 `&self`，因此同一个连接可以被多个业务逻辑同时
-/// 绑定到不同 dock，读 / 写路径在内部互不争锁（模块文档 §2）。
+/// # 生命周期
 ///
-/// # 目标形状（本轮确定，迁移中）
+/// 最后一个应用面对象被丢弃时 `MuxCore` 析构，其 `Drop` 触发两个循环的取消令牌，
+/// 连接随之关闭（循环不持有核心强引用，见
+/// `MuxCore` 的模块文档）。
 ///
-/// 本类型改为**对一个 `MuxCore` 的智能指针的薄封装**：
+/// # 作用域
 ///
-/// ```text
-/// pub struct MuxConnection<C, Rt> where C: TrMuxConfig {
-///     core_: Shared<MuxCore<C>, C::Alloc>,   // 智能指针：Clone 即多一份强引用
-///     _rt_: PhantomData<Rt>,
-/// }
-/// ```
-///
-/// 两处变化对使用者最要紧：
-///
-/// - **`R` / `W` 消失**：它们在 `new` 里被移进读 / 写循环，此后不出现在任何签名中，
-///   公开类型从 `MuxConnection<R, W, C, Rt>` 简化为 `MuxConnection<C, Rt>`；
-/// - **`Clone` 变得廉价且有意义**：会话句柄各自持有一份克隆，因此
-///   「绑定 → 监听 → 接流 → 业务」可以拆到不同函数、不同结构体里，不再被生命周期
-///   参数绑成一串（`dev-notes` §16 记录的 F2 / F3 两处「写不出来」由此消失）。
-///
-/// 设计全文见 [`crate::connection`] 模块文档 §2 与
-/// `dev-notes/connection-20261002-0548.md` §17。///
-/// > **`Rt` 的目标与未决**：目标形状里 `Rt` **不应出现**在公开类型上
-/// > （`MuxConnection<C>`）；但这一点目前**缺乏实证支持**——三个后端的
-/// > `spawn_local` 语义差异很大（tokio 需要 `LocalSet` 上下文、smol 的本地执行器
-/// > 随 `JoinHandle` 存活因而 `detach()` 会取消任务），在跨后端实测完成前 `Rt`
-/// > **保持现状**，视为待实证的临时形状。见 `dev-notes` §17.9。
-pub struct MuxConnection<R, W, C, Rt>
+/// [`MuxConnection::new`] 会把 `scope` 的一份克隆存进核心保活，因此**队列**不会
+/// 先于连接消失；但**驱动**队列仍然是调用方的责任：tokio 必须把整段使用期包在
+/// `scope.run_until(..)` 里，compio 由运行时自己驱动，smol 由 `LocalExecutor` 驱动。
+/// 忘记驱动不会有编译错误，症状是两个循环从不推进（连接静默无响应）。
+pub struct MuxConnection<C, S, RE, WE>
 where
     C: TrMuxConfig,
 {
-    /// 资源策略：建子流环与判定窗口时在 API 面就地取用（`policy()` 返回引用，
-    /// 因此它不能被移进 `'static` 的循环里，只能留在连接对象上）。
-    config_: C,
+    /// 指向演员核心的强引用；最后一个强引用消失时核心析构（并触发收尾）。
+    core_: Shared<MuxCore<C, S>, C::Alloc>,
 
-    /// 握手协商结果（连接级配额）。
-    opts_: HandshakeOpts,
+    /// 两个底层错误类型只以类型形式参与 [`TrConnection::Err`]；用 `fn() -> (..)`
+    /// 占位，使它们不影响本类型的 auto trait（`Send` / `Sync` / `Unpin`）。
+    _err_: PhantomData<fn() -> (RE, WE)>,
+}
 
-    /// dock / 子流索引、失败标志与两个循环的取消令牌。
-    reg_: ChannelRegistry_<C::Alloc>,
-
-    /// 写事件发送端（控制帧、建流注册）。
-    w_events_: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
-
-    /// 读事件发送端（接收环注册）。
-    r_events_: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
-
-    /// `Rx` / `Tx` 与 `Rt` 只以类型形式出现在签名里：前者已被移交给内部循环，
-    /// 后者是纯类型标记（`abs_art` 的 spawn 是无 `self` 的关联函数）。
-    _mark_: MuxMark_<R, W, Rt>}
-
-/// 单线程版本（缺省，compio 首要）：内部循环经 `Rt::spawn_local` 投递，因此要求
-/// `Rt: TrSpawnLocal`。
-#[cfg(not(feature = "multi-thread"))]
-impl<R, W, C, Rt> MuxConnection<R, W, C, Rt>
+impl<C, S, RE, WE> Clone for MuxConnection<C, S, RE, WE>
 where
-    R: TrBuffRead<u8> + 'static,
-    W: TrBuffWrite<u8> + 'static,
-    C: TrMuxConfig + 'static,
-    C::Buff: 'static,
-    C::Alloc: 'static,
-    Rt: TrSpawnLocal,
+    C: TrMuxConfig,
 {
-    /// 由一次成功的握手交付物与资源策略构造连接，接管 `Rx` / `Tx`，并**在内部
-    /// 经 `abs_art` spawn** 读 / 写两个循环（排空控制帧后按对端发送窗口调度数据
-    /// 帧，见 [`crate::connection`] 模块文档 §2）。
+    /// 克隆即多一个强引用：核心不复制，句柄因此可以与任意多个对象共享同一连接。
+    fn clone(&self) -> Self {
+        MuxConnection {
+            core_: self.core_.clone(),
+            _err_: PhantomData,
+        }
+    }
+}
+
+impl<C, S, RE, WE> MuxConnection<C, S, RE, WE>
+where
+    C: TrMuxConfig,
+{
+    /// 由一次成功的握手交付物、调用方的本地作用域与资源策略构造连接：接管
+    /// `Rx` / `Tx`，并**经作用域 `spawn_local`** 投递读 / 写两个循环。
     ///
-    /// # 循环的收尾方式
+    /// # 循环的投递与收尾
     ///
-    /// 不靠句柄停任务：[`TrJoinHandle`](abs_art::TrJoinHandle) **没有 `abort`**，
-    /// 而且三个后端对「drop 句柄」的语义并不一致（tokio 视作 detach、compio /
-    /// smol 视作取消）。因此收尾统一走**取消令牌 + 「连接已失败」标志**：
-    /// spawn 后立即 `detach()` 句柄，循环在每个 await 点检查令牌与失败标志自行
-    /// 退出；连接 `Drop` 时置位即可。句柄因此不需要存成字段，`Rt::JoinHandle`
-    /// 也不必出现在任何类型签名里。
+    /// 两个循环投递后**立即 `detach()`**：
+    ///
+    /// - `detach` 之后任务继续由作用域驱动（这是 `abs_art::TrLocalScope` 的实现
+    ///   契约，三个后端一致），不需要调用方保存句柄；
+    /// - 收尾**不靠句柄**：`abs_art::TrJoinHandle` 没有 `abort`，三个后端对
+    ///   「drop 句柄」的语义也不一致。连接改用**取消令牌**收尾——最后一个应用面
+    ///   对象被丢弃时 `MuxCore` 析构并触发令牌，循环在每个 await 点检查令牌
+    ///   自行退出。
+    ///
+    /// # 作用域契约
+    ///
+    /// `scope` 的一份克隆被存进核心保活，但**队列必须由调用方驱动**（`new` 只
+    /// 负责投递，不负责推进）：tokio 用 `scope.run_until(..)`、smol 用
+    /// `LocalExecutor`、compio 由运行时自己驱动。三个后端的统一写法见
+    /// `abs_art` 的 `TrLocalScope` 文档。
     ///
     /// # Panics
     ///
@@ -139,8 +119,94 @@ where
     ///
     /// 对外不提供任何驱动 API：用户只使用 `abs_smux` 的 trait。后端运行时由最终
     /// 二进制经 `abs_art` 选择（本 crate 不依赖 `abs_art-bridge`）。
-    pub fn new(delivery: HandshakeDelivery<W, R>, config: C) -> Self {
+    pub fn new<R, W>(scope: &S, delivery: HandshakeDelivery<W, R>, config: C) -> Self
+    where
+        S: TrLocalScope + Clone,
+        R: TrBuffRead<u8> + TrBuffTryRead<u8, Err = RE> + 'static,
+        W: TrBuffWrite<u8> + TrBuffTryWrite<u8, Err = WE> + 'static,
+        C: 'static,
+        C::Buff: 'static,
+        C::Alloc: 'static,
+    {
         let HandshakeDelivery { opts, tx, rx } = delivery;
+        let bundle = CoreBundle_::build_(scope, opts, config);
+        let CoreBundle_ {
+            core_,
+            shared_,
+            w_receiver_,
+            r_receiver_,
+            alloc_,
+        } = bundle;
+        let max_packet_size = core_.opts_().basic_opts.max_packet_size;
+        // 投递也走核心里的那一份作用域：调用方给出的值只用来克隆保活。
+        let scope = core_.scope_();
+
+        // 帧暂存一律走调用方注入的分配器（`mm_ptr::Owned`），不再落到全局分配器。
+        let read_fut = read_loop_async_(
+            rx,
+            shared_.clone(),
+            r_receiver_,
+            core_.w_events_().clone(),
+            Owned::new_slice(
+                max_packet_size,
+                |_idx, slot| {
+                    slot.write(0u8);
+                },
+                alloc_.clone(),
+            ),
+            core_.reg_().loop_token_(0usize),
+        );
+        scope.spawn_local(read_fut).detach();
+
+        let write_fut = write_loop_async_(
+            tx,
+            shared_,
+            w_receiver_,
+            core_.r_events_().clone(),
+            core_.reg_().loop_token_(1usize),
+        );
+        scope.spawn_local(write_fut).detach();
+
+        MuxConnection {
+            core_,
+            _err_: PhantomData,
+        }
+    }
+
+    /// 演员核心（crate 内部句柄与两个循环都经它访问共享状态）。
+    pub(crate) fn core_(&self) -> &MuxCore<C, S> {
+        &self.core_
+    }
+}
+
+/// 建连的中间产物：核心 + 两个循环共享的一份量 + 两条事件接收端 + 分配器。
+///
+/// 抽出来是为了让「测试专用构造」（[`MuxConnection::new_test_`]）与正式建连走
+/// **同一份**策略展开逻辑，不在测试里复制一遍。
+struct CoreBundle_<C, S>
+where
+    C: TrMuxConfig,
+{
+    core_: Shared<MuxCore<C, S>, C::Alloc>,
+    shared_: LoopShared_<C::Alloc>,
+    w_receiver_: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
+    r_receiver_: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
+    alloc_: C::Alloc,
+}
+
+impl<C, S> CoreBundle_<C, S>
+where
+    C: TrMuxConfig,
+{
+    /// 展开策略、建注册表与两条事件通道，并把全部共享状态装进核心。
+    ///
+    /// 本函数**不 spawn 任何任务**：`Rx` / `Tx` 的移交由调用方（[`MuxConnection::new`]）
+    /// 完成。
+    fn build_(scope: &S, opts: HandshakeOpts, config: C) -> Self
+    where
+        S: Clone,
+    {
+        // 建连时把策略展开一次：此后循环只需要这几个标量，不再持有 `C` / `P`。
         let max_packet_size = opts.basic_opts.max_packet_size;
         let capacity = config.channel_capacity();
         let initial = config.policy().initial_window(capacity);
@@ -150,120 +216,75 @@ where
         let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), alloc.clone());
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
+
+        // 两个循环共享的那一份量：注册表句柄 + 三个标量。**它不含核心引用**，
+        // 这是核心能被析构（因而连接能被关闭）的前提，见 `core_` 模块文档。
         let shared = LoopShared_::new_(reg.clone(), initial, thresholds, max_packet_size);
 
-        let read_fut = read_loop_async_(
-            rx,
-            shared.clone(),
-            r_receiver,
-            w_events.clone(),
-            vec![0u8; max_packet_size],
-            reg.loop_token_(0usize),
+        let core = Shared::new(
+            MuxCore::new_(
+                config,
+                opts,
+                scope.clone(),
+                reg,
+                w_events,
+                r_events,
+            ),
+            alloc.clone(),
         );
-        Rt::spawn_local(read_fut).detach();
 
-        let write_fut = write_loop_async_(
-            tx,
-            shared,
-            w_receiver,
-            r_events.clone(),
-            reg.loop_token_(1usize),
-        );
-        Rt::spawn_local(write_fut).detach();
+        CoreBundle_ {
+            core_: core,
+            shared_: shared,
+            w_receiver_: w_receiver,
+            r_receiver_: r_receiver,
+            alloc_: alloc,
+        }
+    }
+}
 
+#[cfg(test)]
+impl<C, S, RE, WE> MuxConnection<C, S, RE, WE>
+where
+    C: TrMuxConfig,
+{
+    /// 测试专用构造：只建核心与两条事件通道，**不 spawn 任何循环**。
+    ///
+    /// 因此它既不需要传输，也不需要被驱动的本地作用域——用于直接检查句柄 / 半部的
+    /// 本地行为（环的关闭态、dock 上报、非阻塞转发）。两条事件通道的接收端随本
+    /// 函数返回即被丢弃，因此半部发出的通知按「没有消费者」处理（投递返回 `false`），
+    /// 与生产环境的行为差异仅此一处。
+    pub(crate) fn new_test_(scope: &S, opts: HandshakeOpts, config: C) -> Self
+    where
+        S: Clone,
+    {
         MuxConnection {
-            config_: config,
-            opts_: opts,
-            reg_: reg,
-            w_events_: w_events,
-            r_events_: r_events,
-            _mark_: PhantomData}
+            core_: CoreBundle_::build_(scope, opts, config).core_,
+            _err_: PhantomData,
+        }
     }
 }
 
-/// 多线程版本（开启 `multi-thread`）：语义与单线程版本**完全一致**，唯一区别是
-/// 内部循环经 `Rt::spawn` 投递（可跨线程），因此 bound 换成 `Rt: TrSpawnSend`。
-///
-/// # 本轮状态（待实现）
-///
-/// `Rt::spawn` 要求循环 future `Send`，而 `abs_buff` 的 trait 没有给关联 future
-/// 加 `Send`；把该约束沿「共享字节游标」(`wire_io_`) 补齐会连带要求握手模块
-/// （它也复用同一个游标）全部改为 `Send` 版本。该改动与「多 channel 并发」这一
-/// 本轮目标无关，因此**多线程配置的驱动留作待办**（缺省的单线程 / compio 配置
-/// 已完整实现）。见 `dev-notes/connection-20261002-0548.md` §7。
-#[cfg(feature = "multi-thread")]
-impl<R, W, C, Rt> MuxConnection<R, W, C, Rt>
-where
-    R: TrBuffRead<u8> + Send + 'static,
-    W: TrBuffWrite<u8> + Send + 'static,
-    C: TrMuxConfig + Send + Sync + 'static,
-    C::Buff: 'static,
-    C::Alloc: 'static,
-    Rt: TrSpawnSend,
-{
-    /// 与缺省配置下的同名方法语义相同（含「取消令牌 + 当场 detach」的收尾方式），
-    /// 只是本配置下要求 `Rt: TrSpawnSend`。
-    ///
-    /// # Panics
-    ///
-    /// 本配置尚未实现驱动：调用即 panic（见类型文档「本轮状态」）。
-    pub fn new(delivery: HandshakeDelivery<W, R>, config: C) -> Self {
-        let _ = (delivery, config);
-        todo!("多线程配置的连接驱动待实现：Send 约束需沿共享字节游标与握手模块一并补齐")
-    }
-}
-
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// 会话侧只读访问器（字段一律私有，跨模块只能经这些关联函数）
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-impl<R, W, C, Rt> MuxConnection<R, W, C, Rt>
+impl<C, S, RE, WE> TrConnection for MuxConnection<C, S, RE, WE>
 where
     C: TrMuxConfig,
-{
-    /// 资源策略。
-    pub(crate) fn config_(&self) -> &C {
-        &self.config_
-    }
-
-    /// 握手协商结果（连接级配额）。
-    pub(crate) fn opts_(&self) -> &HandshakeOpts {
-        &self.opts_
-    }
-
-    /// dock / 子流索引与失败标志。
-    pub(crate) fn reg_(&self) -> &ChannelRegistry_<C::Alloc> {
-        &self.reg_
-    }
-
-    /// 写事件发送端。
-    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<C::Buff, C::Alloc>> {
-        &self.w_events_
-    }
-
-    /// 读事件发送端。
-    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<C::Buff, C::Alloc>> {
-        &self.r_events_
-    }
-}
-
-impl<R, W, C, Rt> TrConnection for MuxConnection<R, W, C, Rt>
-where
-    R: TrBuffRead<u8>,
-    W: TrBuffWrite<u8>,
-    C: TrMuxConfig,
+    RE: core::error::Error,
+    WE: core::error::Error,
 {
     type Data = u8;
     type Dock = Dock;
-    type Err = MuxError<R::Err, W::Err>;
+    type Err = MuxError<RE, WE>;
 
+    /// 会话对象是**独立持有者**（自带一份连接克隆），不带 `'f` 之类的生命周期：
+    /// 它可以从函数返回、可以存进结构体、可以与连接同处一个结构体。
     type DockBinding<'f>
-        = DockBinding<'f, R, W, C, Rt>
+        = DockBinding<C, S, RE, WE>
     where
         Self: 'f;
 
+    /// future 仍然借用 `&self`（调用期间），但**输出是 owned 的**。
     type BindAsync<'f>
-        = MuxBindAsync<'f, 'f, R, W, C, Rt>
+        = MuxBindAsync<'f, 'f, C, S, RE, WE>
     where
         Self: 'f;
 
@@ -273,16 +294,15 @@ where
 }
 
 /// [`TrConnection::bind_async`] 的 step 函数。
-#[gen_may_cancel_future(MuxBind, pub)]
-async fn mux_bind_async_<'f, R, W, C, Rt, K>(
-    conn: &'f MuxConnection<R, W, C, Rt>,
+#[gen_may_cancel_future(MuxBind, pub, new(pub(crate)))]
+async fn mux_bind_async_<'f, C, S, RE, WE, K>(
+    conn: &'f MuxConnection<C, S, RE, WE>,
     local_dock: Dock,
     _cancel: K,
-) -> Result<DockBinding<'f, R, W, C, Rt>, MuxError<R::Err, W::Err>>
+) -> Result<DockBinding<C, S, RE, WE>, MuxError<RE, WE>>
 where
-    R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
     C: TrMuxConfig + 'f,
+    S: 'f,
     K: TrCancellationToken,
 {
     if local_dock.is_special() {
@@ -290,9 +310,9 @@ where
     }
     // 独占绑定：同一 local_dock 在任意时刻至多一个 `DockBinding`（见
     // `ChannelRegistry_::bind_dock_` 与 `DockBinding` 的「绑定的独占性」）。
-    conn.reg_()
+    conn.core_()
+        .reg_()
         .bind_dock_(local_dock)
         .map_err(|err| err.cast_())?;
-    Result::Ok(DockBinding::new_(conn, local_dock))
+    Result::Ok(DockBinding::new_(conn.clone(), local_dock))
 }
-

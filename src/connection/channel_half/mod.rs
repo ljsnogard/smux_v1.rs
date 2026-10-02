@@ -22,16 +22,10 @@
 //! 代价是这四个方法只在真正的 `buffex` 半部上成立，因此 `TrChannelHalf` 的 impl
 //! 落在具体类型上（而不是泛型 `H`）。
 //!
-//! > **目标形状（本轮确定，迁移中）**：两个环包装类型改为**对外导出**的具名类型
-//! > （`ChannelTxHalf<C, Rt>` / `ChannelRxHalf<C, Rt>`），`ChannelTx` / `ChannelRx`
-//! > 以 `<C, Rt>` 参数化，使下游能写出具体类型。理由见 `dev-notes` §16.2 F5 与
-//! > §17.5。
+//! 因此两个半部**各自就是那个具名类型**（`ChannelTx<C, S, RE, WE>` /
+//! `ChannelRx<C, S, RE, WE>`），可以直接写进下游的结构体字段——旧模型下内层包装
+//! 未导出，下游连「把半部存进具名字段」都做不到（见 `dev-notes` §16.2 F5）。
 
 mod halves_;
 
-pub use halves_::{
-    ChannelRx,
-    ChannelTx,
-    RxRing_,
-    TxRing_,
-};
+pub use halves_::{ChannelRx, ChannelTx};

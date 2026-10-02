@@ -1,5 +1,3 @@
-use core::marker::PhantomData;
-
 use abs_buff::{
     TrBuffRead, TrBuffWrite,
     gen_may_cancel_future,
@@ -12,53 +10,49 @@ use buffex::x_deps::abs_buff;
 use crate::{
     connection::{
         Dock, FrameKind, MuxConnection, MuxError, TrMuxConfig,
-        channel_half::{ChannelRx, ChannelTx, RxRing_, TxRing_},
+        channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, ChannelState_},
         ring_::new_buffered_channel_,
         signal_::{ControlFrame_, ReadEvent_, TrEventSender_, WriteEvent_},
-        types_::SessionMark_,
         util_::read_available_into_vec_,
     },
     flow_ctrl::FlowCtrl,
 };
 
-/// 一个入向建流请求的待决句柄。///
-/// > **目标形状（本轮确定，迁移中）**：本类型改为**持有一份 [`MuxConnection`] 的
-/// > 克隆**（= 指向 `MuxCore` 的智能指针），不再借用连接，因此生命周期参数从公开
-/// > 类型上消失，可以存进结构体、可以从函数返回。设计见
-/// > [`crate::connection`] 模块文档 §2 与 `dev-notes/connection-20261002-0548.md` §17。
+/// 一个入向建流请求的待决句柄。
 ///
-/// 由 [`TrChannelListener::income_async`](abs_smux::conn::TrChannelListener::income_async) 产出；调用方用
-/// [`TrChannelHandle::accept_async`] 接受并交付欢迎信息，或
+/// **不借用连接**：自己持有一份 [`MuxConnection`] 克隆，因此生命周期参数从公开
+/// 类型上消失，可以存进结构体、可以从函数返回。
+///
+/// 由 [`TrChannelListener::income_async`](abs_smux::conn::TrChannelListener::income_async)
+/// 产出；调用方用 [`TrChannelHandle::accept_async`] 接受并交付欢迎信息，或
 /// [`TrChannelHandle::reject_async`] 拒绝并说明理由。句柄本身也是
 /// [`TrChannelHalf`]，因此可以在决定之前查看两侧 dock。
 ///
 /// 句柄上的 `(local_dock, remote_dock)` 就是这条待决子流的身份：响应方在自己的
 /// `local_dock` 上用 `remote_dock` 区分不同请求端的连接（见
 /// [`crate::connection`] 模块文档 §4.1）。
-pub struct ChannelHandle<'s, 'f, R, W, C, Rt>
+pub struct ChannelHandle<C, S, RE, WE>
 where
     C: TrMuxConfig,
 {
-    /// 连接对象：`accept_async` 用它建子流环并登记会话侧半部。
-    conn_: &'f MuxConnection<R, W, C, Rt>,
+    /// 连接智能指针：`accept_async` 用它建子流环并登记会话侧半部。
+    conn_: MuxConnection<C, S, RE, WE>,
 
     /// 本端 dock。
     local_dock_: Dock,
 
     /// 对端 dock。
     remote_dock_: Dock,
+}
 
-    /// 借用关系与连接泛型的占位；语义同 [`ChannelListener`]。
-    _mark_: SessionMark_<'s, 'f, R, W, C, Rt>}
-
-impl<'s, 'f, R, W, C, Rt> ChannelHandle<'s, 'f, R, W, C, Rt>
+impl<C, S, RE, WE> ChannelHandle<C, S, RE, WE>
 where
     C: TrMuxConfig,
 {
     /// 由连接与 dock 对构造（只允许 `income_async` 调用）。
     pub(crate) fn new_(
-        conn: &'f MuxConnection<R, W, C, Rt>,
+        conn: MuxConnection<C, S, RE, WE>,
         local_dock: Dock,
         remote_dock: Dock,
     ) -> Self {
@@ -66,41 +60,41 @@ where
             conn_: conn,
             local_dock_: local_dock,
             remote_dock_: remote_dock,
-            _mark_: PhantomData}
+        }
     }
 }
 
-impl<'s, 'f, R, W, C, Rt> TrChannelHandle for ChannelHandle<'s, 'f, R, W, C, Rt>
+impl<C, S, RE, WE> TrChannelHandle for ChannelHandle<C, S, RE, WE>
 where
-    R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
-    C: TrMuxConfig + 'f,
+    C: TrMuxConfig,
+    RE: core::error::Error,
+    WE: core::error::Error,
 {
-    type Err = MuxError<R::Err, W::Err>;
+    type Err = MuxError<RE, WE>;
 
-    type Tx = ChannelTx<TxRing_<C::Buff, C::Alloc>>;
-    type Rx = ChannelRx<RxRing_<C::Buff, C::Alloc>>;
+    type Tx = ChannelTx<C, S, RE, WE>;
+    type Rx = ChannelRx<C, S, RE, WE>;
 
-    type AcceptAsync<'a, Wb>
-        = MuxAcceptAsync<'a, 's, 'f, 'a, R, W, C, Rt, Wb>
+    type AcceptAsync<'f, Wb>
+        = MuxAcceptAsync<'f, 'f, C, S, RE, WE, Wb>
     where
-        Self: 'a,
-        Wb: 'a + TrBuffWrite;
+        Self: 'f,
+        Wb: 'f + TrBuffWrite;
 
-    type RejectAsync<'a, Rb>
-        = MuxRejectAsync<'a, 's, 'f, 'a, R, W, C, Rt, Rb>
+    type RejectAsync<'f, Rb>
+        = MuxRejectAsync<'f, 'f, C, S, RE, WE, Rb>
     where
-        Self: 'a,
-        Rb: 'a + TrBuffRead;
+        Self: 'f,
+        Rb: 'f + TrBuffRead;
 
-    fn accept_async<'a, Wb>(&'a mut self, welcome: &'a mut Wb) -> Self::AcceptAsync<'a, Wb>
+    fn accept_async<'f, Wb>(&'f mut self, welcome: &'f mut Wb) -> Self::AcceptAsync<'f, Wb>
     where
         Wb: TrBuffWrite,
     {
         MuxAcceptAsync::new(self, welcome)
     }
 
-    fn reject_async<'a, Rb>(&'a mut self, reason: &'a mut Rb) -> Self::RejectAsync<'a, Rb>
+    fn reject_async<'f, Rb>(&'f mut self, reason: &'f mut Rb) -> Self::RejectAsync<'f, Rb>
     where
         Rb: TrBuffRead,
     {
@@ -108,7 +102,7 @@ where
     }
 }
 
-impl<'s, 'f, R, W, C, Rt> TrChannelHalf for ChannelHandle<'s, 'f, R, W, C, Rt>
+impl<C, S, RE, WE> TrChannelHalf for ChannelHandle<C, S, RE, WE>
 where
     C: TrMuxConfig,
 {
@@ -135,135 +129,134 @@ where
 }
 
 /// [`TrChannelHandle::accept_async`] 的 step 函数。
-#[gen_may_cancel_future(MuxAccept, pub)]
-async fn mux_accept_async_<'a, 's, 'f, R, W, C, Rt, Wb, K>(
-    handle: &'a mut ChannelHandle<'s, 'f, R, W, C, Rt>,
-    welcome: &'a mut Wb,
+#[gen_may_cancel_future(MuxAccept, pub, new(pub(crate)))]
+async fn mux_accept_async_<'f, C, S, RE, WE, Wb, K>(
+    handle: &'f mut ChannelHandle<C, S, RE, WE>,
+    welcome: &'f mut Wb,
     _cancel: K,
-) -> Result<
-    (
-        ChannelTx<TxRing_<C::Buff, C::Alloc>>,
-        ChannelRx<RxRing_<C::Buff, C::Alloc>>,
-    ),
-    MuxError<R::Err, W::Err>,
->
+) -> Result<(ChannelTx<C, S, RE, WE>, ChannelRx<C, S, RE, WE>), MuxError<RE, WE>>
 where
-    'f: 's,
-    R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
     C: TrMuxConfig + 'f,
-    Wb: TrBuffWrite<u8> + 'a,
+    S: 'f,
+    Wb: TrBuffWrite<u8> + 'f,
     K: TrCancellationToken,
 {
-    let conn = handle.conn_;
+    let conn = handle.conn_.clone();
     let local = handle.local_dock_;
     let remote = handle.remote_dock_;
     // 取回对端 `OPEN` 里带过来的窗口通告（由读循环在入向建流时存下）。
-    let peer_report = match conn.reg_().take_inbound_report_(local, remote) {
+    let peer_report = match conn.core_().reg_().take_inbound_report_(local, remote) {
         Option::Some(report) => report,
         Option::None => return Result::Err(MuxError::Closed)};
 
-    let capacity = conn.config_().channel_capacity();
-    let alloc = conn.config_().allocator();
-    let (tx_w, tx_r) = match new_buffered_channel_(conn.config_().make_buff(capacity), alloc.clone())
-    {
-        Result::Ok(pair) => pair,
-        Result::Err(_) => {
-            conn.reg_().release_channel_(local, remote);
-            return Result::Err(MuxError::Closed);
-        }
-    };
-    let (rx_w, rx_r) = match new_buffered_channel_(conn.config_().make_buff(capacity), alloc.clone())
-    {
-        Result::Ok(pair) => pair,
-        Result::Err(_) => {
-            conn.reg_().release_channel_(local, remote);
-            return Result::Err(MuxError::Closed);
-        }
-    };
+    let capacity = conn.core_().config_().channel_capacity();
+    let alloc = conn.core_().config_().allocator();
+    let (tx_w, tx_r) =
+        match new_buffered_channel_(conn.core_().config_().make_buff(capacity), alloc.clone()) {
+            Result::Ok(pair) => pair,
+            Result::Err(_) => {
+                conn.core_().reg_().release_channel_(local, remote);
+                return Result::Err(MuxError::Closed);
+            }
+        };
+    let (rx_w, rx_r) =
+        match new_buffered_channel_(conn.core_().config_().make_buff(capacity), alloc.clone()) {
+            Result::Ok(pair) => pair,
+            Result::Err(_) => {
+                conn.core_().reg_().release_channel_(local, remote);
+                return Result::Err(MuxError::Closed);
+            }
+        };
 
-    let mut flow = FlowCtrl::new(conn.config_().policy(), capacity);
+    let mut flow = FlowCtrl::new(conn.core_().config_().policy(), capacity);
     // 与主动方同理：读循环已经用 `initial_window` 回了自己的 `OPEN`，这里把那份
     // 快照记进 `RecvWindow`，否则对端第一帧会被误判为越权。
     flow.recv_window_mut().report();
     // 被动方的发送额度来自主动方（对端）`OPEN` 里的通告。
     if let Result::Err(err) = flow.send_window_mut().on_report(peer_report) {
-        conn.reg_().release_channel_(local, remote);
+        conn.core_().reg_().release_channel_(local, remote);
         return Result::Err(MuxError::FlowCtrl(err));
     }
     let owner = ChannelOwner_::new_(ChannelState_::new_(flow), alloc);
-    conn.reg_().attach_owner_(local, remote, owner.clone());
-    let _ = conn.w_events_().try_send_event_(WriteEvent_::Attach {
-        local_dock: local,
-        remote_dock: remote,
-        owner: owner.clone(),
-        reader_: tx_r});
-    let _ = conn.r_events_().try_send_event_(ReadEvent_::Attach {
-        local_dock: local,
-        remote_dock: remote,
-        owner: owner.clone(),
-        writer_: rx_w});
+    conn.core_()
+        .reg_()
+        .attach_owner_(local, remote, owner.clone());
+    let _ = conn
+        .core_()
+        .w_events_()
+        .try_send_event_(WriteEvent_::Attach {
+            local_dock: local,
+            remote_dock: remote,
+            owner: owner.clone(),
+            reader_: tx_r});
+    let _ = conn
+        .core_()
+        .r_events_()
+        .try_send_event_(ReadEvent_::Attach {
+            local_dock: local,
+            remote_dock: remote,
+            owner: owner.clone(),
+            writer_: rx_w});
 
     // `ACCEPT` 不带窗口字段。`welcome` 的契约在 `abs_smux` 里是 `TrBuffWrite`，
     // 即「由库写入应用缓冲」的方向，与「把欢迎信息发给对端」相反，语义存疑；本轮
     // 按空载荷发出，并把它记为遗留（见 dev-notes §2.11）。
     let _ = welcome;
-    let _ = conn.w_events_().try_send_event_(WriteEvent_::Control {
-        frame_: ControlFrame_::with_window_(
-            FrameKind::Accept,
-            0u8,
-            local,
-            remote,
-            Option::None,
-            Vec::new(),
-        )});
+    let _ = conn
+        .core_()
+        .w_events_()
+        .try_send_event_(WriteEvent_::Control {
+            frame_: ControlFrame_::with_window_(
+                FrameKind::Accept,
+                0u8,
+                local,
+                remote,
+                Option::None,
+                Vec::new(),
+            )});
 
     Result::Ok((
-        ChannelTx::new_(
-            TxRing_::new_(tx_w, owner.clone(), conn.w_events_().clone(), local, remote),
-            local,
-            remote,
-        ),
-        ChannelRx::new_(
-            RxRing_::new_(rx_r, conn.w_events_().clone(), local, remote),
-            local,
-            remote,
-        ),
+        ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote),
+        ChannelRx::new_(rx_r, conn, local, remote),
     ))
 }
 
 /// [`TrChannelHandle::reject_async`] 的 step 函数。
-#[gen_may_cancel_future(MuxReject, pub)]
-async fn mux_reject_async_<'a, 's, 'f, R, W, C, Rt, Rb, K>(
-    handle: &'a mut ChannelHandle<'s, 'f, R, W, C, Rt>,
-    reason: &'a mut Rb,
+#[gen_may_cancel_future(MuxReject, pub, new(pub(crate)))]
+async fn mux_reject_async_<'f, C, S, RE, WE, Rb, K>(
+    handle: &'f mut ChannelHandle<C, S, RE, WE>,
+    reason: &'f mut Rb,
     cancel: K,
-) -> Result<usize, MuxError<R::Err, W::Err>>
+) -> Result<usize, MuxError<RE, WE>>
 where
-    'f: 's,
-    R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
     C: TrMuxConfig + 'f,
-    Rb: TrBuffRead<u8> + 'a,
+    S: 'f,
+    Rb: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {
-    let conn = handle.conn_;
+    let conn = handle.conn_.clone();
     let local = handle.local_dock_;
     let remote = handle.remote_dock_;
-    let payload =
-        read_available_into_vec_(reason, conn.opts_().basic_opts.max_packet_size, cancel.child_token())
-            .await;
+    let payload = read_available_into_vec_(
+        reason,
+        conn.core_().opts_().basic_opts.max_packet_size,
+        cancel.child_token(),
+    )
+    .await;
     let written = payload.len();
-    let _ = conn.w_events_().try_send_event_(WriteEvent_::Control {
-        frame_: ControlFrame_::with_window_(
-            FrameKind::Reject,
-            0u8,
-            local,
-            remote,
-            Option::None,
-            payload,
-        )});
+    let _ = conn
+        .core_()
+        .w_events_()
+        .try_send_event_(WriteEvent_::Control {
+            frame_: ControlFrame_::with_window_(
+                FrameKind::Reject,
+                0u8,
+                local,
+                remote,
+                Option::None,
+                payload,
+            )});
     // 拒绝即拆掉这条待决子流（环尚未建立）。
-    conn.reg_().release_channel_(local, remote);
+    conn.core_().reg_().release_channel_(local, remote);
     Result::Ok(written)
 }

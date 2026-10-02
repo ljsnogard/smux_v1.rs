@@ -1,8 +1,35 @@
-use core::{
-    alloc::AllocatorClone,
-    borrow::BorrowMut,
-    mem::MaybeUninit,
-};
+//! 子流的两个应用侧半部：[`ChannelTx`] / [`ChannelRx`]。
+//!
+//! 对应 `abs_smux` 的 `TrChannelTx` / `TrChannelRx` / `TrChannelHalf`；数据面则
+//! 直接实现 `abs_buff` 的 `TrBuffWrite` / `TrBuffRead`。
+//!
+//! # 关闭态：直接读环的两个端
+//!
+//! `TrChannelHalf::is_tx_closed` / `is_rx_closed` 不额外维护标志位，而是读
+//! `buffex::ring` 环本身的**两端关闭态**（半部经 `ring_state()` 取
+//! `is_producer_closed` / `is_consumer_closed`）：
+//!
+//! - 发送环的应用端是 [`ChannelTx`]（生产端），另一端由中心循环的写路径持有；
+//!   接收环的会话端是生产端，应用端是 [`ChannelRx`]（消费端）；
+//! - `ChannelTx::is_tx_closed()` 因此是「应用端已关闭发送环的生产端」——丢弃
+//!   [`ChannelTx`] 即置位；`ChannelTx::is_rx_closed()` 是「中心循环已关闭发送环的
+//!   消费端」，即连接已经拆掉这条子流；
+//! - 接收方向对称：`ChannelRx::is_tx_closed()` 表示会话（生产端）已关闭接收环，
+//!   即对端不再发送（EOF）；`ChannelRx::is_rx_closed()` 表示应用端（消费端）已关闭。
+//!
+//! 好处是**关闭态不需要再引入一份共享状态**：环本身就是两个端共享的那点状态。
+//!
+//! # 为什么没有内层包装类型
+//!
+//! 早先的实现在 [`ChannelTx`] 之内还套了一层 `TxRing_` / `RxRing_`，并把
+//! `Drop` 与 `TrChannelHalf` 落在内层上。那一层存在的唯一理由是 E0366：Rust
+//! 不允许为泛型结构体的**某个具体实例化**单独实现 `Drop`，而当时 `ChannelTx<H>`
+//! 对「环半部类型」泛型，`Drop` 只能落到 `ChannelTx<TxRing_<..>>` 上。
+//!
+//! 现在两个半部直接以 `<C, S, RE, WE>` 参数化（环半部类型由 `C` 决定，是**唯一**
+//! 的），E0366 不再适用，因此内层包装被删除：两个半部**各自就是那个具名、可写进
+//! 结构体字段的具体类型**（旧模型下内层包装未导出，下游根本写不出已建立 channel
+//! 的类型，见 `dev-notes` §16.2 F5）。
 
 use abs_buff::{
     Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
@@ -14,28 +41,43 @@ use buffex::x_deps::abs_buff;
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, Dock,
+        BufferedRx, BufferedTx, Dock, MuxConnection, TrMuxConfig,
         owner_::ChannelOwner_,
-        signal_::{EventSender_, TrEventSender_, WriteEvent_},
+        signal_::{TrEventSender_, WriteEvent_},
     },
     flow_ctrl::Credit,
 };
 
-/// 子流发送半边：包一个 `buffex` 生产端半部。
+/// 子流发送半边（应用侧**生产端**）。
 ///
 /// 实现 `TrBuffTryWrite<u8>`，因此应用侧写数据是**非阻塞**的：环满即返回
 /// `WriteErrTag::Stuffed`，由应用决定等待还是丢弃。真正把数据推上网络的是
 /// 内部写循环。
 ///
+/// 除环的生产端外，它还持有：
+///
+/// - 该子流的共享状态（用于「已入队」位去重与关闭记账）；
+/// - **一份连接智能指针克隆**——既用于通知写循环（`WriteEvent_`），也保证
+///   「应用还拿着半部」期间连接不会被回收（最后一个强引用消失才会关闭连接）。
+///
 /// # 关闭语义（半关闭）
 ///
 /// 本类型**按值独占**生产端半部，因此**丢弃它即关闭发送方向**（`buffex` 在
-/// 半部 drop 时置位本端关闭标志）；会话据此得知「应用不再发送」并发出
-/// `CLOSE(FIN)`。两个方向互不影响，关闭态直接取自环本身（见模块文档
+/// 半部 drop 时置位本端关闭标志）；其 `Drop` 同时通知写循环「排空后发
+/// `CLOSE(FIN)`」。两个方向互不影响，关闭态直接取自环本身（见模块文档
 /// 「关闭态」一节）。
-pub struct ChannelTx<H> {
+pub struct ChannelTx<C, S, RE, WE>
+where
+    C: TrMuxConfig,
+{
     /// `buffex` 生产端半部（[`BufferedTx`] 的实例）。
-    half_: H,
+    ring_: BufferedTx<C::Buff, C::Alloc>,
+
+    /// 该子流的共享状态（「已入队」去重与关闭记账）。
+    owner_: ChannelOwner_<C::Alloc>,
+
+    /// 连接智能指针：通知写循环 + 保活。
+    conn_: MuxConnection<C, S, RE, WE>,
 
     /// 本端 dock。
     local_dock_: Dock,
@@ -43,103 +85,25 @@ pub struct ChannelTx<H> {
     /// 对端 dock。
     remote_dock_: Dock}
 
-impl<H> ChannelTx<H> {
-    /// 由 `buffex` 生产端半部与 dock 对构造。
+impl<C, S, RE, WE> ChannelTx<C, S, RE, WE>
+where
+    C: TrMuxConfig,
+{
+    /// 由环生产端、共享状态、连接与 dock 对构造。
     ///
-    /// 只供连接内部（中心循环、建流路径）与单元测试使用：对外部使用者而言，
-    /// 这两个半边只应由 `abs_smux` 的 trait 产出。
-    pub(crate) fn new_(half: H, local_dock: Dock, remote_dock: Dock) -> Self {
-        ChannelTx {
-            half_: half,
-            local_dock_: local_dock,
-            remote_dock_: remote_dock}
-    }
-}
-
-/// 子流接收半边：包一个 `buffex` 消费端半部。
-///
-/// 实现 `TrBuffTryRead<u8>`；环空即返回 `ReadErrTag::Drained`。数据由
-/// 内部读循环从网络解复用后写入。
-///
-/// # 关闭语义（半关闭）
-///
-/// 丢弃本类型即关闭接收方向；写端关闭后先把残留数据读走，再 `try_read` 才会
-/// 报 `Closing`（EOF 语义，见模块文档「关闭态」一节）。
-pub struct ChannelRx<H> {
-    /// `buffex` 消费端半部（[`BufferedRx`] 的实例）。
-    half_: H,
-
-    /// 本端 dock。
-    local_dock_: Dock,
-
-    /// 对端 dock。
-    remote_dock_: Dock}
-
-impl<H> ChannelRx<H> {
-    /// 由 `buffex` 消费端半部与 dock 对构造；可见性同 [`ChannelTx::new_`]。
-    pub(crate) fn new_(half: H, local_dock: Dock, remote_dock: Dock) -> Self {
-        ChannelRx {
-            half_: half,
-            local_dock_: local_dock,
-            remote_dock_: remote_dock}
-    }
-}
-
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// 应用侧环半部包装：环端 + 事件发送端 +（发送侧的）共享状态
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-/// 应用侧**发送**环半部。
-///
-/// 除了 `buffex` 的写端，它还持有该子流的共享状态，因此能在应用开始写数据的那一刻
-/// 通知写循环。
-///
-/// > **目标形状（本轮确定，迁移中）**：通知方式由「往事件通道投一条消息」改为
-/// > **直接调用 `MuxCore::note_tx_ready_`**（同步、锁内改状态、出锁唤醒写循环），
-/// > 见 `dev-notes` §17.3、§17.5。
-/// >
-/// > 同时**本类型改为对外导出**并取一个正常名字（如 `ChannelTxHalf<C, Rt>`），
-/// > `ChannelTx` / `ChannelRx` 直接以 `<C, Rt>` 参数化。旧设计把内层包装标成模块
-/// > 私有、只为保住 `ChannelTx` 的泛型 arity，那个理由在新设计下不再成立；不导出
-/// > 的后果是下游**无法命名**已建立的 channel 类型（`dev-notes` §16.2 F5），
-/// > 连「把半部存进结构体字段」都做不到。
-pub struct TxRing_<B, A>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{
-    /// 应用侧写端。
-    ring_: BufferedTx<B, A>,
-
-    /// 该子流的共享状态（用于「已入队」去重与关闭记账）。
-    owner_: ChannelOwner_<A>,
-
-    /// 写事件发送端。
-    events_: EventSender_<WriteEvent_<B, A>>,
-
-    /// 本端 dock。
-    local_dock_: Dock,
-
-    /// 对端 dock。
-    remote_dock_: Dock}
-
-impl<B, A> TxRing_<B, A>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{
-    /// 构造。
+    /// 只供连接内部（建流路径）与单元测试使用：对外部使用者而言，这两个半边只应由
+    /// `abs_smux` 的 trait 产出。
     pub(crate) fn new_(
-        ring: BufferedTx<B, A>,
-        owner: ChannelOwner_<A>,
-        events: EventSender_<WriteEvent_<B, A>>,
+        ring: BufferedTx<C::Buff, C::Alloc>,
+        owner: ChannelOwner_<C::Alloc>,
+        conn: MuxConnection<C, S, RE, WE>,
         local_dock: Dock,
         remote_dock: Dock,
     ) -> Self {
-        TxRing_ {
+        ChannelTx {
             ring_: ring,
             owner_: owner,
-            events_: events,
+            conn_: conn,
             local_dock_: local_dock,
             remote_dock_: remote_dock}
     }
@@ -155,42 +119,44 @@ where
             fresh
         });
         if fresh {
-            let _ = self.events_.try_send_event_(WriteEvent_::TxReady {
-                local_dock: self.local_dock_,
-                remote_dock: self.remote_dock_});
+            let _ = self
+                .conn_
+                .core_()
+                .w_events_()
+                .try_send_event_(WriteEvent_::TxReady {
+                    local_dock: self.local_dock_,
+                    remote_dock: self.remote_dock_});
         }
     }
 }
 
-impl<B, A> Drop for TxRing_<B, A>
+impl<C, S, RE, WE> Drop for ChannelTx<C, S, RE, WE>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
+    C: TrMuxConfig,
 {
     /// 丢弃发送半边 = 半关闭：显式关闭环的生产端，并通知写循环排空后发 `FIN`。
-    ///
-    /// `Drop` 落在环包装类型上而不是 [`ChannelTx`] 上：Rust 不允许为泛型结构体的
-    /// 某个具体实例化单独实现 `Drop`（E0366），而 `ChannelTx<H>` 是公开的泛型
-    /// 结构体。
     fn drop(&mut self) {
         self.ring_.close();
-        let _ = self.events_.try_send_event_(WriteEvent_::TxClosed {
-            local_dock: self.local_dock_,
-            remote_dock: self.remote_dock_});
+        let _ = self
+            .conn_
+            .core_()
+            .w_events_()
+            .try_send_event_(WriteEvent_::TxClosed {
+                local_dock: self.local_dock_,
+                remote_dock: self.remote_dock_});
     }
 }
 
-impl<B, A> TrBuffTryWrite<u8> for TxRing_<B, A>
+impl<C, S, RE, WE> TrBuffTryWrite<u8> for ChannelTx<C, S, RE, WE>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
+    C: TrMuxConfig,
 {
     type SegmMut<'f>
-        = <BufferedTx<B, A> as TrBuffTryWrite<u8>>::SegmMut<'f>
+        = <BufferedTx<C::Buff, C::Alloc> as TrBuffTryWrite<u8>>::SegmMut<'f>
     where
         Self: 'f;
 
-    type Err = <BufferedTx<B, A> as TrBuffTryWrite<u8>>::Err;
+    type Err = <BufferedTx<C::Buff, C::Alloc> as TrBuffTryWrite<u8>>::Err;
 
     fn try_write<'f>(
         &'f mut self,
@@ -201,13 +167,12 @@ where
     }
 }
 
-impl<B, A> TrBuffWrite<u8> for TxRing_<B, A>
+impl<C, S, RE, WE> TrBuffWrite<u8> for ChannelTx<C, S, RE, WE>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
+    C: TrMuxConfig,
 {
     type WriteAsync<'f>
-        = <BufferedTx<B, A> as TrBuffWrite<u8>>::WriteAsync<'f>
+        = <BufferedTx<C::Buff, C::Alloc> as TrBuffWrite<u8>>::WriteAsync<'f>
     where
         Self: 'f;
 
@@ -217,133 +182,9 @@ where
     }
 }
 
-/// 应用侧**接收**环半部。
-///
-/// 每次应用发起读之前，先按环的 `data_size` 变化算出**已提交消费量**并通知写循环
-/// 回补窗口。用增量而不是「本次借出的段长」是为了不超前通告：段在被 drop 之前
-/// 仍占用环空间。
-/// 可见性理由同 [`TxRing_`]。
-pub struct RxRing_<B, A>
+impl<C, S, RE, WE> TrChannelHalf for ChannelTx<C, S, RE, WE>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{
-    /// 应用侧读端。
-    ring_: BufferedRx<B, A>,
-
-    /// 写事件发送端。
-    events_: EventSender_<WriteEvent_<B, A>>,
-
-    /// 本端 dock。
-    local_dock_: Dock,
-
-    /// 对端 dock。
-    remote_dock_: Dock,
-
-    /// 上一次观察到的环内数据量（用于算已提交消费的增量）。
-    last_data_: usize}
-
-impl<B, A> RxRing_<B, A>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{
-    /// 构造。
-    pub(crate) fn new_(
-        ring: BufferedRx<B, A>,
-        events: EventSender_<WriteEvent_<B, A>>,
-        local_dock: Dock,
-        remote_dock: Dock,
-    ) -> Self {
-        RxRing_ {
-            ring_: ring,
-            events_: events,
-            local_dock_: local_dock,
-            remote_dock_: remote_dock,
-            last_data_: 0usize}
-    }
-
-    /// 观察 `data_size` 的下降量（= 上次调用之后已提交的消费量）并上报。
-    fn note_consumed_(&mut self) {
-        let now = self.ring_.ring_state().data_size();
-        let delta = self.last_data_.saturating_sub(now);
-        self.last_data_ = now;
-        if delta > 0 {
-            let amount = Credit::try_from(delta).unwrap_or(Credit::MAX);
-            let _ = self.events_.try_send_event_(WriteEvent_::RxConsumed {
-                local_dock: self.local_dock_,
-                remote_dock: self.remote_dock_,
-                amount_: amount});
-        }
-    }
-}
-
-impl<B, A> Drop for RxRing_<B, A>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{
-    /// 丢弃接收半边：关掉环的消费端，并通知写循环发 `RESET` 拆掉该方向。
-    fn drop(&mut self) {
-        self.ring_.close();
-        let _ = self.events_.try_send_event_(WriteEvent_::RxClosed {
-            local_dock: self.local_dock_,
-            remote_dock: self.remote_dock_});
-    }
-}
-
-impl<B, A> TrBuffTryRead<u8> for RxRing_<B, A>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{
-    type SegmRef<'f>
-        = <BufferedRx<B, A> as TrBuffTryRead<u8>>::SegmRef<'f>
-    where
-        Self: 'f;
-
-    type Err = <BufferedRx<B, A> as TrBuffTryRead<u8>>::Err;
-
-    fn try_read<'f>(
-        &'f mut self,
-        demand: &'f Demand<usize>,
-    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
-        self.note_consumed_();
-        self.ring_.try_read(demand)
-    }
-}
-
-impl<B, A> TrBuffRead<u8> for RxRing_<B, A>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{
-    type ReadAsync<'f>
-        = <BufferedRx<B, A> as TrBuffRead<u8>>::ReadAsync<'f>
-    where
-        Self: 'f;
-
-    fn read_async<'f>(&'f mut self, demand: &'f Demand<usize>) -> Self::ReadAsync<'f> {
-        self.note_consumed_();
-        self.ring_.read_async(demand)
-    }
-}
-
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// TrConnection
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// 子流发送半边
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-/// 只有真正的 `buffex` 生产端才能回答「两个方向各自的关闭态」，因此本 impl 落在
-/// 具体半部类型上（泛型的 `TrBuffTryWrite` 转发 impl 仍然对任意 `H` 成立）。
-impl<B, A> TrChannelHalf for ChannelTx<TxRing_<B, A>>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
+    C: TrMuxConfig,
 {
     type Data = u8;
     type Dock = Dock;
@@ -358,63 +199,143 @@ where
 
     /// 发送方向是否已关闭：本端（应用）已不再发送，或会话已停止排空本环。
     fn is_tx_closed(&self) -> bool {
-        self.half_.ring_.ring_state().is_producer_closed()
+        self.ring_.ring_state().is_producer_closed()
     }
 
     /// 接收方向是否已关闭：环的消费端（由写循环持有）已关闭，即整条子流已被
     /// 连接拆掉。
     fn is_rx_closed(&self) -> bool {
-        self.half_.ring_.ring_state().is_consumer_closed()
+        self.ring_.ring_state().is_consumer_closed()
     }
 }
 
-impl<H> TrBuffTryWrite<u8> for ChannelTx<H>
+impl<C, S, RE, WE> TrChannelTx for ChannelTx<C, S, RE, WE> where C: TrMuxConfig {}
+
+/// 子流接收半边（应用侧**消费端**）。
+///
+/// 实现 `TrBuffTryRead<u8>`；环空即返回 `ReadErrTag::Drained`。数据由
+/// 内部读循环从网络解复用后写入。
+///
+/// 每次应用发起读之前，先按环的 `data_size` 变化算出**已提交消费量**并通知写循环
+/// 回补窗口。用增量而不是「本次借出的段长」是为了不超前通告：段在被 drop 之前
+/// 仍占用环空间。
+///
+/// # 关闭语义（半关闭）
+///
+/// 丢弃本类型即关闭接收方向；写端关闭后先把残留数据读走，再 `try_read` 才会
+/// 报 `Closing`（EOF 语义，见模块文档「关闭态」一节）。
+pub struct ChannelRx<C, S, RE, WE>
 where
-    H: TrBuffTryWrite<u8>,
+    C: TrMuxConfig,
 {
-    type SegmMut<'f>
-        = H::SegmMut<'f>
+    /// `buffex` 消费端半部（[`BufferedRx`] 的实例）。
+    ring_: BufferedRx<C::Buff, C::Alloc>,
+
+    /// 连接智能指针：通知写循环 + 保活。
+    conn_: MuxConnection<C, S, RE, WE>,
+
+    /// 本端 dock。
+    local_dock_: Dock,
+
+    /// 对端 dock。
+    remote_dock_: Dock,
+
+    /// 上一次观察到的环内数据量（用于算已提交消费的增量）。
+    last_data_: usize}
+
+impl<C, S, RE, WE> ChannelRx<C, S, RE, WE>
+where
+    C: TrMuxConfig,
+{
+    /// 由环消费端、连接与 dock 对构造；可见性同 [`ChannelTx::new_`]。
+    pub(crate) fn new_(
+        ring: BufferedRx<C::Buff, C::Alloc>,
+        conn: MuxConnection<C, S, RE, WE>,
+        local_dock: Dock,
+        remote_dock: Dock,
+    ) -> Self {
+        ChannelRx {
+            ring_: ring,
+            conn_: conn,
+            local_dock_: local_dock,
+            remote_dock_: remote_dock,
+            last_data_: 0usize}
+    }
+
+    /// 观察 `data_size` 的下降量（= 上次调用之后已提交的消费量）并上报。
+    fn note_consumed_(&mut self) {
+        let now = self.ring_.ring_state().data_size();
+        let delta = self.last_data_.saturating_sub(now);
+        self.last_data_ = now;
+        if delta > 0 {
+            let amount = Credit::try_from(delta).unwrap_or(Credit::MAX);
+            let _ = self
+                .conn_
+                .core_()
+                .w_events_()
+                .try_send_event_(WriteEvent_::RxConsumed {
+                    local_dock: self.local_dock_,
+                    remote_dock: self.remote_dock_,
+                    amount_: amount});
+        }
+    }
+}
+
+impl<C, S, RE, WE> Drop for ChannelRx<C, S, RE, WE>
+where
+    C: TrMuxConfig,
+{
+    /// 丢弃接收半边：关掉环的消费端，并通知写循环发 `RESET` 拆掉该方向。
+    fn drop(&mut self) {
+        self.ring_.close();
+        let _ = self
+            .conn_
+            .core_()
+            .w_events_()
+            .try_send_event_(WriteEvent_::RxClosed {
+                local_dock: self.local_dock_,
+                remote_dock: self.remote_dock_});
+    }
+}
+
+impl<C, S, RE, WE> TrBuffTryRead<u8> for ChannelRx<C, S, RE, WE>
+where
+    C: TrMuxConfig,
+{
+    type SegmRef<'f>
+        = <BufferedRx<C::Buff, C::Alloc> as TrBuffTryRead<u8>>::SegmRef<'f>
     where
         Self: 'f;
 
-    type Err = H::Err;
+    type Err = <BufferedRx<C::Buff, C::Alloc> as TrBuffTryRead<u8>>::Err;
 
-    fn try_write<'f>(
+    fn try_read<'f>(
         &'f mut self,
         demand: &'f Demand<usize>,
-    ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
-        self.half_.try_write(demand)
+    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
+        self.note_consumed_();
+        self.ring_.try_read(demand)
     }
 }
 
-impl<H> TrBuffWrite<u8> for ChannelTx<H>
+impl<C, S, RE, WE> TrBuffRead<u8> for ChannelRx<C, S, RE, WE>
 where
-    H: TrBuffWrite<u8>,
+    C: TrMuxConfig,
 {
-    type WriteAsync<'f>
-        = H::WriteAsync<'f>
+    type ReadAsync<'f>
+        = <BufferedRx<C::Buff, C::Alloc> as TrBuffRead<u8>>::ReadAsync<'f>
     where
         Self: 'f;
 
-    fn write_async<'f>(&'f mut self, demand: &'f Demand<usize>) -> Self::WriteAsync<'f> {
-        self.half_.write_async(demand)
+    fn read_async<'f>(&'f mut self, demand: &'f Demand<usize>) -> Self::ReadAsync<'f> {
+        self.note_consumed_();
+        self.ring_.read_async(demand)
     }
 }
 
-impl<B, A> TrChannelTx for ChannelTx<TxRing_<B, A>>
+impl<C, S, RE, WE> TrChannelHalf for ChannelRx<C, S, RE, WE>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{}
-
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// 子流接收半边
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-impl<B, A> TrChannelHalf for ChannelRx<RxRing_<B, A>>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
+    C: TrMuxConfig,
 {
     type Data = u8;
     type Dock = Dock;
@@ -430,57 +351,21 @@ where
     /// 发送方向是否已关闭：环的生产端（由读循环持有）已关闭，即对端不再发送
     /// （EOF）或整条子流已被连接拆掉。
     fn is_tx_closed(&self) -> bool {
-        self.half_.ring_.ring_state().is_producer_closed()
+        self.ring_.ring_state().is_producer_closed()
     }
 
     /// 接收方向是否已关闭：本端（应用）已不再接收。
     fn is_rx_closed(&self) -> bool {
-        self.half_.ring_.ring_state().is_consumer_closed()
+        self.ring_.ring_state().is_consumer_closed()
     }
 }
 
-impl<H> TrBuffTryRead<u8> for ChannelRx<H>
-where
-    H: TrBuffTryRead<u8>,
-{
-    type SegmRef<'f>
-        = H::SegmRef<'f>
-    where
-        Self: 'f;
-
-    type Err = H::Err;
-
-    fn try_read<'f>(
-        &'f mut self,
-        demand: &'f Demand<usize>,
-    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
-        self.half_.try_read(demand)
-    }
-}
-
-impl<H> TrBuffRead<u8> for ChannelRx<H>
-where
-    H: TrBuffRead<u8>,
-{
-    type ReadAsync<'f>
-        = H::ReadAsync<'f>
-    where
-        Self: 'f;
-
-    fn read_async<'f>(&'f mut self, demand: &'f Demand<usize>) -> Self::ReadAsync<'f> {
-        self.half_.read_async(demand)
-    }
-}
-
-impl<B, A> TrChannelRx for ChannelRx<RxRing_<B, A>>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: AllocatorClone + Send + Sync,
-{}
-
+impl<C, S, RE, WE> TrChannelRx for ChannelRx<C, S, RE, WE> where C: TrMuxConfig {}
 
 #[cfg(test)]
 mod tests_ {
+    use core::mem::MaybeUninit;
+
     use abs_buff::{
         Demand,
         buffer::{TrBuffSegmMut, TrBuffSegmRef}};
@@ -490,37 +375,39 @@ mod tests_ {
     use crate::{
         connection::{
             owner_::ChannelState_,
-            ring_::test_support_::{TestBuff, make_test_channel_},
-            signal_::event_channel_,
+            ring_::test_support_::make_test_channel_,
+            test_support_::{NullScope_, TestMuxConfig_, make_test_conn_},
         },
         flow_ctrl::{DefaultPolicy, FlowCtrl},
     };
 
     use super::*;
 
-    /// 测试用的子流半边类型。
-    type TestTx = ChannelTx<TxRing_<TestBuff, CoreAlloc>>;
-    type TestRx = ChannelRx<RxRing_<TestBuff, CoreAlloc>>;
+    /// 测试用的子流半边类型（连接未经握手、不含任何循环，只用于检查本地行为）。
+    type TestTx = ChannelTx<TestMuxConfig_, NullScope_, (), ()>;
+    type TestRx = ChannelRx<TestMuxConfig_, NullScope_, (), ()>;
 
     /// 构造一对包在**内存环**上的子流半边（容量 64，dock 对 `(3, 7)`）。
-    /// - 手段：用 `buffex::ring` 建一条容量 64 的环并切成读写两端，再为它建一份
-    ///   共享状态与一对（无人消费的）事件通道，最后把两个半部包进
-    ///   [`ChannelTx`] / [`ChannelRx`]。
+    /// - 手段：先建一个「无循环连接」（[`make_test_conn_`]，只提供事件发送端与
+    ///   保活），再用 `buffex::ring` 建一条容量 64 的环并切成读写两端，为它建一份
+    ///   共享状态，最后把两个半部各自包成 [`ChannelTx`] / [`ChannelRx`]。
     /// - 判断：返回的 `(Tx, Rx)` 即被测对象；构建失败即测试失败。
     fn make_halves_() -> (TestTx, TestRx) {
         let (half_tx, half_rx) = make_test_channel_(64usize);
         let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
         let owner = ChannelOwner_::new_(ChannelState_::new_(flow), CoreAlloc);
-        let (events, _events_rx) = event_channel_::<WriteEvent_<TestBuff, CoreAlloc>>();
+        let conn = make_test_conn_();
         let local = Dock::new(3u32);
         let remote = Dock::new(7u32);
         (
             ChannelTx::new_(
-                TxRing_::new_(half_tx, owner, events.clone(), local, remote),
+                half_tx,
+                owner,
+                conn.clone(),
                 local,
                 remote,
             ),
-            ChannelRx::new_(RxRing_::new_(half_rx, events, local, remote), local, remote),
+            ChannelRx::new_(half_rx, conn, local, remote),
         )
     }
 
@@ -636,13 +523,13 @@ mod tests_ {
         assert!(!rx.is_tx_closed());
         assert!(!rx.is_rx_closed());
 
-        tx.half_.ring_.close();
+        tx.ring_.close();
         assert!(tx.is_tx_closed(), "关闭生产端后发送方向应视为已关闭");
         assert!(rx.is_tx_closed(), "发送方向的关闭应对接收半边可见");
         assert!(!tx.is_rx_closed(), "接收方向不应受影响");
         assert!(!rx.is_rx_closed(), "接收方向不应受影响");
 
-        rx.half_.ring_.close();
+        rx.ring_.close();
         assert!(rx.is_rx_closed(), "关闭消费端后接收方向应视为已关闭");
         assert!(tx.is_rx_closed(), "接收方向的关闭应对发送半边可见");
     }
@@ -659,7 +546,7 @@ mod tests_ {
         try_write_all_(&mut tx, &payload)
             .await
             .expect("写入内存环应当成功");
-        tx.half_.ring_.close();
+        tx.ring_.close();
         assert!(rx.is_tx_closed(), "写端关闭应立即可见");
 
         let mut got = [0u8; 3];

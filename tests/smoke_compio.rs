@@ -11,11 +11,13 @@
 //! - [`mux_small_socket_compio_`]：同一条链路的小场景（`2 dock × 2 条 = 4` 条），
 //!   作为快速传输回归。
 //!
-//! 两者都只跑**缺省（单线程）feature 配置**：`multi-thread` 配置下连接驱动尚未
-//! 实现（`MuxConnection::new` 仍是 `todo!()`），因此用 `#[cfg]` 跳过而不是失败。
+//! 两个用例都用 **compio 的本地作用域值**（`abs_art_compio::LocalScope`，零大小）
+//! 承载连接的两个循环：compio 的本地队列归运行时所有并由运行时自己驱动，因此用例
+//! 只需取得作用域值即可。
 
 mod common;
 
+use abs_art::TrLocalScope;
 use buffex::x_deps::abs_buff::{
     TrBuffRead, TrBuffWrite,
     io::{TrInput, TrOutput},
@@ -41,22 +43,10 @@ fn assert_compio_adapters_fit_(read: &mut UnixStream, write: &mut UnixStream) {
     assert_output_(WriteAsOutput::new(write));
 }
 
-/// 连接层使用的运行时标记类型。
-///
-/// 同时声明 `SPAWN_SEND` 与 `SPAWN_LOCAL` 两种能力：缺省（单线程）配置下
-/// `MuxConnection::new` 要求 `Rt: TrSpawnLocal`，开启 `multi-thread` 后要求
-/// `Rt: TrSpawnSend`；两种都声明，同一份测试才能在两种 feature 配置下都通过
-/// 编译检查。compio 的运行时是线程本地的，因此实际执行路径始终是 `spawn_local`
-/// 语义（见 `abs_art-compio` 的 `spawn_send` 模块文档）。
-#[cfg(not(feature = "multi-thread"))]
-type SmokeRt =
-    abs_art_compio::Runtime<{ abs_art_compio::SPAWN_SEND | abs_art_compio::SPAWN_LOCAL }>;
-
 /// 建立一条已注册进 compio 运行时的 UNIX socket 连接的两个端点。
 ///
 /// compio 0.19 的 `UnixStream` 没有 `pair()`，因此先建 `std` 的 socket 对再逐个
 /// `from_std` 注册。
-#[cfg(not(feature = "multi-thread"))]
 fn compio_socket_pair_() -> (UnixStream, UnixStream) {
     let (std_a, std_b) =
         std::os::unix::net::UnixStream::pair().expect("建立 std UNIX socket 对应当成功");
@@ -81,20 +71,21 @@ fn compio_socket_pair_() -> (UnixStream, UnixStream) {
 ///   `accept_async` 全部返回成功；每条子流按 `(dock, index)` 自洽校验载荷（不依赖
 ///   open / accept 的配对顺序），丢弃发送半边后对端读到 `Closing`（EOF）。任一
 ///   不满足即 panic，测试失败。
-#[cfg(not(feature = "multi-thread"))]
 #[compio::test]
 async fn mux_smoke_compio_() {
     let (stream_a, stream_b) = compio_socket_pair_();
     let (mut a_read, mut a_write) = stream_a.into_split();
     let (mut b_read, mut b_write) = stream_b.into_split();
 
-    common::run_socket_scenario_::<_, _, _, _, SmokeRt>(
+    let scope = abs_art_compio::LocalScope::new();
+    let scenario = common::run_socket_scenario_(
+        &scope,
         ReadAsInput::new(&mut a_read),
         WriteAsOutput::new(&mut a_write),
         ReadAsInput::new(&mut b_read),
         WriteAsOutput::new(&mut b_write),
-    )
-    .await;
+    );
+    scope.run_until(scenario).await;
 }
 
 /// 测试目标：与 [`mux_smoke_compio_`] 同一条链路，但只跑 `2 dock × 2 条 = 4` 条
@@ -103,18 +94,19 @@ async fn mux_smoke_compio_() {
 /// - 手段：同样用 std socket 对 + `from_std` + `into_split()` + 设备级适配 +
 ///   调用方驱动泵，只是把场景换成 [`common::run_small_socket_scenario_`]。
 /// - 判断：4 条子流的 open / accept / 双向收发 / 半关闭全部成功；失败即 panic。
-#[cfg(not(feature = "multi-thread"))]
 #[compio::test]
 async fn mux_small_socket_compio_() {
     let (stream_a, stream_b) = compio_socket_pair_();
     let (mut a_read, mut a_write) = stream_a.into_split();
     let (mut b_read, mut b_write) = stream_b.into_split();
 
-    common::run_small_socket_scenario_::<_, _, _, _, SmokeRt>(
+    let scope = abs_art_compio::LocalScope::new();
+    let scenario = common::run_small_socket_scenario_(
+        &scope,
         ReadAsInput::new(&mut a_read),
         WriteAsOutput::new(&mut a_write),
         ReadAsInput::new(&mut b_read),
         WriteAsOutput::new(&mut b_write),
-    )
-    .await;
+    );
+    scope.run_until(scenario).await;
 }

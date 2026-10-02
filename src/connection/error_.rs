@@ -29,6 +29,11 @@ use crate::flow_ctrl::FlowCtrlError;
 /// 驱动循环那一侧、无法跨过去，所以另外给出载荷无关的
 /// [`MuxError::Transport`]——它只保留**方向**，用于表达「连接因传输错误中断」，
 /// 与「对端主动关闭」（[`MuxError::PeerClosed`]）是两件不同的事。
+///
+/// 因此：`Rx` / `Tx` 实际上只在连接内部的循环里构造（循环把错误投影成
+/// `FailKind_` 再回传），API 面上产出的一律是载荷无关的变体。两个载荷参数留在
+/// [`MuxConnection`](crate::connection::MuxConnection) 的类型上是为了如实表达
+/// 「这条连接的底层错误是什么」。
 #[derive(Debug)]
 pub enum MuxError<RE, WE> {
     /// 底层网络读失败（本次操作直接遇到）。
