@@ -482,6 +482,14 @@ impl RecvWindow {
     where
         P: TrFlowCtrlPolicy,
     {
+        self.should_report_with_(&ReportThresholds_::new_(policy, self.initial_))
+    }
+
+    /// 与 [`RecvWindow::should_report`] 同判据，但用**预先展开好的阈值快照**。
+    ///
+    /// 读写循环不持有调用方的 `C`/`P`，因此在连接建立时把策略展开成
+    /// [`ReportThresholds_`] 交给它们即可（见 `connection/session_.rs`）。
+    pub(crate) fn should_report_with_(&self, thresholds: &ReportThresholds_) -> bool {
         let Option::Some((_, last)) = self.reported_ else {
             return true;
         };
@@ -489,19 +497,19 @@ impl RecvWindow {
         if self.reset_due() {
             return true;
         }
-        if self.frames_since_report_ < policy.min_frames_between_reports() {
+        if self.frames_since_report_ < thresholds.min_frames_ {
             return false;
         }
         let current = self.window();
         if current < last {
-            return policy
-                .shrink_levels(self.initial_)
+            return thresholds
+                .shrink_
                 .iter()
                 .any(|level| current <= *level && *level < last);
         }
         if current > last {
-            return policy
-                .expand_levels(self.initial_)
+            return thresholds
+                .expand_
                 .iter()
                 .any(|level| current >= *level && *level > last);
         }
@@ -531,8 +539,40 @@ impl RecvWindow {
     }
 }
 
-/// 一条子流**双向**流控状态的聚合。
+/// 通告判定所需的策略快照。
 ///
+/// 读写循环运行在 `abs_art` spawn 出来的任务里（`'static`），既拿不到
+/// [`TrMuxConfig`](crate::connection::TrMuxConfig) 也借不到 `TrFlowCtrlPolicy`；
+/// 因此在连接建立时把「是否该通告」用到的三个量**展开一次**，此后判定只用它。
+/// 三个量都只依赖策略与初始窗口，而初始窗口由环容量唯一确定，所以整条连接共享
+/// 一份即可。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReportThresholds_ {
+    /// 两次通告之间至少经过的数据帧数。
+    min_frames_: usize,
+
+    /// 收缩水位（跌破即通告）。
+    shrink_: [Credit; K_REPORT_LEVEL_COUNT],
+
+    /// 扩张水位（升过即通告）。
+    expand_: [Credit; K_REPORT_LEVEL_COUNT],
+}
+
+impl ReportThresholds_ {
+    /// 从策略与初始窗口展开。
+    pub(crate) fn new_<P>(policy: &P, initial: Credit) -> Self
+    where
+        P: TrFlowCtrlPolicy,
+    {
+        ReportThresholds_ {
+            min_frames_: policy.min_frames_between_reports(),
+            shrink_: policy.shrink_levels(initial),
+            expand_: policy.expand_levels(initial),
+        }
+    }
+}
+
+/// 一条子流**双向**流控状态的聚合。///
 /// 子流对象持有它，`Tx` 侧只访问 [`FlowCtrl::send_window`]，`Rx` 侧只访问
 /// [`FlowCtrl::recv_window`]，两个方向互不干扰。
 pub struct FlowCtrl {

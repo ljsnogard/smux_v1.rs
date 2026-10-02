@@ -63,7 +63,8 @@ use buffex::{
     ring::Ring,
     x_deps::abs_buff::{
         Demand, TrBuffRead, TrBuffWrite,
-        buffer::{TrBuffSegmMut, TrBuffSegmRef},
+        buffer::{TrBuffSegmMut, TrBuffSegmRef, TrBuffSegmView},
+        error::{ReadErrTag, TrTaggedError},
         io::{TrInput, TrOutput},
     },
 };
@@ -127,6 +128,10 @@ impl TrMuxConfig for SmokeMuxConfig {
 
     fn channel_capacity(&self) -> usize {
         K_CHANNEL_CAPACITY
+    }
+
+    fn make_buff(&self, len: usize) -> Self::Buff {
+        Owned::new_uninit_slice(len, CoreAlloc)
     }
 }
 
@@ -288,13 +293,68 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB, Rt>(
     OB: TrOutput<u8>,
     Rt: TrSmokeRuntime,
 {
+    run_socket_scenario_with_(input_a, output_a, input_b, output_b, |a_rx, a_tx, b_rx, b_tx| {
+        run_smoke_scenario_::<_, _, _, _, Rt>(a_rx, a_tx, b_rx, b_tx)
+    })
+    .await
+}
+
+/// 与 [`run_socket_scenario_`] 相同的传输装配，但跑**本轮验收用的小场景**
+/// （2 dock × 各 2 条 channel，双向收发 + 半关闭），见 [`run_small_mux_scenario_`]。
+pub async fn run_small_socket_scenario_<IA, OA, IB, OB, Rt>(
+    input_a: IA,
+    output_a: OA,
+    input_b: IB,
+    output_b: OB,
+) where
+    IA: TrInput<u8>,
+    OA: TrOutput<u8>,
+    IB: TrInput<u8>,
+    OB: TrOutput<u8>,
+    Rt: TrSmokeRuntime,
+{
+    run_socket_scenario_with_(
+        input_a,
+        output_a,
+        input_b,
+        output_b,
+        |a_rx, a_tx, b_rx, b_tx| {
+            run_small_mux_scenario_::<_, _, _, _, Rt>(a_rx, a_tx, b_rx, b_tx)
+        },
+    )
+    .await
+}
+
+/// 把一次场景挂在「socket + 调用方驱动的泵 + 全被动环」的传输上。
+///
+/// 四个泵与场景用 `select` 并发推进（同一任务内轮询，不要求任何类型 `Send`）；
+/// 场景完成即丢弃泵 future，从而结束对设备（及其借用的 socket 半边）的借用。
+async fn run_socket_scenario_with_<IA, OA, IB, OB, F, Fut>(
+    input_a: IA,
+    output_a: OA,
+    input_b: IB,
+    output_b: OB,
+    scenario: F,
+) where
+    IA: TrInput<u8>,
+    OA: TrOutput<u8>,
+    IB: TrInput<u8>,
+    OB: TrOutput<u8>,
+    F: FnOnce(
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+    ) -> Fut,
+    Fut: core::future::Future<Output = ()>,
+{
     // 每端两个环：一个承载「socket → smux」（Rx），一个承载「smux → socket」（Tx）。
     let (a_rx_ring_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
     let (a_tx, a_tx_ring_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
     let (b_rx_ring_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
     let (b_tx, b_tx_ring_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
 
-    let scenario_fut = run_smoke_scenario_::<_, _, _, _, Rt>(a_rx, a_tx, b_rx, b_tx);
+    let scenario_fut = scenario(a_rx, a_tx, b_rx, b_tx);
     let pumps_fut = async {
         futures::join!(
             pump_input_(input_a, a_rx_ring_tx),
@@ -312,6 +372,185 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB, Rt>(
         futures::future::Either::Left(((), _pumps)) => {}
         futures::future::Either::Right((_pumps, _scenario)) => {
             panic!("四个传输泵在场景完成之前全部退出")
+        }
+    }
+}
+
+/// 本轮验收场景：**2 个 dock × 各 2 条 channel**，双向并发收发 + 半关闭。
+///
+/// 与 [`run_smoke_scenario_`] 的区别有两点，都来自本轮裁决：
+///
+/// 1. **每条并发子流用不同的 `local_dock`**（Q2）：dock 对即身份，协议不允许同一
+///    dock 对上同时存在两条活动子流，因此发起侧为每条子流分配一个临时 dock；
+///    被动方的断言也随之改为「自己的 `local_dock` 是监听 dock」；
+/// 2. 规模小、**不在 `#[ignore]` 之列**：这是本轮「多 channel 并发通信」的验收点。
+///
+/// `side` 参数（0 = A，1 = B）只用来保证两侧的临时 dock 区间不重叠。
+///
+/// # Panics
+///
+/// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
+pub async fn run_small_mux_scenario_<RA, WA, RB, WB, Rt>(
+    rx_a: RA,
+    tx_a: WA,
+    rx_b: RB,
+    tx_b: WB,
+) where
+    RA: TrBuffRead<u8> + Send + 'static,
+    WA: TrBuffWrite<u8> + Send + 'static,
+    RB: TrBuffRead<u8> + Send + 'static,
+    WB: TrBuffWrite<u8> + Send + 'static,
+    Rt: TrSmokeRuntime,
+{
+    let invite_opts = BasicOpts::default();
+    let listen_opts = BasicOpts::default();
+    let invite_fut = HandshakeAgent::new(rx_a, tx_a).invite_async(&invite_opts, AcceptAllEntries);
+    let listen_fut = HandshakeAgent::new(rx_b, tx_b).listen_async(&listen_opts, AcceptAllEntries);
+    let (invited, accepted) = futures::join!(async { invite_fut.await }, async { listen_fut.await });
+    let delivery_a = invited.expect("发起方握手应当成功");
+    let delivery_b = accepted.expect("等待方握手应当成功");
+
+    let conn_a = MuxConnection::<RA, WA, SmokeMuxConfig, Rt>::new(delivery_a, SmokeMuxConfig);
+    let conn_b = MuxConnection::<RB, WB, SmokeMuxConfig, Rt>::new(delivery_b, SmokeMuxConfig);
+
+    futures::join!(small_side_(&conn_a, 0u32), small_side_(&conn_b, 1u32));
+}
+
+/// 小场景里的 dock 数量与每个 dock 上的子流数量（`2 × 2 = 4` 条/端）。
+pub const K_SMALL_DOCK_COUNT: u32 = 2;
+pub const K_SMALL_CHANNELS_PER_DOCK: usize = 2;
+
+/// 为一端（`side` = 0/1）跑完小场景：在 `1..=2` 上监听，同时向对端的 `1..=2`
+/// 发起 4 条子流（每条用不同的临时 local_dock）。
+async fn small_side_<R, W, C, Rt>(conn: &MuxConnection<R, W, C, Rt>, side: u32)
+where
+    R: TrBuffRead<u8>,
+    W: TrBuffWrite<u8>,
+    C: TrMuxConfig,
+    Rt: TrSmokeRuntime,
+{
+    let conn_ref = conn;
+
+    let mut accept_tasks = Vec::new();
+    for dock in 1..=K_SMALL_DOCK_COUNT {
+        accept_tasks.push(async move {
+            let mut binding = conn_ref
+                .bind_async(Dock::new(dock))
+                .await
+                .expect("绑定监听 dock 应当成功");
+            let mut listener = binding
+                .listen_async()
+                .await
+                .expect("在本地 dock 上建立 listener 应当成功");
+            for index in 0..K_SMALL_CHANNELS_PER_DOCK {
+                let mut handle = listener
+                    .income_async()
+                    .await
+                    .expect("应当取到下一条入向建流请求");
+                assert_eq!(
+                    handle.local_dock(),
+                    Dock::new(dock),
+                    "被动方的 local_dock 应当是监听 dock（镜像语义）"
+                );
+                let mut welcome_buf: [u8; 0] = [];
+                let mut welcome: &mut [u8] = &mut welcome_buf[..];
+                let (tx, mut rx) = handle
+                    .accept_async(&mut welcome)
+                    .await
+                    .expect("accept 入向子流应当成功");
+                exchange_and_half_close_(tx, &mut rx, dock, index).await;
+            }
+        });
+    }
+
+    let mut open_tasks = Vec::new();
+    for dock in 1..=K_SMALL_DOCK_COUNT {
+        for index in 0..K_SMALL_CHANNELS_PER_DOCK {
+            // 每条并发子流一个**互不相同**的临时 local_dock（Q2 裁决）。
+            let local = Dock::new(0x1000u32 + side * 0x100u32 + dock * 0x10u32 + index as u32);
+            open_tasks.push(async move {
+                let mut binding = conn_ref
+                    .bind_async(local)
+                    .await
+                    .expect("绑定发起 dock 应当成功");
+                let mut message: &[u8] = &[];
+                let (tx, mut rx) = binding
+                    .open_channel_async(Dock::new(dock), &mut message)
+                    .await
+                    .expect("向对端 dock 发起子流应当成功");
+                exchange_and_half_close_(tx, &mut rx, dock, index).await;
+            });
+        }
+    }
+
+    futures::join!(
+        futures::future::join_all(open_tasks),
+        futures::future::join_all(accept_tasks),
+    );
+}
+
+/// 一条子流上的完整交互：写本端载荷 → 读对端载荷并校验 → 丢弃发送半边（半关闭）
+/// → 在接收半边等到 EOF。
+///
+/// 载荷校验**不依赖 open / accept 的配对顺序**：先读 4 字节 tag，tag 里编码了发送方
+/// 的 `(dock, index)`，据此推出对方的完整载荷再逐字节比对。这样即使两侧的临时
+/// dock 分配与 accept 顺序不同，校验依然成立。
+async fn exchange_and_half_close_<T, R>(tx: T, rx: &mut R, dock: u32, index: usize)
+where
+    T: TrBuffWrite<u8>,
+    R: TrBuffRead<u8>,
+{
+    let payload = make_payload_(dock, index);
+    let mut tx = tx;
+    write_channel_all_(&mut tx, &payload)
+        .await
+        .expect("子流写入本端载荷应当成功");
+
+    let mut tag = [0u8; 4];
+    read_channel_exact_(rx, &mut tag)
+        .await
+        .expect("子流读取对端载荷 tag 应当成功");
+    let raw = u32::from_be_bytes(tag);
+    let expected = make_payload_(raw >> 16, (raw & 0xFFFF) as usize);
+    assert_eq!(tag, expected[..4], "对端载荷 tag 应当自洽");
+
+    let mut rest = vec![0u8; expected.len() - 4];
+    read_channel_exact_(rx, &mut rest)
+        .await
+        .expect("子流读取对端载荷正文应当成功");
+    let got = [tag.as_slice(), rest.as_slice()].concat();
+    assert_eq!(got, expected, "对端载荷应逐字节相等");
+
+    // 半关闭：丢弃发送半边（= 发 FIN），对端应当在读尽后看到 EOF。
+    drop(tx);
+    expect_eof_(rx).await;
+}
+
+/// 在接收半边等到 EOF（对端 `FIN` 生效）。
+///
+/// 先尝试读 1 字节：写端关闭且已排空时应当返回 `ConsumerError::Closing`；若对端
+/// 的 `FIN` 还没到，`read_async` 会 park 到它到达为止（这正是要验证的行为）。
+async fn expect_eof_<R>(rx: &mut R)
+where
+    R: TrBuffRead<u8>,
+{
+    let demand = Demand::exactly(1usize);
+    let mut outcome = rx.read_async(&demand).await;
+    match outcome.as_mut().pick_left() {
+        Option::Some(segm) => {
+            if segm.least_count() > 0 {
+                panic!("半关闭之后仍然读到了数据");
+            }
+        }
+        Option::None => {
+            let err = outcome
+                .pick_right()
+                .expect("IO 结果必须要么是段、要么是错误");
+            let tag: ReadErrTag = err.err_tag();
+            assert!(
+                tag == ReadErrTag::Closing,
+                "半关闭之后应当读到 Closing（EOF），实际是 {tag:?}"
+            );
         }
     }
 }
@@ -544,10 +783,12 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB, Rt>(
     rx_b: RB,
     tx_b: WB,
 ) where
-    RA: TrBuffRead<u8>,
-    WA: TrBuffWrite<u8>,
-    RB: TrBuffRead<u8>,
-    WB: TrBuffWrite<u8>,
+    // 连接内部把 Rx / Tx 移交给 `'static` 的读写循环（`abs_art` 的 spawn 要求）；
+    // `Send` 是 `multi-thread` 配置下 `Rt::spawn` 的要求（测试用的环半部本就 `Send`）。
+    RA: TrBuffRead<u8> + Send + 'static,
+    WA: TrBuffWrite<u8> + Send + 'static,
+    RB: TrBuffRead<u8> + Send + 'static,
+    WB: TrBuffWrite<u8> + Send + 'static,
     Rt: TrSmokeRuntime,
 {
     // 1. 握手：A 端发起、B 端等待，两侧并发推进。

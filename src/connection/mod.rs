@@ -279,6 +279,7 @@
 mod channel_;
 mod error_;
 mod frame_;
+mod owner_;
 pub(crate) mod ring_;
 mod session_;
 mod signal_;

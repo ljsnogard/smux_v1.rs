@@ -124,3 +124,32 @@ where
     WE: core::error::Error,
 {
 }
+
+impl MuxError<(), ()> {
+    /// 把「载荷无关」的错误搬到另一个底层错误类型上。
+    ///
+    /// 注册表 / 建流登记这类路径只知道「哪一类错误」，不持有底层错误值，因此它们
+    /// 用 `MuxError<(), ()>` 表达，再由 API 面 `cast_` 成目标类型。`Rx(())` /
+    /// `Tx(())` 没有可搬运的载荷，退化为保留方向的 [`MuxError::Transport`]。
+    pub(crate) fn cast_<RE, WE>(self) -> MuxError<RE, WE> {
+        match self {
+            MuxError::Rx(()) => MuxError::Transport { write: false },
+            MuxError::Tx(()) => MuxError::Transport { write: true },
+            MuxError::Transport { write } => MuxError::Transport { write },
+            MuxError::Cancelled => MuxError::Cancelled,
+            MuxError::PeerClosed => MuxError::PeerClosed,
+            MuxError::Closed => MuxError::Closed,
+            MuxError::IdleTimeout => MuxError::IdleTimeout,
+            MuxError::ReservedDock => MuxError::ReservedDock,
+            MuxError::MalformedFrame => MuxError::MalformedFrame,
+            MuxError::UnsupportedField => MuxError::UnsupportedField,
+            MuxError::FrameTooLarge => MuxError::FrameTooLarge,
+            MuxError::DockInUse => MuxError::DockInUse,
+            MuxError::DockChanLimit => MuxError::DockChanLimit,
+            MuxError::ChanLimit => MuxError::ChanLimit,
+            MuxError::Refused => MuxError::Refused,
+            MuxError::Duplicate => MuxError::Duplicate,
+            MuxError::FlowCtrl(err) => MuxError::FlowCtrl(err),
+        }
+    }
+}

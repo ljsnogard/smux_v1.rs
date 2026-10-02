@@ -64,11 +64,15 @@ async fn mux_smoke_tokio_multi_thread_() {
     let (mut a_read, mut a_write) = stream_a.into_split();
     let (mut b_read, mut b_write) = stream_b.into_split();
 
-    common::run_socket_scenario_::<_, _, _, _, SmokeRt>(
-        ReadAsInput::new(&mut a_read),
-        WriteAsOutput::new(&mut a_write),
-        ReadAsInput::new(&mut b_read),
-        WriteAsOutput::new(&mut b_write),
-    )
-    .await;
+    // 缺省（单线程）配置下连接内部用 `Rt::spawn_local`，tokio 侧必须在
+    // `LocalSet` 里跑（compio 的运行时本身就是线程本地的，无需这一步）。
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(common::run_socket_scenario_::<_, _, _, _, SmokeRt>(
+            ReadAsInput::new(&mut a_read),
+            WriteAsOutput::new(&mut a_write),
+            ReadAsInput::new(&mut b_read),
+            WriteAsOutput::new(&mut b_write),
+        ))
+        .await;
 }

@@ -345,6 +345,34 @@ impl FrameHeader {
     pub const fn is_total_reset(&self) -> bool {
         self.flags_ & flags::K_TOTAL_RESET != 0
     }
+
+    /// 由写路径组装一个帧头。
+    ///
+    /// `window` 只在 `OPEN` / `PULSE` / `WINDOW_UPDATE` 上给出（`(累计已收 R,
+    /// 接收窗口 W)`），其余帧必须传 `None`；合法性由
+    /// [`write_header_async_`] 再次校验。
+    pub(crate) const fn new_(
+        kind: FrameKind,
+        flags: u8,
+        local_dock: Dock,
+        remote_dock: Dock,
+        payload_len: usize,
+        window: Option<(RecvTotal, Credit)>,
+    ) -> Self {
+        let (recv_window_, recv_total_) = match window {
+            Option::Some((total, window)) => (Option::Some(window), Option::Some(total)),
+            Option::None => (Option::None, Option::None),
+        };
+        FrameHeader {
+            kind_: kind,
+            flags_: flags,
+            local_dock_: local_dock,
+            remote_dock_: remote_dock,
+            payload_len_: payload_len,
+            recv_window_,
+            recv_total_,
+        }
+    }
 }
 
 /// 组装帧首字节：`head = (flags << 4) | kind`。

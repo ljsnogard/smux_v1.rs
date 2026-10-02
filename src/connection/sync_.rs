@@ -51,8 +51,8 @@ use buffex::x_deps::{abs_cancel, atomic_sync};
 use mm_ptr::{Owned, Shared};
 
 use crate::{
-    connection::{Dock, MuxError},
-    flow_ctrl::FlowCtrlError,
+    connection::{Dock, MuxError, owner_::ChannelOwner_},
+    flow_ctrl::{FlowCtrlError, WindowReport},
     handshake::opts::BasicOpts,
 };
 
@@ -424,6 +424,20 @@ pub(crate) struct WakerSlot_ {
     waker_: Option<Waker>,
 }
 
+impl core::fmt::Debug for WakerSlot_ {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WakerSlot_")
+            .field("registered", &self.waker_.is_some())
+            .finish()
+    }
+}
+
+impl Default for WakerSlot_ {
+    fn default() -> Self {
+        WakerSlot_::new_()
+    }
+}
+
 impl WakerSlot_ {
     /// 空槽。
     pub(crate) const fn new_() -> Self {
@@ -468,16 +482,38 @@ pub(crate) enum DockUse_ {
     Telegraph,
 }
 
-/// 一条活动子流在索引里的条目。
+/// 入向建流请求在索引节点上的状态。
 ///
-/// 只保存身份（`remote_dock_`）；子流自身的共享状态（窗口、环半部句柄等）在第 7
-/// 步随读写循环一并挂上。
+/// 被动方收到 `OPEN` 后**先回一条自己的 `OPEN`**（通告接收窗口），此时环还没有
+/// 建立——真正建环发生在应用 `accept_async` 那一刻（那时才拿得到调用方注入的
+/// 配置）。因此这里要先把对端 `OPEN` 携带的窗口通告存住，直到 `accept` 使用。
+pub(crate) enum Inbound_ {
+    /// 该节点不是入向请求（主动方发起的子流，或入向请求已处理完）。
+    None,
+
+    /// 已收到 `OPEN`、等待 `income_async` 取走。
+    Pending(WindowReport),
+
+    /// 已被 `income_async` 取走（`ChannelHandle` 在应用手里），等待 accept / reject。
+    HandedOut(WindowReport),
+}
+
+/// 一条活动子流在索引里的条目。
 struct ChannelNode_<A>
 where
     A: AllocatorClone,
 {
     /// 对端 dock；与本节点所属 dock 节点合起来就是子流身份。
     remote_dock_: Dock,
+
+    /// 该子流的共享状态句柄。
+    ///
+    /// `None` 表示环尚未建立（被动方的入向请求在 `accept` 之前）。主动方在
+    /// `open_channel_async` 建好环后立刻挂上；被动方在 `accept_async` 挂上。
+    owner_: Option<ChannelOwner_<A>>,
+
+    /// 入向建流请求的状态。
+    inbound_: Inbound_,
 
     /// 同一条链上的下一个子流。
     next_: Option<Owned<ChannelNode_<A>, A>>,
@@ -552,10 +588,26 @@ where
     inner_: Shared<SyncCell_<RegistryInner_<A>>, A>,
 }
 
+impl<A> Clone for ChannelRegistry_<A>
+where
+    A: AllocatorClone,
+{
+    fn clone(&self) -> Self {
+        ChannelRegistry_ {
+            inner_: self.inner_.clone(),
+        }
+    }
+}
+
 impl<A> ChannelRegistry_<A>
 where
     A: AllocatorClone + Send + Sync,
 {
+    /// 取分配器（读 / 写循环为自己的本地表按需分配节点）。
+    pub(crate) fn allocator_(&self) -> A {
+        self.inner_.with_(|inner| inner.alloc_.clone())
+    }
+
     /// 建立注册表：分配根对象，并为两个循环建好取消令牌。
     ///
     /// # Panics
@@ -602,6 +654,8 @@ where
     /// # Errors
     ///
     /// - `local_dock` 已被 telegraph 占用 → [`MuxError::DockInUse`]；
+    /// - 同一 dock 对上已有活动子流 → [`MuxError::Duplicate`]（dock 对即身份，
+    ///   见 `crate::connection` 模块文档 §4.1）；
     /// - 该 dock 上的在册子流数已达 `max_dock_chan_count` → [`MuxError::DockChanLimit`]；
     /// - 连接上的在册子流数已达 `max_channel_count` → [`MuxError::ChanLimit`]。
     pub(crate) fn reserve_channel_(
@@ -621,6 +675,9 @@ where
             if let Option::Some(DockUse_::Telegraph) = dock.use_ {
                 return Result::Err(MuxError::DockInUse);
             }
+            if find_channel_(&dock.head_, remote_dock).is_some() {
+                return Result::Err(MuxError::Duplicate);
+            }
             if dock.chan_count_ >= max_dock {
                 return Result::Err(MuxError::DockChanLimit);
             }
@@ -629,6 +686,8 @@ where
             dock.head_ = Option::Some(Owned::new(
                 ChannelNode_ {
                     remote_dock_: remote_dock,
+                    owner_: Option::None,
+                    inbound_: Inbound_::None,
                     next_: dock.head_.take(),
                 },
                 alloc,
@@ -660,6 +719,126 @@ where
                 inner.total_ = inner.total_.saturating_sub(1);
             }
             inner.prune_dock_(local_dock);
+        })
+    }
+
+    /// 把建好环之后的共享状态句柄挂到已有节点上。
+    ///
+    /// 主动方在 `open_channel_async`、被动方在 `accept_async` 调用；节点必须已经由
+    /// [`ChannelRegistry_::reserve_channel_`] 登记过，否则返回 `false`（调用方按
+    /// 内部错误处理）。
+    pub(crate) fn attach_owner_(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        owner: ChannelOwner_<A>,
+    ) -> bool {
+        self.inner_.with_mut_(|inner| {
+            let Some(dock) = inner.find_dock_mut_(local_dock) else {
+                return false;
+            };
+            let Some(node) = find_channel_mut_(&mut dock.head_, remote_dock) else {
+                return false;
+            };
+            node.owner_ = Option::Some(owner);
+            true
+        })
+    }
+
+    /// 取一条子流的共享状态句柄（克隆）；不存在或尚未挂上时返回 `None`。
+    pub(crate) fn channel_owner_(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+    ) -> Option<ChannelOwner_<A>> {
+        self.inner_.with_(|inner| {
+            let dock = inner.find_dock_(local_dock)?;
+            let node = find_channel_(&dock.head_, remote_dock)?;
+            node.owner_.clone()
+        })
+    }
+
+    /// 被动方收到 `OPEN`：登记节点并把它标为「待决入向请求」，随后唤醒该 dock 上的
+    /// 监听者。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`ChannelRegistry_::reserve_channel_`] 相同（含 dock 对已存在时的
+    /// [`MuxError::Duplicate`]）。
+    pub(crate) fn reserve_inbound_(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        peer_report: WindowReport,
+    ) -> Result<(), MuxError<(), ()>> {
+        self.reserve_channel_(local_dock, remote_dock)?;
+        let marked = self.inner_.with_mut_(|inner| {
+            let Some(dock) = inner.find_dock_mut_(local_dock) else {
+                return false;
+            };
+            let Some(node) = find_channel_mut_(&mut dock.head_, remote_dock) else {
+                return false;
+            };
+            node.inbound_ = Inbound_::Pending(peer_report);
+            true
+        });
+        if marked {
+            self.notify_inbound_(local_dock);
+        }
+        Result::Ok(())
+    }
+
+    /// 是否有**尚未被 `income_async` 取走**的入向请求。
+    pub(crate) fn has_pending_inbound_(&self, local_dock: Dock) -> bool {
+        self.inner_.with_(|inner| {
+            let Some(dock) = inner.find_dock_(local_dock) else {
+                return false;
+            };
+            let mut cursor = dock.head_.as_ref();
+            while let Option::Some(node) = cursor {
+                if matches!(node.inbound_, Inbound_::Pending(_)) {
+                    return true;
+                }
+                cursor = node.next_.as_ref();
+            }
+            false
+        })
+    }
+
+    /// 取走 `local_dock` 上最早的一个待决入向请求（改成 `HandedOut`），返回对端 dock。
+    ///
+    /// 返回 `None` 表示当前没有待决请求（调用方应当先登记 waker 再重试）。
+    pub(crate) fn take_pending_inbound_(&self, local_dock: Dock) -> Option<Dock> {
+        self.inner_.with_mut_(|inner| {
+            let dock = inner.find_dock_mut_(local_dock)?;
+            let mut cursor = dock.head_.as_mut();
+            while let Option::Some(node) = cursor {
+                if matches!(node.inbound_, Inbound_::Pending(_)) {
+                    let remote = node.remote_dock_;
+                    if let Inbound_::Pending(report) = node.inbound_ {
+                        node.inbound_ = Inbound_::HandedOut(report);
+                    }
+                    return Option::Some(remote);
+                }
+                cursor = node.next_.as_mut();
+            }
+            Option::None
+        })
+    }
+
+    /// `accept_async` 取走该入向请求保存的对端窗口通告（状态归为 `None`）。
+    pub(crate) fn take_inbound_report_(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+    ) -> Option<WindowReport> {
+        self.inner_.with_mut_(|inner| {
+            let dock = inner.find_dock_mut_(local_dock)?;
+            let node = find_channel_mut_(&mut dock.head_, remote_dock)?;
+            match core::mem::replace(&mut node.inbound_, Inbound_::None) {
+                Inbound_::HandedOut(report) | Inbound_::Pending(report) => Option::Some(report),
+                Inbound_::None => Option::None,
+            }
         })
     }
 
@@ -717,14 +896,38 @@ where
         }
     }
 
-    /// 记下连接级失败（**首个**原因生效），并唤醒两个循环的取消令牌。
+    /// 记下连接级失败（**首个**原因生效），唤醒两个循环的取消令牌，并唤醒所有
+    /// 等待中的 API 面 future（监听者的 `income_async` 与建流的
+    /// `open_channel_async`），避免它们空等一个已经死掉的循环。
     pub(crate) fn mark_failed_<RE, WE>(&self, err: &MuxError<RE, WE>) {
         let kind = FailKind_::of_(err);
-        self.inner_.with_mut_(|inner| {
+        let wakers = self.inner_.with_mut_(|inner| {
             if inner.fail_.is_none() {
                 inner.fail_ = Option::Some(kind);
             }
+            let mut out: Vec<Waker> = Vec::new();
+            let mut cursor = inner.docks_.as_mut();
+            while let Option::Some(node) = cursor {
+                if let Option::Some(waker) = node.inbound_waker_.take_() {
+                    out.push(waker);
+                }
+                let mut chan = node.head_.as_mut();
+                while let Option::Some(entry) = chan {
+                    if let Option::Some(owner) = entry.owner_.as_ref()
+                        && let Option::Some(waker) =
+                            owner.with_mut_(|state| state.establish_.waker_.take_())
+                    {
+                        out.push(waker);
+                    }
+                    chan = entry.next_.as_mut();
+                }
+                cursor = node.next_.as_mut();
+            }
+            out
         });
+        for waker in wakers {
+            waker.wake();
+        }
         self.cancel_loops_();
     }
 
@@ -756,6 +959,18 @@ impl<A> RegistryInner_<A>
 where
     A: AllocatorClone + Send + Sync,
 {
+    /// 找到 `dock` 对应的节点（共享借用）；不存在时返回 `None`。
+    fn find_dock_(&self, dock: Dock) -> Option<&DockNode_<A>> {
+        let mut cursor = self.docks_.as_ref();
+        while let Option::Some(node) = cursor {
+            if node.dock_ == dock {
+                return Option::Some(node);
+            }
+            cursor = node.next_.as_ref();
+        }
+        Option::None
+    }
+
     /// 找到 `dock` 对应的节点；不存在时返回 `None`。
     fn find_dock_mut_(&mut self, dock: Dock) -> Option<&mut DockNode_<A>> {
         let mut cursor = self.docks_.as_mut();
@@ -825,6 +1040,42 @@ where
             cursor = node.next_.as_mut();
         }
     }
+}
+
+/// 在子流链上按 `remote_dock` 找一个节点（共享借用）。
+fn find_channel_<A>(
+    head: &Option<Owned<ChannelNode_<A>, A>>,
+    remote_dock: Dock,
+) -> Option<&ChannelNode_<A>>
+where
+    A: AllocatorClone,
+{
+    let mut cursor = head.as_ref();
+    while let Option::Some(node) = cursor {
+        if node.remote_dock_ == remote_dock {
+            return Option::Some(node);
+        }
+        cursor = node.next_.as_ref();
+    }
+    Option::None
+}
+
+/// 在子流链上按 `remote_dock` 找一个节点（可变借用）。
+fn find_channel_mut_<A>(
+    head: &mut Option<Owned<ChannelNode_<A>, A>>,
+    remote_dock: Dock,
+) -> Option<&mut ChannelNode_<A>>
+where
+    A: AllocatorClone,
+{
+    let mut cursor = head.as_mut();
+    while let Option::Some(node) = cursor {
+        if node.remote_dock_ == remote_dock {
+            return Option::Some(node);
+        }
+        cursor = node.next_.as_mut();
+    }
+    Option::None
 }
 
 fn remove_channel_<A>(
@@ -1115,5 +1366,94 @@ mod tests_ {
             1usize,
             "没有登记等待者时不应再唤醒"
         );
+    }
+
+    /// 测试同一 dock 对上的第二条并发子流被拒（dock 对即身份）。
+    /// - 手段：在 `(1,9)` 上登记一次后重复登记；释放后再登记。
+    /// - 判断：重复登记报 `MuxError::Duplicate`；释放后同一 dock 对可以重新登记。
+    #[test]
+    fn duplicate_dock_pair_is_rejected() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+        assert!(registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok());
+        assert_eq!(
+            registry.total_channels_(),
+            1usize,
+            "重复登记不应计入第二条"
+        );
+
+        let err = registry
+            .reserve_channel_(Dock::new(1u32), Dock::new(9u32))
+            .unwrap_err();
+        assert!(matches!(err, MuxError::Duplicate));
+        assert_eq!(registry.total_channels_(), 1usize);
+
+        registry.release_channel_(Dock::new(1u32), Dock::new(9u32));
+        assert!(
+            registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok(),
+            "释放后同一 dock 对应当可以重新登记"
+        );
+    }
+
+    /// 测试入向请求的完整流转：登记 → 唤醒监听者 → 取走（HandedOut）→ 取回窗口通告。
+    /// - 手段：先用 `reserve_inbound_` 登记 `(2,7)` 并带上对端窗口通告 `(0, 64)`；
+    ///   再依次调用 `has_pending_inbound_` / `take_pending_inbound_` /
+    ///   `take_inbound_report_`。
+    /// - 判断：登记时唤醒计数为 1；取走前 `has_pending_inbound_` 为真、取走后为假；
+    ///   取回的通告与登记时给出的完全相同。
+    #[test]
+    fn inbound_request_is_handed_out_with_report() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+        let (waker, probe) = counting_waker_();
+        registry.register_inbound_waker_(Dock::new(2u32), &waker);
+
+        let report = WindowReport::new(0u64, 64u32);
+        assert!(
+            registry
+                .reserve_inbound_(Dock::new(2u32), Dock::new(7u32), report)
+                .is_ok()
+        );
+        assert_eq!(probe.count_.load(Ordering::SeqCst), 1usize, "登记入向请求应唤醒监听者");
+        assert!(registry.has_pending_inbound_(Dock::new(2u32)));
+
+        assert_eq!(
+            registry.take_pending_inbound_(Dock::new(2u32)),
+            Option::Some(Dock::new(7u32))
+        );
+        assert!(
+            !registry.has_pending_inbound_(Dock::new(2u32)),
+            "取走之后不应再报告有待决请求"
+        );
+        assert_eq!(registry.take_pending_inbound_(Dock::new(2u32)), Option::None);
+
+        assert_eq!(
+            registry.take_inbound_report_(Dock::new(2u32), Dock::new(7u32)),
+            Option::Some(report)
+        );
+    }
+
+    /// 测试建好环之后挂上的共享状态句柄能被按 dock 对查回。
+    /// - 手段：登记 `(3,8)`，用 `FlowCtrl::new` 建一个 owner 并 `attach_owner_`；
+    ///   再查 `channel_owner_`。
+    /// - 判断：挂上之前查不到；挂上之后能查到同一个句柄（改一处、另一处可见）。
+    #[test]
+    fn attached_owner_is_visible_by_dock_pair() {
+        use crate::flow_ctrl::{DefaultPolicy, FlowCtrl};
+
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+        assert!(registry.reserve_channel_(Dock::new(3u32), Dock::new(8u32)).is_ok());
+        assert!(registry.channel_owner_(Dock::new(3u32), Dock::new(8u32)).is_none());
+
+        let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
+        let owner = ChannelOwner_::new_(
+            crate::connection::owner_::ChannelState_::new_(flow, Option::None),
+            CoreAlloc,
+        );
+        assert!(registry.attach_owner_(Dock::new(3u32), Dock::new(8u32), owner.clone()));
+
+        let found = registry
+            .channel_owner_(Dock::new(3u32), Dock::new(8u32))
+            .expect("挂上之后应当能查到");
+        owner.with_mut_(|state| state.tx_queued_ = true);
+        assert!(found.with_(|state| state.tx_queued_), "查回的应是同一个共享句柄");
     }
 }
