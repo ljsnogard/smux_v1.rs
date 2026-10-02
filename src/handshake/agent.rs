@@ -93,6 +93,9 @@ pub trait TrNegotiator {
 /// 接受一切条目的协商器。
 ///
 /// 它会把条目流读到结束，因此同时充当「流式协商能跑通」的最小实现与测试替身。
+///
+/// 条目流以 `Err` 表示终止（读完或读侧失败），这里对两者都返回「不再拒绝」；若终止
+/// 源于失败，调用方会从读状态机取回它，并优先按失败分类（不会变成 `REJECT`）。
 pub struct AcceptAllEntries;
 
 /// `AcceptAllEntry` 的协商逻辑。
@@ -118,9 +121,12 @@ where
             .may_cancel_with(cancel.child_token())
             .await;
         match next {
-            Result::Ok(Option::Some(_)) => continue,
-            Result::Ok(Option::None) => return true,
-            Result::Err(_) => return false,
+            // 还有下一条：继续读，边收边判。
+            Result::Ok(_) => continue,
+            // 流已终止（读完，或读侧失败）：都按「接受」返回。失败原因不在这里
+            // 区分，由调用方经 `FrameReader::take_error_` 取回后分类处置
+            // （见 `StreamEnd_` 的文档）。
+            Result::Err(_) => return true,
         }
     }
 }
@@ -333,12 +339,14 @@ where
         &mut reader,
         cancel.child_token(),
     ).await;
+    // 读侧失败（CRC 不匹配、保留键、对端关闭……）**优先**分类：它既不能当成
+    // 「本端主动拒绝」（按模块文档 §9，这类失败不得回 REJECT），也不能因为协商器
+    // 在条目流终止时返回「不再拒绝」而被吞掉——[`TrAsyncIterator`] 用 `Err` 同时
+    // 表达「读完」与「失败」，两者的区分只在 `take_error_` 里。
+    if let Option::Some(err) = reader.take_error_() {
+        return Result::Err(from_read_frame_err_(err));
+    }
     if !accepted {
-        // 读侧失败（CRC 不匹配、保留键、对端关闭……）不能当成「本端主动拒绝」：
-        // 按模块文档 §9，这类失败不得回 REJECT。
-        if let Option::Some(err) = reader.take_error_() {
-            return Result::Err(from_read_frame_err_(err));
-        }
         // D4：协商中途拒绝 → 立即回 REJECT，不再读剩余条目。
         let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
         return Result::Err(HandshakeError::Rejected);
@@ -403,11 +411,11 @@ where
         return Result::Err(HandshakeError::InvalidMagic);
     }
     let accepted = negotiate_async(&mut negotiator, &mut reader, cancel.child_token()).await;
+    // 与 `listen` 路径同理：读侧失败优先分类（见上一处注释）。
+    if let Option::Some(err) = reader.take_error_() {
+        return Result::Err(from_read_frame_err_(err));
+    }
     if !accepted {
-        // 读侧失败不能当成「本端主动拒绝」：按模块文档 §9，这类失败不得回 REJECT。
-        if let Option::Some(err) = reader.take_error_() {
-            return Result::Err(from_read_frame_err_(err));
-        }
         // D4：协商中途拒绝 → 立即回 REJECT，不再读剩余条目。
         let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
         return Result::Err(HandshakeError::Rejected);
@@ -448,13 +456,10 @@ where
 
 #[cfg(test)]
 mod tests_ {
-    use core::mem::MaybeUninit;
-
     use abs_art_bridge::Runtime;
     use abs_cancel::NonCancellableToken;
-    use abs_mm::mem_alloc::CoreAlloc;
-    use buffex::circular_buff::builder::CircularBuffBuilder;
-    use mm_ptr::{Owned, x_deps::abs_mm};
+
+    use crate::connection::ring_::test_support_::make_test_channel_;
 
     use super::*;
 
@@ -479,10 +484,8 @@ mod tests_ {
         C: TrCancellationToken,
     {
         loop {
-            let Ok(maybe) = entries.next_async().await else {
-                return false;
-            };
-            let Option::Some(entry) = maybe else {
+            let Ok(entry) = entries.next_async().await else {
+                // 流已终止：按「接受」返回，失败原因由调用方取回。
                 return true;
             };
             this.seen_ += 1;
@@ -520,28 +523,8 @@ mod tests_ {
         HandshakeAgent<impl TrBuffRead<u8>, impl TrBuffWrite<u8>>,
         HandshakeAgent<impl TrBuffRead<u8>, impl TrBuffWrite<u8>>,
     ) {
-        let (a_tx, b_rx) = CircularBuffBuilder::
-            try_with_buffer(
-                Owned::<[MaybeUninit<u8>], _>::new_uninit_slice(buff_size, CoreAlloc),
-                CoreAlloc,
-            )
-            .expect("分配 a→b 缓冲")
-            .consumer_passive()
-            .producer_passive()
-            .build_async()
-            .await
-            .expect("构建 a→b 缓冲");
-        let (b_tx, a_rx) = CircularBuffBuilder::
-            try_with_buffer(
-                Owned::<[MaybeUninit<u8>], _>::new_uninit_slice(buff_size, CoreAlloc),
-                CoreAlloc,
-            )
-            .expect("分配 b→a 缓冲")
-            .consumer_passive()
-            .producer_passive()
-            .build_async()
-            .await
-            .expect("构建 b→a 缓冲");
+        let (a_tx, b_rx) = make_test_channel_(buff_size);
+        let (b_tx, a_rx) = make_test_channel_(buff_size);
         (
             HandshakeAgent::new(a_rx, a_tx),
             HandshakeAgent::new(b_rx, b_tx),
@@ -554,7 +537,7 @@ mod tests_ {
     /// - 判断：两侧 future 都返回 `Ok`，且各自拿到的 `max_packet_size` 都是
     ///   4096（`BasicOpts::DEFAULT`）。
     #[compio::test]
-    async fn handshake_through_circ_buff_test_() {
+    async fn handshake_through_ring_test_() {
         let (a, b) = make_pair_(16usize).await;
 
         let a_accept = Runtime::spawn_local(async move {

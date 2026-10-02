@@ -265,13 +265,14 @@ pub mod flags {
 
     /// **窗口通告的变体**：累计已收量已经重置。
     ///
-    /// 本帧携带的 [`FieldId::RecvTotal`] 是**重置前**的累计量（即上一个 epoch 的
+    /// 本帧携带的 [`FieldId::RecvTotal`](super::FieldId::RecvTotal) 是**重置前**的累计量（即上一个 epoch 的
     /// 总量），收到它的一方据此把本端的发送计数 rebase 过来，之后的通告里
     /// `RecvTotal` 从 `0` 重新计数。这样窄规格（2 / 4 字节）的累计量可以在快要放
     /// 不下时干净地重新开始，而不必改用更宽的字段。
     ///
-    /// 只允许出现在携带窗口通告的帧上（[`FrameKind::Pulse`] /
-    /// [`FrameKind::WindowUpdate`]）；`OPEN` 时还没有 epoch，带上即非法。
+    /// 只允许出现在携带窗口通告的帧上（[`FrameKind::Pulse`](super::FrameKind::Pulse)
+    /// / [`FrameKind::WindowUpdate`](super::FrameKind::WindowUpdate)）；`OPEN` 时还没有
+    /// epoch，带上即非法。
     pub const K_TOTAL_RESET: u8 = 0b0000_1000;
 }
 

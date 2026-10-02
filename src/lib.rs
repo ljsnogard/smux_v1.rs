@@ -1,6 +1,7 @@
+#![feature(allocator_api)]
 #![feature(impl_trait_in_assoc_type)]
 
-#[cfg(any(test))]
+#[cfg(test)]
 extern crate std;
 
 pub mod connection;
@@ -18,6 +19,7 @@ pub mod x_deps {
     pub use abs_smux;
     pub use buffex;
     pub use buffex::x_deps::abs_buff;
+    pub use mm_ptr;
 
     pub use crc;
 }

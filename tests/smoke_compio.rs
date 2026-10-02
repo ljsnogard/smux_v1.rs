@@ -2,16 +2,16 @@
 //!
 //! 场景本体与 tokio 版逐字相同（`tests/common/mod.rs`），差别只在接线：compio
 //! 0.19 的 `UnixStream` 没有 `pair()`，因此先用 `std` 的 socket 对再注册进运行时；
-//! 两个半边经 `abs_buff_compio_adapt` 的**设备级**适配（`ReadAsInput` /
+//! 两个半边经 `buffex_compio_adapt` 的**设备级**适配（`ReadAsInput` /
 //! `WriteAsOutput`）交给 [`common::run_socket_scenario_`] 的四条调用方驱动泵。
 
 mod common;
 
-use abs_buff::io::{TrInput, TrOutput};
-use abs_buff::{TrBuffRead, TrBuffWrite};
-use abs_buff_compio_adapt::{
-    CompioReadAsBuff, CompioWriteAsBuff, ReadAsInput, WriteAsOutput,
+use buffex::x_deps::abs_buff::{
+    TrBuffRead, TrBuffWrite,
+    io::{TrInput, TrOutput},
 };
+use buffex_compio_adapt::{BuffRead, BuffWrite, ReadAsInput, WriteAsOutput};
 use compio::net::UnixStream;
 
 /// 编译期断言：compio 侧两类适配都成立——(1) socket 半边经**缓冲级**适配后直接
@@ -26,8 +26,8 @@ fn assert_compio_adapters_fit_(read: &mut UnixStream, write: &mut UnixStream) {
     fn assert_input_<I: TrInput<u8>>(_: I) {}
     fn assert_output_<O: TrOutput<u8>>(_: O) {}
 
-    assert_buff_read_::<CompioReadAsBuff<UnixStream>>();
-    assert_buff_write_::<CompioWriteAsBuff<UnixStream>>();
+    assert_buff_read_::<BuffRead<UnixStream>>();
+    assert_buff_write_::<BuffWrite<UnixStream>>();
     assert_input_(ReadAsInput::new(read));
     assert_output_(WriteAsOutput::new(write));
 }

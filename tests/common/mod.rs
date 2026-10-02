@@ -59,14 +59,15 @@
 
 use core::mem::MaybeUninit;
 
-use abs_buff::{
-    Demand, TrBuffRead, TrBuffWrite,
-    buffer::{TrBuffSegmMut, TrBuffSegmRef},
-    io::{TrInput, TrOutput},
+use buffex::{
+    ring::Ring,
+    x_deps::abs_buff::{
+        Demand, TrBuffRead, TrBuffWrite,
+        buffer::{TrBuffSegmMut, TrBuffSegmRef},
+        io::{TrInput, TrOutput},
+    },
 };
-use buffex::circular_buff::builder::CircularBuffBuilder;
-use mm_ptr::{Owned, x_deps::abs_mm};
-use abs_mm::mem_alloc::CoreAlloc;
+use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
 use abs_smux::conn::{
     TrChannelHandle, TrChannelHalf, TrChannelListener, TrConnection, TrDockBinding,
 };
@@ -129,26 +130,27 @@ impl TrMuxConfig for SmokeMuxConfig {
     }
 }
 
-/// buffex 构建器的具体类型别名（元素 `u8` + 缺省分配器），避免类型推断歧义。
-type SmokeBuffBuilder = CircularBuffBuilder<Owned<[MaybeUninit<u8>], CoreAlloc>>;
+/// 环存储的具体类型（元素 `u8` + `CoreAlloc`），避免类型推断歧义。
+type SmokeBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
 
-/// 单条**全被动**环，返回 `(生产端, 消费端)`。
+/// 单条**全被动**环，返回 `(写端, 读端)`。
 ///
-/// 消费端交给 smux 当 `Rx`（由 [`pump_input_`] 写入），或生产端交给 smux 当 `Tx`
-/// （由 [`pump_output_`] 排空）。全被动模式不接任何设备，搬运完全由调用方的泵
-/// 负责——原因见模块文档「为什么必须由调用方驱动泵」。
-pub async fn make_passive_ring_(
+/// 读端交给 smux 当 `Rx`（由 [`pump_input_`] 写入），或写端交给 smux 当 `Tx`
+/// （由 [`pump_output_`] 排空）。环不接任何设备，搬运完全由调用方的泵负责——原因
+/// 见模块文档「为什么必须由调用方驱动泵」。
+pub fn make_passive_ring_(
     capacity: usize,
-) -> (impl TrBuffWrite<u8>, impl TrBuffRead<u8>) {
-    let mut ready = SmokeBuffBuilder::with_allocator(capacity, CoreAlloc)
-        .expect("分配环缓冲应当成功")
-        .producer_passive()
-        .consumer_passive();
-    let (tx, rx) = ready
-        .build_async()
-        .await
-        .expect("构建全被动环应当成功");
-    (tx, rx)
+) -> (
+    smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+    smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+) {
+    let buffer: SmokeBuff = Owned::new_uninit_slice(capacity, CoreAlloc);
+    let ring = Ring::try_new(buffer).expect("环容量应当落在 buffex 允许的区间内");
+    let shared = Shared::new(ring, CoreAlloc);
+    // SAFETY: 这条环只被刚建出的 `Shared` 独占，且没有对应的 `Weak`（不存在升级
+    // 路径），因此两个半部各持一个强引用是安全的；与 `Ring::split_unchecked` 文档
+    // 要求的两条调用方保证一致。
+    unsafe { Ring::split_unchecked(shared) }
 }
 
 /// 单次从 socket 搬进环的分块上限（字节）。
@@ -262,9 +264,8 @@ where
 /// 用「socket + 调用方驱动的泵 + 全被动环」跑完 [`run_smoke_scenario_`]。
 ///
 /// 参数依次是 A 端（握手发起方）与 B 端（等待方）的 socket 读设备（`TrInput`）与
-/// 写设备（`TrOutput`）：tokio 侧由 `abs_buff_tokio_adapt::{ReadAsInput,
-/// WriteAsOutput}` 提供，compio 侧由 `abs_buff_compio_adapt::{ReadAsInput,
-/// WriteAsOutput}` 提供。
+/// 写设备（`TrOutput`）：tokio 侧由 `buffex_tokio_adapt`（设备级适配来自它依赖的
+/// `abs_buff_tokio_adapt`）提供，compio 侧由 `buffex_compio_adapt` 直接提供。
 ///
 /// 每端装配两个全被动环：
 ///
@@ -288,10 +289,10 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB, Rt>(
     Rt: TrSmokeRuntime,
 {
     // 每端两个环：一个承载「socket → smux」（Rx），一个承载「smux → socket」（Tx）。
-    let (a_rx_ring_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE).await;
-    let (a_tx, a_tx_ring_rx) = make_passive_ring_(K_NET_BUFFER_SIZE).await;
-    let (b_rx_ring_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE).await;
-    let (b_tx, b_tx_ring_rx) = make_passive_ring_(K_NET_BUFFER_SIZE).await;
+    let (a_rx_ring_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    let (a_tx, a_tx_ring_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    let (b_rx_ring_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    let (b_tx, b_tx_ring_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
 
     let scenario_fut = run_smoke_scenario_::<_, _, _, _, Rt>(a_rx, a_tx, b_rx, b_tx);
     let pumps_fut = async {

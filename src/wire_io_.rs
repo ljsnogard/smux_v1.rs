@@ -13,9 +13,10 @@
 use abs_buff::{
     Demand, TrBuffRead, TrBuffWrite,
     buffer::{TrBuffSegmMut, TrBuffSegmRef},
+    x_deps::abs_cancel,
 };
 use abs_cancel::{TrCancellationToken, TrMayCancel};
-use buffex::x_deps::{abs_buff, abs_cancel};
+use buffex::x_deps::abs_buff;
 
 /// 字节游标操作失败。
 ///

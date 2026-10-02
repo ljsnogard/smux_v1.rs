@@ -37,9 +37,9 @@
 #![allow(dead_code)]
 
 #[cfg(not(feature = "multi-thread"))]
+use core::cell::RefCell;
 use core::{
-    alloc::{Allocator, AllocatorClone},
-    cell::RefCell,
+    alloc::AllocatorClone,
     future::Future,
     pin::Pin,
     task::{Context, Poll, Waker},
@@ -207,7 +207,7 @@ where
 
 impl<A> CancelToken_<A>
 where
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
     /// 用调用方注入的分配器建立令牌（未取消）。
     pub(crate) fn new_(alloc: A) -> Self {
@@ -243,7 +243,7 @@ where
 
 impl<A> TrCancellationToken for CancelToken_<A>
 where
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
     type Cancellation = CancelWait_<A>;
 
@@ -269,14 +269,14 @@ where
 /// [`CancelToken_::cancellation`] 产出的 future。
 pub(crate) struct CancelWait_<A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     token_: CancelToken_<A>,
 }
 
 impl<A> Future for CancelWait_<A>
 where
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
     type Output = ();
 
@@ -474,7 +474,7 @@ pub(crate) enum DockUse_ {
 /// 步随读写循环一并挂上。
 struct ChannelNode_<A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     /// 对端 dock；与本节点所属 dock 节点合起来就是子流身份。
     remote_dock_: Dock,
@@ -485,7 +485,7 @@ where
 
 impl<A> DockNode_<A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     /// 是否「空」：无子流、无显式占用、无等待者。
     fn is_empty_(&self) -> bool {
@@ -496,7 +496,7 @@ where
 /// 一个 local_dock 的索引条目。
 struct DockNode_<A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     /// 本节点对应的 local_dock。
     dock_: Dock,
@@ -520,7 +520,7 @@ where
 /// 共享注册表的内部状态。
 struct RegistryInner_<A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     /// 协商结果：本层只用到其中的两个配额。
     opts_: BasicOpts,
@@ -547,14 +547,14 @@ where
 /// 增删与计数），且**不跨 `await`**。
 pub(crate) struct ChannelRegistry_<A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     inner_: Shared<SyncCell_<RegistryInner_<A>>, A>,
 }
 
 impl<A> ChannelRegistry_<A>
 where
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
     /// 建立注册表：分配根对象，并为两个循环建好取消令牌。
     ///
@@ -754,7 +754,7 @@ where
 
 impl<A> RegistryInner_<A>
 where
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
     /// 找到 `dock` 对应的节点；不存在时返回 `None`。
     fn find_dock_mut_(&mut self, dock: Dock) -> Option<&mut DockNode_<A>> {
@@ -832,7 +832,7 @@ fn remove_channel_<A>(
     remote_dock: Dock,
 ) -> bool
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     let remove_head = match head.as_ref() {
         Option::Some(node) => node.remote_dock_ == remote_dock,
@@ -870,7 +870,7 @@ mod tests_ {
         task::Wake,
     };
 
-    use buffex::x_deps::abs_mm::mem_alloc::CoreAlloc;
+    use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
     use super::*;
 

@@ -28,8 +28,8 @@
 //! # 关闭态：直接读环的两个端
 //!
 //! `TrChannelHalf::is_tx_closed` / `is_rx_closed` 不额外维护标志位，而是读
-//! `buffex` 环本身的**两端关闭态**（`Producer::is_producer_closed` /
-//! `is_consumer_closed`）：
+//! `buffex::ring` 环本身的**两端关闭态**（半部经 `ring_state()` 取
+//! `is_producer_closed` / `is_consumer_closed`）：
 //!
 //! - 每条子流两个方向各一条环。发送环的应用端是 [`ChannelTx`]（生产端），另一端
 //!   由中心循环的写路径持有；接收环的会话端是生产端，应用端是 [`ChannelRx`]（消费端）；
@@ -50,6 +50,7 @@
 #![allow(dead_code, unused_variables)]
 
 use core::{
+    alloc::AllocatorClone,
     borrow::BorrowMut,
     marker::PhantomData,
     mem::MaybeUninit,
@@ -67,14 +68,12 @@ use abs_art::TrSpawnSend;
 use abs_art::TrSpawnLocal;
 
 use abs_cancel::TrCancellationToken;
-use abs_mm::mem_alloc::TrMalloc;
 use abs_smux::conn::{
     TrChannelHandle, TrChannelHalf, TrChannelListener, TrChannelRx, TrChannelTx, TrConnection,
     TrDockBinding,
 };
 use anylr::SomeOf;
 use buffex::x_deps::abs_buff;
-use mm_ptr::x_deps::abs_mm;
 
 use crate::{
     connection::{BufferedRx, BufferedTx, Dock, MuxError},
@@ -106,7 +105,7 @@ pub trait TrMuxConfig {
     type Buff: BorrowMut<[MaybeUninit<u8>]> + Send + Sync;
 
     /// 环内存与帧暂存的分配器。
-    type Alloc: TrMalloc + Clone + Send + Sync;
+    type Alloc: AllocatorClone + Send + Sync;
 
     /// 流控策略。
     type Policy: TrFlowCtrlPolicy;
@@ -665,7 +664,7 @@ where
 impl<B, A> TrChannelHalf for ChannelTx<BufferedTx<B, A>>
 where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
     type Data = u8;
     type Dock = Dock;
@@ -680,13 +679,32 @@ where
 
     /// 发送方向是否已关闭：本端（应用）已不再发送，或会话已停止排空本环。
     fn is_tx_closed(&self) -> bool {
-        self.half_.is_producer_closed()
+        self.half_.ring_state().is_producer_closed()
     }
 
     /// 接收方向是否已关闭：环的消费端（由中心循环持有）已关闭，即整条子流已被
     /// 连接拆掉。
     fn is_rx_closed(&self) -> bool {
-        self.half_.is_consumer_closed()
+        self.half_.ring_state().is_consumer_closed()
+    }
+}
+
+impl<H> TrBuffTryWrite<u8> for ChannelTx<H>
+where
+    H: TrBuffTryWrite<u8>,
+{
+    type SegmMut<'f>
+        = H::SegmMut<'f>
+    where
+        Self: 'f;
+
+    type Err = H::Err;
+
+    fn try_write<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
+        self.half_.try_write(demand)
     }
 }
 
@@ -699,35 +717,15 @@ where
     where
         Self: 'f;
 
-    type SegmMut<'f>
-        = H::SegmMut<'f>
-    where
-        Self: 'f;
-
-    type Err = H::Err;
-
-    fn is_stuffed_closing(&self) -> bool {
-        self.half_.is_stuffed_closing()
-    }
-
     fn write_async<'f>(&'f mut self, demand: &'f Demand<usize>) -> Self::WriteAsync<'f> {
         self.half_.write_async(demand)
-    }
-}
-
-impl<H> TrBuffTryWrite<u8> for ChannelTx<H>
-where
-    H: TrBuffTryWrite<u8>,
-{
-    fn try_write<'f>(&'f mut self, demand: &'f Demand<usize>) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
-        self.half_.try_write(demand)
     }
 }
 
 impl<B, A> TrChannelTx for ChannelTx<BufferedTx<B, A>>
 where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
 }
 
@@ -738,7 +736,7 @@ where
 impl<B, A> TrChannelHalf for ChannelRx<BufferedRx<B, A>>
 where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
     type Data = u8;
     type Dock = Dock;
@@ -754,12 +752,31 @@ where
     /// 发送方向是否已关闭：环的生产端（由中心循环持有）已关闭，即对端不再发送
     /// （EOF）或整条子流已被连接拆掉。
     fn is_tx_closed(&self) -> bool {
-        self.half_.is_producer_closed()
+        self.half_.ring_state().is_producer_closed()
     }
 
     /// 接收方向是否已关闭：本端（应用）已不再接收。
     fn is_rx_closed(&self) -> bool {
-        self.half_.is_consumer_closed()
+        self.half_.ring_state().is_consumer_closed()
+    }
+}
+
+impl<H> TrBuffTryRead<u8> for ChannelRx<H>
+where
+    H: TrBuffTryRead<u8>,
+{
+    type SegmRef<'f>
+        = H::SegmRef<'f>
+    where
+        Self: 'f;
+
+    type Err = H::Err;
+
+    fn try_read<'f>(
+        &'f mut self,
+        demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
+        self.half_.try_read(demand)
     }
 }
 
@@ -772,35 +789,15 @@ where
     where
         Self: 'f;
 
-    type SegmRef<'f>
-        = H::SegmRef<'f>
-    where
-        Self: 'f;
-
-    type Err = H::Err;
-
-    fn is_drained_closing(&self) -> bool {
-        self.half_.is_drained_closing()
-    }
-
     fn read_async<'f>(&'f mut self, demand: &'f Demand<usize>) -> Self::ReadAsync<'f> {
         self.half_.read_async(demand)
-    }
-}
-
-impl<H> TrBuffTryRead<u8> for ChannelRx<H>
-where
-    H: TrBuffTryRead<u8>,
-{
-    fn try_read<'f>(&'f mut self, demand: &'f Demand<usize>) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
-        self.half_.try_read(demand)
     }
 }
 
 impl<B, A> TrChannelRx for ChannelRx<BufferedRx<B, A>>
 where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
-    A: TrMalloc + Clone + Send + Sync,
+    A: AllocatorClone + Send + Sync,
 {
 }
 
@@ -810,34 +807,23 @@ mod tests_ {
         Demand,
         buffer::{TrBuffSegmMut, TrBuffSegmRef},
     };
-    use buffex::circular_buff::builder::CircularBuffBuilder;
-    use mm_ptr::{Owned, x_deps::abs_mm};
+    use buffex::ring::ConsumerError;
+    use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
-    use abs_mm::mem_alloc::CoreAlloc;
+    use crate::connection::ring_::test_support_::{TestBuff, make_test_channel_};
 
     use super::*;
-
-    /// 测试用的环存储类型与构建器（与集成测试的 `SmokeMuxConfig` 同款）。
-    type TestBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
-    type TestBuilder = CircularBuffBuilder<TestBuff>;
 
     /// 测试用的子流半边类型。
     type TestTx = ChannelTx<BufferedTx<TestBuff, CoreAlloc>>;
     type TestRx = ChannelRx<BufferedRx<TestBuff, CoreAlloc>>;
 
     /// 构造一对包在**内存环**上的子流半边（容量 64，dock 对 `(3, 7)`）。
-    /// - 手段：用 `buffex` 构建器装配「全被动 × 全被动」环，再把两个半部包进
-    ///   [`ChannelTx`] / [`ChannelRx`]。
+    /// - 手段：用 `buffex::ring` 建一条容量 64 的环并切成读写两端，再把两个半部
+    ///   包进 [`ChannelTx`] / [`ChannelRx`]。
     /// - 判断：返回的 `(Tx, Rx)` 即被测对象；构建失败即测试失败。
-    async fn make_halves_() -> (TestTx, TestRx) {
-        let mut ready = TestBuilder::with_allocator(64usize, CoreAlloc)
-            .expect("分配环缓冲应当成功")
-            .producer_passive()
-            .consumer_passive();
-        let (half_tx, half_rx) = ready
-            .build_async()
-            .await
-            .expect("构建全被动环应当成功");
+    fn make_halves_() -> (TestTx, TestRx) {
+        let (half_tx, half_rx) = make_test_channel_(64usize);
         (
             ChannelTx::new_(half_tx, Dock::new(3u32), Dock::new(7u32)),
             ChannelRx::new_(half_rx, Dock::new(3u32), Dock::new(7u32)),
@@ -922,7 +908,7 @@ mod tests_ {
     ///   没有吞掉或改写数据。
     #[compio::test]
     async fn halves_report_docks_and_delegate_try_io() {
-        let (mut tx, mut rx) = make_halves_().await;
+        let (mut tx, mut rx) = make_halves_();
 
         assert_eq!(tx.local_dock(), Dock::new(3u32));
         assert_eq!(tx.remote_dock(), Dock::new(7u32));
@@ -949,7 +935,7 @@ mod tests_ {
     ///   互不影响、且状态由环共享。
     #[compio::test]
     async fn close_flags_track_both_ends_independently() {
-        let (mut tx, mut rx) = make_halves_().await;
+        let (tx, rx) = make_halves_();
 
         assert!(!tx.is_tx_closed());
         assert!(!tx.is_rx_closed());
@@ -962,18 +948,18 @@ mod tests_ {
         assert!(!tx.is_rx_closed(), "接收方向不应受影响");
         assert!(!rx.is_rx_closed(), "接收方向不应受影响");
 
-        rx.half_.close_async().await;
+        rx.half_.close();
         assert!(rx.is_rx_closed(), "关闭消费端后接收方向应视为已关闭");
         assert!(tx.is_rx_closed(), "接收方向的关闭应对发送半边可见");
     }
 
     /// 测试半关闭后的 EOF 语义：写端关闭不丢数据，排空后才报关闭。
     /// - 手段：写入 3 字节后关闭发送端；先把 3 字节读走，再尝试读 1 字节。
-    /// - 判断：关闭后仍能读回全部残留数据；排空后 `is_drained_closing()` 为真，
-    ///   且再读返回错误——即「先读完再 EOF」。
+    /// - 判断：关闭后仍能读回全部残留数据；排空后再读返回
+    ///   [`ConsumerError::Closing`]——即「先读完再 EOF」。
     #[compio::test]
     async fn send_close_keeps_buffered_data_then_eof() {
-        let (mut tx, mut rx) = make_halves_().await;
+        let (mut tx, mut rx) = make_halves_();
 
         let payload = [9u8, 8, 7];
         try_write_all_(&mut tx, &payload)
@@ -988,14 +974,13 @@ mod tests_ {
             .expect("关闭写端不应丢弃已缓存的数据");
         assert_eq!(got, payload);
 
-        assert!(
-            rx.half_.is_drained_closing(),
-            "排空且写端已关闭后应报告 drained"
-        );
         let mut one = [0u8; 1];
+        let err = try_read_exact_(&mut rx, &mut one)
+            .await
+            .expect_err("排空后继续读应当报错而不是空转");
         assert!(
-            try_read_exact_(&mut rx, &mut one).await.is_err(),
-            "排空后继续读应当报错而不是空转"
+            matches!(err, ConsumerError::Closing),
+            "排空且写端已关闭后应报告 Closing"
         );
     }
 }

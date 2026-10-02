@@ -212,7 +212,8 @@
 //!
 //! ## 5. 缓冲区
 //!
-//! 子流收发环与协议帧的收发暂存**一律使用 `buffex::circular_buff`**：
+//! 子流收发环与协议帧的收发暂存**一律使用 `buffex::ring`**（上游已用 `ring` 取代
+//! 早先的 `circular_buff`，见 dev-notes §12）：
 //!
 //! - 每条子流持有一对 `buffex` 半部（[`BufferedTx`] / [`BufferedRx`]），
 //!   因此 [`ChannelTx`] / [`ChannelRx`] 的 `try_*` 直接作用在环形缓冲上；
@@ -278,6 +279,7 @@
 mod channel_;
 mod error_;
 mod frame_;
+pub(crate) mod ring_;
 mod session_;
 mod signal_;
 mod sync_;
@@ -289,6 +291,7 @@ pub use channel_::{
 };
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
+pub use ring_::{BufferedChannel, BufferedRx, BufferedTx};
 pub use telegraph_::Telegraph;
 
 /// smux v1 使用的 dock 类型。
@@ -297,13 +300,3 @@ pub use telegraph_::Telegraph;
 /// 1 / 2 / 4 字节自适应宽度编码。
 pub type Dock = abs_smux::dock::Dock<u32>;
 
-/// 子流发送半边所用的 `buffex` 生产端类型。
-pub type BufferedTx<B, A> =
-    buffex::circular_buff::Producer<buffex::circular_buff::BufConsumer<u8>, B, u8, A>;
-
-/// 子流接收半边所用的 `buffex` 消费端类型。
-pub type BufferedRx<B, A> =
-    buffex::circular_buff::Consumer<buffex::circular_buff::BufProducer<u8>, B, u8, A>;
-
-/// 一条子流的收发环（双端被动，两端都交给会话与调用方）。
-pub type BufferedChannel<B, A> = buffex::circular_buff::SpscPair<B, u8, A>;

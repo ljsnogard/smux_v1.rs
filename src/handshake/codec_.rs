@@ -38,8 +38,12 @@
 use core::time::Duration;
 
 use abs_async_iter::TrAsyncIterator;
-use abs_buff::{TrBuffRead, TrBuffWrite, gen_may_cancel_future, x_deps::abs_cancel};
+use abs_buff::{
+    TrBuffRead, TrBuffWrite, gen_may_cancel_future,
+    x_deps::abs_cancel,
+};
 use abs_cancel::TrCancellationToken;
+use buffex::x_deps::abs_buff;
 
 use crate::wire_io_::{CursorError, ReadCursor, write_all_async_};
 use crate::handshake::{
@@ -267,7 +271,7 @@ impl CrcDigest {
 async fn next_entry_async_<'s, 'f, 'r, R, K, C>(
     reader: &'r mut FrameReader<'f, R, K>,
     _cancel: C,
-) -> Result<Option<NegotiationEntry<'s>>, StreamEnd_>
+) -> Result<NegotiationEntry<'s>, StreamEnd_>
 where
     'f: 's,
     R: TrBuffRead<u8> + 'f,
@@ -277,7 +281,10 @@ where
     let res: Result<Option<NegotiationEntry<'s>>, WireError<R::Err, ()>> =
         FrameReader::next_entry_async_(&mut *reader).await;
     match res {
-        Result::Ok(item) => Result::Ok(item),
+        // 有下一条：正常产出。
+        Result::Ok(Option::Some(entry)) => Result::Ok(entry),
+        // 条目读完（正常结束）：[`TrAsyncIterator`] 用 `Err` 表达「不能再产出」。
+        Result::Ok(Option::None) => Result::Err(StreamEnd_::Ended),
         Result::Err(err) => {
             // 详细原因留给调用方取回；流本身只需报告「终止」。
             reader.last_err_ = Option::Some(err);
@@ -525,11 +532,15 @@ where
 
 /// 条目流的终止标记。
 ///
-/// 协商器只需要知道「流已经不能再继续」；真正的失败原因由
-/// [`FrameReader::take_error_`] 取回，调用方据此按模块文档 §9 分类处置——
-/// 例如 `ChecksumErr` 与主动拒绝的处置完全不同（前者不得回 `REJECT`）。
+/// [`TrAsyncIterator`] 的契约是 `Result<Item, Err>`——**没有** `Option`，因此「条目
+/// 读完」也要用 `Err` 表达。协商器只需要知道「流已经不能再继续」，不必区分两种终止；
+/// 真正的失败原因由 [`FrameReader::take_error_`] 取回，调用方据此按模块文档 §9 分类
+/// 处置——例如 `ChecksumErr` 与主动拒绝的处置完全不同（前者不得回 `REJECT`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamEnd_ {
+    /// 条目流已经读到底（正常结束）。
+    Ended,
+
     /// 读侧发生失败，条目流就此终止。
     Failed,
 }
@@ -793,7 +804,7 @@ pub(super) fn confirm_matches_(
 
 #[cfg(test)]
 mod tests_ {
-    use abs_buff::x_deps::abs_cancel::NonCancellableToken;
+    use buffex::x_deps::abs_cancel::NonCancellableToken;
 
     use super::*;
     use crate::handshake::{K_ACCEPT_MAGIC, K_INVITE_MAGIC};

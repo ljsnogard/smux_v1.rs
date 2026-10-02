@@ -13,7 +13,7 @@ abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev
 # 复用子流与协议帧的缓冲区一律使用 `buffex::circular_buff`，因此它是正式依赖
 # 而非测试专用依赖（`no_std` 成立；缺省分配器由 `buffex` 重导出）。
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
-mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1.3" }
+mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
 
 crc = { version = "3.4.*" }
 flume = { version = "0.12.*" }

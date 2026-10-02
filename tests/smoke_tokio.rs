@@ -2,12 +2,13 @@
 //!
 //! 场景本体在 `tests/common/mod.rs`，与 compio 版逐字相同；本文件只负责运行时
 //! 特化的接线：建立 tokio UNIX socket 对，把两个半边经 `abs_buff_tokio_adapt`
-//! 的设备级适配交给 [`common::run_socket_scenario_`] 的四条调用方驱动泵。
+//! 的设备级适配（经 `buffex_tokio_adapt::x_deps` 重导出）交给
+//! [`common::run_socket_scenario_`] 的四条调用方驱动泵。
 
 mod common;
 
-use abs_buff::io::{TrInput, TrOutput};
-use abs_buff_tokio_adapt::{ReadAsInput, WriteAsOutput};
+use buffex::x_deps::abs_buff::io::{TrInput, TrOutput};
+use buffex_tokio_adapt::x_deps::abs_buff_tokio_adapt::{ReadAsInput, WriteAsOutput};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 

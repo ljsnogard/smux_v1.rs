@@ -21,14 +21,11 @@
 #![allow(dead_code, unused_variables)]
 
 
-use abs_buff::{
-    TrBuffRead, TrBuffWrite, gen_may_cancel_future,
-    x_deps::anylr,
-};
+use abs_buff::{TrBuffRead, TrBuffWrite, gen_may_cancel_future};
 use abs_cancel::TrCancellationToken;
 use abs_smux::conn::TrTelegraph;
 use anylr::SomeOf;
-use buffex::x_deps::{abs_buff, abs_cancel}
+use buffex::x_deps::{abs_buff, abs_cancel, anylr};
 
 use crate::connection::{Dock, MuxError, TrMuxConfig};
 use super::channel_::SessionMark_;
