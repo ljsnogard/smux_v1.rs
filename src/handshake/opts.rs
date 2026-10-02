@@ -29,23 +29,23 @@
 //! - 所有多字节整数均为大端无符号数。
 //! - 发送方必须使用能容纳数值的**最小** `val_type` 宽度；接收方必须接受任意
 //!   足够宽的编码，并把它还原为 `usize`。
-//! - 除基础键（`0x00..=0x03`）与校验键（`0x0C`）外的键在 v1 中一律非法；接收
+//! - 除基础键（`0x00..=0x04`）与校验键（`0x0C`）外的键在 v1 中一律非法；接收
 //!   方遇到保留键或未识别的键时必须拒绝该帧（见模块文档 §6.3）。
 
 use core::{borrow::Borrow, time::Duration};
 
 /// 一次成功握手产出的协商结果。
 ///
-/// 目前只包含四项基础协商项的最终取值。
+/// 目前只包含五项基础协商项的最终取值。
 #[derive(Debug, Clone)]
 pub struct HandshakeOpts {
-    /// 协商后的四项基础配置。
+    /// 协商后的五项基础配置。
     pub basic_opts: BasicOpts,
     // 扩展条目暂缓实现：恢复时在此加回扩展条目存放区与有效数量字段，见
     // dev-notes.md（仓库根目录）。
 }
 
-/// 基础协商结果，即四项基础协商项的最终取值。
+/// 基础协商结果，即五项基础协商项的最终取值。
 ///
 /// 各字段在网络上的单位、合法范围与协商流程见 [`crate::handshake`] 模块文档
 /// §7.1。
@@ -75,6 +75,25 @@ pub struct BasicOpts {
     /// # Discussion
     /// 不断地发送心跳报文（ACK）可以无限地延长 channel 存活时间，直到有一端主动关闭。
     pub max_channel_timeout: Duration,
+
+    /// **一条 channel 关闭后**，其 `(local_dock, remote_dock)` 身份在本地保留的
+    /// 宽限秒数。
+    ///
+    /// 宽限期内到达的该 dock 对的**在途帧被静默丢弃**，且同一 dock 对**不允许
+    /// 立即复用**（否则会把旧子流的迟到帧错误地投递给新子流）；宽限期结束后身份
+    /// 记录（tombstone）才被回收，该 dock 对可以重新建流。完整语义见
+    /// [`crate::connection`] 模块文档 §4.3。
+    ///
+    /// # 与 [`BasicOpts::max_channel_timeout`] 的区别
+    ///
+    /// - [`BasicOpts::max_channel_timeout`]：**活跃** channel 的空闲超时
+    ///   （保活语义）——两端持续互发心跳即可无限延长，只有彻底静默才触发；
+    /// - 本项：**已关闭** channel 的宽限期（吸收拆流竞态语义）——自本端认定该
+    ///   channel 关闭那一刻起算，与之后是否有数据往来无关，只用来吸收「双方对
+    ///   关闭时刻的认知差」造成的在途帧。
+    ///
+    /// 合法范围 `>= 1` 秒；取值为 `0` 由编解码层按 `MalformedBody` 拒绝。
+    pub max_channel_wait_close: Duration,
 }
 
 impl BasicOpts {
@@ -87,11 +106,16 @@ impl BasicOpts {
     /// `1usize << 28`，可在 32 位 `usize` 上表示。但线格式允许 `BeU64`，而
     /// 本结构以 `usize` 承载，32 位平台上超过 `usize::MAX` 的取值必须在解码
     /// 时报错，不得截断。
+    ///
+    /// `max_channel_wait_close` 取 5 秒：宽限期只需覆盖「对端处理我们 `CLOSE`
+    /// 的时间」（约 1 个 RTT 加调度余量），远小于空闲超时；取值越小，关闭后
+    /// 留下的 tombstone 越少。该值可协商。
     pub const DEFAULT: BasicOpts = BasicOpts {
         max_packet_size: 4096usize,
         max_channel_count: 1usize << 28,
         max_dock_chan_count: 1usize << 28,
         max_channel_timeout: Duration::from_secs(30u64),
+        max_channel_wait_close: Duration::from_secs(5u64),
     };
 
     /// 从「基础条目」迭代器还原 [`BasicOpts`]，未出现的项保留
@@ -122,6 +146,9 @@ impl BasicOpts {
                 NegotiationKey::MaxChannelTimeout => {
                     x.max_channel_timeout = Duration::from_secs(entry.val_data as u64)
                 }
+                NegotiationKey::MaxChannelWaitClose => {
+                    x.max_channel_wait_close = Duration::from_secs(entry.val_data as u64)
+                }
                 _ => (),
             }
         }
@@ -145,6 +172,7 @@ impl<'a> core::iter::IntoIterator for &'a BasicOpts {
             NegotiationKey::MaxChannelCount,
             NegotiationKey::MaxDockChanCount,
             NegotiationKey::MaxChannelTimeout,
+            NegotiationKey::MaxChannelWaitClose,
         ];
         let items: [NegotiationEntry<'a>; K_BASIC_KEY_COUNT] = core::array::from_fn(|i| {
             let value = match KEYS[i] {
@@ -152,6 +180,9 @@ impl<'a> core::iter::IntoIterator for &'a BasicOpts {
                 NegotiationKey::MaxChannelCount => self.max_channel_count,
                 NegotiationKey::MaxDockChanCount => self.max_dock_chan_count,
                 NegotiationKey::MaxChannelTimeout => self.max_channel_timeout.as_secs() as usize,
+                NegotiationKey::MaxChannelWaitClose => {
+                    self.max_channel_wait_close.as_secs() as usize
+                }
                 _ => 0usize,
             };
             NegotiationEntry::Basic(NegotiationBasicEntry {
@@ -164,7 +195,7 @@ impl<'a> core::iter::IntoIterator for &'a BasicOpts {
 }
 
 /// 基础项个数，等于 [`NegotiationKey`] 中基础键的数量。
-pub(crate) const K_BASIC_KEY_COUNT: usize = 4;
+pub(crate) const K_BASIC_KEY_COUNT: usize = 5;
 
 /// 取能容纳 `value` 的最小 [`NegotiationValType`]（规范化编码，见 §6）。
 pub(crate) const fn min_val_type_(value: usize) -> NegotiationValType {
@@ -203,6 +234,14 @@ pub enum NegotiationKey {
     /// channel 无数据后的最长存活秒数。
     MaxChannelTimeout = 0x03,
 
+    /// channel 关闭后其 dock 对身份保留的宽限秒数。
+    ///
+    /// 这是**已关闭** channel 的宽限期，与 [`NegotiationKey::MaxChannelTimeout`]
+    /// 的「活跃 channel 空闲超时」语义不同：宽限期内到达该 dock 对的在途帧被
+    /// 静默丢弃，且该 dock 对不允许立即复用（见 §7.1 与 [`BasicOpts`] 的字段
+    /// 文档）。合法范围 `>= 1`。
+    MaxChannelWaitClose = 0x04,
+
     /// 校验键。
     ///
     /// 该键**不是协商项**。它的头字节编码（高半字节 `val_type` 给出算法与
@@ -238,6 +277,7 @@ impl TryFrom<u8> for NegotiationKey {
             0x01 => Result::Ok(NegotiationKey::MaxChannelCount),
             0x02 => Result::Ok(NegotiationKey::MaxDockChanCount),
             0x03 => Result::Ok(NegotiationKey::MaxChannelTimeout),
+            0x04 => Result::Ok(NegotiationKey::MaxChannelWaitClose),
             0x0C => Result::Ok(NegotiationKey::Checksum),
             0x0E => Result::Ok(NegotiationKey::ExtMsg),
             _ => Result::Err(value),
@@ -334,13 +374,13 @@ impl From<NegotiationValType> for u8 {
 /// 帧的条目区由若干条目顺序拼接而成（见模块文档 §6），本枚举是它们在 Rust 侧
 /// 的表示：
 ///
-/// - [`NegotiationEntry::Basic`]：4 个基础键之一，值是定长整数；
+/// - [`NegotiationEntry::Basic`]：5 个基础键之一，值是定长整数；
 /// - [`NegotiationEntry::Extended`]：扩展条目。**v1 中扩展条目是保留键**，读侧
 ///   遇到即 `UnsupportedOption`，因此该变体目前只用于表示「将来的形状」，
 ///   见仓库根目录 `dev-notes.md`。
 #[derive(Debug)]
 pub enum NegotiationEntry<'a> {
-    /// 基础条目（`key ∈ 0x00..=0x03`）。
+    /// 基础条目（`key ∈ 0x00..=0x04`）。
     Basic(NegotiationBasicEntry),
 
     /// 扩展条目（`key == 0x0E`）；v1 中尚未启用。

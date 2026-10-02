@@ -1,7 +1,10 @@
-// 本模块目前是**骨架**：类型、签名与文档已定稿，方法体统一为 `todo!()`。
-// 实现落地后必须移除本行的 `allow`（见 `dev-notes/` 的待办）。
+// 本模块目前是**骨架**：类型、签名与文档已定稿，收发方法体统一为 `todo!()`。
+// 身份登记 / 释放路径已经落地（端点存活期间独占 local_dock）。实现落地后必须移除
+// `unused_variables`（`dead_code` 仍由未实现的支线需要，见 dev-notes 的待办）。
 #![allow(dead_code, unused_variables)]
 
+
+use core::marker::PhantomData;
 
 use abs_buff::{TrBuffRead, TrBuffWrite, gen_may_cancel_future};
 use abs_cancel::TrCancellationToken;
@@ -9,21 +12,52 @@ use abs_smux::conn::TrTelegraph;
 use anylr::SomeOf;
 use buffex::x_deps::{abs_buff, abs_cancel, anylr};
 
-use crate::connection::{Dock, MuxError, TrMuxConfig};
+use crate::connection::{Dock, MuxConnection, MuxError, TrMuxConfig};
 use crate::connection::types_::SessionMark_;
 
 /// 数据报端点。
 ///
 /// 由 [`TrDockBinding::open_telegraph_async`](abs_smux::conn::TrDockBinding::open_telegraph_async)
 /// 在某个 binding 上建立；端点存活期间该 local_dock 被独占，不能再被 channel
-/// 使用（反之亦然）。
-pub struct Telegraph<'s, 'f, R, W, C, Rt> {
+/// 或 listener 使用（反之亦然，见 `ChannelRegistry_::reserve_telegraph_`）。
+pub struct Telegraph<'s, 'f, R, W, C, Rt>
+where
+    C: TrMuxConfig,
+{
+    /// 连接对象：端点被 drop 时用它解除身份登记。
+    conn_: &'f MuxConnection<R, W, C, Rt>,
+
     /// 本端 dock。
     local_dock_: Dock,
 
     /// 借用关系与连接泛型的占位；语义同
     /// [`ChannelListener`](super::ChannelListener)。
     _mark_: SessionMark_<'s, 'f, R, W, C, Rt>,
+}
+
+impl<'s, 'f, R, W, C, Rt> Telegraph<'s, 'f, R, W, C, Rt>
+where
+    C: TrMuxConfig,
+{
+    /// 由连接与 `local_dock` 构造（只允许 `open_telegraph_async` 调用）。
+    pub(crate) fn new_(conn: &'f MuxConnection<R, W, C, Rt>, local_dock: Dock) -> Self {
+        Telegraph {
+            conn_: conn,
+            local_dock_: local_dock,
+            _mark_: PhantomData,
+        }
+    }
+}
+
+/// 丢弃端点即**解除 telegraph 身份**，使同一个 `local_dock` 之后可以再作 channel
+/// 或 listener 使用（见 `ChannelRegistry_::release_telegraph_`）。
+impl<R, W, C, Rt> Drop for Telegraph<'_, '_, R, W, C, Rt>
+where
+    C: TrMuxConfig,
+{
+    fn drop(&mut self) {
+        self.conn_.reg_().release_telegraph_(self.local_dock_);
+    }
 }
 
 impl<'s, 'f, R, W, C, Rt> TrTelegraph for Telegraph<'s, 'f, R, W, C, Rt>

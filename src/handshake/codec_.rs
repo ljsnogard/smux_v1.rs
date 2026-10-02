@@ -21,7 +21,7 @@
 //! 内存因此与**帧长、条目数量都无关**：
 //!
 //! - 基础项是定长整数，最多 8 字节，直接在栈上解码（`decode_value_`），
-//!   **不留存原始字节**；4 个基础键各有一个定长槽位；
+//!   **不留存原始字节**；5 个基础键各有一个定长槽位；
 //! - 扩展条目在 v1 中是保留键，读到键就拒绝，因此目前**没有任何**按声明长度
 //!   申请缓冲的路径。将来启用时会先校验「声明长度 ≤ 内部上限」再准备等长
 //!   缓冲，这一步必须在读负载**之前**发生（`dev-notes.md` D2）；
@@ -297,7 +297,7 @@ where
 ///
 /// 生命周期 `'f` 是底层读缓冲的借用；[`FrameReader`] 本身**不累积整帧**：
 ///
-/// - 基础项解码后存进 4 个定长槽位（[`NegotiationBasicEntry`]），原始字节丢弃；
+/// - 基础项解码后存进 5 个定长槽位（[`NegotiationBasicEntry`]），原始字节丢弃；
 /// - 扩展条目在 v1 中是保留键，读到即 `UnsupportedOption`（见 `dev-notes.md`）；
 /// - 校验只维护一个 [`CrcDigest`]。
 ///
@@ -386,7 +386,7 @@ where
         self.magic_
     }
 
-    /// 已解析的基础项槽位；下标即基础键 `0x00..=0x03`。
+    /// 已解析的基础项槽位；下标即基础键 `0x00..=0x04`。
     pub(crate) fn basics_(&self) -> &[Option<NegotiationBasicEntry>; K_BASIC_KEY_COUNT] {
         &self.basics_
     }
@@ -686,6 +686,7 @@ fn basic_key_(key: NegotiationKey) -> Result<u8, NegotiationKey> {
         NegotiationKey::MaxChannelCount => Result::Ok(1u8),
         NegotiationKey::MaxDockChanCount => Result::Ok(2u8),
         NegotiationKey::MaxChannelTimeout => Result::Ok(3u8),
+        NegotiationKey::MaxChannelWaitClose => Result::Ok(4u8),
         other => Result::Err(other),
     }
 }
@@ -737,25 +738,28 @@ fn encode_entry_(key: NegotiationKey, value: usize) -> (NegotiationValType, [u8;
 
 /// 把基础键的可选取值集合补全为 [`BasicOpts`]；缺位项使用协议缺省值。
 pub(super) fn values_to_basic_(values: &[Option<usize>; K_BASIC_KEY_COUNT]) -> BasicOpts {
+    let default_wait_close = BasicOpts::DEFAULT.max_channel_wait_close.as_secs() as usize;
     BasicOpts {
         max_packet_size: values[0].unwrap_or(BasicOpts::DEFAULT.max_packet_size),
         max_channel_count: values[1].unwrap_or(BasicOpts::DEFAULT.max_channel_count),
         max_dock_chan_count: values[2].unwrap_or(BasicOpts::DEFAULT.max_dock_chan_count),
         max_channel_timeout: Duration::from_secs(values[3].unwrap_or(30usize) as u64),
+        max_channel_wait_close: Duration::from_secs(values[4].unwrap_or(default_wait_close) as u64),
     }
 }
 
-/// 把 [`BasicOpts`] 展开为 4 个全部存在的基础键取值。
+/// 把 [`BasicOpts`] 展开为 5 个全部存在的基础键取值。
 pub(super) fn basic_to_values_(opts: &BasicOpts) -> [Option<usize>; K_BASIC_KEY_COUNT] {
     [
         Option::Some(opts.max_packet_size),
         Option::Some(opts.max_channel_count),
         Option::Some(opts.max_dock_chan_count),
         Option::Some(opts.max_channel_timeout.as_secs() as usize),
+        Option::Some(opts.max_channel_wait_close.as_secs() as usize),
     ]
 }
 
-/// 判断 4 个基础键是否全部出现。
+/// 判断 5 个基础键是否全部出现。
 pub(super) fn is_complete_(values: &[Option<usize>; K_BASIC_KEY_COUNT]) -> bool {
     values.iter().all(Option::is_some)
 }
@@ -776,7 +780,7 @@ pub(super) fn complete_invite_(
 }
 
 /// 把流式读出的条目转换为按键下标排列的取值；`ACCEPT` / `CONFIRM` 必须补齐
-/// 全部 4 项，否则返回 `None`。
+/// 全部 5 项，否则返回 `None`。
 pub(super) fn complete_values_(
     entries: &[Option<NegotiationBasicEntry>; K_BASIC_KEY_COUNT],
 ) -> Option<[Option<usize>; K_BASIC_KEY_COUNT]> {
@@ -837,6 +841,7 @@ mod tests_ {
             Option::None,
             Option::None,
             Option::None,
+            Option::None,
         ];
         let cases = [
             HandshakeChecksum::Crc16(&HANDSHAKE_CRC16),
@@ -879,6 +884,7 @@ mod tests_ {
     async fn roundtrip_supports_crc16_crc24_crc32() {
         let values = [
             Option::Some(7usize),
+            Option::None,
             Option::None,
             Option::None,
             Option::None,
@@ -927,6 +933,7 @@ mod tests_ {
             Option::None,
             Option::None,
             Option::None,
+            Option::None,
         ];
         let checksum = HandshakeChecksum::Crc24(&HANDSHAKE_CRC24);
         let mut buf = [0u8; 64];
@@ -960,6 +967,7 @@ mod tests_ {
     async fn checksum_header_mismatch_is_rejected() {
         let values = [
             Option::Some(7usize),
+            Option::None,
             Option::None,
             Option::None,
             Option::None,
@@ -1074,6 +1082,7 @@ mod tests_ {
             Option::Some(1usize << 28),
             Option::Some(64usize),
             Option::Some(30usize),
+            Option::Some(5usize),
         ];
         let checksum = HandshakeChecksum::Crc16(&HANDSHAKE_CRC16);
         let mut buf = [0u8; 64];
@@ -1106,8 +1115,8 @@ mod tests_ {
     }
 
     /// 测试等待方补全规则：已提及项覆盖本地值，未提及项保留本地值。
-    /// - 手段：本地四项齐全，`INVITE` 只提及 `max_packet_size = 8192`。
-    /// - 判断：补全结果第 0 项为 8192，其余三项等于本地值。
+    /// - 手段：本地五项齐全，`INVITE` 只提及 `max_packet_size = 8192`。
+    /// - 判断：补全结果第 0 项为 8192，其余四项等于本地值。
     ///
     /// 本测试不涉及 async，故使用同步的 `#[test]`（符合目标 3 的豁免条款）。
     #[test]
@@ -1126,6 +1135,79 @@ mod tests_ {
         assert_eq!(
             values[3],
             Option::Some(local.max_channel_timeout.as_secs() as usize)
+        );
+        assert_eq!(
+            values[4],
+            Option::Some(local.max_channel_wait_close.as_secs() as usize)
+        );
+    }
+
+    /// 测试新增基础键 `MaxChannelWaitClose`（`0x04`）的编解码往返一致性。
+    /// - 手段：构造一个 `max_channel_wait_close` 取非缺省值（7 秒）的
+    ///   [`BasicOpts`]，用 `basic_to_values_` 展开为基础项取值、`write_frame_`
+    ///   写成 `INVITE` 帧，再由 `FrameReader` 逐条读回，经 `complete_values_` 与
+    ///   `values_to_basic_` 还原为 [`BasicOpts`]。
+    /// - 判断：第 5 个槽位（下标 4）对应的键确实是 `MaxChannelWaitClose`，还原出的
+    ///   `max_channel_wait_close` 恰为 7 秒，且其余基础项与原始值一致。
+    #[compio::test]
+    async fn max_channel_wait_close_roundtrips_through_codec() {
+        let opts = BasicOpts {
+            max_channel_wait_close: Duration::from_secs(7u64),
+            ..BasicOpts::default()
+        };
+        let values = basic_to_values_(&opts);
+        let mut buf = [0u8; 64];
+        let total = write_into_buf_(
+            &mut buf,
+            K_INVITE_MAGIC,
+            &values,
+            &HandshakeChecksum::Crc16(&HANDSHAKE_CRC16),
+        )
+        .await;
+
+        let mut probe: &[u8] = &buf[..total];
+        let mut reader = FrameReader::begin_async_(&mut probe, NonCancellableToken::new())
+            .await
+            .expect("magic 与算法预告应当可读");
+        reader.drain_async_().await.expect("整帧应当校验通过");
+
+        let entry = reader.basics_()[4].as_ref().expect("第 5 槽位应当已填充");
+        assert!(matches!(
+            NegotiationKey::try_from(entry.opts_key),
+            Result::Ok(NegotiationKey::MaxChannelWaitClose)
+        ));
+
+        let restored =
+            values_to_basic_(&complete_values_(reader.basics_()).expect("五项基础项应当齐全"));
+        assert_eq!(restored.max_channel_wait_close, Duration::from_secs(7u64));
+        assert_eq!(restored.max_packet_size, opts.max_packet_size);
+        assert_eq!(restored.max_channel_count, opts.max_channel_count);
+        assert_eq!(restored.max_dock_chan_count, opts.max_dock_chan_count);
+        assert_eq!(restored.max_channel_timeout, opts.max_channel_timeout);
+    }
+
+    /// 测试新增基础键 `MaxChannelWaitClose`（`0x04`）的最小宽度选择。
+    /// - 手段：用 `encode_entry_` 分别以 5 与 300 为取值编码该键的条目，再按
+    ///   头字节的高半字节解析回 [`NegotiationValType`]，并用 `decode_value_`
+    ///   把大端数值解回。
+    /// - 判断：取值 5 必须选 `BeU8`（头字节 `0x04`）；取值 300 必须选 `BeU16`
+    ///   （头字节 `0x14`）；两者解回的数值都与原值相同。
+    #[test]
+    fn max_channel_wait_close_uses_minimal_width() {
+        let (vl_type, bytes) = encode_entry_(NegotiationKey::MaxChannelWaitClose, 5usize);
+        assert_eq!(u8::from(vl_type), u8::from(NegotiationValType::BeU8));
+        assert_eq!(bytes[0], 0x04);
+        assert_eq!(
+            decode_value_(vl_type.value_len(), &bytes[1..1 + vl_type.value_len()]),
+            Result::Ok(5usize)
+        );
+
+        let (vl_type, bytes) = encode_entry_(NegotiationKey::MaxChannelWaitClose, 300usize);
+        assert_eq!(u8::from(vl_type), u8::from(NegotiationValType::BeU16));
+        assert_eq!(bytes[0], 0x14);
+        assert_eq!(
+            decode_value_(vl_type.value_len(), &bytes[1..1 + vl_type.value_len()]),
+            Result::Ok(300usize)
         );
     }
 }

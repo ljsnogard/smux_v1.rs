@@ -52,6 +52,19 @@ where
     }
 }
 
+/// 丢弃监听器即**解除 listener 身份**，使同一个 `local_dock` 之后可以再作
+/// telegraph 使用（见 `ChannelRegistry_::release_listener_`）。
+///
+/// 注意这不影响该 dock 上已经建立、且在应用手里的子流半部。
+impl<R, W, C, Rt> Drop for ChannelListener<'_, '_, R, W, C, Rt>
+where
+    C: TrMuxConfig,
+{
+    fn drop(&mut self) {
+        self.conn_.reg_().release_listener_(self.local_dock_);
+    }
+}
+
 impl<'s, 'f, R, W, C, Rt> TrChannelListener for ChannelListener<'s, 'f, R, W, C, Rt>
 where
     R: TrBuffRead<u8> + 'f,

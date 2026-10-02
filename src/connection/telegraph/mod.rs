@@ -2,7 +2,9 @@
 //!
 //! 数据报（telegraph）是类似 UDP 的短消息通道：**不需要建流握手**，但按
 //! `abs_smux` 的约定，`channel` 与 `telegraph` **不得共用同一个 local_dock**，
-//! 因此它在绑定期与 channel 互斥。
+//! 因此它在 `local_dock` 上与 channel / listener 互斥（登记在统一身份表的
+//! `(local, wildcard)` / `(local, 具体值)` 之外，占 `(local, unspecified)`，
+//! 见 `mux_connection::registry_`）。
 //!
 //! # 语义
 //!

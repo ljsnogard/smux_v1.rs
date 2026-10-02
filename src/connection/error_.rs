@@ -90,6 +90,13 @@ pub enum MuxError<RE, WE> {
     /// 同一条子流上出现重复的建立 / 应答请求。
     Duplicate,
 
+    /// 该 dock 对刚关闭，仍在**拆流宽限期**内，暂不可复用。
+    ///
+    /// 宽限期由协商项 `max_channel_wait_close` 决定（见 [`crate::connection`]
+    /// 模块文档 §4.3）：期间到达的在途帧被静默丢弃，同一
+    /// `(local_dock, remote_dock)` 也不允许重新登记。
+    WaitClose,
+
     /// 流控失败（窗口违例或计数溢出）。
     FlowCtrl(FlowCtrlError),
 }
@@ -114,6 +121,7 @@ impl<RE, WE> core::fmt::Display for MuxError<RE, WE> {
             MuxError::ChanLimit => f.write_str("连接上的活动子流数已达上限"),
             MuxError::Refused => f.write_str("对端拒绝建立子流"),
             MuxError::Duplicate => f.write_str("同一条子流上出现重复请求"),
+            MuxError::WaitClose => f.write_str("该 dock 对刚关闭，仍在拆流宽限期内"),
             MuxError::FlowCtrl(_) => f.write_str("流控失败"),
         }
     }
@@ -150,6 +158,7 @@ impl MuxError<(), ()> {
             MuxError::ChanLimit => MuxError::ChanLimit,
             MuxError::Refused => MuxError::Refused,
             MuxError::Duplicate => MuxError::Duplicate,
+            MuxError::WaitClose => MuxError::WaitClose,
             MuxError::FlowCtrl(err) => MuxError::FlowCtrl(err),
         }
     }

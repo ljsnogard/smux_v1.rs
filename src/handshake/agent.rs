@@ -356,7 +356,7 @@ where
         reader.drain_async_().await.map_err(from_read_frame_err_)?;
     }
 
-    // 3. ACCEPT 必须补全全部 4 项。
+    // 3. ACCEPT 必须补全全部 5 项。
     let Option::Some(accepted_values) = complete_values_(reader.basics_()) else {
         // 该分支随即返回，`cancel` 之后不再使用，因此直接按值移交即可。
         let _ = write_frame_async_::<W, K, R::Err>(&mut tx, K_REJECT_MAGIC, &empty, cancel).await;
@@ -573,6 +573,7 @@ mod tests_ {
             Option::Some(1usize << 28),
             Option::Some(64usize),
             Option::Some(30usize),
+            Option::Some(5usize),
         ];
         let mut buf = [0u8; 64];
         let capacity = buf.len();
@@ -608,9 +609,14 @@ mod tests_ {
     ///   缺省值 4096，于是等待方在读到该条目的**那一刻**就拒绝。
     /// - 判断：等待方返回 `Rejected`，发起方返回 `PeerRejected`，即拒绝路径
     ///   确实立即回了 `REJECT`，而不是等整帧收完。
+    ///
+    /// 环容量必须**大于**「首条目之后剩余的全部 INVITE 字节」：等待方在读到
+    /// `MaxPacketSize` 后就不再读取，而发起方仍会把剩余条目与校验尾写完；环放不下
+    /// 就会让发起方阻塞在写上、双方互等。基础协商项每多一项，这个下界就抬高一截，
+    /// 因此这里留出足够余量（64 字节）而不是贴着算。
     #[compio::test]
     async fn negotiator_rejects_immediately() {
-        let (a, b) = make_pair_(16usize).await;
+        let (a, b) = make_pair_(64usize).await;
 
         let a_accept = Runtime::spawn_local(async move {
             let local_opts = BasicOpts::default();

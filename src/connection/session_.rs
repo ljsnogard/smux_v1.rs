@@ -55,8 +55,10 @@ use core::{
     borrow::BorrowMut,
     future::poll_fn,
     mem::MaybeUninit,
+    ops::Bound,
     task::Poll,
 };
+use std::collections::BTreeMap;
 
 use abs_buff::{
     Demand, TrBuffRead, TrBuffWrite,
@@ -65,7 +67,6 @@ use abs_buff::{
 };
 use abs_cancel::{TrCancellationToken, TrMayCancel};
 use buffex::x_deps::abs_buff;
-use mm_ptr::Owned;
 
 use crate::{
     connection::{
@@ -135,16 +136,15 @@ where
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 /// 读循环本地持有的一条子流：共享状态 + 会话侧**接收环写端**。
+///
+/// `local_dock` / `remote_dock` 不再是字段：dock 对已经是所在表的键。
 struct ReadEntry_<B, A>
 where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
     A: AllocatorClone + Send + Sync + 'static,
 {
-    local_dock_: Dock,
-    remote_dock_: Dock,
     owner_: ChannelOwner_<A>,
     writer_: BufferedTx<B, A>,
-    next_: Option<Owned<ReadEntry_<B, A>, A>>,
 }
 
 /// 写循环本地持有的一条子流：共享状态 + 会话侧**发送环读端**。
@@ -153,114 +153,19 @@ where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
     A: AllocatorClone + Send + Sync + 'static,
 {
-    local_dock_: Dock,
-    remote_dock_: Dock,
     owner_: ChannelOwner_<A>,
     reader_: BufferedRx<B, A>,
-    next_: Option<Owned<WriteEntry_<B, A>, A>>,
 }
 
-fn find_read_mut_<B, A>(
-    head: &mut Option<Owned<ReadEntry_<B, A>, A>>,
-    pair: (Dock, Dock),
-) -> Option<&mut ReadEntry_<B, A>>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
-{
-    let mut cursor = head.as_mut();
-    while let Option::Some(entry) = cursor {
-        if entry.local_dock_ == pair.0 && entry.remote_dock_ == pair.1 {
-            return Option::Some(entry);
-        }
-        cursor = entry.next_.as_mut();
-    }
-    Option::None
-}
+/// 读循环的本地表：dock 对 → 该子流的接收环写端与共享状态。
+///
+/// 用 `BTreeMap` 而不是手写单链表：链表的 `find` / `remove` 是 O(n)，且每次
+/// 增删都要自己用分配器构造 / 释放节点；`BTreeMap` 直接以调用方注入的分配器
+/// （`allocator_api` 的 `new_in`）承担这些分配，查找降到 O(log n)。
+type ReadTable_<B, A> = BTreeMap<(Dock, Dock), ReadEntry_<B, A>, A>;
 
-fn remove_read_<B, A>(
-    head: &mut Option<Owned<ReadEntry_<B, A>, A>>,
-    pair: (Dock, Dock),
-) -> bool
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
-{
-    let remove_head = match head.as_ref() {
-        Option::Some(entry) => entry.local_dock_ == pair.0 && entry.remote_dock_ == pair.1,
-        Option::None => false,
-    };
-    if remove_head {
-        let next = head.as_mut().and_then(|entry| entry.next_.take());
-        *head = next;
-        return true;
-    }
-    let mut cursor = head.as_mut();
-    while let Option::Some(entry) = cursor {
-        let remove_next = match entry.next_.as_ref() {
-            Option::Some(next) => next.local_dock_ == pair.0 && next.remote_dock_ == pair.1,
-            Option::None => false,
-        };
-        if remove_next {
-            let next_next = entry.next_.as_mut().and_then(|next| next.next_.take());
-            entry.next_ = next_next;
-            return true;
-        }
-        cursor = entry.next_.as_mut();
-    }
-    false
-}
-
-fn find_write_mut_<B, A>(
-    head: &mut Option<Owned<WriteEntry_<B, A>, A>>,
-    pair: (Dock, Dock),
-) -> Option<&mut WriteEntry_<B, A>>
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
-{
-    let mut cursor = head.as_mut();
-    while let Option::Some(entry) = cursor {
-        if entry.local_dock_ == pair.0 && entry.remote_dock_ == pair.1 {
-            return Option::Some(entry);
-        }
-        cursor = entry.next_.as_mut();
-    }
-    Option::None
-}
-
-fn remove_write_<B, A>(
-    head: &mut Option<Owned<WriteEntry_<B, A>, A>>,
-    pair: (Dock, Dock),
-) -> bool
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
-{
-    let remove_head = match head.as_ref() {
-        Option::Some(entry) => entry.local_dock_ == pair.0 && entry.remote_dock_ == pair.1,
-        Option::None => false,
-    };
-    if remove_head {
-        let next = head.as_mut().and_then(|entry| entry.next_.take());
-        *head = next;
-        return true;
-    }
-    let mut cursor = head.as_mut();
-    while let Option::Some(entry) = cursor {
-        let remove_next = match entry.next_.as_ref() {
-            Option::Some(next) => next.local_dock_ == pair.0 && next.remote_dock_ == pair.1,
-            Option::None => false,
-        };
-        if remove_next {
-            let next_next = entry.next_.as_mut().and_then(|next| next.next_.take());
-            entry.next_ = next_next;
-            return true;
-        }
-        cursor = entry.next_.as_mut();
-    }
-    false
-}
+/// 写循环的本地表：dock 对 → 该子流的发送环读端与共享状态。
+type WriteTable_<B, A> = BTreeMap<(Dock, Dock), WriteEntry_<B, A>, A>;
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 小工具
@@ -409,14 +314,14 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
     A: AllocatorClone + Send + Sync + 'static,
     K: TrCancellationToken,
 {
-    let mut table: Option<Owned<ReadEntry_<B, A>, A>> = Option::None;
+    let mut table: ReadTable_<B, A> = BTreeMap::new_in(shared.reg_.allocator_());
 
     loop {
         if cancel.is_cancelled() {
             return;
         }
         // 1. 先把挂起的 Attach / Release 排空。
-        drain_read_events_(&mut events, &mut table, &shared);
+        drain_read_events_(&mut events, &mut table);
 
         // 2. 读一个帧头（park 在网络读上）。
         let header = match read_header_async_(&mut rx, cancel.child_token()).await {
@@ -429,7 +334,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
 
         // 3. 读到帧头之后再排空一次：`Attach` 可能就在这段时间里到齐，
         //    而该帧正是它要送进去的那条子流的数据。
-        drain_read_events_(&mut events, &mut table, &shared);
+        drain_read_events_(&mut events, &mut table);
 
         // 4. 载荷长度校验。
         let len = header.payload_len();
@@ -460,8 +365,16 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
         match header.kind() {
             FrameKind::Data => {
                 let amount = Credit::try_from(len).unwrap_or(Credit::MAX);
-                let Some(entry) = find_read_mut_(&mut table, pair) else {
-                    // 未知子流的数据帧：协议违例。
+                let Some(entry) = table.get_mut(&pair) else {
+                    // 本地表里没有这条子流，分两种情况：
+                    //
+                    // - 该 dock 对刚被拆掉（**宽限态**）：这是拆流竞态里对端在收到
+                    //   我们 `CLOSE` 之前发出的**在途帧**，静默丢弃即可——两个方向
+                    //   是各自有序的独立字节流，「按序」并不能阻止它晚于本地拆流到达；
+                    // - 真正的未知子流：协议违例，终止连接。
+                    if shared.reg_.is_wait_close_(local, remote) {
+                        continue;
+                    }
                     shared
                         .reg_
                         .mark_failed_(&MuxError::<R::Err, ()>::MalformedFrame);
@@ -496,7 +409,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                         .mark_failed_(&MuxError::<R::Err, ()>::MalformedFrame);
                     return;
                 };
-                if let Option::Some(entry) = find_read_mut_(&mut table, pair) {
+                if let Option::Some(entry) = table.get_mut(&pair) {
                     // 本端主动发起的子流：这是对端回的 `OPEN`，带上它的接收窗口。
                     let owner = entry.owner_.clone();
                     owner.with_mut_(|state| {
@@ -534,7 +447,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                 }
             }
             FrameKind::Accept | FrameKind::Reject => {
-                if let Option::Some(entry) = find_read_mut_(&mut table, pair) {
+                if let Option::Some(entry) = table.get_mut(&pair) {
                     let owner = entry.owner_.clone();
                     let outcome = if header.kind() == FrameKind::Accept {
                         crate::connection::owner_::EstablishOutcome_::Accepted
@@ -550,7 +463,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
             }
             FrameKind::Close => {
                 let reset = header.flags() & flags::K_RESET != 0;
-                if let Option::Some(entry) = find_read_mut_(&mut table, pair) {
+                if let Option::Some(entry) = table.get_mut(&pair) {
                     // 关掉接收环写端：应用先把已缓存数据读完，再读到 EOF。
                     entry.writer_.close();
                     let owner = entry.owner_.clone();
@@ -578,7 +491,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                 }
             }
             FrameKind::WindowUpdate | FrameKind::Pulse => {
-                if let Option::Some(entry) = find_read_mut_(&mut table, pair)
+                if let Option::Some(entry) = table.get_mut(&pair)
                     && let Option::Some(report) = window_report_of_(&header)
                 {
                     entry.owner_.with_mut_(|state| {
@@ -608,8 +521,7 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
 /// 非阻塞排空读事件（`Attach` / `Release`）。
 fn drain_read_events_<B, A>(
     events: &mut EventReceiver_<ReadEvent_<B, A>>,
-    table: &mut Option<Owned<ReadEntry_<B, A>, A>>,
-    shared: &LoopShared_<A>,
+    table: &mut ReadTable_<B, A>,
 ) where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
     A: AllocatorClone + Send + Sync + 'static,
@@ -622,23 +534,21 @@ fn drain_read_events_<B, A>(
                 owner,
                 writer_,
             } => {
-                let alloc = shared.reg_.allocator_();
-                *table = Option::Some(Owned::new(
+                // 节点分配由表自己的分配器承担（`new_in` 时已注入），这里不再需要
+                // 手工构造 `Owned`。重复 `Attach` 直接覆盖，不会留下陈旧条目。
+                table.insert(
+                    (local_dock, remote_dock),
                     ReadEntry_ {
-                        local_dock_: local_dock,
-                        remote_dock_: remote_dock,
                         owner_: owner,
                         writer_,
-                        next_: table.take(),
                     },
-                    alloc,
-                ));
+                );
             }
             ReadEvent_::Release {
                 local_dock,
                 remote_dock,
             } => {
-                remove_read_(table, (local_dock, remote_dock));
+                table.remove(&(local_dock, remote_dock));
             }
         }
     }
@@ -661,7 +571,7 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
     A: AllocatorClone + Send + Sync + 'static,
     K: TrCancellationToken,
 {
-    let mut table: Option<Owned<WriteEntry_<B, A>, A>> = Option::None;
+    let mut table: WriteTable_<B, A> = BTreeMap::new_in(shared.reg_.allocator_());
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
     // 循环独占的载荷暂存：把环段的字节搬进来（**搬出即消费**，见 `drain_one_`），
     // 再写上网。整条连接只分配一次。
@@ -721,7 +631,7 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
             let mut taken: Option<WriteEvent_<B, A>> = Option::None;
             let mut ring_ready = false;
             let alive = {
-                let Option::Some(entry) = find_write_mut_(&mut table, pair) else {
+                let Option::Some(entry) = table.get_mut(&pair) else {
                     last_ready = Option::None;
                     continue;
                 };
@@ -808,7 +718,7 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
 async fn handle_write_event_<W, B, A, K>(
     event: WriteEvent_<B, A>,
     tx: &mut W,
-    table: &mut Option<Owned<WriteEntry_<B, A>, A>>,
+    table: &mut WriteTable_<B, A>,
     scratch: &mut Vec<u8>,
     shared: &LoopShared_<A>,
     read_events: &EventSender_<ReadEvent_<B, A>>,
@@ -828,17 +738,14 @@ where
             owner,
             reader_,
         } => {
-            let alloc = shared.reg_.allocator_();
-            *table = Option::Some(Owned::new(
+            // 节点分配由表自己的分配器承担（`new_in` 时已注入）。
+            table.insert(
+                (local_dock, remote_dock),
                 WriteEntry_ {
-                    local_dock_: local_dock,
-                    remote_dock_: remote_dock,
                     owner_: owner,
                     reader_,
-                    next_: table.take(),
                 },
-                alloc,
-            ));
+            );
         }
         WriteEvent_::Control { frame_ } => {
             write_control_(tx, &frame_, cancel.child_token()).await?;
@@ -855,7 +762,7 @@ where
             amount_,
         } => {
             let pair = (local_dock, remote_dock);
-            let Some(entry) = find_write_mut_(table, pair) else {
+            let Some(entry) = table.get_mut(&pair) else {
                 return Result::Ok(());
             };
             let owner = entry.owner_.clone();
@@ -884,13 +791,13 @@ where
             // 把已缓存数据全部发完，再发 FIN。
             flush_entry_(tx, table, scratch, pair, cancel).await?;
             control_close_via_(tx, local_dock, remote_dock, false, cancel.child_token()).await?;
-            if let Option::Some(entry) = find_write_mut_(table, pair) {
+            if let Option::Some(entry) = table.get_mut(&pair) {
                 entry.owner_.with_mut_(|state| {
                     state.set_app_tx_closed_();
                     state.set_local_fin_sent_();
                 });
             }
-            remove_write_(table, pair);
+            table.remove(&pair);
             maybe_release_(shared, read_events, table, pair);
         }
         WriteEvent_::RxClosed {
@@ -898,7 +805,7 @@ where
             remote_dock,
         } => {
             let pair = (local_dock, remote_dock);
-            if let Option::Some(entry) = find_write_mut_(table, pair) {
+            if let Option::Some(entry) = table.get_mut(&pair) {
                 entry.owner_.with_mut_(|state| {
                     state.set_app_rx_closed_();
                 });
@@ -907,7 +814,7 @@ where
                 local_dock,
                 remote_dock,
             });
-            remove_write_(table, pair);
+            table.remove(&pair);
             control_close_via_(tx, local_dock, remote_dock, true, cancel.child_token()).await?;
             maybe_release_(shared, read_events, table, pair);
         }
@@ -919,7 +826,7 @@ where
             let pair = (local_dock, remote_dock);
             if reset_ {
                 // 对端不再接收：停止发送并释放该方向。
-                remove_write_(table, pair);
+                table.remove(&pair);
             }
             maybe_release_(shared, read_events, table, pair);
         }
@@ -931,28 +838,17 @@ where
 fn maybe_release_<B, A>(
     shared: &LoopShared_<A>,
     read_events: &EventSender_<ReadEvent_<B, A>>,
-    table: &Option<Owned<WriteEntry_<B, A>, A>>,
+    table: &WriteTable_<B, A>,
     pair: (Dock, Dock),
 ) where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
     A: AllocatorClone + Send + Sync + 'static,
 {
     // 找到 owner：表里可能已经移除，因此用注册表兜底。
-    let owner = {
-        let mut cursor = table.as_ref();
-        let mut found = Option::None;
-        while let Option::Some(entry) = cursor {
-            if entry.local_dock_ == pair.0 && entry.remote_dock_ == pair.1 {
-                found = Option::Some(entry.owner_.clone());
-                break;
-            }
-            cursor = entry.next_.as_ref();
-        }
-        match found {
-            Option::Some(owner) => Option::Some(owner),
-            Option::None => shared.reg_.channel_owner_(pair.0, pair.1),
-        }
-    };
+    let owner = table
+        .get(&pair)
+        .map(|entry| entry.owner_.clone())
+        .or_else(|| shared.reg_.channel_owner_(pair.0, pair.1));
     let Some(owner) = owner else {
         return;
     };
@@ -1021,7 +917,7 @@ where
 /// 把某条子流发送环里已提交的数据全部写出（直到取空）。
 async fn flush_entry_<W, B, A, K>(
     tx: &mut W,
-    table: &mut Option<Owned<WriteEntry_<B, A>, A>>,
+    table: &mut WriteTable_<B, A>,
     scratch: &mut Vec<u8>,
     pair: (Dock, Dock),
     cancel: &K,
@@ -1043,7 +939,7 @@ where
 /// 轮转一遍本地表，最多写出一段数据；返回是否有进展。
 async fn drain_once_<W, B, A, K>(
     tx: &mut W,
-    table: &mut Option<Owned<WriteEntry_<B, A>, A>>,
+    table: &mut WriteTable_<B, A>,
     scratch: &mut Vec<u8>,
     cancel: &K,
 ) -> Result<bool, MuxError<(), W::Err>>
@@ -1053,27 +949,33 @@ where
     A: AllocatorClone + Send + Sync + 'static,
     K: TrCancellationToken,
 {
-    // 收集待轮转的 dock 对，避免在持有表可变借用的同时 await。
-    let mut pairs: Vec<(Dock, Dock)> = Vec::new();
-    {
-        let mut cursor = table.as_ref();
-        while let Option::Some(entry) = cursor {
-            pairs.push((entry.local_dock_, entry.remote_dock_));
-            cursor = entry.next_.as_ref();
-        }
-    }
-    for pair in pairs {
+    // 逐个 dock 对轮转。这里**不能**先把键收集成 `Vec`：那会在每次轮转时引入一次
+    // 堆分配，而热路径上只该有环与网络的内存动作。改为每轮用「上一个键之后的第一个
+    // 键」推进（`range` 的 O(log n)，整轮 O(n log n)），既不分配，也不会在
+    // `await` 期间持有对表的借用。
+    let mut cursor: Option<(Dock, Dock)> = Option::None;
+    loop {
+        let next = match cursor {
+            Option::None => table.keys().next().copied(),
+            Option::Some(last) => table
+                .range((Bound::Excluded(last), Bound::Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        };
+        let Option::Some(pair) = next else {
+            return Result::Ok(false);
+        };
+        cursor = Option::Some(pair);
         if drain_one_(tx, table, scratch, pair, cancel).await? {
             return Result::Ok(true);
         }
     }
-    Result::Ok(false)
 }
 
 /// 尝试为 `pair` 写出一段数据；返回是否写出。
 async fn drain_one_<W, B, A, K>(
     tx: &mut W,
-    table: &mut Option<Owned<WriteEntry_<B, A>, A>>,
+    table: &mut WriteTable_<B, A>,
     scratch: &mut Vec<u8>,
     pair: (Dock, Dock),
     cancel: &K,
@@ -1085,7 +987,7 @@ where
     K: TrCancellationToken,
 {
     let token = cancel.child_token();
-    let Some(entry) = find_write_mut_(table, pair) else {
+    let Some(entry) = table.get_mut(&pair) else {
         return Result::Ok(false);
     };
 

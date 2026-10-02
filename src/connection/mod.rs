@@ -217,6 +217,41 @@
 //!   `1/2`/`1/4`/`0`、扩张升过 `1/2`/`3/4`/满、两次之间至少若干个数据帧）见
 //!   [`crate::flow_ctrl::RecvWindow::should_report`]。
 //!
+//! ### 4.3 统一身份表：channel / telegraph / listener / wait-close
+//!
+//! 三类子流的身份**元数并不相同**：channel 有 `(local_dock, remote_dock)` 两个
+//! 具体值；telegraph（[`TrTelegraph`](abs_smux::conn::TrTelegraph)）的
+//! `remote_dock` 是**逐次操作的实参**，端点本身只占一个 `local_dock`；listener
+//! 则天然等待**任意** `remote_dock`。但连接内部只用**一张**索引表管理它们：
+//!
+//! | 身份 | 表的键 | 说明 |
+//! | --- | --- | --- |
+//! | channel | `(local, 具体值)` | 一条子流，见 §4.1 |
+//! | telegraph | `(local, unspecified)` | 数据报端点，**独占**该 `local_dock` |
+//! | listener | `(local, wildcard)` | 监听器，与 channel 可共存于同一 `local_dock` |
+//! | 已关闭（宽限） | `(local, 具体值)` | 见下 |
+//!
+//! 第三段用**协议保留值**作内部哨兵：`unspecified`（`0`）与 `wildcard`（全 1）
+//! 永远不会作为真实子流的 `remote_dock`（§4），因此可以安全地承担这个语义。
+//! 实现见 `mux_connection::registry_`。
+//!
+//! **拆流宽限期**：TCP 关闭后短时间内不复用端口，是为了让网络陈旧报文过期；
+//! 本协议跑在可靠、**有序**的字节流上，同连接内不存在重排 / 重传，经典 TIME_WAIT
+//! 的动机不成立。但拆流本身有一个真实竞态——本端判定「两个方向都收尾」后立即摘掉
+//! 接收侧表项，而对端在**收到我们 `CLOSE` 之前**发出的数据帧仍在途（两个方向是各自
+//! 有序的独立字节流，「按序」拦不住它）。因此一条子流释放后其键**不立即消失**，
+//! 而是转为**宽限态**并在协商项 `max_channel_wait_close` 秒内保留：
+//!
+//! - 宽限期内到达的在途帧被**静默丢弃**；真正的未知子流仍然按协议违例处理
+//!   （[`MuxError::MalformedFrame`]），可检测性不丢；
+//! - 同一 `(local_dock, remote_dock)` 在宽限期内**不得复用**，重新登记报
+//!   [`MuxError::WaitClose`]——这是顺带得到的、与 TCP 同形的复用保护；
+//! - 宽限期是**dock 对**级而非 dock 级：同一 `local_dock` 上发往其它 `remote_dock`
+//!   的子流不受影响（响应方的共享监听 dock 因此不会被误伤）。
+//!
+//! `max_channel_wait_close` 与 `max_channel_timeout` 是**两个不同的量**：后者是
+//! **活跃**子流的空闲超时（保活语义，见 §7），前者是**已关闭**子流的宽限期。
+//!
 //! ## 5. 缓冲区
 //!
 //! 子流收发环与协议帧的收发暂存**一律使用 `buffex::ring`**（上游已用 `ring` 取代
@@ -228,7 +263,14 @@
 //!
 //! 环的物理内存由**调用方注入**的分配器 `A` 分配（缺省 `buffex::CoreAlloc`），
 //! 容量策略同样由调用方注入（见 [`crate::flow_ctrl::TrFlowCtrlPolicy`] 与
-//! [`MuxConnection::new`] 的参数）。本 crate 不隐式分配、不隐藏内存预算。
+//! [`MuxConnection::new`] 的参数）。
+//!
+//! **分配纪律**（准确表述，勿过度解读为「不分配堆内存」）：本 crate 会做堆分配，
+//! 但每一处都必须走**调用方注入的分配器**（`allocator_api`），不得隐式落到全局
+//! 分配器，也不得靠 `Vec` 之类的临时堆结构绕开设计。索引 / 管理结构一律用
+//! `BTreeMap` / `BTreeSet` 并在构造时显式注入分配器（见 `mux_connection::registry_`
+//! 的三张索引表与 `session_` 的两个循环本地表）；连接内其余的堆分配点计划集中到
+//! `TrMaxAllocConfig` 统一描述（下一轮落地）。
 //!
 //! ## 6. 线程模型与运行时参数 `Rt`
 //!
@@ -298,8 +340,9 @@
 //! | `telegraph` | [`Telegraph`] | `TrTelegraph` |
 //! | `config_` | [`TrMuxConfig`] | —（本 crate 自有） |
 //! | `types_` / `util_` | 占位类型别名 / 控制面小工具 | — |
-//! | `session_` | 读 / 写两个内部循环 | —（内部） |
-//! | `sync_` / `owner_` | 注册表、共享单元 / 每条子流的共享标量状态 | —（内部） |
+//! | `session_` | 读 / 写两个内部循环（本地表也是 `BTreeMap`） | —（内部） |
+//! | `mux_connection::registry_` | 统一身份表（channel / telegraph / listener / 宽限态）+ 反向索引 | —（内部） |
+//! | `sync_` / `owner_` | 通用共享单元 / 每条子流的共享标量状态 | —（内部） |
 //! | `signal_` / `frame_` / `ring_` / `error_` | 事件通道 / 线格式 / 环别名 / 错误 | —（内部） |
 //!
 //! 纪律：**任何 struct / enum 成员都不得带 `pub(crate)`**；跨模块访问一律经

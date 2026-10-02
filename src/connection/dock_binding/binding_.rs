@@ -43,7 +43,8 @@ where
     conn_: &'f MuxConnection<R, W, C, Rt>,
 
     /// 本会话绑定的 local_dock。
-    local_dock_: Dock}
+    local_dock_: Dock,
+}
 
 impl<'f, R, W, C, Rt> DockBinding<'f, R, W, C, Rt>
 where
@@ -53,7 +54,8 @@ where
     pub(crate) fn new_(conn: &'f MuxConnection<R, W, C, Rt>, local_dock: Dock) -> Self {
         DockBinding {
             conn_: conn,
-            local_dock_: local_dock}
+            local_dock_: local_dock,
+        }
     }
 }
 
@@ -148,14 +150,23 @@ where
     Rt: 'f,
     K: TrCancellationToken,
 {
-    // dock 已在 `bind_async` 时登记为 channel 用途，这里只是派生监听器。
-    Result::Ok(ChannelListener::new_(binding.conn_, binding.local_dock_))
+    let conn = binding.conn_;
+    let local = binding.local_dock_;
+    // 登记 listener 身份（统一身份表里的 `(local, wildcard)`）：它既是「本 dock 在
+    // 监听」的事实，也是入向等待者的落点；若该 dock 已作 telegraph 会被拒。
+    conn.reg_()
+        .reserve_listener_(local)
+        .map_err(|err| err.cast_())?;
+    Result::Ok(ChannelListener::new_(conn, local))
 }
 
 /// [`TrDockBinding::open_telegraph_async`] 的 step 函数。
+///
+/// 本轮只登记端点身份（telegraph **独占**该 `local_dock`）并交付端点对象；
+/// 端点的收发方法仍是 `todo!()`（见 [`crate::connection::Telegraph`]）。
 #[gen_may_cancel_future(MuxOpenTelegraph, pub)]
 async fn mux_open_telegraph_async_<'s, 'f, R, W, C, Rt, K>(
-    _binding: &'s mut DockBinding<'f, R, W, C, Rt>,
+    binding: &'s mut DockBinding<'f, R, W, C, Rt>,
     _cancel: K,
 ) -> Result<crate::connection::Telegraph<'s, 'f, R, W, C, Rt>, MuxError<R::Err, W::Err>>
 where
@@ -163,9 +174,15 @@ where
     R: TrBuffRead<u8> + 'f,
     W: TrBuffWrite<u8> + 'f,
     C: TrMuxConfig + 'f,
+    Rt: 'f,
     K: TrCancellationToken,
 {
-    todo!("在本地 dock 上建立数据报端点")
+    let conn = binding.conn_;
+    let local = binding.local_dock_;
+    conn.reg_()
+        .reserve_telegraph_(local)
+        .map_err(|err| err.cast_())?;
+    Result::Ok(crate::connection::Telegraph::new_(conn, local))
 }
 
 /// [`TrDockBinding::open_channel_async`] 的 step 函数。

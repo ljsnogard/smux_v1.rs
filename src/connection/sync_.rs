@@ -286,6 +286,9 @@ pub(crate) enum FailKind_ {
     /// 同一条子流上出现重复请求。
     Duplicate,
 
+    /// 该 dock 对刚关闭，仍在拆流宽限期内。
+    WaitClose,
+
     /// 流控失败。
     FlowCtrl(FlowCtrlError),
 
@@ -317,6 +320,7 @@ impl FailKind_ {
             MuxError::ChanLimit => FailKind_::ChanLimit,
             MuxError::Refused => FailKind_::Refused,
             MuxError::Duplicate => FailKind_::Duplicate,
+            MuxError::WaitClose => FailKind_::WaitClose,
             MuxError::FlowCtrl(err) => FailKind_::FlowCtrl(*err),
         }
     }
@@ -337,6 +341,7 @@ impl FailKind_ {
             FailKind_::ChanLimit => MuxError::ChanLimit,
             FailKind_::Refused => MuxError::Refused,
             FailKind_::Duplicate => MuxError::Duplicate,
+            FailKind_::WaitClose => MuxError::WaitClose,
             FailKind_::FlowCtrl(err) => MuxError::FlowCtrl(err),
             FailKind_::Cancelled => MuxError::Cancelled,
         }
@@ -394,6 +399,9 @@ impl WakerSlot_ {
     }
 
     /// 当前是否有等待者登记。
+    // 仅供单元测试断言「登记成功 / 取出后清空」；生产路径只经 `register_` /
+    // `take_` 使用本槽，不需要查询态。
+    #[allow(dead_code)]
     pub(crate) fn is_registered_(&self) -> bool {
         self.waker_.is_some()
     }
