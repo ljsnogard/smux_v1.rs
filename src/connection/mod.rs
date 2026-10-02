@@ -256,7 +256,7 @@
 //! 子流支持**半关闭**：每个方向的结束是独立的，`is_tx_closed` / `is_rx_closed`
 //! 分别反映；对端关闭一半只影响对应方向。这两个标志**不额外维护**：它们直接读
 //! `buffex` 环两端各自的关闭位（会话通过关闭 / 丢弃自己那一端来表达 `FIN` /
-//! `RESET` / 拆流），映射与理由见私有模块 `channel_` 的「关闭态」一节。
+//! `RESET` / 拆流），映射与理由见私有模块 `channel_half` 的「关闭态」一节。
 //! ### 7.1 保活：只用一种 `PULSE` 帧
 
 //! `max_channel_timeout` 的**空闲超时由连接内部用 `abs_art` 的 `TrDelay` 维持**，不要求
@@ -282,29 +282,55 @@
 //! `TrBuffTryWrite`）直接使用 `buffex` 端半部的错误
 //! （`ConsumerError` / `ProducerError`），它们已携带 `ReadErrTag` /
 //! `WriteErrTag`，足以区分「取消」「对端关闭」与「暂时无数据」。
+//!
+//! ## 9. 模块划分
+//!
+//! 对外类型按它们实现的 `abs_smux` trait 分文件（一个 trait / 一族类型一个子模块），
+//! 便于按 trait 定位实现；基础设施（线格式、注册表、事件、循环）另立模块。
+//!
+//! | 模块 | 内容 | 对应 trait |
+//! | --- | --- | --- |
+//! | `mux_connection` | [`MuxConnection`] + 建连 + `bind_async` | `TrConnection` |
+//! | `dock_binding` | [`DockBinding`] + 监听 / 建流 | `TrDockBinding` |
+//! | `channel_listener` | [`ChannelListener`] + `income_async` | `TrChannelListener` |
+//! | `channel_handle` | [`ChannelHandle`] + accept / reject | `TrChannelHandle` |
+//! | `channel_half` | [`ChannelTx`] / [`ChannelRx`] + 环半部包装 | `TrChannelTx` / `TrChannelRx` / `TrChannelHalf` |
+//! | `telegraph` | [`Telegraph`] | `TrTelegraph` |
+//! | `config_` | [`TrMuxConfig`] | —（本 crate 自有） |
+//! | `types_` / `util_` | 占位类型别名 / 控制面小工具 | — |
+//! | `session_` | 读 / 写两个内部循环 | —（内部） |
+//! | `sync_` / `owner_` | 注册表、共享单元 / 每条子流的共享标量状态 | —（内部） |
+//! | `signal_` / `frame_` / `ring_` / `error_` | 事件通道 / 线格式 / 环别名 / 错误 | —（内部） |
+//!
+//! 纪律：**任何 struct / enum 成员都不得带 `pub(crate)`**；跨模块访问一律经
+//! `pub(crate)` 关联函数。同一个 `impl` 内按「`pub` → `pub(crate)` → 私有」集中排列。
 
-mod channel_;
+mod channel_handle;
+mod channel_half;
+mod channel_listener;
+mod config_;
+mod dock_binding;
 mod error_;
 mod frame_;
+mod mux_connection;
 mod owner_;
 pub(crate) mod ring_;
 mod session_;
 mod signal_;
 mod sync_;
-mod telegraph_;
+mod telegraph;
+mod types_;
+mod util_;
 
-pub use channel_::{
-    ChannelHandle, ChannelListener, ChannelRx, ChannelTx, DockBinding, MuxConnection,
-    TrMuxConfig,
-};
+pub use channel_handle::ChannelHandle;
+pub use channel_half::{ChannelRx, ChannelTx};
+pub use channel_listener::ChannelListener;
+pub use config_::TrMuxConfig;
+pub use dock_binding::DockBinding;
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
+pub use mux_connection::MuxConnection;
 pub use ring_::{BufferedChannel, BufferedRx, BufferedTx};
-pub use telegraph_::Telegraph;
-
-/// smux v1 使用的 dock 类型。
-///
-/// 见模块文档 §4。`unspecified()` 为 0，`wildcard()` 为 `u32::MAX`；线格式按
-/// 1 / 2 / 4 字节自适应宽度编码。
-pub type Dock = abs_smux::dock::Dock<u32>;
+pub use telegraph::Telegraph;
+pub use types_::Dock;
 

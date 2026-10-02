@@ -19,13 +19,22 @@
 // 允许；**接线完成后必须移除本行**。
 #![allow(dead_code)]
 
-use core::alloc::AllocatorClone;
+use core::{
+    alloc::AllocatorClone,
+    future::poll_fn,
+    task::{Poll, Waker},
+};
 use std::time::Instant;
 
+use buffex::x_deps::abs_buff;
+use abs_buff::x_deps::abs_cancel::TrCancellationToken;
 use mm_ptr::Shared;
 
 use crate::{
-    connection::sync_::{SyncCell_, WakerSlot_},
+    connection::{
+        error_::MuxError,
+        sync_::{ChannelRegistry_, SyncCell_, WakerSlot_},
+    },
     flow_ctrl::{FlowCtrl, WindowReport},
 };
 
@@ -37,13 +46,13 @@ use crate::{
 #[derive(Debug, Default)]
 pub(crate) struct Establish_ {
     /// 是否已收到对端的 `OPEN`（其中携带对端接收窗口）。
-    pub(crate) peer_opened_: bool,
+    peer_opened_: bool,
 
     /// 建流结果；`None` 表示仍在等待。
-    pub(crate) outcome_: Option<EstablishOutcome_>,
+    outcome_: Option<EstablishOutcome_>,
 
     /// `open_channel_async` 的等待者（至多一个：该 future 独占 `&mut DockBinding`）。
-    pub(crate) waker_: WakerSlot_,
+    waker_: WakerSlot_,
 }
 
 /// 建流的最终结果。
@@ -57,42 +66,44 @@ pub(crate) enum EstablishOutcome_ {
 }
 
 /// 一条子流的共享状态。
+///
+/// 成员一律私有：读写循环在 `session_` 模块，只能经本模块的关联函数访问。
 pub(crate) struct ChannelState_ {
     /// 收发双向流控状态。
-    pub(crate) flow_: FlowCtrl,
+    flow_: FlowCtrl,
 
     /// 建流三步的进展。
-    pub(crate) establish_: Establish_,
+    establish_: Establish_,
 
     /// 该子流的发送环是否已经有「有数据」事件在队列里（每条子流至多一条）。
-    pub(crate) tx_queued_: bool,
+    tx_queued_: bool,
 
     /// 应用已丢弃发送半边（[`ChannelTx`](super::ChannelTx)）。
-    pub(crate) app_tx_closed_: bool,
+    app_tx_closed_: bool,
 
     /// 应用已丢弃接收半边（[`ChannelRx`](super::ChannelRx)）。
-    pub(crate) app_rx_closed_: bool,
+    app_rx_closed_: bool,
 
     /// 本端已发出 `CLOSE(FIN)`：不再发送数据。
-    pub(crate) local_fin_sent_: bool,
+    local_fin_sent_: bool,
 
     /// 本端已关闭接收方向（发过 `CLOSE(RESET)` 或已让读循环释放接收环）。
-    pub(crate) local_rx_closed_: bool,
+    local_rx_closed_: bool,
 
     /// 对端已声明不再发送（收到 `CLOSE(FIN)`）。
-    pub(crate) peer_fin_: bool,
+    peer_fin_: bool,
 
     /// 对端已声明不再接收（收到 `CLOSE(RESET)`）。
-    pub(crate) peer_reset_: bool,
+    peer_reset_: bool,
 
     /// 配额与注册表条目是否已经释放（保证只释放一次）。
-    pub(crate) released_: bool,
+    released_: bool,
 
     /// 最近一次与本子流相关的收发活动时间（保活只记录，本轮不判定超时）。
-    pub(crate) active_: Instant,
+    active_: Instant,
 
     /// 被动方在建流阶段收到的对端窗口通告；`accept` 建 `FlowCtrl` 时应用。
-    pub(crate) peer_report_: Option<WindowReport>,
+    peer_report_: Option<WindowReport>,
 }
 
 impl ChannelState_ {
@@ -140,6 +151,66 @@ impl ChannelState_ {
         self.released_ = true;
         true
     }
+
+    /// 收发双向流控状态（只读）。
+    pub(crate) fn flow_(&self) -> &FlowCtrl {
+        &self.flow_
+    }
+
+    /// 收发双向流控状态（可变）。
+    pub(crate) fn flow_mut_(&mut self) -> &mut FlowCtrl {
+        &mut self.flow_
+    }
+
+    /// 取出建流等待者（若有）；读循环在收到 `OPEN` / `ACCEPT` / `REJECT` 后唤醒它。
+    pub(crate) fn take_establish_waker_(&mut self) -> Option<Waker> {
+        self.establish_.waker_.take_()
+    }
+
+    /// 记录「已收到对端 `OPEN`」。
+    pub(crate) fn set_peer_opened_(&mut self) {
+        self.establish_.peer_opened_ = true;
+    }
+
+    /// 记录建流结果（`ACCEPT` / `REJECT`）。
+    pub(crate) fn set_establish_outcome_(&mut self, outcome: EstablishOutcome_) {
+        self.establish_.outcome_ = Option::Some(outcome);
+    }
+
+    /// 记录「对端已声明不再接收」（收到 `CLOSE(RESET)`）。
+    pub(crate) fn set_peer_reset_(&mut self) {
+        self.peer_reset_ = true;
+    }
+
+    /// 记录「对端已声明不再发送」（收到 `CLOSE(FIN)`）。
+    pub(crate) fn set_peer_fin_(&mut self) {
+        self.peer_fin_ = true;
+    }
+
+    /// 记录「应用已丢弃发送半边」。
+    pub(crate) fn set_app_tx_closed_(&mut self) {
+        self.app_tx_closed_ = true;
+    }
+
+    /// 记录「应用已丢弃接收半边」。
+    pub(crate) fn set_app_rx_closed_(&mut self) {
+        self.app_rx_closed_ = true;
+    }
+
+    /// 记录「本端已发出 `CLOSE(FIN)`」。
+    pub(crate) fn set_local_fin_sent_(&mut self) {
+        self.local_fin_sent_ = true;
+    }
+
+    /// 该子流的发送环是否已有「有数据」事件在队列里。
+    pub(crate) fn tx_queued_(&self) -> bool {
+        self.tx_queued_
+    }
+
+    /// 设置「该子流的发送环已有事件入队」位。
+    pub(crate) fn set_tx_queued_(&mut self, queued: bool) {
+        self.tx_queued_ = queued;
+    }
 }
 
 /// 一条子流的共享句柄：`Shared<SyncCell_<ChannelState_>>`。
@@ -183,6 +254,39 @@ where
     /// 持可变借用执行 `f`（闭包内不得 `await`）。
     pub(crate) fn with_mut_<R>(&self, f: impl FnOnce(&mut ChannelState_) -> R) -> R {
         self.inner_.with_mut_(f)
+    }
+}
+
+/// 等待建流完成：等对端的 `OPEN` + `ACCEPT` / `REJECT`，或被取消 / 连接失败打断。
+pub(crate) async fn wait_establish_<RE, WE, A, K>(
+    reg: &ChannelRegistry_<A>,
+    owner: &ChannelOwner_<A>,
+    cancel: K,
+) -> Result<EstablishOutcome_, MuxError<RE, WE>>
+where
+    A: AllocatorClone + Send + Sync,
+    K: TrCancellationToken,
+{
+    loop {
+        if cancel.is_cancelled() {
+            return Result::Err(MuxError::Cancelled);
+        }
+        if let Option::Some(kind) = reg.failure_() {
+            return Result::Err(kind.into_mux_error_());
+        }
+        if let Option::Some(outcome) = owner.with_(|state| state.establish_.outcome_) {
+            return Result::Ok(outcome);
+        }
+        // 先登记 waker，再复检；读循环在建流事件到达时会唤醒它。
+        poll_fn(|cx| {
+            owner.with_mut_(|state| state.establish_.waker_.register_(cx.waker()));
+            if owner.with_(|state| state.establish_.outcome_.is_some()) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
     }
 }
 

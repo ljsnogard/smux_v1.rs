@@ -45,7 +45,10 @@
 //!
 //! 每个方向独立收尾，两个方向都收尾后释放注册表条目（`ChannelState_::is_done_`）。
 
-// 临时：接线完成后必须移除 dead_code 允许。
+// 多线程配置下 `MuxConnection::new` 仍是 `todo!()`（见 dev-notes），读写循环整块
+// 暂时不可达，因此**仅在该配置下**允许 dead_code；缺省（单线程）配置不放开，
+// 保持零告警。多线程驱动落地后请连同本行一起移除。
+#![cfg_attr(feature = "multi-thread", allow(dead_code))]
 
 use core::{
     alloc::AllocatorClone,
@@ -95,16 +98,36 @@ where
     A: AllocatorClone + Send + Sync,
 {
     /// 注册表（dock / 子流索引与配额、失败标志、取消令牌）。
-    pub(crate) reg_: ChannelRegistry_<A>,
+    reg_: ChannelRegistry_<A>,
 
     /// 本端建流时通告的初始接收窗口（被动方回 `OPEN` 用）。
-    pub(crate) initial_window_: Credit,
+    initial_window_: Credit,
 
     /// 通告判定的阈值快照。
-    pub(crate) thresholds_: ReportThresholds_,
+    thresholds_: ReportThresholds_,
 
     /// 协商出的单帧总长上限。
-    pub(crate) max_packet_size_: usize,
+    max_packet_size_: usize,
+}
+
+impl<A> LoopShared_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 由建连路径展开后的量构造（成员私有，构造只能走这里）。
+    pub(crate) fn new_(
+        reg: ChannelRegistry_<A>,
+        initial_window: Credit,
+        thresholds: ReportThresholds_,
+        max_packet_size: usize,
+    ) -> Self {
+        LoopShared_ {
+            reg_: reg,
+            initial_window_: initial_window,
+            thresholds_: thresholds,
+            max_packet_size_: max_packet_size,
+        }
+    }
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -248,7 +271,7 @@ fn wake_establish_<A>(owner: &ChannelOwner_<A>)
 where
     A: AllocatorClone + Send + Sync,
 {
-    let waker = owner.with_mut_(|state| state.establish_.waker_.take_());
+    let waker = owner.with_mut_(|state| state.take_establish_waker_());
     if let Option::Some(waker) = waker {
         waker.wake();
     }
@@ -323,14 +346,14 @@ where
     K: TrCancellationToken,
 {
     let header = FrameHeader::new_(
-        frame.kind_,
-        frame.flags_,
-        frame.local_dock_,
-        frame.remote_dock_,
-        frame.payload_.len(),
-        frame.window_,
+        frame.kind_(),
+        frame.flags_(),
+        frame.local_dock_(),
+        frame.remote_dock_(),
+        frame.payload_().len(),
+        frame.window_(),
     );
-    write_frame_(tx, &header, &frame.payload_, cancel).await
+    write_frame_(tx, &header, frame.payload_(), cancel).await
 }
 
 /// 把游标错误映射为 [`MuxError`]。
@@ -449,7 +472,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                 });
                 let counted = entry
                     .owner_
-                    .with_mut_(|state| state.flow_.recv_window_mut().on_data(amount));
+                    .with_mut_(|state| state.flow_mut_().recv_window_mut().on_data(amount));
                 if let Result::Err(err) = counted {
                     shared
                         .reg_
@@ -477,8 +500,8 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     // 本端主动发起的子流：这是对端回的 `OPEN`，带上它的接收窗口。
                     let owner = entry.owner_.clone();
                     owner.with_mut_(|state| {
-                        let _ = state.flow_.send_window_mut().on_report(report);
-                        state.establish_.peer_opened_ = true;
+                        let _ = state.flow_mut_().send_window_mut().on_report(report);
+                        state.set_peer_opened_();
                         state.touch_();
                     });
                     wake_establish_(&owner);
@@ -519,7 +542,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                         crate::connection::owner_::EstablishOutcome_::Refused
                     };
                     owner.with_mut_(|state| {
-                        state.establish_.outcome_ = Option::Some(outcome);
+                        state.set_establish_outcome_(outcome);
                         state.touch_();
                     });
                     wake_establish_(&owner);
@@ -533,9 +556,9 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     let owner = entry.owner_.clone();
                     owner.with_mut_(|state| {
                         if reset {
-                            state.peer_reset_ = true;
+                            state.set_peer_reset_();
                         } else {
-                            state.peer_fin_ = true;
+                            state.set_peer_fin_();
                         }
                         state.touch_();
                     });
@@ -559,7 +582,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     && let Option::Some(report) = window_report_of_(&header)
                 {
                     entry.owner_.with_mut_(|state| {
-                        let _ = state.flow_.send_window_mut().on_report(report);
+                        let _ = state.flow_mut_().send_window_mut().on_report(report);
                         state.touch_();
                     });
                 }
@@ -837,14 +860,14 @@ where
             };
             let owner = entry.owner_.clone();
             let report = owner.with_mut_(|state| {
-                state.flow_.recv_window_mut().on_consumed(amount_);
+                state.flow_mut_().recv_window_mut().on_consumed(amount_);
                 state.touch_();
                 if state
-                    .flow_
+                    .flow_mut_()
                     .recv_window()
                     .should_report_with_(&shared.thresholds_)
                 {
-                    Option::Some(state.flow_.recv_window_mut().report())
+                    Option::Some(state.flow_mut_().recv_window_mut().report())
                 } else {
                     Option::None
                 }
@@ -863,8 +886,8 @@ where
             control_close_via_(tx, local_dock, remote_dock, false, cancel.child_token()).await?;
             if let Option::Some(entry) = find_write_mut_(table, pair) {
                 entry.owner_.with_mut_(|state| {
-                    state.app_tx_closed_ = true;
-                    state.local_fin_sent_ = true;
+                    state.set_app_tx_closed_();
+                    state.set_local_fin_sent_();
                 });
             }
             remove_write_(table, pair);
@@ -877,7 +900,7 @@ where
             let pair = (local_dock, remote_dock);
             if let Option::Some(entry) = find_write_mut_(table, pair) {
                 entry.owner_.with_mut_(|state| {
-                    state.app_rx_closed_ = true;
+                    state.set_app_rx_closed_();
                 });
             }
             let _ = read_events.try_send_event_(ReadEvent_::Release {
@@ -1068,9 +1091,9 @@ where
 
     // 清「已入队」位：此后新的写入会重新入队（顺序不可反，见 dev-notes §11.4）。
     let owner = entry.owner_.clone();
-    owner.with_mut_(|state| state.tx_queued_ = false);
+    owner.with_mut_(|state| state.set_tx_queued_(false));
 
-    let available = owner.with_(|state| state.flow_.send_window().available());
+    let available = owner.with_(|state| state.flow_().send_window().available());
     if available == 0 {
         return Result::Ok(false);
     }
@@ -1093,9 +1116,9 @@ where
     }
 
     // 预扣窗口（`take <= available`，因此必定足额）。
-    let granted = owner.with_mut_(|state| state.flow_.send_window_mut().reserve(take as Credit));
+    let granted = owner.with_mut_(|state| state.flow_mut_().send_window_mut().reserve(take as Credit));
     if granted < take as Credit {
-        owner.with_mut_(|state| state.flow_.send_window_mut().refund(granted));
+        owner.with_mut_(|state| state.flow_mut_().send_window_mut().refund(granted));
         return Result::Ok(false);
     }
 
@@ -1128,7 +1151,7 @@ where
     };
     if moved != take {
         // 段长度与搬出量应当一致；不一致说明上游语义变了。
-        owner.with_mut_(|state| state.flow_.send_window_mut().refund(take as Credit));
+        owner.with_mut_(|state| state.flow_mut_().send_window_mut().refund(take as Credit));
         return Result::Err(MuxError::MalformedFrame);
     }
     write_all_async_(tx, &scratch[..moved], token.child_token())

@@ -65,23 +65,23 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct ControlFrame_ {
     /// 帧种类。
-    pub(crate) kind_: FrameKind,
+    kind_: FrameKind,
 
     /// 标志位（[`super::flags`] 的常量按位或）。
-    pub(crate) flags_: u8,
+    flags_: u8,
 
     /// 本端 dock。
-    pub(crate) local_dock_: Dock,
+    local_dock_: Dock,
 
     /// 对端 dock。
-    pub(crate) remote_dock_: Dock,
+    remote_dock_: Dock,
 
     /// 窗口通告 `(累计已收 R, 接收窗口 W)`；只有 `OPEN` / `PULSE` /
     /// `WINDOW_UPDATE` 带。
-    pub(crate) window_: Option<(RecvTotal, Credit)>,
+    window_: Option<(RecvTotal, Credit)>,
 
     /// 帧载荷字节。
-    pub(crate) payload_: Vec<u8>,
+    payload_: Vec<u8>,
 }
 
 impl ControlFrame_ {
@@ -114,6 +114,36 @@ impl ControlFrame_ {
             window_: window,
             payload_: payload,
         }
+    }
+
+    /// 帧种类。
+    pub(crate) fn kind_(&self) -> FrameKind {
+        self.kind_
+    }
+
+    /// 标志位。
+    pub(crate) fn flags_(&self) -> u8 {
+        self.flags_
+    }
+
+    /// 本端 dock。
+    pub(crate) fn local_dock_(&self) -> Dock {
+        self.local_dock_
+    }
+
+    /// 对端 dock。
+    pub(crate) fn remote_dock_(&self) -> Dock {
+        self.remote_dock_
+    }
+
+    /// 窗口通告（若带）。
+    pub(crate) fn window_(&self) -> Option<(RecvTotal, Credit)> {
+        self.window_
+    }
+
+    /// 帧载荷字节。
+    pub(crate) fn payload_(&self) -> &[u8] {
+        &self.payload_
     }
 }
 

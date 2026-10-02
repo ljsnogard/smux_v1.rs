@@ -988,7 +988,7 @@ where
                 while let Option::Some(entry) = chan {
                     if let Option::Some(owner) = entry.owner_.as_ref()
                         && let Option::Some(waker) =
-                            owner.with_mut_(|state| state.establish_.waker_.take_())
+                            owner.with_mut_(|state| state.take_establish_waker_())
                     {
                         out.push(waker);
                     }
@@ -1586,7 +1586,7 @@ mod tests_ {
         let found = registry
             .channel_owner_(Dock::new(3u32), Dock::new(8u32))
             .expect("挂上之后应当能查到");
-        owner.with_mut_(|state| state.tx_queued_ = true);
-        assert!(found.with_(|state| state.tx_queued_), "查回的应是同一个共享句柄");
+        owner.with_mut_(|state| state.set_tx_queued_(true));
+        assert!(found.with_(|state| state.tx_queued_()), "查回的应是同一个共享句柄");
     }
 }
