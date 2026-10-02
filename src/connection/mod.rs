@@ -178,9 +178,16 @@
 //! 错的地方。
 //!
 //! `channel` 与 `telegraph` **不得共用同一个 local_dock**（见
-//! `channel` 与 `telegraph` **不得共用同一个 local_dock**（见
 //! [`TrTelegraph`](abs_smux::conn::TrTelegraph) 的文档）；绑定期由注册表拒绝，
 //! 报 [`MuxError::DockInUse`]。
+//!
+//! 同样在绑定期：一个 `local_dock` 在任意时刻**至多被一个 `DockBinding` 占用**
+//! ——对已绑定的 dock 再次
+//! [`bind_async`](abs_smux::conn::TrConnection::bind_async) 报
+//! [`MuxError::DockInUse`]，丢弃 binding 即解绑。这是「dock 对即身份」在**绑定层**
+//! 的前置检查：子流层的唯一性检查（`MuxError::Duplicate`）只能发现同一个 dock 对上
+//! 的重复子流，发现不了同一个 dock 上两个独立 binding 各自向不同 `remote_dock`
+//! 建流、却同时对外代表同一个 local_dock 身份。
 //!
 //! ### 4.2 子流建立：三步、双方同一状态机
 //!

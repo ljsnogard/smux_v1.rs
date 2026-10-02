@@ -394,7 +394,7 @@ where
 /// 半部 drop 时置位本端关闭标志）；会话据此得知「应用不再发送」并发出
 /// `CLOSE(FIN)`。两个方向互不影响，关闭态直接取自环本身（见模块文档
 /// 「关闭态」一节）。
-pub struct ChannelTx<H> {
+pub struct  ChannelTx<H> {
     /// `buffex` 生产端半部（[`BufferedTx`] 的实例）。
     half_: H,
 

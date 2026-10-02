@@ -45,17 +45,25 @@
 //! 返回值）是这条连接的两端，不是两条连接；每端各持有自己的读 / 写半边，由四条
 //! 调用方驱动的泵与场景并发推进。
 //!
-//! # 关于「同一 dock 上 64 条子流」的约定
+//! # 子流身份：每条并发子流一个临时 `local_dock`
 //!
 //! 帧头（`connection::frame_`）只有 `LocalDock` / `RemoteDock`，**没有 channel
-//! 标识字段**；而本场景按需求在**同一个 dock** 上并发 64 条子流，因此同一个
-//! `(local_dock, remote_dock)` 对会对应多条子流。本测试据此采用「同一 dock 内
-//! 按 FIFO 配对」的约定：dock `d` 上第 `k` 条被 accept 的子流，对应发起端发往
-//! dock `d` 的第 `k` 条 `open_channel_async`。载荷 tag 编码 `(d, k)`，两侧各自
-//! 独立校验，因此一旦配对规则或线格式与此约定不符，测试会立刻失败——这正是本
-//! 冒烟测试想要暴露的规格问题。
+//! 标识字段**；按 `src/connection/mod.rs` §4.1「dock 对即身份」，同一
+//! `(local_dock, remote_dock)` 对在同一时刻**至多一条活动子流**。因此本模块的全部
+//! 场景（含 1024 条的冒烟场景）都遵守这条协议规则：发起侧为每条并发子流分配一个
+//! **互不相同**的临时 `local_dock`（类比 TCP 临时端口），被动侧则断言
+//! `handle.local_dock()` 就是自己的监听 dock（镜像语义）、`remote_dock` 是对方的
+//! 临时 dock。
 //!
-#![allow(dead_code)] // 两个测试 target 各自只用到本模块的一部分。
+//! 载荷校验**不依赖 open / accept 的配对顺序**：先读 4 字节 tag，tag 里编码了发送方
+//! 的 `(dock, index)`，据此推出对方的完整载荷再逐字节比对。这样即使两侧任务推进顺序
+//! 不同，校验依然成立。
+//!
+//! > 历史：本模块曾按「同一 dock 内 FIFO 配对」在同一个 dock 对上并发 64 条子流，
+//! > 那与 §4.1 冲突（第 2 条 `OPEN` 会被 `MuxError::Duplicate` 拒绝）。该冲突的裁决
+//! > 是「改测试、协议不动」，见 `dev-notes/connection-20261002-0548.md` §6.5 Q2。
+//!
+#![allow(dead_code)] // 三个测试 target 各自只用到本模块的一部分。
 
 use core::mem::MaybeUninit;
 
@@ -73,7 +81,7 @@ use abs_smux::conn::{
     TrChannelHandle, TrChannelHalf, TrChannelListener, TrConnection, TrDockBinding,
 };
 use smux_v1::{
-    connection::{Dock, MuxConnection, TrMuxConfig},
+    connection::{Dock, MuxConnection, MuxError, TrMuxConfig},
     flow_ctrl::DefaultPolicy,
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
@@ -376,16 +384,13 @@ async fn run_socket_scenario_with_<IA, OA, IB, OB, F, Fut>(
     }
 }
 
-/// 本轮验收场景：**2 个 dock × 各 2 条 channel**，双向并发收发 + 半关闭。
+/// 小规模验收场景：**2 个 dock × 各 2 条 channel**，双向并发收发 + 半关闭。
 ///
-/// 与 [`run_smoke_scenario_`] 的区别有两点，都来自本轮裁决：
-///
-/// 1. **每条并发子流用不同的 `local_dock`**（Q2）：dock 对即身份，协议不允许同一
-///    dock 对上同时存在两条活动子流，因此发起侧为每条子流分配一个临时 dock；
-///    被动方的断言也随之改为「自己的 `local_dock` 是监听 dock」；
-/// 2. 规模小、**不在 `#[ignore]` 之列**：这是本轮「多 channel 并发通信」的验收点。
-///
-/// `side` 参数（0 = A，1 = B）只用来保证两侧的临时 dock 区间不重叠。
+/// 即 [`run_mux_scenario_`] 在 `K_SMALL_DOCK_COUNT × K_SMALL_CHANNELS_PER_DOCK`
+/// 下的实例；与 1024 条的 [`run_smoke_scenario_`] 走的是**同一份**驱动
+/// （[`drive_side_`]，每条并发子流一个互不相同的临时 `local_dock`），只是规模不同。
+/// 它同时是进程内直连（`tests/inmem_mux.rs`）与 socket 版
+/// （[`run_small_socket_scenario_`]）快速回归的挂点。
 ///
 /// # Panics
 ///
@@ -402,6 +407,65 @@ pub async fn run_small_mux_scenario_<RA, WA, RB, WB, Rt>(
     WB: TrBuffWrite<u8> + Send + 'static,
     Rt: TrSmokeRuntime,
 {
+    run_mux_scenario_::<_, _, _, _, Rt>(
+        rx_a,
+        tx_a,
+        rx_b,
+        tx_b,
+        K_SMALL_DOCK_COUNT,
+        K_SMALL_CHANNELS_PER_DOCK,
+    )
+    .await
+}
+
+/// 与 [`run_small_mux_scenario_`] 相同，但 dock 数量与每个 dock 的子流数量可调。
+///
+/// 这是全部场景的唯一实现：握手 → 建两个 [`MuxConnection`]（内部各自 spawn 读 / 写
+/// 循环）→ 两端并发跑「`dock_count` 个 dock × 每个 `per_dock` 条子流」的双向收发与
+/// 半关闭（[`drive_side_`]）。1024 条的冒烟场景只是它的 `16 × 64` 特例。
+async fn run_mux_scenario_<RA, WA, RB, WB, Rt>(
+    rx_a: RA,
+    tx_a: WA,
+    rx_b: RB,
+    tx_b: WB,
+    dock_count: u32,
+    per_dock: usize,
+) where
+    RA: TrBuffRead<u8> + Send + 'static,
+    WA: TrBuffWrite<u8> + Send + 'static,
+    RB: TrBuffRead<u8> + Send + 'static,
+    WB: TrBuffWrite<u8> + Send + 'static,
+    Rt: TrSmokeRuntime,
+{
+    let (conn_a, conn_b) = connect_pair_::<RA, WA, RB, WB, Rt>(rx_a, tx_a, rx_b, tx_b).await;
+
+    futures::join!(
+        drive_side_(&conn_a, 0u32, dock_count, per_dock),
+        drive_side_(&conn_b, 1u32, dock_count, per_dock),
+    );
+}
+
+/// 握手（A 端发起、B 端等待）并由交付物建立两个 [`MuxConnection`]。
+///
+/// 抽出来给「收发场景」与「绑定独占性场景」共用，保证两者走的是**同一套**
+/// 连接建立路径。
+async fn connect_pair_<RA, WA, RB, WB, Rt>(
+    rx_a: RA,
+    tx_a: WA,
+    rx_b: RB,
+    tx_b: WB,
+) -> (
+    MuxConnection<RA, WA, SmokeMuxConfig, Rt>,
+    MuxConnection<RB, WB, SmokeMuxConfig, Rt>,
+)
+where
+    // 连接内部把 Rx / Tx 移交给 `'static` 的读写循环（`abs_art` 的 spawn 要求）。
+    RA: TrBuffRead<u8> + Send + 'static,
+    WA: TrBuffWrite<u8> + Send + 'static,
+    RB: TrBuffRead<u8> + Send + 'static,
+    WB: TrBuffWrite<u8> + Send + 'static,
+    Rt: TrSmokeRuntime,
+{
     let invite_opts = BasicOpts::default();
     let listen_opts = BasicOpts::default();
     let invite_fut = HandshakeAgent::new(rx_a, tx_a).invite_async(&invite_opts, AcceptAllEntries);
@@ -410,20 +474,98 @@ pub async fn run_small_mux_scenario_<RA, WA, RB, WB, Rt>(
     let delivery_a = invited.expect("发起方握手应当成功");
     let delivery_b = accepted.expect("等待方握手应当成功");
 
-    let conn_a = MuxConnection::<RA, WA, SmokeMuxConfig, Rt>::new(delivery_a, SmokeMuxConfig);
-    let conn_b = MuxConnection::<RB, WB, SmokeMuxConfig, Rt>::new(delivery_b, SmokeMuxConfig);
-
-    futures::join!(small_side_(&conn_a, 0u32), small_side_(&conn_b, 1u32));
+    (
+        MuxConnection::<RA, WA, SmokeMuxConfig, Rt>::new(delivery_a, SmokeMuxConfig),
+        MuxConnection::<RB, WB, SmokeMuxConfig, Rt>::new(delivery_b, SmokeMuxConfig),
+    )
 }
+
+/// 绑定独占性场景：验证 [`TrConnection::bind_async`] 对同一个 `local_dock` 拒绝
+/// 第二次绑定，且丢弃 binding 后可以重绑。
+///
+/// 只做本地注册表行为验证，不建子流、不交换业务字节；但**必须**先完成握手并建出
+/// 两个真实 `MuxConnection`，因为 binding 是连接对象上的东西。
+///
+/// # Panics
+///
+/// 握手失败、绑定出现的错误类型不是 `DockInUse`、或解绑后重绑失败都会 panic。
+///
+/// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
+pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, Rt>(
+    rx_a: RA,
+    tx_a: WA,
+    rx_b: RB,
+    tx_b: WB,
+) where
+    RA: TrBuffRead<u8> + Send + 'static,
+    WA: TrBuffWrite<u8> + Send + 'static,
+    RB: TrBuffRead<u8> + Send + 'static,
+    WB: TrBuffWrite<u8> + Send + 'static,
+    Rt: TrSmokeRuntime,
+{
+    let (conn_a, conn_b) = connect_pair_::<RA, WA, RB, WB, Rt>(rx_a, tx_a, rx_b, tx_b).await;
+
+    // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
+    let dock = Dock::new(0x2000u32);
+    let other = Dock::new(0x2001u32);
+
+    // 1) 首次绑定成功；同一 dock 第二次绑定必须报 `DockInUse`，而不是又发一个
+    //    binding。
+    let first = conn_a.bind_async(dock).await.expect("首次绑定应当成功");
+    assert!(
+        matches!(
+            conn_a.bind_async(dock).await,
+            Result::Err(MuxError::DockInUse)
+        ),
+        "同一 local_dock 第二次 bind_async 应当报 DockInUse"
+    );
+
+    // 2) 另一个 dock 不受影响。
+    let second = conn_a
+        .bind_async(other)
+        .await
+        .expect("不同 local_dock 应当可以绑定");
+
+    // 3) 丢弃 binding 即解绑，之后同一个 dock 可以重绑。
+    drop(first);
+    let third = conn_a
+        .bind_async(dock)
+        .await
+        .expect("解绑后应当可以重新绑定");
+
+    // 4) 绑定是**每条连接**独立的状态：对端用同一个 dock 值不受本端影响。
+    let peer_binding = conn_b
+        .bind_async(dock)
+        .await
+        .expect("另一条连接上的同名 local_dock 应当可以绑定");
+
+    drop((second, third, peer_binding));
+}
+
 
 /// 小场景里的 dock 数量与每个 dock 上的子流数量（`2 × 2 = 4` 条/端）。
 pub const K_SMALL_DOCK_COUNT: u32 = 2;
 pub const K_SMALL_CHANNELS_PER_DOCK: usize = 2;
 
-/// 为一端（`side` = 0/1）跑完小场景：在 `1..=2` 上监听，同时向对端的 `1..=2`
-/// 发起 4 条子流（每条用不同的临时 local_dock）。
-async fn small_side_<R, W, C, Rt>(conn: &MuxConnection<R, W, C, Rt>, side: u32)
-where
+/// 为一端（`side` = 0/1）跑完场景：在 `1..=dock_count` 上监听，同时向对端的
+/// 同名 dock 发起 `dock_count × per_dock` 条子流（每条用不同的临时 local_dock）。
+///
+/// 发起侧的临时 dock 取值 `0x1000 + side·0x100_0000 + dock·0x100 + index`：
+///
+/// - 与监听 dock（`1..=dock_count`）天然不重叠；
+/// - 同侧不同 `(dock, index)` 互不相同（`per_dock ≤ 0x100` 时不会串到下一个 dock），
+///   满足 §4.1「每条并发子流一个互不相同的 local_dock」；
+/// - `side` 抬高一整段，保证两侧的临时 dock 区间不重叠。
+///
+/// # Panics
+///
+/// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
+async fn drive_side_<R, W, C, Rt>(
+    conn: &MuxConnection<R, W, C, Rt>,
+    side: u32,
+    dock_count: u32,
+    per_dock: usize,
+) where
     R: TrBuffRead<u8>,
     W: TrBuffWrite<u8>,
     C: TrMuxConfig,
@@ -432,7 +574,7 @@ where
     let conn_ref = conn;
 
     let mut accept_tasks = Vec::new();
-    for dock in 1..=K_SMALL_DOCK_COUNT {
+    for dock in 1..=dock_count {
         accept_tasks.push(async move {
             let mut binding = conn_ref
                 .bind_async(Dock::new(dock))
@@ -442,7 +584,7 @@ where
                 .listen_async()
                 .await
                 .expect("在本地 dock 上建立 listener 应当成功");
-            for index in 0..K_SMALL_CHANNELS_PER_DOCK {
+            for index in 0..per_dock {
                 let mut handle = listener
                     .income_async()
                     .await
@@ -464,10 +606,12 @@ where
     }
 
     let mut open_tasks = Vec::new();
-    for dock in 1..=K_SMALL_DOCK_COUNT {
-        for index in 0..K_SMALL_CHANNELS_PER_DOCK {
+    for dock in 1..=dock_count {
+        for index in 0..per_dock {
             // 每条并发子流一个**互不相同**的临时 local_dock（Q2 裁决）。
-            let local = Dock::new(0x1000u32 + side * 0x100u32 + dock * 0x10u32 + index as u32);
+            let local = Dock::new(
+                0x1000u32 + side * 0x100_0000u32 + dock * 0x100u32 + index as u32,
+            );
             open_tasks.push(async move {
                 let mut binding = conn_ref
                     .bind_async(local)
@@ -654,129 +798,16 @@ where
     Ok(())
 }
 
-/// 在一端（一个 `MuxConnection`）上完成「16 个 dock 监听 + 1024 条子流发起」。
-///
-/// - 监听侧：每个 dock 一个 `DockBinding`，`listen_async()` 一次，然后串行
-///   `income_async()` → `accept_async()` 64 次；每次 accept 后先写本端载荷、
-///   再读对端载荷并校验；
-/// - 发起侧：每个 `(dock, index)` 一个**独立** `DockBinding`（`bind_async` 取
-///   `&self`，可对同一 dock 反复调用），因为 `open_channel_async` 取
-///   `&mut self`、其 future 在整个生命周期内独占该 binding；
-/// - 两组任务用 `join_all` + `join!` 并发推进，从而两侧的 open 与 accept 互为
-///   对方的前置条件而不会互相等待。
-pub async fn drive_side_<R, W, C, Rt>(conn: &MuxConnection<R, W, C, Rt>)
-where
-    R: TrBuffRead<u8>,
-    W: TrBuffWrite<u8>,
-    C: TrMuxConfig,
-    Rt: TrSmokeRuntime,
-{
-    let conn_ref = &conn;
-
-    let mut accept_tasks = Vec::with_capacity(K_DOCK_COUNT as usize);
-    for dock in 1..=K_DOCK_COUNT {
-        accept_tasks.push(async move {
-            let mut binding = conn_ref
-                .bind_async(Dock::new(dock))
-                .await
-                .expect("绑定监听 dock 应当成功");
-            let mut listener = binding
-                .listen_async()
-                .await
-                .expect("在本地 dock 上建立 listener 应当成功");
-            for index in 0..K_CHANNELS_PER_DOCK {
-                let mut handle = listener
-                    .income_async()
-                    .await
-                    .expect("应当取到下一条入向建流请求");
-                assert_eq!(
-                    handle.remote_dock(),
-                    Dock::new(dock),
-                    "入向请求的远端 dock 应与监听 dock 相同"
-                );
-                // 欢迎信息留空：用 `&mut &mut [u8]` 作为 `Wb`，因为生成的
-                // future 要求 `Wb: Sized`，而 `[u8]` 是 unsized。
-                let mut welcome_buf: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome_buf[..];
-                let (mut tx, mut rx) = handle
-                    .accept_async(&mut welcome)
-                    .await
-                    .expect("accept 入向子流应当成功");
-                let payload = make_payload_(dock, index);
-                write_channel_all_(&mut tx, &payload)
-                    .await
-                    .expect("入向子流写入本端载荷应当成功");
-                let mut got = vec![0u8; payload.len()];
-                read_channel_exact_(&mut rx, &mut got)
-                    .await
-                    .expect("入向子流读取对端载荷应当成功");
-                assert_eq!(
-                    got, payload,
-                    "dock {dock} 第 {index} 条入向子流载荷应逐字节相等"
-                );
-            }
-        });
-    }
-
-    let mut open_tasks = Vec::with_capacity(K_TOTAL_CHANNELS);
-    for dock in 1..=K_DOCK_COUNT {
-        for index in 0..K_CHANNELS_PER_DOCK {
-            open_tasks.push(async move {
-                let mut binding = conn_ref
-                    .bind_async(Dock::new(dock))
-                    .await
-                    .expect("绑定发起 dock 应当成功");
-                let mut message: &[u8] = &[];
-                let (mut tx, mut rx) = binding
-                    .open_channel_async(Dock::new(dock), &mut message)
-                    .await
-                    .expect("向对端 dock 发起子流应当成功");
-                let payload = make_payload_(dock, index);
-                write_channel_all_(&mut tx, &payload)
-                    .await
-                    .expect("发起子流写入本端载荷应当成功");
-                let mut got = vec![0u8; payload.len()];
-                read_channel_exact_(&mut rx, &mut got)
-                    .await
-                    .expect("发起子流读取对端载荷应当成功");
-                assert_eq!(
-                    got, payload,
-                    "dock {dock} 第 {index} 条发起子流载荷应逐字节相等"
-                );
-            });
-        }
-    }
-
-    futures::join!(
-        futures::future::join_all(open_tasks),
-        futures::future::join_all(accept_tasks),
-    );
-}
-
-/// 同时驱动连接的两端（每端各自并发推进 open / accept）。
-pub async fn drive_both_sides_<RA, WA, RB, WB, C, Rt>(
-    conn_a: &MuxConnection<RA, WA, C, Rt>,
-    conn_b: &MuxConnection<RB, WB, C, Rt>,
-) where
-    RA: TrBuffRead<u8>,
-    WA: TrBuffWrite<u8>,
-    RB: TrBuffRead<u8>,
-    WB: TrBuffWrite<u8>,
-    C: TrMuxConfig,
-    Rt: TrSmokeRuntime,
-{
-    futures::join!(drive_side_(conn_a), drive_side_(conn_b));
-}
-
-/// 场景主体：握手 → 建立复用连接 → 并发驱动连接与全部子流。
+/// 场景主体：握手 → 建立复用连接 → 并发驱动连接与全部子流（`16 dock × 64 条`）。
 ///
 /// 参数是两端的 `Rx` / `Tx`（`A` 端发起握手，`B` 端等待）。连接接管 `Rx` / `Tx`
-/// 后在内部自行 spawn 读写循环，本函数只推进业务面 [`drive_both_sides_`]。
+/// 后在内部自行 spawn 读写循环，本函数只是 [`run_mux_scenario_`] 在
+/// `K_DOCK_COUNT × K_CHANNELS_PER_DOCK` 规模下的特例。
 ///
 /// # Panics
 ///
-/// 握手失败、任意一次 open / accept / 读写失败，或读写会话在场景完成前退出时
-/// panic——本函数是测试专用，失败即测试失败。
+/// 握手失败、任意一次 open / accept / 读写 / 半关闭校验失败，或读写会话在场景完成
+/// 前退出时 panic——本函数是测试专用，失败即测试失败。
 pub async fn run_smoke_scenario_<RA, WA, RB, WB, Rt>(
     rx_a: RA,
     tx_a: WA,
@@ -791,24 +822,13 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB, Rt>(
     WB: TrBuffWrite<u8> + Send + 'static,
     Rt: TrSmokeRuntime,
 {
-    // 1. 握手：A 端发起、B 端等待，两侧并发推进。
-    let invite_opts = BasicOpts::default();
-    let listen_opts = BasicOpts::default();
-    let invite_fut = HandshakeAgent::new(rx_a, tx_a).invite_async(&invite_opts, AcceptAllEntries);
-    let listen_fut = HandshakeAgent::new(rx_b, tx_b).listen_async(&listen_opts, AcceptAllEntries);
-    let (invited, accepted) = futures::join!(
-        async { invite_fut.await },
-        async { listen_fut.await },
-    );
-    let delivery_a = invited.expect("发起方握手应当成功");
-    let delivery_b = accepted.expect("等待方握手应当成功");
-
-    // 2. 由交付物建立复用连接：`Rx` / `Tx` 由 `MuxConnection` 接管，
-    //    读 / 写循环在其内部经 `abs_art` spawn，这里不再需要手动驱动。
-    //    `Rt` 由测试目标给出（tokio / compio 各自的 `Runtime`）。
-    let conn_a = MuxConnection::<RA, WA, SmokeMuxConfig, Rt>::new(delivery_a, SmokeMuxConfig);
-    let conn_b = MuxConnection::<RB, WB, SmokeMuxConfig, Rt>::new(delivery_b, SmokeMuxConfig);
-
-    // 3. 推进业务面（open / accept / 读写）；收发由内部任务自动进行。
-    drive_both_sides_(&conn_a, &conn_b).await;
+    run_mux_scenario_::<_, _, _, _, Rt>(
+        rx_a,
+        tx_a,
+        rx_b,
+        tx_b,
+        K_DOCK_COUNT,
+        K_CHANNELS_PER_DOCK,
+    )
+    .await
 }

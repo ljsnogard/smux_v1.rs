@@ -523,9 +523,17 @@ impl<A> DockNode_<A>
 where
     A: AllocatorClone,
 {
-    /// 是否「空」：无子流、无显式占用、无等待者。
+    /// 是否「空」：无子流、无显式占用、无绑定、无等待者。
+    ///
+    /// `bound_` 必须计入：绑定是**持久**占用（直到对应 [`DockBinding`] 被 drop），
+    /// 不能因为该 dock 上暂时没有子流就把节点剪掉、把绑定状态一起丢掉。
+    ///
+    /// [`DockBinding`]: crate::connection::DockBinding
     fn is_empty_(&self) -> bool {
-        self.chan_count_ == 0 && self.use_.is_none() && !self.inbound_waker_.is_registered_()
+        self.chan_count_ == 0
+            && self.use_.is_none()
+            && !self.bound_
+            && !self.inbound_waker_.is_registered_()
     }
 }
 
@@ -539,6 +547,15 @@ where
 
     /// 显式登记的用途（telegraph）；`None` 表示尚未被显式占用。
     use_: Option<DockUse_>,
+
+    /// 该 dock 是否已被某个 [`DockBinding`] **独占绑定**。
+    ///
+    /// 与 `use_` 分开记：`use_` 是「用途种类」标记，会被
+    /// [`ChannelRegistry_::release_channel_`] 在子流清零时清空；而绑定是比子流
+    /// 更长寿的占用（见 `DockBinding` 的「绑定的独占性」），必须独立持久。
+    ///
+    /// [`DockBinding`]: crate::connection::DockBinding
+    bound_: bool,
 
     /// 本 dock 上当前在册的子流数（受 `max_dock_chan_count` 约束）。
     chan_count_: usize,
@@ -842,12 +859,16 @@ where
         })
     }
 
-    /// 在 `local_dock` 上显式登记一个用途（telegraph 端点 / channel 监听）。
+    /// 在 `local_dock` 上显式登记一个**用途种类**（telegraph 端点 / channel），
+    /// 用于保证 channel 与 telegraph 不共用同一个 local_dock。
+    ///
+    /// 注意：本方法只是「种类标记」，**不**承担绑定的独占性——重复登记同一种用途
+    /// 是幂等的。`bind_async` 的独占性由 [`ChannelRegistry_::bind_dock_`] 负责，
+    /// 因为 `use_` 会被 `release_channel_` 在子流清零时抹掉，不能当作绑定的凭据。
     ///
     /// # Errors
     ///
-    /// 该 dock 已被**另一种**用途占用 → [`MuxError::DockInUse`]；重复登记同一种
-    /// 用途是幂等的。
+    /// 该 dock 已被**另一种**用途占用 → [`MuxError::DockInUse`]。
     pub(crate) fn reserve_dock_(
         &self,
         local_dock: Dock,
@@ -874,6 +895,58 @@ where
             };
             if dock.chan_count_ == 0 {
                 dock.use_ = Option::None;
+            }
+            inner.prune_dock_(local_dock);
+        })
+    }
+
+    /// **独占绑定** `local_dock`（[`TrConnection::bind_async`] 的登记点）。
+    ///
+    /// 一个 `local_dock` 在任意时刻至多被一个 [`DockBinding`] 占用：绑定即认领
+    /// 该 dock 的「会话身份」，之后第二次 `bind_async` 必须失败，而不是静默地
+    /// 再发一个 binding 出去。这是 §4.1「dock 对即身份」在**绑定层**的前置检查
+    /// ——子流层的 `reserve_channel_` 只拦得住「同一个 dock 对上的第二条并发
+    /// 子流」，拦不住「同一个 dock 上两个各自独立的 binding」。
+    ///
+    /// 绑定是**持久**占用：直到 [`ChannelRegistry_::unbind_dock_`] 被调用（即对应
+    /// `DockBinding` 被 drop）为止，该 dock 一直处于已绑定状态，即使其上暂时没有
+    /// 任何子流（对比 `use_` 会被 `release_channel_` 清零）。
+    ///
+    /// # Errors
+    ///
+    /// - 该 dock 已被另一个绑定占用 → [`MuxError::DockInUse`]；
+    /// - 该 dock 已被 telegraph 占用 → [`MuxError::DockInUse`]（channel 与
+    ///   telegraph 不得共用 local_dock，见 [crate::connection] 模块文档 §4.1）。
+    ///
+    /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
+    /// [`DockBinding`]: crate::connection::DockBinding
+    pub(crate) fn bind_dock_(&self, local_dock: Dock) -> Result<(), MuxError<(), ()>> {
+        self.inner_.with_mut_(|inner| {
+            let dock = inner.dock_mut_(local_dock);
+            if dock.bound_ {
+                return Result::Err(MuxError::DockInUse);
+            }
+            if let Option::Some(DockUse_::Telegraph) = dock.use_ {
+                return Result::Err(MuxError::DockInUse);
+            }
+            dock.bound_ = true;
+            dock.use_ = Option::Some(DockUse_::Channel);
+            Result::Ok(())
+        })
+    }
+
+    /// 解除 [`ChannelRegistry_::bind_dock_`] 的独占绑定；不存在时是空操作。
+    ///
+    /// 由 `DockBinding` 的 `Drop` 调用。解绑只清 `bound_`；`use_` 的清除与节点
+    /// 回收交给 `prune_dock_` 判空，因此「解绑后该 dock 上还有活动子流」不会
+    /// 影响这些子流。
+    pub(crate) fn unbind_dock_(&self, local_dock: Dock) {
+        self.inner_.with_mut_(|inner| {
+            if let Option::Some(dock) = inner.find_dock_mut_(local_dock) {
+                dock.bound_ = false;
+                if dock.chan_count_ == 0 {
+                    dock.use_ = Option::None;
+                }
             }
             inner.prune_dock_(local_dock);
         })
@@ -997,6 +1070,7 @@ where
             DockNode_ {
                 dock_: dock,
                 use_: Option::None,
+                bound_: false,
                 chan_count_: 0usize,
                 head_: Option::None,
                 next_: self.docks_.take(),
@@ -1328,6 +1402,65 @@ mod tests_ {
             .reserve_dock_(Dock::new(6u32), DockUse_::Telegraph)
             .unwrap_err();
         assert!(matches!(err, MuxError::DockInUse));
+    }
+
+    /// 测试 dock 绑定是**独占**且**持久**的：同一 `local_dock` 第二次绑定必须报错，
+    /// 解绑后可以重绑，且绑定状态不因该 dock 上子流清零而丢失。
+    ///
+    /// - 手段：对同一 dock 连续 `bind_dock_`；在另一个 dock 上正常绑定；用
+    ///   telegraph 占用第三个 dock 后再绑定；再在一个已绑定的 dock 上登记并释放
+    ///   一条子流；最后 `unbind_dock_` 后重绑。
+    /// - 判断：第二次绑定、绑定 telegraph 占用的 dock 都报 `MuxError::DockInUse`；
+    ///   不同 dock 互不影响；子流清零后再次绑定**仍**报 `DockInUse`（绑定是持久
+    ///   占用，这正是只能靠独立的 `bound_` 而不能靠 `use_` 的地方）；解绑后重绑
+    ///   成功。
+    #[test]
+    fn dock_binding_is_exclusive_and_persistent() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+
+        // 首次绑定成功；同一 dock 第二次绑定必须失败。
+        assert!(registry.bind_dock_(Dock::new(7u32)).is_ok());
+        let err = registry.bind_dock_(Dock::new(7u32)).unwrap_err();
+        assert!(
+            matches!(err, MuxError::DockInUse),
+            "同一 dock 重复绑定应当报 DockInUse"
+        );
+
+        // 不同 dock 互不影响。
+        assert!(registry.bind_dock_(Dock::new(8u32)).is_ok());
+
+        // telegraph 占用的 dock 不能绑定。
+        assert!(
+            registry
+                .reserve_dock_(Dock::new(9u32), DockUse_::Telegraph)
+                .is_ok()
+        );
+        let err = registry.bind_dock_(Dock::new(9u32)).unwrap_err();
+        assert!(
+            matches!(err, MuxError::DockInUse),
+            "已作 telegraph 的 dock 不能绑定"
+        );
+
+        // 绑定状态不因该 dock 上子流清零而丢失（`use_` 会被 release_channel_ 清掉，
+        // 因此绑定必须是独立字段）。
+        assert!(
+            registry
+                .reserve_channel_(Dock::new(7u32), Dock::new(3u32))
+                .is_ok()
+        );
+        registry.release_channel_(Dock::new(7u32), Dock::new(3u32));
+        let err = registry.bind_dock_(Dock::new(7u32)).unwrap_err();
+        assert!(
+            matches!(err, MuxError::DockInUse),
+            "子流清零不应解除绑定"
+        );
+
+        // 解绑后可重新绑定。
+        registry.unbind_dock_(Dock::new(7u32));
+        assert!(
+            registry.bind_dock_(Dock::new(7u32)).is_ok(),
+            "解绑后应当可以重新绑定"
+        );
     }
 
     /// 测试唤醒槽只保留一个等待者，取出后即清空。

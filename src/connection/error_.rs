@@ -74,7 +74,8 @@ pub enum MuxError<RE, WE> {
     /// 帧总长超过协商出的 `max_packet_size`。
     FrameTooLarge,
 
-    /// 请求的 local_dock 已被占用：channel 与 telegraph 不得共用 dock。
+    /// 请求的 local_dock 已被占用：已被某个 `DockBinding` 绑定，或已作 telegraph
+    /// 端点（channel 与 telegraph 不得共用 dock）。
     DockInUse,
 
     /// 该 dock 上的活动子流数已达 `max_dock_chan_count`。
@@ -108,7 +109,7 @@ impl<RE, WE> core::fmt::Display for MuxError<RE, WE> {
             MuxError::MalformedFrame => f.write_str("复用帧结构非法"),
             MuxError::UnsupportedField => f.write_str("复用帧包含未知或非法的字段"),
             MuxError::FrameTooLarge => f.write_str("复用帧超过协商的最大报文长度"),
-            MuxError::DockInUse => f.write_str("该 dock 已被 channel 或 telegraph 占用"),
+            MuxError::DockInUse => f.write_str("该 dock 已被绑定或已作其他用途占用"),
             MuxError::DockChanLimit => f.write_str("该 dock 上的活动子流数已达上限"),
             MuxError::ChanLimit => f.write_str("连接上的活动子流数已达上限"),
             MuxError::Refused => f.write_str("对端拒绝建立子流"),
