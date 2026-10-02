@@ -22,7 +22,11 @@ use crate::{
     flow_ctrl::FlowCtrl,
 };
 
-/// 一个入向建流请求的待决句柄。
+/// 一个入向建流请求的待决句柄。///
+/// > **目标形状（本轮确定，迁移中）**：本类型改为**持有一份 [`MuxConnection`] 的
+/// > 克隆**（= 指向 `MuxCore` 的智能指针），不再借用连接，因此生命周期参数从公开
+/// > 类型上消失，可以存进结构体、可以从函数返回。设计见
+/// > [`crate::connection`] 模块文档 §2 与 `dev-notes/connection-20261002-0548.md` §17。
 ///
 /// 由 [`TrChannelListener::income_async`](abs_smux::conn::TrChannelListener::income_async) 产出；调用方用
 /// [`TrChannelHandle::accept_async`] 接受并交付欢迎信息，或

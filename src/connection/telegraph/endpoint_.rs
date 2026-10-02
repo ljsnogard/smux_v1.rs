@@ -15,7 +15,11 @@ use buffex::x_deps::{abs_buff, abs_cancel, anylr};
 use crate::connection::{Dock, MuxConnection, MuxError, TrMuxConfig};
 use crate::connection::types_::SessionMark_;
 
-/// 数据报端点。
+/// 数据报端点。///
+/// > **目标形状（本轮确定，迁移中）**：本类型改为**持有一份 [`MuxConnection`] 的
+/// > 克隆**（= 指向 `MuxCore` 的智能指针），不再借用连接，因此生命周期参数从公开
+/// > 类型上消失，可以存进结构体、可以从函数返回。设计见
+/// > [`crate::connection`] 模块文档 §2 与 `dev-notes/connection-20261002-0548.md` §17。
 ///
 /// 由 [`TrDockBinding::open_telegraph_async`](abs_smux::conn::TrDockBinding::open_telegraph_async)
 /// 在某个 binding 上建立；端点存活期间该 local_dock 被独占，不能再被 channel

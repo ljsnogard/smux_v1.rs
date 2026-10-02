@@ -56,6 +56,33 @@ use super::registry_::ChannelRegistry_;
 ///
 /// [`TrConnection::bind_async`] 取 `&self`，因此同一个连接可以被多个业务逻辑同时
 /// 绑定到不同 dock，读 / 写路径在内部互不争锁（模块文档 §2）。
+///
+/// # 目标形状（本轮确定，迁移中）
+///
+/// 本类型改为**对一个 `MuxCore` 的智能指针的薄封装**：
+///
+/// ```text
+/// pub struct MuxConnection<C, Rt> where C: TrMuxConfig {
+///     core_: Shared<MuxCore<C>, C::Alloc>,   // 智能指针：Clone 即多一份强引用
+///     _rt_: PhantomData<Rt>,
+/// }
+/// ```
+///
+/// 两处变化对使用者最要紧：
+///
+/// - **`R` / `W` 消失**：它们在 `new` 里被移进读 / 写循环，此后不出现在任何签名中，
+///   公开类型从 `MuxConnection<R, W, C, Rt>` 简化为 `MuxConnection<C, Rt>`；
+/// - **`Clone` 变得廉价且有意义**：会话句柄各自持有一份克隆，因此
+///   「绑定 → 监听 → 接流 → 业务」可以拆到不同函数、不同结构体里，不再被生命周期
+///   参数绑成一串（`dev-notes` §16 记录的 F2 / F3 两处「写不出来」由此消失）。
+///
+/// 设计全文见 [`crate::connection`] 模块文档 §2 与
+/// `dev-notes/connection-20261002-0548.md` §17。///
+/// > **`Rt` 的目标与未决**：目标形状里 `Rt` **不应出现**在公开类型上
+/// > （`MuxConnection<C>`）；但这一点目前**缺乏实证支持**——三个后端的
+/// > `spawn_local` 语义差异很大（tokio 需要 `LocalSet` 上下文、smol 的本地执行器
+/// > 随 `JoinHandle` 存活因而 `detach()` 会取消任务），在跨后端实测完成前 `Rt`
+/// > **保持现状**，视为待实证的临时形状。见 `dev-notes` §17.9。
 pub struct MuxConnection<R, W, C, Rt>
 where
     C: TrMuxConfig,

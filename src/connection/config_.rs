@@ -1,8 +1,12 @@
 //! 复用连接的资源策略 [`TrMuxConfig`]。
 //!
 //! 「环存储类型 / 分配器 / 流控策略」三者在整个连接里总是成组出现，因此打包成
-//! 一个由调用方实现的 trait；这样公开类型只需要 `MuxConnection<R, W, C, Rt>`
-//! 四个参数。设计背景见 [`crate::connection`] 模块文档。
+//! 一个由调用方实现的 trait；这样公开类型只需要一个策略参数 `C`。设计背景见
+//! [`crate::connection`] 模块文档。
+//!
+//! > **目标形状（本轮确定，迁移中）**：连接改为「`MuxCore` 演员 + 智能指针封装」
+//! > 之后，`R` / `W` 从公开类型上消失，连接类型从 `MuxConnection<R, W, C, Rt>`
+//! > 简化为 `MuxConnection<C, Rt>`；本 trait 仍是唯一的策略打包入口。
 
 use core::{
     alloc::AllocatorClone,

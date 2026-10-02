@@ -20,7 +20,11 @@ use crate::{
     flow_ctrl::{FlowCtrl, RecvTotal, TrFlowCtrlPolicy},
 };
 
-/// 在某个 `local_dock` 上派生的会话对象。
+/// 在某个 `local_dock` 上派生的会话对象。///
+/// > **目标形状（本轮确定，迁移中）**：本类型改为**持有一份 [`MuxConnection`] 的
+/// > 克隆**（= 指向 `MuxCore` 的智能指针），不再借用连接，因此生命周期参数从公开
+/// > 类型上消失，可以存进结构体、可以从函数返回。设计见
+/// > [`crate::connection`] 模块文档 §2 与 `dev-notes/connection-20261002-0548.md` §17。
 ///
 /// 一个 [`DockBinding`] 对应一个业务逻辑：它自带 `local_dock`，可以在其上监听
 /// 入向请求（[`TrDockBinding::listen_async`]）、打开数据报端点

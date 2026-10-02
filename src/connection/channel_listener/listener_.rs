@@ -19,7 +19,16 @@ use crate::connection::{
     types_::SessionMark_,
 };
 
-/// 某 `local_dock` 上的入向子流监听器（类 `TcpListener`）。
+/// 某 `local_dock` 上的入向子流监听器（类 `TcpListener`）。///
+/// > **目标形状（本轮确定，迁移中）**：本类型改为**持有一份 [`MuxConnection`] 的
+/// > 克隆**（= 指向 `MuxCore` 的智能指针），不再借用连接，因此生命周期参数从公开
+/// > 类型上消失，可以存进结构体、可以从函数返回。设计见
+/// > [`crate::connection`] 模块文档 §2 与 `dev-notes/connection-20261002-0548.md` §17。
+///
+/// > 特别注意：`listen_async(&mut self)` 的 `&mut` 只覆盖**调用期间**，返回值是独立
+/// > 对象。因此「建 listener」与「accept 循环」可以拆成两个函数——旧模型下
+/// > `ChannelListener<'s,'f,…>` 借用 `DockBinding`，这一步写不出来
+/// > （`dev-notes` §16.1 F3）。
 ///
 /// [`TrChannelListener::income_async`] 每次返回一个**待决句柄**
 /// [`ChannelHandle`]；调用方决定 accept 还是 reject，之后该 dock 才能继续接受

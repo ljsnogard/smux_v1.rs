@@ -674,7 +674,10 @@ where
 ///
 /// 先尝试读 1 字节：写端关闭且已排空时应当返回 `ConsumerError::Closing`；若对端
 /// 的 `FIN` 还没到，`read_async` 会 park 到它到达为止（这正是要验证的行为）。
-async fn expect_eof_<R>(rx: &mut R)
+///
+/// 对外可见的理由同 `write_channel_all_`：分层 RPC 用例（`tests/layered_rpc.rs`）
+/// 需要同一套「半关闭 → 等 EOF」收尾语义，不该在第二个文件里重写一遍。
+pub async fn expect_eof_<R>(rx: &mut R)
 where
     R: TrBuffRead<u8>,
 {
@@ -719,7 +722,11 @@ pub fn make_payload_(dock: u32, index: usize) -> Vec<u8> {
 ///
 /// 与 `abs_buff` 的段语义一致：每次按剩余长度借段、把实际写入量计入段偏移、
 /// drop 段提交，直到写完。
-async fn write_channel_all_<W>(tx: &mut W, bytes: &[u8]) -> Result<(), W::Err>
+///
+/// 对外可见是为了让**分层 RPC** 用例（`tests/layered_rpc.rs`）复用同一份搬运
+/// 代码：读方向必须用 `unsafe` 的 `move_items_to_buff` 才能把段搬进字节缓冲，
+/// 全测试套件只该有一份这样的代码与一份 SAFETY 论证（见 `read_channel_exact_`）。
+pub async fn write_channel_all_<W>(tx: &mut W, bytes: &[u8]) -> Result<(), W::Err>
 where
     W: TrBuffWrite<u8>,
 {
@@ -754,8 +761,8 @@ where
 /// 从子流接收半边读满 `out`。
 ///
 /// 与 `write_channel_all_` 对称：段可能比请求更长，只搬走需要的前缀，剩余字节在
-/// 段回收时归还缓冲。
-async fn read_channel_exact_<R>(rx: &mut R, out: &mut [u8]) -> Result<(), R::Err>
+/// 段回收时归还缓冲。可见性与 `write_channel_all_` 同理。
+pub async fn read_channel_exact_<R>(rx: &mut R, out: &mut [u8]) -> Result<(), R::Err>
 where
     R: TrBuffRead<u8>,
 {
