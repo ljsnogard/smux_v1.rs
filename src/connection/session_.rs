@@ -2,7 +2,7 @@
 //!
 //! 本模块是 `abs_art` spawn 出来的两个 `'static` 任务的全部实现。结构见
 //! [`crate::connection`] 模块文档 §2，落地裁决见
-//! `dev-notes/connection-20261002-0548.md` §6.5（Q3 双循环 / Q4 唤醒 / Q5 流控 /
+//! `dev-notes/connection-20261002-0548.md` §5（Q3 双循环 / Q4 唤醒 / Q5 流控 /
 //! Q7 半部移交）。
 //!
 //! # 数据流

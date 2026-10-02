@@ -61,7 +61,7 @@
 //!
 //! > 历史：本模块曾按「同一 dock 内 FIFO 配对」在同一个 dock 对上并发 64 条子流，
 //! > 那与 §4.1 冲突（第 2 条 `OPEN` 会被 `MuxError::Duplicate` 拒绝）。该冲突的裁决
-//! > 是「改测试、协议不动」，见 `dev-notes/connection-20261002-0548.md` §6.5 Q2。
+//! > 是「改测试、协议不动」，见 `dev-notes/connection-20261002-0548.md` §5 Q2。
 //!
 #![allow(dead_code)] // 三个测试 target 各自只用到本模块的一部分。
 
