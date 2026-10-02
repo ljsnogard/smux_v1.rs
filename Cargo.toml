@@ -8,23 +8,15 @@ description = "流复用协议第一版"
 [dependencies]
 abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
-abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev/0.3.0" }
 abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
 
 # 复用子流与协议帧的缓冲区一律使用 `buffex::circular_buff`，因此它是正式依赖
 # 而非测试专用依赖（`no_std` 成立；缺省分配器由 `buffex` 重导出）。
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
+mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1.3" }
 
 crc = { version = "3.4.*" }
-
-[dependencies.asyncband]
-# 上行通知通道（多生产者 → 单消费者）的候选实现之一，见
-# `src/connection/signal_.rs` 与 dev-notes §11.4.1。它是 **std-only**（`mpsc`
-# 内部包 `std::sync::mpsc`），因此只作为可选依赖：默认构建仍保持 `#![no_std]`。
-version = "0.7.*"
-default-features = false
-features = ["mpsc"]
-optional = true
+flume = { version = "0.12.*" }
 
 [features]
 # 线程模型开关，二选一；详见 `src/connection/mod.rs` 的「线程模型」一节。
@@ -35,23 +27,18 @@ optional = true
 #   原子原语，读写 session 可跨线程 spawn。
 multi-thread = []
 
-# 上行通知通道改用 `asyncband::mpsc`（std-only）。不开启时用 `signal_` 里自带的
-# 定容环实现（`no_std`、走调用方注入的分配器）。两者实现同一组内部 trait，便于对比。
-asyncband = ["dep:asyncband"]
-
 [dev-dependencies]
 # 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在
 # dev-dependencies 中出现（`buffex` 已是正式依赖，不在此重复）。
 abs_art-bridge = { version = "0.2.2", default-features = false, features = ["backend-compio"] }
 compio = { version = "0.19.*", features = ["fs", "macros", "time", "net", "runtime"] }
-mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.1.3" }
 
 # 集成冒烟测试（tests/）用两个运行时各跑一遍同一场景，且都跑真实 UNIX socket：
 # - 两个运行时都用「调用方驱动的泵 + 全被动 buffex 环」搬运 socket 数据；
 # - tokio 侧用 `abs_buff_tokio_adapt` 的设备适配，compio 侧用
 #   `abs_buff_compio_adapt` 的设备适配（原因与三处阻塞点见 dev-notes §9）。
-abs_buff_tokio_adapt = { path = "../abs_buff_tokio_adapt" }
-abs_buff_compio_adapt = { path = "../abs_buff_compio_adapt" }
+buffex_tokio_adapt = { path = "../buffex_tokio_adapt" }
+buffex_compio_adapt = { path = "../buffex_compio_adapt" }
 
 # 连接层内部经 `abs_art` spawn 读 / 写循环，因此冒烟测试必须给出具体的运行时
 # 标记类型（`MuxConnection<.., Rt>`）：tokio 版用 `abs_art_tokio::Runtime`，

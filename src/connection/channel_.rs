@@ -57,25 +57,31 @@ use core::{
 
 use abs_buff::{
     Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
+    gen_may_cancel_future,
     x_deps::{abs_cancel, anylr},
 };
 #[cfg(feature = "multi-thread")]
 use abs_art::TrSpawnSend;
+
 #[cfg(not(feature = "multi-thread"))]
 use abs_art::TrSpawnLocal;
+
 use abs_cancel::TrCancellationToken;
-use abs_buff::gen_may_cancel_future;
+use abs_mm::mem_alloc::TrMalloc;
 use abs_smux::conn::{
     TrChannelHandle, TrChannelHalf, TrChannelListener, TrChannelRx, TrChannelTx, TrConnection,
     TrDockBinding,
 };
 use anylr::SomeOf;
-use buffex::x_deps::abs_mm::mem_alloc::TrMalloc;
+use buffex::x_deps::abs_buff;
+use mm_ptr::x_deps::abs_mm;
 
-use crate::connection::{BufferedRx, BufferedTx, Dock, MuxError};
-use crate::flow_ctrl::TrFlowCtrlPolicy;
-use crate::handshake::agent::HandshakeDelivery;
-use crate::handshake::opts::HandshakeOpts;
+use crate::{
+    connection::{BufferedRx, BufferedTx, Dock, MuxError},
+    flow_ctrl::TrFlowCtrlPolicy,
+    handshake::agent::HandshakeDelivery,
+    handshake::opts::HandshakeOpts,
+};
 
 /// 会话派生类型（listener / handle / telegraph）的借用关系与连接泛型占位。
 ///

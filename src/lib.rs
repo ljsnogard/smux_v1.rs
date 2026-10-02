@@ -1,7 +1,6 @@
 #![feature(impl_trait_in_assoc_type)]
-#![no_std]
 
-#[cfg(any(test, feature = "asyncband"))]
+#[cfg(any(test))]
 extern crate std;
 
 pub mod connection;
@@ -16,9 +15,9 @@ mod wire_io_;
 pub mod x_deps {
     pub use abs_art;
     pub use abs_async_iter;
-    pub use abs_buff;
     pub use abs_smux;
     pub use buffex;
+    pub use buffex::x_deps::abs_buff;
 
     pub use crc;
 }

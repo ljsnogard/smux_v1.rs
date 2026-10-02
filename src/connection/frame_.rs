@@ -75,13 +75,15 @@
 
 use abs_buff::{TrBuffRead, TrBuffWrite, x_deps::abs_cancel};
 use abs_cancel::TrCancellationToken;
-
 use abs_smux::conn::TrDock;
+use buffex::x_deps::abs_buff;
 
-use crate::connection::{Dock, MuxError};
-use crate::flow_ctrl::{Credit, RecvTotal};
-use crate::handshake::opts::NegotiationValType as FieldValType;
-use crate::wire_io_::{CursorError, ReadCursor, write_all_async_};
+use crate::{
+    connection::{Dock, MuxError},
+    flow_ctrl::{Credit, RecvTotal},
+    handshake::opts::NegotiationValType as FieldValType,
+    wire_io_::{CursorError, ReadCursor, write_all_async_},
+};
 
 /// `kind` 在帧首字节中的掩码（低 4 位）。
 pub const K_KIND_MASK: u8 = 0x0F;

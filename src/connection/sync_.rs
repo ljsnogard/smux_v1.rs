@@ -37,24 +37,24 @@
 #![allow(dead_code)]
 
 #[cfg(not(feature = "multi-thread"))]
-use core::cell::RefCell;
 use core::{
+    alloc::{Allocator, AllocatorClone},
+    cell::RefCell,
     future::Future,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
 
-use abs_buff::x_deps::abs_cancel;
 use abs_cancel::{NonCancellableToken, TrCancellationToken};
-use buffex::x_deps::{
-    abs_mm::mem_alloc::TrMalloc,
-    atomic_sync::mutex::preemptive::SpinningMutex,
-    mm_ptr::{Owned, Shared},
-};
+use atomic_sync::mutex::preemptive::SpinningMutex;
+use buffex::x_deps::{abs_cancel, atomic_sync};
+use mm_ptr::{Owned, Shared};
 
-use crate::connection::{Dock, MuxError};
-use crate::flow_ctrl::FlowCtrlError;
-use crate::handshake::opts::BasicOpts;
+use crate::{
+    connection::{Dock, MuxError},
+    flow_ctrl::FlowCtrlError,
+    handshake::opts::BasicOpts,
+};
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 共享单元
@@ -180,7 +180,7 @@ fn with_spin_lock_<T, R>(lock: &SpinningMutex<T>, f: impl FnOnce(&mut T) -> R) -
 /// `cancellation()` 在 poll，后登记者会覆盖前一个——本 crate 的用法不会这样。
 pub(crate) struct CancelToken_<A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     inner_: Shared<SyncAtomicCell_<CancelInner_>, A>,
 }
@@ -196,7 +196,7 @@ struct CancelInner_ {
 
 impl<A> Clone for CancelToken_<A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn clone(&self) -> Self {
         CancelToken_ {

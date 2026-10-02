@@ -6,6 +6,7 @@
 use core::fmt;
 
 use abs_buff::error::{ReadErrTag, TrTaggedError, WriteErrTag};
+use buffex::x_deps::abs_buff;
 
 use crate::handshake::codec_::WireError;
 

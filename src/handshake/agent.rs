@@ -34,8 +34,9 @@
 use core::marker::PhantomData;
 
 use abs_async_iter::TrAsyncIterator;
-use abs_buff::{TrBuffRead, TrBuffWrite, gen_may_cancel_future, x_deps::abs_cancel};
+use abs_buff::{TrBuffRead, TrBuffWrite, gen_may_cancel_future};
 use abs_cancel::{TrCancellationToken, TrMayCancel};
+use buffex::x_deps::{abs_buff, abs_cancel};
 
 use crate::handshake::{
     K_ACCEPT_MAGIC, K_CONFRM_MAGIC, K_INVITE_MAGIC, K_REJECT_MAGIC,
