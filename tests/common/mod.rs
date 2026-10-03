@@ -86,8 +86,8 @@ use abs_smux::{
 };
 use smux_v1::{
     connection::{
-        BindError, ChannelHandle, ChannelRx, ChannelTx, Dock, HandleError, MuxConnection,
-        TrConnCfg,
+        BindError, BuffAllocError, ChannelHandle, ChannelRx, ChannelTx, Dock, HandleError,
+        MuxConnection, TrConnCfg,
     },
     flow_ctrl::DefaultPolicy,
     handshake::{
@@ -234,6 +234,17 @@ where
 
     fn policy(&self) -> &Self::Policy {
         &SMOKE_POLICY
+    }
+
+    fn make_ring_buffs(
+        &self,
+        alloc: Self::Alloc,
+        capacity: usize,
+    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
+        Result::Ok((
+            Owned::new_uninit_slice(capacity, alloc),
+            Owned::new_uninit_slice(capacity, alloc),
+        ))
     }
 }
 

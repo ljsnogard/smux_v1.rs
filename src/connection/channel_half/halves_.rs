@@ -84,7 +84,8 @@ where
     local_dock_: Dock,
 
     /// 对端 dock。
-    remote_dock_: Dock}
+    remote_dock_: Dock,
+}
 
 impl<C, S> ChannelTx<C, S>
 where

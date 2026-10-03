@@ -19,13 +19,15 @@ use core::{
     task::{Context, Poll},
 };
 
+use mm_ptr::Owned;
+
 use abs_smux::conf::TrMuxConfig;
 use abs_art::{TrJoinHandle, TrLocalScope};
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, MuxConnection, TrConnCfg,
+        BufferedRx, BufferedTx, BuffAllocError, MuxChanBuff, MuxConnection, TrConnCfg,
         ring_::test_support_::TestBuff,
     },
     flow_ctrl::DefaultPolicy,
@@ -126,6 +128,51 @@ impl TrConnCfg for TestMuxConfig_ {
 
     fn policy(&self) -> &Self::Policy {
         &TEST_POLICY_
+    }
+
+    fn make_ring_buffs(
+        &self,
+        alloc: Self::Alloc,
+        capacity: usize,
+    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
+        Result::Ok((
+            Owned::new_uninit_slice(capacity, alloc),
+            Owned::new_uninit_slice(capacity, alloc),
+        ))
+    }
+}
+
+/// 与 [`TestMuxConfig_`] 同构，但 `Buff` 使用擦除分配器的 [`MuxChanBuff`]。
+///
+/// 用于在同一个二进制内对比「零 dyn 的具体缓冲」与「擦除载具」。
+pub(crate) struct ErasedTestMuxConfig_;
+
+impl TrMuxConfig for ErasedTestMuxConfig_ {
+    type Data = u8;
+    type Dock = crate::connection::Dock;
+    type Buff = MuxChanBuff;
+}
+
+impl TrConnCfg for ErasedTestMuxConfig_ {
+    type Alloc = CoreAlloc;
+    type Policy = DefaultPolicy;
+    type ConnTx = TestWireTx_;
+    type ConnRx = TestWireRx_;
+
+    fn allocator(&self) -> Self::Alloc {
+        CoreAlloc
+    }
+
+    fn policy(&self) -> &Self::Policy {
+        &TEST_POLICY_
+    }
+
+    fn make_ring_buffs(
+        &self,
+        alloc: Self::Alloc,
+        capacity: usize,
+    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
+        MuxChanBuff::pair_from_alloc_(alloc, capacity).map_err(|_| BuffAllocError)
     }
 }
 

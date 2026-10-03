@@ -38,13 +38,28 @@ pub trait TrMuxAllocConfig {
     type ChanOwnerAlloc: AllocatorClone;
 }
 
+/// managed 路径构造环缓冲失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuffAllocError;
+
+impl core::fmt::Display for BuffAllocError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("构造 channel ring 缓冲失败")
+    }
+}
+
+impl core::error::Error for BuffAllocError {}
+
 /// 连接的配置类型。
 ///
 /// 它是**使用环境**与连接之间的唯一约定：数据与 dock 类型由上游
 /// [`TrMuxConfig`] 给出；本 trait 再补上内部结构分配器、流控策略与两条传输半边。
 /// 所有公开类型都只带 `<C, S>` 两个参数（配置 + 本地作用域），因此加一个旋钮
 /// 只需要改一处。
-pub trait TrConnCfg: TrMuxConfig<Data = u8, Dock = Dock> + 'static {
+pub trait TrConnCfg
+where
+    Self: TrMuxConfig<Data = u8, Dock = Dock> + 'static,
+{
     /// 连接内部结构（帧暂存、注册表等）的分配器。
     type Alloc: AllocatorClone + Send + Sync;
 
@@ -60,6 +75,16 @@ pub trait TrConnCfg: TrMuxConfig<Data = u8, Dock = Dock> + 'static {
 
     /// 取流控策略。
     fn policy(&self) -> &Self::Policy;
+
+    /// 用自身分配器造出一对该 channel 使用的环缓冲（Tx、Rx）。
+    ///
+    /// 这是 managed 路径的扩展点：`C::Buff` 是具体类型时返回具体缓冲，
+    /// 因此整个数据面可以完全单态化、没有 `dyn`。
+    fn make_ring_buffs(
+        &self,
+        alloc: Self::Alloc,
+        capacity: usize,
+    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError>;
 }
 
 /// 默认配置：`u8` 数据、[`Dock`] dock、[`CoreAlloc`] 分配、[`DefaultPolicy`]
@@ -121,5 +146,13 @@ where
 
     fn policy(&self) -> &Self::Policy {
         &self.policy_
+    }
+
+    fn make_ring_buffs(
+        &self,
+        alloc: Self::Alloc,
+        capacity: usize,
+    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
+        MuxChanBuff::pair_from_alloc_(alloc, capacity).map_err(|_| BuffAllocError)
     }
 }

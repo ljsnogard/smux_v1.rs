@@ -40,6 +40,9 @@ pub enum HandleError {
     /// 对端拒绝建立这条子流（`accept_async` 的发起方一侧）。
     Refused,
 
+    /// 由连接管理内存时，底层分配器分配失败。
+    AllocationFailed,
+
     /// 流控失败（窗口违例或计数溢出）。
     FlowCtrl(FlowCtrlError),
 
@@ -53,6 +56,7 @@ pub enum HandleError {
 face_error_impls!(
     HandleError,
     HandleError::RingRejected => "调用方给出的环内存大小不合用，已拒绝接受",
+    HandleError::AllocationFailed => "由连接管理内存时，底层分配器分配失败",
     HandleError::Refused => "对端拒绝建立这条子流",
     HandleError::FlowCtrl(_) => "流控失败",
     HandleError::Cancelled => "本次操作被取消",
@@ -188,15 +192,23 @@ where
     where
         P: TrPrepareChannelRing<C::Buff, C::Data>,
     {
+        self.accept_buffs_(prepare.prepare())
+    }
+
+    /// 已经拿到两块 `C::Buff` 之后的公共安装逻辑。
+    fn accept_buffs_(
+        &mut self,
+        buffs: ChannelBuffAlloc<C::Buff, C::Data>,
+    ) -> AcceptOutcomeProj_<C, S> {
         let conn = self.conn_.clone();
         let local = self.local_dock_;
         let remote = self.remote_dock_;
 
-        // 1. 调用方给出本子流的环存储。
-        let ChannelBuffAlloc { tx_buff, rx_buff, .. } = prepare.prepare();
+        // 调用方 / managed 路径已经给出本子流的环存储。
+        let ChannelBuffAlloc { tx_buff, rx_buff, .. } = buffs;
 
-        // 2. 对端的窗口通告：发起方还没有（对端 `OPEN` 未到，读循环稍后写进发送
-        //    窗口），响应方在登记时已存下。
+        // 对端的窗口通告：发起方还没有（对端 `OPEN` 未到，读循环稍后写进发送
+        // 窗口），响应方在登记时已存下。
         let peer_report = if self.is_initiator_ {
             Option::None
         } else {
@@ -206,12 +218,45 @@ where
             }
         };
 
-        // 3. 建环 + 登记 + 移交会话侧半部。
+        // 建环 + 登记 + 移交会话侧半部。
         let (owner, tx, rx, initial) =
             install_channel_(&conn, local, remote, tx_buff, rx_buff, peer_report)?;
         self.accepted_initial_window_ = initial;
         self.accepted_owner_ = Option::Some(owner);
         Result::Ok((tx, rx))
+    }
+
+    /// **由 `MuxConnection` 管理内存的 `accept` 路径**：不需要调用方实现
+    /// `TrPrepareChannelRing`，连接按 [`TrConnCfg::RING_CAPACITY`] 从自身分配器申请
+    /// 两块缓冲，具体类型由 `C::Buff` 决定。
+    pub async fn accept_async_managed<'f, W>(
+        &'f mut self,
+        welcome: &'f mut W,
+        ring_cap: usize,
+    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>
+    where
+        W: 'f + TrBuffWrite<u8>,
+        S: 'f,
+    {
+        let conn = self.conn_.clone();
+        let config = conn.core_().config_();
+        let alloc = config.allocator();
+        let accept_result = match config.make_ring_buffs(alloc, ring_cap) {
+            Result::Ok((tx_buff, rx_buff)) => {
+                self.accept_buffs_(ChannelBuffAlloc::new(tx_buff, rx_buff))
+            }
+            Result::Err(_) => Result::Err(HandleError::AllocationFailed),
+        };
+        if accept_result.is_err() {
+            self.settled_ = true;
+            abort_pending_(
+                &self.conn_,
+                self.local_dock_,
+                self.remote_dock_,
+                self.is_initiator_,
+            );
+        }
+        MuxAcceptAsync::new(self, welcome, accept_result).await
     }
 }
 
@@ -502,4 +547,109 @@ where
     }
     handle.settled_ = true;
     Result::Ok(written)
+}
+
+#[cfg(test)]
+mod tests_ {
+    use std::time::Instant;
+
+    use futures::executor::block_on;
+
+    use crate::{
+        connection::test_support_::{
+            ErasedTestMuxConfig_, NullScope_, TestMuxConfig_,
+        },
+        flow_ctrl::WindowReport,
+        handshake::opts::{BasicOpts, HandshakeOpts},
+    };
+
+    use super::*;
+
+    const BENCH_WARMUP: usize = 2_000;
+    const BENCH_ITERS: usize = 50_000;
+
+    fn make_conn_<C>(config: C) -> MuxConnection<C, NullScope_>
+    where
+        C: TrConnCfg,
+    {
+        MuxConnection::new_test_(
+            &NullScope_,
+            HandshakeOpts {
+                basic_opts: BasicOpts::default(),
+            },
+            config,
+        )
+    }
+
+    /// 测一次 responder accept 的建环 + 登记 + 返回半部 + drop 半部。
+    async fn accept_once_<C, S>(conn: &MuxConnection<C, S>, remote: Dock) -> u128
+    where
+        C: TrConnCfg,
+        S: Clone + 'static,
+    {
+        let local = Dock::new(2u32);
+        let mut welcome: [u8; 0] = [];
+        let mut welcome_slice: &mut [u8] = &mut welcome[..];
+
+        conn.core_()
+            .reg_()
+            .reserve_inbound_(local, remote, WindowReport::new(0u64, 64u32))
+            .expect("登记入向请求应当成功");
+        let mut handle = ChannelHandle::new_(conn.clone(), local, remote);
+
+        let t0 = Instant::now();
+        let accepted = handle.accept_async_managed(&mut welcome_slice, 4096).await;
+        let elapsed = t0.elapsed().as_nanos();
+        drop(accepted.expect("responder accept 应当成功"));
+        elapsed
+    }
+
+    async fn bench_both_managed_buffers_() -> (f64, f64) {
+        let conn_owned = make_conn_(TestMuxConfig_);
+        let conn_erased = make_conn_(ErasedTestMuxConfig_);
+
+        // 交替顺序，消除“某个模式总是先跑、堆/缓存更冷”的顺序偏差。
+        let mut total_owned = 0u128;
+        let mut total_erased = 0u128;
+        for i in 0..BENCH_ITERS {
+            let base = 0x1000u32 + (i as u32) * 2u32;
+            if i % 2 == 0 {
+                total_owned += accept_once_(&conn_owned, Dock::new(base)).await;
+                total_erased += accept_once_(&conn_erased, Dock::new(base + 1)).await;
+            } else {
+                total_erased += accept_once_(&conn_erased, Dock::new(base + 1)).await;
+                total_owned += accept_once_(&conn_owned, Dock::new(base)).await;
+            }
+        }
+        (
+            total_owned as f64 / BENCH_ITERS as f64,
+            total_erased as f64 / BENCH_ITERS as f64,
+        )
+    }
+
+    /// 非正式 benchmark：managed 路径下 `Owned<..., CoreAlloc>`（零 dyn）与
+    /// `MuxChanBuff`（擦除分配器）的每 channel accept 建/拆开销。
+    ///
+    /// 默认 `#[ignore]`，用 release + `--nocapture` 手动运行：
+    ///
+    /// ```bash
+    /// cargo test --release --lib -- \
+    ///   --ignored --nocapture managed_owned_vs_erased_accept_bench_
+    /// ```
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn managed_owned_vs_erased_accept_bench_() {
+        block_on(async {
+            // 先跑一次短预热，避免首次分配 / 缺页被算进正式数据。
+            let conn = make_conn_(TestMuxConfig_);
+            for i in 0..BENCH_WARMUP {
+                let _ = accept_once_(&conn, Dock::new(0x8000u32 + i as u32)).await;
+            }
+        });
+
+        let (owned, erased) = block_on(bench_both_managed_buffers_());
+        eprintln!("owned managed accept:  {owned:8.1} ns/channel");
+        eprintln!("erased managed accept: {erased:8.1} ns/channel");
+        eprintln!("delta: {:+.1} ns/channel", erased - owned);
+    }
 }

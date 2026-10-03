@@ -455,7 +455,7 @@ mod util_;
 pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
-pub use config_::{DefaultConnCfg, TrConnCfg};
+pub use config_::{BuffAllocError, DefaultConnCfg, TrConnCfg};
 pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
