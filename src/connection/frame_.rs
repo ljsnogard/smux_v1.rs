@@ -75,7 +75,7 @@
 use abs_buff::{
     TrBuffTryRead, TrBuffTryWrite,TrBuffRead, TrBuffWrite, x_deps::abs_cancel};
 use abs_cancel::TrCancellationToken;
-use abs_smux::conn::TrDock;
+use abs_smux::dock::TrDock;
 use buffex::x_deps::abs_buff;
 
 use crate::{

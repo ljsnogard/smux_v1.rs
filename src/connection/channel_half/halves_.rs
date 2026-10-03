@@ -41,7 +41,7 @@ use buffex::x_deps::abs_buff;
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, Dock, MuxConnection, TrMuxConfig,
+        BufferedRx, BufferedTx, MuxChanBuff, Dock, MuxConnection, TrMuxConfig,
         // config_::TrMuxAllocConfig,
         owner_::ChannelOwner_,
         signal_::{TrEventSender_, WriteEvent_},
@@ -72,7 +72,7 @@ where
     C: TrMuxConfig,
 {
     /// `buffex` 生产端半部（[`BufferedTx`] 的实例）。
-    ring_: BufferedTx<C::Buff, C::Alloc>,
+    ring_: BufferedTx<MuxChanBuff, C::Alloc>,
 
     /// 该子流的共享状态（「已入队」去重与关闭记账）。
     owner_: ChannelOwner_<C::Alloc>,
@@ -95,7 +95,7 @@ where
     /// 只供连接内部（建流路径）与单元测试使用：对外部使用者而言，这两个半边只应由
     /// `abs_smux` 的 trait 产出。
     pub(crate) fn new_(
-        ring: BufferedTx<C::Buff, C::Alloc>,
+        ring: BufferedTx<MuxChanBuff, C::Alloc>,
         owner: ChannelOwner_<C::Alloc>,
         conn: MuxConnection<W, R, S, C>,
         local_dock: Dock,
@@ -153,11 +153,11 @@ where
     C: TrMuxConfig,
 {
     type SegmMut<'f>
-        = <BufferedTx<C::Buff, C::Alloc> as TrBuffTryWrite<u8>>::SegmMut<'f>
+        = <BufferedTx<MuxChanBuff, C::Alloc> as TrBuffTryWrite<u8>>::SegmMut<'f>
     where
         Self: 'f;
 
-    type Err = <BufferedTx<C::Buff, C::Alloc> as TrBuffTryWrite<u8>>::Err;
+    type Err = <BufferedTx<MuxChanBuff, C::Alloc> as TrBuffTryWrite<u8>>::Err;
 
     fn try_write<'f>(
         &'f mut self,
@@ -173,7 +173,7 @@ where
     C: TrMuxConfig,
 {
     type WriteAsync<'f>
-        = <BufferedTx<C::Buff, C::Alloc> as TrBuffWrite<u8>>::WriteAsync<'f>
+        = <BufferedTx<MuxChanBuff, C::Alloc> as TrBuffWrite<u8>>::WriteAsync<'f>
     where
         Self: 'f;
 
@@ -230,7 +230,7 @@ where
     C: TrMuxConfig,
 {
     /// `buffex` 消费端半部（[`BufferedRx`] 的实例）。
-    ring_: BufferedRx<C::Buff, C::Alloc>,
+    ring_: BufferedRx<MuxChanBuff, C::Alloc>,
 
     /// 连接智能指针：通知写循环 + 保活。
     conn_: MuxConnection<W, R, S, C>,
@@ -250,7 +250,7 @@ where
 {
     /// 由环消费端、连接与 dock 对构造；可见性同 [`ChannelTx::new_`]。
     pub(crate) fn new_(
-        ring: BufferedRx<C::Buff, C::Alloc>,
+        ring: BufferedRx<MuxChanBuff, C::Alloc>,
         conn: MuxConnection<W, R, S, C>,
         local_dock: Dock,
         remote_dock: Dock,
@@ -304,11 +304,11 @@ where
     C: TrMuxConfig,
 {
     type SegmRef<'f>
-        = <BufferedRx<C::Buff, C::Alloc> as TrBuffTryRead<u8>>::SegmRef<'f>
+        = <BufferedRx<MuxChanBuff, C::Alloc> as TrBuffTryRead<u8>>::SegmRef<'f>
     where
         Self: 'f;
 
-    type Err = <BufferedRx<C::Buff, C::Alloc> as TrBuffTryRead<u8>>::Err;
+    type Err = <BufferedRx<MuxChanBuff, C::Alloc> as TrBuffTryRead<u8>>::Err;
 
     fn try_read<'f>(
         &'f mut self,
@@ -324,7 +324,7 @@ where
     C: TrMuxConfig,
 {
     type ReadAsync<'f>
-        = <BufferedRx<C::Buff, C::Alloc> as TrBuffRead<u8>>::ReadAsync<'f>
+        = <BufferedRx<MuxChanBuff, C::Alloc> as TrBuffRead<u8>>::ReadAsync<'f>
     where
         Self: 'f;
 
@@ -379,7 +379,7 @@ mod tests_ {
             ring_::test_support_::make_test_channel_,
             test_support_::{NullScope_, TestMuxConfig_, TestWireRx_, TestWireTx_, make_test_conn_},
         },
-        flow_ctrl::{DefaultPolicy, FlowCtrl},
+        flow_ctrl::{DefaultPolicy, FlowCtrl, ReportThresholds_},
     };
 
     use super::*;
@@ -396,7 +396,13 @@ mod tests_ {
     fn make_halves_() -> (TestTx, TestRx) {
         let (half_tx, half_rx) = make_test_channel_(64usize);
         let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
-        let owner = ChannelOwner_::new_(ChannelState_::new_(flow), CoreAlloc);
+        let owner = ChannelOwner_::new_(
+            ChannelState_::new_(
+                flow,
+                ReportThresholds_::new_(&DefaultPolicy, 64u32),
+            ),
+            CoreAlloc,
+        );
         let conn = make_test_conn_();
         let local = Dock::new(3u32);
         let remote = Dock::new(7u32);

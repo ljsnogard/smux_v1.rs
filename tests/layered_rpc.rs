@@ -134,8 +134,10 @@ mod common;
 use core::mem::MaybeUninit;
 
 use abs_art::TrLocalScope;
-use abs_smux::conn::{
-    TrChannelHalf, TrChannelHandle, TrChannelListener, TrConnection, TrDock, TrDockBinding,
+use abs_smux::{
+    chan::{TrChannelHalf, TrChannelHandle},
+    conn::{TrChannelListener, TrConnection, TrDockBinding},
+    dock::TrDock,
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
@@ -180,16 +182,16 @@ type WireTx = smux_v1::connection::BufferedTx<WireBuff, CoreAlloc>;
 type Mux<S> = common::SmokeConn<WireRx, WireTx, S>;
 
 /// 【F5 ✅】已建立 channel 的发送半边：**可以直接写出的具名类型**。
-type ChanTx<S> = ChannelTx<common::SmokeMuxConfig, S, WireRx, WireTx>;
+type ChanTx<S> = ChannelTx<WireTx, WireRx, S, common::SmokeMuxConfig>;
 
 /// 同 [`ChanTx`]，接收半边。
-type ChanRx<S> = ChannelRx<common::SmokeMuxConfig, S, WireRx, WireTx>;
+type ChanRx<S> = ChannelRx<WireTx, WireRx, S, common::SmokeMuxConfig>;
 
 /// 【F3 ✅】listener 也是具名类型，可以作为返回值与结构体字段。
-type Listener<S> = ChannelListener<common::SmokeMuxConfig, S, WireRx, WireTx>;
+type Listener<S> = ChannelListener<WireTx, WireRx, S, common::SmokeMuxConfig>;
 
 /// 【F2 ✅】binding 同上。
-type Binding<S> = DockBinding<common::SmokeMuxConfig, S, WireRx, WireTx>;
+type Binding<S> = DockBinding<WireTx, WireRx, S, common::SmokeMuxConfig>;
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // L4：传输层
@@ -298,10 +300,19 @@ where
         .expect("客户端绑定临时 dock 应当成功");
     // 【F7 ⚠️】开场消息当前没有消费者，这里按空载荷建流，业务数据走 channel。
     let mut message: &[u8] = &[];
-    let (tx, rx) = binding
+    let mut handle = binding
         .open_channel_async(service_dock, &mut message)
         .await
         .expect("客户端发起子流应当成功");
+    // 最终裁决：给出本条子流的两块缓冲（本端接收窗口由此容量算出），此后才发 `OPEN`。
+    let mut welcome_buf: [u8; 0] = [];
+    let mut welcome: &mut [u8] = &mut welcome_buf[..];
+    let (tx, rx) = handle
+        .accept_async(&mut welcome, || {
+            (common::make_channel_buff_(), common::make_channel_buff_())
+        })
+        .await
+        .expect("客户端最终裁决子流应当成功");
     (tx, rx)
 }
 
@@ -380,7 +391,9 @@ impl<S> RpcServer_<S> {
             let mut welcome_buf: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome_buf[..];
             let (tx, rx) = handle
-                .accept_async(&mut welcome)
+                .accept_async(&mut welcome, || {
+                    (common::make_channel_buff_(), common::make_channel_buff_())
+                })
                 .await
                 .expect("服务端接受入向子流应当成功");
 

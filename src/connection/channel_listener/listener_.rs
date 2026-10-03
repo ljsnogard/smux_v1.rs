@@ -1,6 +1,9 @@
 use core::future::poll_fn;
 
-use abs_buff::{TrBuffTryRead, TrBuffTryWrite, gen_may_cancel_future, x_deps::abs_cancel};
+use abs_buff::{
+    TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite, gen_may_cancel_future,
+    x_deps::abs_cancel,
+};
 use abs_cancel::TrCancellationToken;
 use abs_smux::conn::TrChannelListener;
 use buffex::x_deps::abs_buff;
@@ -24,7 +27,7 @@ pub struct ChannelListener<W, R, S, C>
 where
     C: TrMuxConfig,
 {
-    /// 连接智能指针：accept 时要用它的配置（`make_buff` / `policy`）建子流环。
+    /// 连接智能指针：accept 时要用它的配置（`policy` 等）建子流环。
     conn_: MuxConnection<W, R, S, C>,
 
     /// 监听的 local_dock。
@@ -63,8 +66,8 @@ where
 impl<W, R, S, C> TrChannelListener for ChannelListener<W, R, S, C>
 where
     C: TrMuxConfig,
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    R: TrBuffRead<u8>,
+    W: TrBuffWrite<u8>,
 {
     type Data = u8;
     type Dock = Dock;

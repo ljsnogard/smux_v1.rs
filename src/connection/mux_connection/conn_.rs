@@ -13,12 +13,11 @@ use mm_ptr::{Owned, Shared};
 
 use crate::{
     connection::{
-        Dock, MuxError, TrMuxConfig,
+        MuxChanBuff, Dock, MuxError, TrMuxConfig,
         dock_binding::DockBinding,
         session_::{LoopShared_, read_loop_async_, write_loop_async_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
     },
-    flow_ctrl::{ReportThresholds_, TrFlowCtrlPolicy},
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
 };
 
@@ -202,8 +201,8 @@ where
 {
     core_: Shared<MuxCore<C, S>, C::Alloc>,
     shared_: LoopShared_<C::Alloc>,
-    w_receiver_: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
-    r_receiver_: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
+    w_receiver_: EventReceiver_<WriteEvent_<MuxChanBuff, C::Alloc>>,
+    r_receiver_: EventReceiver_<ReadEvent_<MuxChanBuff, C::Alloc>>,
     alloc_: C::Alloc,
 }
 
@@ -219,20 +218,20 @@ where
     where
         S: Clone,
     {
-        // 建连时把策略展开一次：此后循环只需要这几个标量，不再持有 `C` / `P`。
+        // 建连时把策略展开一次：此后循环只需要注册表与单帧上限，不再持有 `C`。
+        //
+        // 窗口与通告阈值**不在这里**：子流缓冲由调用方在建流最终裁决时给出，容量逐条
+        // 子流不同，因此它们在 `accept_async` 里按该子流的接收缓冲容量算出。
         let max_packet_size = opts.basic_opts.max_packet_size;
-        let capacity = config.channel_capacity();
-        let initial = config.policy().initial_window(capacity);
-        let thresholds = ReportThresholds_::new_(config.policy(), initial);
         let alloc = config.allocator();
 
         let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), alloc.clone());
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
 
-        // 两个循环共享的那一份量：注册表句柄 + 三个标量。**它不含核心引用**，
+        // 两个循环共享的那一份量：注册表句柄 + 单帧上限。**它不含核心引用**，
         // 这是核心能被析构（因而连接能被关闭）的前提，见 `core_` 模块文档。
-        let shared = LoopShared_::new_(reg.clone(), initial, thresholds, max_packet_size);
+        let shared = LoopShared_::new_(reg.clone(), max_packet_size);
 
         let core = Shared::new(
             MuxCore::new_(

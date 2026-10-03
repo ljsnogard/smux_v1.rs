@@ -75,6 +75,43 @@ async fn mux_small_inmem_compio_() {
     scope.run_until(scenario).await;
 }
 
+/// 测试目标（**本轮验收点**）：**最终裁决**（`accept_async`）成为建流的唯一提交点
+/// ——在它之前丢弃半建立句柄，两个角色都不留垃圾、不悬着对端。
+///
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_unsettled_handle_scenario_`]：发起方在 `accept` 前丢弃句柄后立刻
+///   复用同一个 dock 对；响应方在 `accept` 前丢弃句柄，主动方等它的裁决。场景由
+///   `scope.run_until` 驱动。
+/// - 判断：丢弃发起方句柄后同一 dock 对**立刻**可复用（报 `WaitClose`/`Duplicate`
+///   即失败）；丢弃响应方句柄后主动方拿到 `MuxError::Refused`（若不发 `REJECT`，
+///   主动方会永远悬着，测试超时即失败）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_unsettled_handle_tokio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = LocalScope::new();
+    let scenario = common::run_unsettled_handle_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    scope.run_until(scenario).await;
+}
+
+/// 测试目标：与 tokio 版逐字相同的「半建立句柄收尾」验收，改用 **compio 运行时**。
+///
+/// - 手段：同样两条内存环直连，交给
+///   [`common::run_unsettled_handle_scenario_`]；作用域换成
+///   `abs_art_compio::LocalScope`，队列由运行时驱动。
+/// - 判断：与 tokio 版相同——发起方丢弃后同一 dock 对立刻可复用；响应方丢弃后主动
+///   方拿到 `Refused`。
+#[compio::test]
+async fn mux_unsettled_handle_compio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = abs_art_compio::LocalScope::new();
+    let scenario = common::run_unsettled_handle_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    scope.run_until(scenario).await;
+}
+
 /// 测试目标：tokio 下 `bind_async` 对同一个 `local_dock` 是**独占**的——首次绑定
 /// 成功，第二次绑定报 `MuxError::DockInUse`，丢弃 binding 后可重绑。
 ///
@@ -109,6 +146,43 @@ async fn mux_bind_is_exclusive_compio_() {
 
     let scope = abs_art_compio::LocalScope::new();
     let scenario = common::run_bind_exclusivity_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    scope.run_until(scenario).await;
+}
+
+/// 测试目标（**本轮验收点**）：同一条连接上的两条子流可以各用**不同的具体缓冲类型**
+/// ——缓冲由使用环境按 channel 决定，连接不规定其类型。
+///
+/// - 手段：两条内存环直连并完成握手，交给
+///   [`common::run_mixed_carrier_scenario_`]：一条子流用
+///   `Owned<[MaybeUninit<u8>], CoreAlloc>`（容量 4096），另一条用
+///   `Box<[MaybeUninit<u8>]>`（容量 8192），两侧的承载者还各自不同；两条子流都双向
+///   收发并半关闭。场景由 `scope.run_until` 驱动。
+/// - 判断：两条子流都成功建立、载荷逐字节相符、半关闭后读到 EOF。若连接被某个固定
+///   的缓冲类型参数化（例如要求 `prepare` 的缓冲类型等于配置声明的类型），本用例
+///   **编译不过**——这正是要钉住的能力。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_mixed_carrier_tokio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = LocalScope::new();
+    let scenario = common::run_mixed_carrier_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    scope.run_until(scenario).await;
+}
+
+/// 测试目标：与 tokio 版逐字相同的「混合承载者」验收，改用 **compio 运行时**。
+///
+/// - 手段：同样两条内存环直连，交给
+///   [`common::run_mixed_carrier_scenario_`]；作用域换成
+///   `abs_art_compio::LocalScope`，队列由运行时驱动。
+/// - 判断：与 tokio 版相同——两条不同承载者的子流都建立成功且数据逐字节相符。
+#[compio::test]
+async fn mux_mixed_carrier_compio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = abs_art_compio::LocalScope::new();
+    let scenario = common::run_mixed_carrier_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
     scope.run_until(scenario).await;
 }
 

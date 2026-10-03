@@ -4,20 +4,14 @@ use abs_buff::{
     x_deps::abs_cancel,
 };
 use abs_cancel::TrCancellationToken;
-use abs_smux::conn::{TrDock, TrDockBinding};
+use abs_smux::{conn::TrDockBinding, dock::TrDock};
 use buffex::x_deps::abs_buff;
 
-use crate::{
-    connection::{
-        ChannelHandle, Dock, FrameKind, MuxConnection, MuxError, TrMuxConfig,
-        channel_half::{ChannelRx, ChannelTx},
-        channel_listener::ChannelListener,
-        owner_::{ChannelOwner_, ChannelState_, EstablishOutcome_, wait_establish_},
-        ring_::new_buffered_channel_,
-        signal_::{ControlFrame_, ReadEvent_, TrEventSender_, WriteEvent_},
-        util_::read_available_into_vec_,
-    },
-    flow_ctrl::{FlowCtrl, RecvTotal, TrFlowCtrlPolicy},
+use crate::connection::{
+    ChannelHandle, Dock, MuxConnection, MuxError, TrMuxConfig,
+    channel_half::{ChannelRx, ChannelTx},
+    channel_listener::ChannelListener,
+    util_::read_available_into_vec_,
 };
 
 /// 在某个 `local_dock` 上派生的会话对象。
@@ -183,6 +177,17 @@ where
 ///
 /// `message` 是随 `OPEN` 帧附带的开场消息；由于关联类型已泛型于它
 /// （`OpenChannelAsync<'f, M>`），future 可以直接持有该缓冲。
+///
+/// # 本函数**不发任何帧**（`abs_smux` 更新后的语义）
+///
+/// 子流缓冲由调用方在**最终裁决建立 channel** 时（返回的
+/// [`ChannelHandle::accept_async`](abs_smux::chan::TrChannelHandle::accept_async)）
+/// 给出，而本端 `OPEN` 要通告的接收窗口正是由那块接收缓冲的容量算出来的。因此在
+/// 拿到缓冲之前**不能**发 `OPEN`——否则通告值与真实容量不符（要么违约、要么浪费）。
+///
+/// 于是本函数只做两件本地的事：**登记身份**（dock 对唯一性 + 配额）与**搬走开场
+/// 消息**（冷路径允许一次堆分配），然后交出一个「尚未在线上露面」的半建立句柄。
+/// 调用方若不 `accept`，对端根本不会知道这条子流存在（句柄 drop 即回收登记）。
 #[gen_may_cancel_future(MuxOpenChannel, pub, new(pub(crate)))]
 async fn mux_open_channel_async_<'f, W, R, S, C, M, K>(
     binding: &'f mut DockBinding<W, R, S, C>,
@@ -210,87 +215,13 @@ where
         .reserve_channel_(local, remote_dock)
         .map_err(|err| err.cast_())?;
 
-    // 2. 建两条环：发送环（应用写 / 写循环读）与接收环（读循环写 / 应用读）。
-    let capacity = conn.core_().config_().channel_capacity();
-    let alloc = conn.core_().config_().allocator();
-    let initial = conn.core_().config_().policy().initial_window(capacity);
-    let (tx_w, tx_r) = match new_buffered_channel_(
-        conn.core_().config_().make_buff(capacity),
-        alloc.clone(),
-    ) {
-        Result::Ok(pair) => pair,
-        Result::Err(_) => {
-            // 容量已在建连时校验过，这里不可达。
-            conn.core_().reg_().release_channel_(local, remote_dock);
-            return Result::Err(MuxError::Closed);
-        }
-    };
-    let (rx_w, rx_r) = match new_buffered_channel_(
-        conn.core_().config_().make_buff(capacity),
-        alloc.clone(),
-    ) {
-        Result::Ok(pair) => pair,
-        Result::Err(_) => {
-            conn.core_().reg_().release_channel_(local, remote_dock);
-            return Result::Err(MuxError::Closed);
-        }
-    };
-
-    // 3. 共享状态 + 把会话侧半部移交给两个循环。
-    let mut flow = FlowCtrl::new(conn.core_().config_().policy(), capacity);
-    // 记下即将在 `OPEN` 里通告的那份窗口快照：`RecvWindow` 的越权判定以「最近一次
-    // 通告」为准，不记录的话对端的第一帧就会被误判为 `PeerViolation`。
-    flow.recv_window_mut().report();
-    let owner = ChannelOwner_::new_(ChannelState_::new_(flow), alloc.clone());
-    conn.core_()
-        .reg_()
-        .attach_owner_(local, remote_dock, owner.clone());
-    let _ = conn
-        .core_()
-        .w_events_()
-        .try_send_event_(WriteEvent_::Attach {
-            local_dock: local,
-            remote_dock,
-            owner: owner.clone(),
-            reader_: tx_r});
-    let _ = conn
-        .core_()
-        .r_events_()
-        .try_send_event_(ReadEvent_::Attach {
-            local_dock: local,
-            remote_dock,
-            owner: owner.clone(),
-            writer_: rx_w});
-
-    // 4. 发 `OPEN`（带开场消息与本端接收窗口）。
+    // 2. 把开场消息搬进句柄（`OPEN` 要等 `accept_async` 才发）。
     let payload = read_available_into_vec_(
         message,
         conn.core_().opts_().basic_opts.max_packet_size,
         cancel.child_token(),
     )
     .await;
-    let _ = conn
-        .core_()
-        .w_events_()
-        .try_send_event_(WriteEvent_::Control {
-            frame_: ControlFrame_::with_window_(
-                FrameKind::Open,
-                0u8,
-                local,
-                remote_dock,
-                Option::Some((0u64 as RecvTotal, initial)),
-                payload,
-            )});
 
-    // 5. 等待对端 `OPEN` + `ACCEPT` / `REJECT`。
-    match wait_establish_(conn.core_().reg_(), &owner, cancel.child_token()).await? {
-        EstablishOutcome_::Accepted => Result::Ok((
-            ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote_dock),
-            ChannelRx::new_(rx_r, conn, local, remote_dock),
-        )),
-        EstablishOutcome_::Refused => {
-            conn.core_().reg_().release_channel_(local, remote_dock);
-            Result::Err(MuxError::Refused)
-        }
-    }
+    Result::Ok(ChannelHandle::new_initiator_(conn, local, remote_dock, payload))
 }

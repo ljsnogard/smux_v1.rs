@@ -92,7 +92,7 @@ use crate::{
             TrEventSender_, WriteEvent_,
         },
     },
-    flow_ctrl::{Credit, RecvTotal, ReportThresholds_, WindowReport},
+    flow_ctrl::{Credit, WindowReport},
     wire_io_::{CursorError, ReadCursor, write_all_async_},
 };
 
@@ -104,9 +104,14 @@ const K_MAX_DATA_CHUNK: usize = 16usize * 1024usize;
 
 /// 两个循环共享的、与调用方配置无关的量，也是**循环持有的全部连接状态**。
 ///
-/// 它由建连路径从核心展开而来：注册表句柄 + 三个标量。注意它**不含核心引用**
+/// 它由建连路径从核心展开而来：注册表句柄 + 单帧上限。注意它**不含核心引用**
 /// （模块文档「循环不持有连接核心」），因此核心可以在最后一个应用面对象被丢弃时
 /// 正常析构并触发收尾。
+///
+/// 「初始接收窗口」与「通告阈值」**不在这里**：`abs_smux` 更新后，子流缓冲由调用方
+/// 在最终裁决（`accept_async`）时给出，容量逐条子流不同，因此这两个量在**建流时**
+/// 按该子流的接收缓冲容量算出，存进该子流的 [`ChannelState_`]（见
+/// [`crate::connection::owner_`]）。循环侧不再需要任何连接级窗口快照。
 #[derive(Clone)]
 pub(crate) struct LoopShared_<A>
 where
@@ -114,12 +119,6 @@ where
 {
     /// 注册表（dock / 子流索引与配额、失败标志、取消令牌）。
     reg_: ChannelRegistry_<A>,
-
-    /// 本端建流时通告的初始接收窗口（被动方回 `OPEN` 用）。
-    initial_window_: Credit,
-
-    /// 通告判定的阈值快照。
-    thresholds_: ReportThresholds_,
 
     /// 协商出的单帧总长上限。
     max_packet_size_: usize,
@@ -130,16 +129,9 @@ where
     A: AllocatorClone + Send + Sync,
 {
     /// 由建连路径展开后的量构造（成员私有，构造只能走这里）。
-    pub(crate) fn new_(
-        reg: ChannelRegistry_<A>,
-        initial_window: Credit,
-        thresholds: ReportThresholds_,
-        max_packet_size: usize,
-    ) -> Self {
+    pub(crate) fn new_(reg: ChannelRegistry_<A>, max_packet_size: usize) -> Self {
         LoopShared_ {
             reg_: reg,
-            initial_window_: initial_window,
-            thresholds_: thresholds,
             max_packet_size_: max_packet_size,
         }
     }
@@ -350,29 +342,6 @@ where
     }
 }
 
-/// 控制帧发送助手：`OPEN`（携带本端接收窗口）。
-fn send_open_<B, A>(
-    events: &EventSender_<WriteEvent_<B, A>>,
-    local_dock: Dock,
-    remote_dock: Dock,
-    window: Credit,
-    payload: Vec<u8>,
-) where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
-{
-    let _ = events.try_send_event_(WriteEvent_::Control {
-        frame_: ControlFrame_::with_window_(
-            FrameKind::Open,
-            0u8,
-            local_dock,
-            remote_dock,
-            Option::Some((0u64 as RecvTotal, window)),
-            payload,
-        ),
-    });
-}
-
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 读循环
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -512,17 +481,14 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     });
                     wake_establish_(&owner);
                 } else {
-                    // 入向请求：登记并回一条自己的 `OPEN`（通告接收窗口）。
+                    // 入向请求：**只登记，不回帧**。
+                    //
+                    // 本端自己的 `OPEN`（通告本端接收窗口）不能在读循环里发：窗口值
+                    // 取决于调用方在最终裁决（`accept_async`）时给出的接收缓冲容量，
+                    // 而读循环不知道那个容量。因此 `OPEN` 与 `ACCEPT` 都由
+                    // `accept_async` 发出（见 `channel_handle` 模块文档）。
                     match shared.reg_.reserve_inbound_(local, remote, report) {
-                        Result::Ok(()) => {
-                            send_open_(
-                                &events_tx,
-                                local,
-                                remote,
-                                shared.initial_window_,
-                                Vec::new(),
-                            );
-                        }
+                        Result::Ok(()) => {}
                         Result::Err(_) => {
                             // 配额 / 重复：回 `REJECT`，理由载荷留空。
                             let _ = events_tx.try_send_event_(WriteEvent_::Control {
@@ -915,10 +881,11 @@ where
             let report = owner.with_mut_(|state| {
                 state.flow_mut_().recv_window_mut().on_consumed(amount_);
                 state.touch_();
+                let thresholds = state.thresholds_();
                 if state
                     .flow_mut_()
                     .recv_window()
-                    .should_report_with_(&shared.thresholds_)
+                    .should_report_with_(&thresholds)
                 {
                     Option::Some(state.flow_mut_().recv_window_mut().report())
                 } else {

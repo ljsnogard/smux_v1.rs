@@ -20,7 +20,7 @@ use core::{
 };
 
 use abs_art::{TrJoinHandle, TrLocalScope};
-use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
+use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
 use crate::{
     connection::{
@@ -108,7 +108,6 @@ pub(crate) struct TestMuxConfig_;
 static TEST_POLICY_: DefaultPolicy = DefaultPolicy;
 
 impl TrMuxConfig for TestMuxConfig_ {
-    type Buff = TestBuff;
     type Alloc = CoreAlloc;
     type Policy = DefaultPolicy;
 
@@ -120,13 +119,6 @@ impl TrMuxConfig for TestMuxConfig_ {
         &TEST_POLICY_
     }
 
-    fn channel_capacity(&self) -> usize {
-        64usize
-    }
-
-    fn make_buff(&self, len: usize) -> Self::Buff {
-        Owned::new_uninit_slice(len, CoreAlloc)
-    }
 }
 
 /// 测试连接用的两个传输类型（真实的内存环端；本连接不驱动它们，只为满足类型参数）。

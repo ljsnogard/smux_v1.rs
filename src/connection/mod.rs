@@ -21,11 +21,11 @@
 //! | [`TrConnection`](abs_smux::conn::TrConnection) | [`MuxConnection`] | 连接根对象；`bind_async(local_dock)` 在某个 dock 上派生一个会话 |
 //! | [`TrDockBinding`](abs_smux::conn::TrDockBinding) | [`DockBinding`] | **一个业务逻辑持有的会话**：可 listen / open_telegraph / open_channel |
 //! | [`TrChannelListener`](abs_smux::conn::TrChannelListener) | [`ChannelListener`] | 某 dock 上的类 `TcpListener`；`income_async()` 取下一个入向请求 |
-//! | [`TrChannelHandle`](abs_smux::conn::TrChannelHandle) | [`ChannelHandle`] | 入向请求的待决句柄；`accept_async` / `reject_async` |
-//! | [`TrChannelTx`](abs_smux::conn::TrChannelTx) | [`ChannelTx`] | 子流发送半边，包一个 `buffex` 生产端（`TrBuffTryWrite`） |
-//! | [`TrChannelRx`](abs_smux::conn::TrChannelRx) | [`ChannelRx`] | 子流接收半边，包一个 `buffex` 消费端（`TrBuffTryRead`） |
+//! | [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) | [`ChannelHandle`] | 入向请求的待决句柄；`accept_async` / `reject_async` |
+//! | [`TrChannelTx`](abs_smux::chan::TrChannelTx) | [`ChannelTx`] | 子流发送半边，包一个 `buffex` 生产端（`TrBuffTryWrite`） |
+//! | [`TrChannelRx`](abs_smux::chan::TrChannelRx) | [`ChannelRx`] | 子流接收半边，包一个 `buffex` 消费端（`TrBuffTryRead`） |
 //! | [`TrTelegraph`](abs_smux::conn::TrTelegraph) | [`Telegraph`] | 数据报端点；`send_async` / `recv_async` |
-//! | [`TrDock`](abs_smux::conn::TrDock) | [`Dock`] | dock 的具体类型（见 §4） |
+//! | [`TrDock`](abs_smux::dock::TrDock) | [`Dock`] | dock 的具体类型（见 §4） |
 //!
 //! 子流的 `Tx` / `Rx` 实现的是**非阻塞（try）**接口：应用只与本地环形缓冲打交道，
 //! 真正的网络收发由内部循环在后台推进。因此「快生产者 + 慢网络」不会把网络阻塞
@@ -230,26 +230,47 @@
 //! 的重复子流，发现不了同一个 dock 上两个独立 binding 各自向不同 `remote_dock`
 //! 建流、却同时对外代表同一个 local_dock 身份。
 //!
-//! ### 4.2 子流建立：三步、双方同一状态机
+//! ### 4.2 子流建立：**最终裁决**是唯一的提交点
 //!
-//! 建流的过程被设计成**对称**的，使两侧可以用同一套状态机实现（人类决策）：
+//! 建流的过程被设计成**对称**的，使两侧可以用同一套状态机实现（人类决策）。自
+//! `abs_smux` 把「子流缓冲由调用方在最终裁决时给出」写进契约后，两侧都变成**两步**：
 //!
 //! ```text
-//! 主动方 A                                        被动方 B（ChannelListener）
-//!    | -- OPEN(开场消息, A 的接收窗口) -------------> |
-//!    | <-- OPEN(载荷为空, B 的接收窗口) ------------- |   B 收到 OPEN 后先回一条 OPEN
-//!    | <-- ACCEPT(欢迎信息) ----------------------- |   再发 ACCEPT
+//! 主动方 A（DockBinding::open_channel_async）   被动方 B（ChannelListener::income_async）
+//!    | ① 本地登记身份 + 暂存开场消息（**不发帧**） |  （等 A 的 OPEN；收到后只登记，**不回帧**）
+//!    | ② accept_async(welcome, prepare)          | ② accept_async(welcome, prepare)
+//!    |    -- OPEN(开场消息, A 的接收窗口) -------> |
+//!    |    <-- OPEN(载荷为空, B 的接收窗口) ------- |    B 断言自己的接收窗口
+//!    |    <-- ACCEPT(欢迎信息) ------------------ |    再发 ACCEPT
+//!    |    拿到 (Tx, Rx)                          |    拿到 (Tx, Rx)
 //! ```
 //!
 //! 要点：
 //!
+//! - **`OPEN` 一律等到 `accept_async` 才发**。原因不是风格，而是语义：`OPEN` 要通告
+//!   本端的**接收窗口**，而窗口值取决于调用方在最终裁决时给出的**接收缓冲容量**。
+//!   在拿到缓冲之前发 `OPEN` 只能撒谎（要么违约、要么白留额度）。因此主动方的
+//!   `open_channel_async` 只做本地登记与开场消息搬运，返回一个**尚未在线上露面**的
+//!   [`ChannelHandle`]；这也是为什么被动方读到 `OPEN` 后**不再抢先回一条 `OPEN`**
+//!   （旧形状在读循环里回，因为那时容量由配置统一定死）。
+//! - **`accept_async` 是唯一的提交点**：建两条环、把会话侧半部交给循环、把握手推完
+//!   （主动方发 `OPEN` 后等对端 `OPEN` + `ACCEPT`；被动方发自己的 `OPEN` + `ACCEPT`
+//!   后立即完成）。在它之前丢弃句柄 = 放弃建立：主动方**没有任何线上痕迹**，登记
+//!   立刻撤销（同一 dock 对马上可复用）；被动方则补一条 `REJECT`，免得对端悬着。
 //! - `OPEN` **双方都发**：主动方那条带自己的开场消息；被动方那条载荷为空，作用是
 //!   **通告自己的接收窗口**。两条 `OPEN` 都必需携带窗口通告的两个字段
 //!   （[`FieldId::RecvTotal`] + [`FieldId::RecvWindow`]）。
 //! - `ACCEPT` **只有被动方发**，载荷为欢迎信息；它的接收窗口已经在自己的 `OPEN` 里
 //!   通告过，因此 `ACCEPT` 不再带窗口字段。
-//! - 于是两侧的状态机同形：**发送 `OPEN` → 收到对端 `OPEN` →（被动方多一步发送
-//!   `ACCEPT`）→ 建立完成**；谁都不会先看到对方的数据帧。
+//! - 于是两侧的状态机同形：**（本地准备）→ 发送 `OPEN` → 收到对端 `OPEN` →（被动方
+//!   多一步发送 `ACCEPT`）→ 建立完成**；谁都不会先看到对方的数据帧。
+//! - **缓冲归属**：`accept_async` 的 `prepare` 给出的两块缓冲**就是**本条子流的环
+//!   存储，而且**每条子流可以各用不同的具体类型**（自有所有权、借用切片、池分配、
+//!   `Vec`、静态区……）。做法是连接侧只认一个**类型擦除载具**
+//!   （[`MuxChanBuff`]）：调用方给的存储被装箱进去，
+//!   于是两个循环、两条事件通道与两个半部的类型固定下来，而「用什么承载」仍是使用
+//!   环境的自由。连接因此**不需要**任何缓冲类型参数，资源策略也只有「分配器 + 流控
+//!   策略」。接收窗口与发送环大小按该子流自己的缓冲容量算出（逐条不同）。
 //! - 主动方的 `local_dock` 是为这条子流新分配的临时 dock，`remote_dock` 是对端监听的
 //!   dock；被动方**镜像**过来：自己的 `local_dock` 是监听 dock，`remote_dock` 是主动方
 //!   的临时 dock（见 §4.1）。
@@ -443,10 +464,15 @@ mod util_;
 pub use channel_handle::ChannelHandle;
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::ChannelListener;
-pub use config_::TrMuxConfig;
+pub use config_::{DefaultMuxConfig, TrMuxConfig};
 pub use dock_binding::DockBinding;
 pub use error_::MuxError;
 pub(crate) use error_::{MuxReadErr_, MuxWriteErr_, NoHalfway_};
+// 环存储的类型擦除载具会出现在 `ChannelTx` / `ChannelRx` 的关联类型里，因此必须是
+// **可达的公开类型**（否则使用者既写不出那些类型，rustdoc 也无法链接）；它不是给
+// 手工构造的入口，故 `doc(hidden)`。
+#[doc(hidden)]
+pub use ring_::MuxChanBuff;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::MuxConnection;
 pub use ring_::{BufferedChannel, BufferedRx, BufferedTx};

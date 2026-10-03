@@ -5,8 +5,17 @@
 //! [`crate::connection`] 模块文档。
 //!
 //! 连接已改为「演员核心 + 智能指针封装」：收发半边从公开类型上消失，连接类型是
-//! `MuxConnection<C, S, R, W>`。本 trait 仍是唯一的策略打包入口——环存储工厂、
-//! 分配器与流控策略三者总是成组出现，因此打包成一个由调用方实现的 trait。
+//! `MuxConnection<W, R, S, C>`。本 trait 是策略打包入口——**分配器 + 流控策略**。
+//!
+//! # 环存储**不在**这里
+//!
+//! 子流缓冲由**使用环境**在**最终裁决建立 channel** 时通过 `TrPrepareChannelBuff`
+//! （`accept_async` 的 `prepare` 参数）给出，**每条子流各自决定用什么承载**（自有
+//! 所有权、借用切片、池分配、`Vec`、静态区……）。连接侧对缓冲类型一无所知：它把
+//! 调用方给的存储装箱进一个内部载具
+//! （[`MuxChanBuff`](crate::connection::mux_connection)），于是两个循环、两条事件通道
+//! 与两个半部的类型固定下来，而缓冲的承载者仍然自由。因此本 trait **没有**（也不该
+//! 有）「环存储类型」这一项。
 
 extern crate alloc;
 
@@ -25,16 +34,11 @@ pub trait TrMuxAllocConfig {
     type ChanOwnerAlloc: AllocatorClone;
 }
 
-/// 复用连接的资源策略：环存储、分配器与流控策略。
+/// 复用连接的资源策略：分配器与流控策略。
 ///
 /// 由调用方实现并注入 [`MuxConnection::new`](crate::connection::MuxConnection::new)；本 crate 只规定「必须能提供这
-/// 三样东西」，不规定它们从哪来（堆、静态池、`mm_ptr`、自定义 arena 均可）。
-///
-/// # 缓冲策略
-///
-/// 每条子流需要一对 `buffex` 环（发送 / 接收）。[`TrMuxConfig::Buff`] 是环的
-/// 存储类型，[`TrMuxConfig::channel_capacity`] 给出单条子流每个方向的容量；
-/// 建流时由连接按容量实例化存储并交给 `buffex` 构建器。
+/// 两样东西」，不规定它们从哪来（堆、静态池、`mm_ptr`、自定义 arena 均可）。子流缓冲
+/// **不在这里**（见模块文档）。
 pub trait TrMuxConfig {
     /// 环内存与帧暂存的分配器。
     type Alloc: AllocatorClone + Send + Sync;
@@ -47,6 +51,7 @@ pub trait TrMuxConfig {
 
     /// 取流控策略。
     fn policy(&self) -> &Self::Policy;
+
 }
 
 #[derive(Clone, Copy, Debug, Default)]

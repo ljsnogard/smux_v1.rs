@@ -532,6 +532,33 @@ where
     ///
     /// 宽限期内到达的在途帧被读循环静默丢弃，同一 dock 对也不得复用
     /// （见模块文档「`WaitClose`：拆流宽限期」）。
+    /// **撤销**一条尚未在线上露面的子流登记（不留拆流宽限期）。
+    ///
+    /// 与 [`release_channel_`](Self::release_channel_) 的区别只在宽限期：
+    ///
+    /// - `release_channel_`：用于「已经和对端交换过帧」的拆流。同一 dock 对在
+    ///   `max_channel_wait_close` 内不可复用，好让在途帧被静默丢弃（§16.3 F8）；
+    /// - `unreserve_channel_`：用于**发起方还没发出 `OPEN`** 就放弃的情形。对端根本
+    ///   不知道这条子流存在、没有任何在途帧，因此身份与配额**立即**归还，同一 dock
+    ///   对可以马上再用（否则「打开后反悔」会白白占住 dock 对一整个宽限期）。
+    pub(crate) fn unreserve_channel_(&self, local_dock: Dock, remote_dock: Dock) {
+        self.with_mut_(|inner| {
+            let removed = inner
+                .bindings_
+                .remove(&(local_dock, remote_dock));
+            if !matches!(removed, Option::Some(DockBinding_::Channel(_))) {
+                // 不是活跃子流（已拆、已宽限、或从来不是子流）：无事可做。
+                return;
+            }
+            inner.remote_index_.remove(&(remote_dock, local_dock));
+            inner.total_ = inner.total_.saturating_sub(1usize);
+            if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
+                dock.chan_count_ = dock.chan_count_.saturating_sub(1usize);
+            }
+            inner.prune_dock_(local_dock);
+        })
+    }
+
     pub(crate) fn release_channel_(&self, local_dock: Dock, remote_dock: Dock) {
         self.with_mut_(|inner| {
             let now = Instant::now();
@@ -1512,7 +1539,10 @@ use crate::{
 
         let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
         let owner = ChannelOwner_::new_(
-            crate::connection::owner_::ChannelState_::new_(flow),
+            crate::connection::owner_::ChannelState_::new_(
+                flow,
+                crate::flow_ctrl::ReportThresholds_::new_(&crate::flow_ctrl::DefaultPolicy, 64u32),
+            ),
             CoreAlloc,
         );
         assert!(registry.attach_owner_(Dock::new(3u32), Dock::new(8u32), owner.clone()));

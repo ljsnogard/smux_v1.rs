@@ -70,15 +70,16 @@ use core::mem::MaybeUninit;
 use buffex::{
     ring::Ring,
     x_deps::abs_buff::{
-        Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
+        Demand, TrBuffRead, TrBuffWrite,
         buffer::{TrBuffSegmMut, TrBuffSegmRef, TrBuffSegmView},
         error::{ReadErrTag, TrTaggedError},
         io::{TrInput, TrOutput},
     },
 };
 use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
-use abs_smux::conn::{
-    TrChannelHandle, TrChannelHalf, TrChannelListener, TrConnection, TrDockBinding,
+use abs_smux::{
+    chan::{TrChannelHalf, TrChannelHandle},
+    conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use smux_v1::{
     connection::{Dock, MuxConnection, MuxError, TrMuxConfig},
@@ -100,7 +101,7 @@ pub use abs_art::TrLocalScope as TrSmokeScope;
 /// 一端连接对象的类型：策略固定为 [`SmokeMuxConfig`]，另外两个参数就是**传输**类型
 /// （`R` / `W`）——连接对外的错误类型由它们派生（`MuxError<R::Err, W::Err>`），
 /// 因此调用方不必（也常常无法）命名错误类型。
-pub type SmokeConn<R, W, S> = MuxConnection<SmokeMuxConfig, S, R, W>;
+pub type SmokeConn<R, W, S> = MuxConnection<W, R, S, SmokeMuxConfig>;
 
 /// 每个端点监听的 dock 数量（dock 取值 `1..=16`）。
 pub const K_DOCK_COUNT: u32 = 16;
@@ -125,7 +126,6 @@ pub struct SmokeMuxConfig;
 static SMOKE_POLICY: DefaultPolicy = DefaultPolicy;
 
 impl TrMuxConfig for SmokeMuxConfig {
-    type Buff = Owned<[MaybeUninit<u8>], CoreAlloc>;
     type Alloc = CoreAlloc;
     type Policy = DefaultPolicy;
 
@@ -137,17 +137,23 @@ impl TrMuxConfig for SmokeMuxConfig {
         &SMOKE_POLICY
     }
 
-    fn channel_capacity(&self) -> usize {
-        K_CHANNEL_CAPACITY
-    }
-
-    fn make_buff(&self, len: usize) -> Self::Buff {
-        Owned::new_uninit_slice(len, CoreAlloc)
-    }
 }
 
 /// 环存储的具体类型（元素 `u8` + `CoreAlloc`），避免类型推断歧义。
 type SmokeBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
+
+/// 造一块子流环存储（容量 [`K_CHANNEL_CAPACITY`]）。
+///
+/// 建流最终裁决（`accept_async`）要求调用方给出**本条子流**要用的两块缓冲
+/// （`TrPrepareChannelBuff`），本函数就是给 `prepare` 用的构造入口。
+pub fn make_channel_buff_() -> SmokeBuff {
+    Owned::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc)
+}
+
+/// 另一种**具体类型**的环存储：说明「缓冲用什么承载」是调用方的自由选择。
+pub fn make_boxed_channel_buff_(capacity: usize) -> Box<[MaybeUninit<u8>]> {
+    vec![MaybeUninit::<u8>::uninit(); capacity].into_boxed_slice()
+}
 
 /// 单条**全被动**环，返回 `(写端, 读端)`。
 ///
@@ -445,7 +451,8 @@ async fn run_mux_scenario_<RA, WA, RB, WB, S>(
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone,
 {
-    let (conn_a, conn_b) = connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+    let (conn_a, conn_b) =
+        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
 
     futures::join!(
         drive_side_(&conn_a, 0u32, dock_count, per_dock),
@@ -511,7 +518,8 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone,
 {
-    let (conn_a, conn_b) = connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+    let (conn_a, conn_b) =
+        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
     let dock = Dock::new(0x2000u32);
@@ -551,6 +559,274 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
 }
 
 
+/// 半建立句柄的收尾场景：验证「最终裁决之前丢弃句柄」在两个角色下都**不留垃圾、
+/// 不悬着对端**。
+///
+/// - 手段：两条内存环直连并完成握手，取两个真实 `MuxConnection`；A 侧绑定一个
+///   dock、B 侧在同一 dock 上 `listen_async`。然后跑两小段：
+///   1. A **未 accept 就 drop** 发起方句柄，随即用**同一个 dock 对**再开一次，这次
+///      两侧都正常 `accept_async`；
+///   2. A 发起并 `accept_async`（会等对端裁决），同时 B 取到入向句柄后**未裁决就
+///      drop**。
+///
+///   整个场景由 `scope.run_until` 驱动。
+/// - 判断：第 1 段中第二次 `open_channel_async` 必须**立刻成功**——若丢弃发起方句柄
+///   只是把它放进拆流宽限期，这里会报 `WaitClose`/`Duplicate`（发起方此刻还没发过
+///   `OPEN`，对端不可能有在途帧，所以理应立刻可复用）；第 2 段中 A 的
+///   `accept_async` 必须返回 `MuxError::Refused`——若丢弃响应方句柄不发 `REJECT`，
+///   A 会永远悬着，测试会超时。任一不满足即 panic。
+///
+/// # Panics
+///
+/// 握手/绑定/监听失败，或上述两条判断不成立，都会 panic。
+pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
+    scope: &S,
+    rx_a: RA,
+    tx_a: WA,
+    rx_b: RB,
+    tx_b: WB,
+) where
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: TrSmokeScope + Clone,
+{
+    let (conn_a, conn_b) =
+        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+
+    // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
+    let local_a = Dock::new(0x3000u32);
+    let remote_b = Dock::new(0x3001u32);
+
+    let mut binding_a = conn_a
+        .bind_async(local_a)
+        .await
+        .expect("A 侧绑定应当成功");
+    let mut listener_b = conn_b
+        .bind_async(remote_b)
+        .await
+        .expect("B 侧绑定应当成功")
+        .listen_async()
+        .await
+        .expect("B 侧开始监听应当成功");
+
+    // -- 第 1 段：发起方未裁决就丢弃 ⇒ 登记被彻底撤销，同一 dock 对立刻可复用。
+    let mut message: &[u8] = &[];
+    let abandoned = binding_a
+        .open_channel_async(remote_b, &mut message)
+        .await
+        .expect("第一次发起应当成功");
+    drop(abandoned);
+
+    let mut again = binding_a
+        .open_channel_async(remote_b, &mut message)
+        .await
+        .expect("撤销登记后，同一个 dock 对应当立刻可以再次发起");
+    let mut welcome_buf: [u8; 0] = [];
+    let mut welcome: &mut [u8] = &mut welcome_buf[..];
+    let (opened, incoming) = futures::join!(
+        async {
+            again
+                .accept_async(&mut welcome, || {
+                    (make_channel_buff_(), make_channel_buff_())
+                })
+                .await
+        },
+        async {
+            let mut handle = listener_b
+                .income_async()
+                .await
+                .expect("B 侧应当取到第二次发起的请求");
+            let mut peer_welcome_buf: [u8; 0] = [];
+            let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
+            handle
+                .accept_async(&mut peer_welcome, || {
+                    (make_channel_buff_(), make_channel_buff_())
+                })
+                .await
+        },
+    );
+    let (tx, rx) = opened.expect("A 侧最终裁决应当成功");
+    let (peer_tx, peer_rx) = incoming.expect("B 侧最终裁决应当成功");
+    drop((tx, rx, peer_tx, peer_rx));
+
+    // -- 第 2 段：响应方未裁决就丢弃 ⇒ 主动方必须收到 `Refused`，而不是悬着。
+    //
+    // 换一个 dock 对：上一条子流已经拆掉，同一 dock 对会处于拆流宽限期。
+    let remote_c = Dock::new(0x3002u32);
+    let mut listener_c = conn_b
+        .bind_async(remote_c)
+        .await
+        .expect("B 侧再绑定一个 dock 应当成功")
+        .listen_async()
+        .await
+        .expect("B 侧第二个监听应当成功");
+    let mut message2: &[u8] = &[];
+    let mut waiter = binding_a
+        .open_channel_async(remote_c, &mut message2)
+        .await
+        .expect("第二次发起应当成功");
+    let mut welcome2_buf: [u8; 0] = [];
+    let mut welcome2: &mut [u8] = &mut welcome2_buf[..];
+    let (verdict, ()) = futures::join!(
+        async {
+            waiter
+                .accept_async(&mut welcome2, || {
+                    (make_channel_buff_(), make_channel_buff_())
+                })
+                .await
+        },
+        async {
+            let handle = listener_c
+                .income_async()
+                .await
+                .expect("B 侧应当取到第三次发起的请求");
+            // 未裁决就丢弃：按契约应当给对端补一条 `REJECT`。
+            drop(handle);
+        },
+    );
+    assert!(
+        matches!(verdict, Result::Err(MuxError::Refused)),
+        "响应方丢弃待决句柄后，主动方的 accept_async 应当得到 Refused"
+    );
+}
+
+/// 混合承载者场景：同一条连接上的**两条子流各用不同的具体缓冲类型**。
+///
+/// 这是「缓冲由使用环境按 channel 自行决定、连接不统一规定其类型」的验收点：
+/// 连接类型里**没有**任何缓冲类型参数，因此两条子流可以分别用
+/// `Owned<[MaybeUninit<u8>], CoreAlloc>`（容量 4096）与
+/// `Box<[MaybeUninit<u8>]>`（容量 8192）——连容量都不同，因此接收窗口也是逐条的。
+///
+/// - 手段：两条内存环直连并完成握手；A 侧绑定一个 dock、B 侧在两个 dock 上各建一个
+///   listener。随后**依次**跑两条子流（A 侧 `binding` 需要 `&mut`，故不并发）：每条
+///   都是 A `open_channel_async` + `accept_async`（用自己的承载者）与 B
+///   `income_async` + `accept_async`（用另一种承载者）`join!`，再用
+///   [`exchange_and_half_close_`] 双向发收 + 半关闭。
+/// - 判断：两条子流的载荷都逐字节相符、半关闭后都能读到 EOF；任一步失败即 panic。
+///
+/// # Panics
+///
+/// 握手 / 绑定 / 监听 / 交互任一环节失败都会 panic。
+pub async fn run_mixed_carrier_scenario_<RA, WA, RB, WB, S>(
+    scope: &S,
+    rx_a: RA,
+    tx_a: WA,
+    rx_b: RB,
+    tx_b: WB,
+) where
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: TrSmokeScope + Clone,
+{
+    let (conn_a, conn_b) =
+        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+
+    let local_a = Dock::new(0x4000u32);
+    let dock_owned = Dock::new(0x4001u32);
+    let dock_boxed = Dock::new(0x4002u32);
+
+    let mut binding_a = conn_a
+        .bind_async(local_a)
+        .await
+        .expect("A 侧绑定应当成功");
+    let mut listener_owned = conn_b
+        .bind_async(dock_owned)
+        .await
+        .expect("B 侧绑定 dock_owned 应当成功")
+        .listen_async()
+        .await
+        .expect("B 侧监听 dock_owned 应当成功");
+    let mut listener_boxed = conn_b
+        .bind_async(dock_boxed)
+        .await
+        .expect("B 侧绑定 dock_boxed 应当成功")
+        .listen_async()
+        .await
+        .expect("B 侧监听 dock_boxed 应当成功");
+
+    // -- 第一条：A 用 `Owned<…>`，B 用 `Box<[MaybeUninit<u8>]>`。
+    let (a_done, b_done) = futures::join!(
+        async {
+            let mut message: &[u8] = &[];
+            let mut handle = binding_a
+                .open_channel_async(dock_owned, &mut message)
+                .await
+                .expect("发起第一条子流应当成功");
+            let mut welcome_buf: [u8; 0] = [];
+            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let (tx, mut rx) = handle
+                .accept_async(&mut welcome, || {
+                    (make_channel_buff_(), make_channel_buff_())
+                })
+                .await
+                .expect("第一条子流裁决应当成功");
+            exchange_and_half_close_(tx, &mut rx, 0x4001u32, 0usize).await;
+        },
+        async {
+            let mut handle = listener_owned
+                .income_async()
+                .await
+                .expect("B 侧应当取到第一条子流");
+            let mut welcome_buf: [u8; 0] = [];
+            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let (tx, mut rx) = handle
+                .accept_async(&mut welcome, || {
+                    (
+                        make_boxed_channel_buff_(K_CHANNEL_CAPACITY / 2),
+                        make_boxed_channel_buff_(K_CHANNEL_CAPACITY / 2),
+                    )
+                })
+                .await
+                .expect("B 侧第一条子流裁决应当成功");
+            exchange_and_half_close_(tx, &mut rx, 0x4001u32, 0usize).await;
+        },
+    );
+    let _ = (a_done, b_done);
+
+    // -- 第二条：A 用 `Box<[MaybeUninit<u8>]>`（**另一种类型 + 另一种容量**），B 用 `Owned<…>`。
+    let (a_done, b_done) = futures::join!(
+        async {
+            let mut message: &[u8] = &[];
+            let mut handle = binding_a
+                .open_channel_async(dock_boxed, &mut message)
+                .await
+                .expect("发起第二条子流应当成功");
+            let mut welcome_buf: [u8; 0] = [];
+            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let (tx, mut rx) = handle
+                .accept_async(&mut welcome, || {
+                    (
+                        make_boxed_channel_buff_(K_CHANNEL_CAPACITY * 2),
+                        make_boxed_channel_buff_(K_CHANNEL_CAPACITY * 2),
+                    )
+                })
+                .await
+                .expect("第二条子流裁决应当成功");
+            exchange_and_half_close_(tx, &mut rx, 0x4002u32, 1usize).await;
+        },
+        async {
+            let mut handle = listener_boxed
+                .income_async()
+                .await
+                .expect("B 侧应当取到第二条子流");
+            let mut welcome_buf: [u8; 0] = [];
+            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let (tx, mut rx) = handle
+                .accept_async(&mut welcome, || {
+                    (make_channel_buff_(), make_channel_buff_())
+                })
+                .await
+                .expect("B 侧第二条子流裁决应当成功");
+            exchange_and_half_close_(tx, &mut rx, 0x4002u32, 1usize).await;
+        },
+    );
+    let _ = (a_done, b_done);
+}
+
 /// 小场景里的 dock 数量与每个 dock 上的子流数量（`2 × 2 = 4` 条/端）。
 pub const K_SMALL_DOCK_COUNT: u32 = 2;
 pub const K_SMALL_CHANNELS_PER_DOCK: usize = 2;
@@ -569,14 +845,14 @@ pub const K_SMALL_CHANNELS_PER_DOCK: usize = 2;
 ///
 /// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
 async fn drive_side_<C, S, R, W>(
-    conn: &MuxConnection<C, S, R, W>,
+    conn: &MuxConnection<W, R, S, C>,
     side: u32,
     dock_count: u32,
     per_dock: usize,
 ) where
     C: TrMuxConfig,
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    R: TrBuffRead<u8>,
+    W: TrBuffWrite<u8>,
 {
     let conn_ref = conn;
 
@@ -604,7 +880,9 @@ async fn drive_side_<C, S, R, W>(
                 let mut welcome_buf: [u8; 0] = [];
                 let mut welcome: &mut [u8] = &mut welcome_buf[..];
                 let (tx, mut rx) = handle
-                    .accept_async(&mut welcome)
+                    .accept_async(&mut welcome, || {
+                        (make_channel_buff_(), make_channel_buff_())
+                    })
                     .await
                     .expect("accept 入向子流应当成功");
                 exchange_and_half_close_(tx, &mut rx, dock, index).await;
@@ -625,10 +903,20 @@ async fn drive_side_<C, S, R, W>(
                     .await
                     .expect("绑定发起 dock 应当成功");
                 let mut message: &[u8] = &[];
-                let (tx, mut rx) = binding
+                // `open_channel_async` 现在只交出**半建立**句柄：本端 `OPEN` 要
+                // 等最终裁决（`accept_async`）时拿到缓冲后才发。
+                let mut handle = binding
                     .open_channel_async(Dock::new(dock), &mut message)
                     .await
                     .expect("向对端 dock 发起子流应当成功");
+                let mut welcome_buf: [u8; 0] = [];
+                let mut welcome: &mut [u8] = &mut welcome_buf[..];
+                let (tx, mut rx) = handle
+                    .accept_async(&mut welcome, || {
+                        (make_channel_buff_(), make_channel_buff_())
+                    })
+                    .await
+                    .expect("发起方最终裁决子流应当成功");
                 exchange_and_half_close_(tx, &mut rx, dock, index).await;
             });
         }

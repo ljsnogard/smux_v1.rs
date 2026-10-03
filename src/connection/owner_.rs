@@ -37,7 +37,7 @@ use crate::{
         mux_connection::ChannelRegistry_,
         sync_::{WakerSlot_, on_lock_contended_},
     },
-    flow_ctrl::FlowCtrl,
+    flow_ctrl::{FlowCtrl, ReportThresholds_},
 };
 
 /// 建流三步的进展。
@@ -103,11 +103,17 @@ pub(crate) struct ChannelState_ {
 
     /// 最近一次与本子流相关的收发活动时间（保活只记录，本轮不判定超时）。
     active_: Instant,
+
+    /// 通告判定的阈值快照。
+    ///
+    /// 建流最终裁决时**由调用方给的接收缓冲容量**算出，因此是**每条子流各自的**
+    /// （旧形状把它放在连接级快照里，因为容量由配置统一定死）。
+    thresholds_: ReportThresholds_,
 }
 
 impl ChannelState_ {
     /// 以建流已知的量构造。
-    pub(crate) fn new_(flow: FlowCtrl) -> Self {
+    pub(crate) fn new_(flow: FlowCtrl, thresholds: ReportThresholds_) -> Self {
         ChannelState_ {
             flow_: flow,
             establish_: Establish_::default(),
@@ -120,7 +126,13 @@ impl ChannelState_ {
             peer_reset_: false,
             released_: false,
             active_: Instant::now(),
+            thresholds_: thresholds,
         }
+    }
+
+    /// 通告判定的阈值快照（写循环判定 `should_report` 时取用）。
+    pub(crate) fn thresholds_(&self) -> ReportThresholds_ {
+        self.thresholds_
     }
 
     /// 刷新活跃时间。
@@ -312,7 +324,7 @@ mod tests_ {
     fn make_owner_() -> ChannelOwner_<CoreAlloc> {
         let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
         ChannelOwner_::new_(
-            ChannelState_::new_(flow),
+            ChannelState_::new_(flow, ReportThresholds_::new_(&DefaultPolicy, 64u32)),
             CoreAlloc,
         )
     }
