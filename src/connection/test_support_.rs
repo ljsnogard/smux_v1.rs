@@ -136,7 +136,7 @@ pub(crate) type TestWireRx_ = BufferedRx<TestBuff, CoreAlloc>;
 pub(crate) type TestWireTx_ = BufferedTx<TestBuff, CoreAlloc>;
 
 /// 建一个**不含任何循环**的测试连接。
-pub(crate) fn make_test_conn_() -> MuxConnection<TestMuxConfig_, NullScope_, TestWireRx_, TestWireTx_> {
+pub(crate) fn make_test_conn_() -> MuxConnection<TestWireTx_, TestWireRx_, NullScope_, TestMuxConfig_> {
     MuxConnection::new_test_(
         &NullScope_,
         HandshakeOpts {

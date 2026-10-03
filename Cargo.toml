@@ -8,7 +8,8 @@ description = "流复用协议第一版"
 [dependencies]
 abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
-abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
+# abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
+abs_smux = { path = "../abs_smux" }
 atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch = "dev/0.3.0" }
 
 # 复用子流与协议帧的缓冲区一律使用 `buffex::circular_buff`，因此它是正式依赖

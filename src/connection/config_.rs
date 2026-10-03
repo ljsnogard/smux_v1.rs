@@ -8,13 +8,22 @@
 //! `MuxConnection<C, S, R, W>`。本 trait 仍是唯一的策略打包入口——环存储工厂、
 //! 分配器与流控策略三者总是成组出现，因此打包成一个由调用方实现的 trait。
 
-use core::{
-    alloc::AllocatorClone,
-    borrow::BorrowMut,
-    mem::MaybeUninit,
-};
+extern crate alloc;
+
+use core::alloc::AllocatorClone;
+
+use abs_mm::CoreAlloc;
+use mm_ptr::x_deps::abs_mm;
 
 use crate::flow_ctrl::TrFlowCtrlPolicy;
+
+#[allow(unused)]
+pub trait TrMuxAllocConfig {
+    type RegistryAlloc: AllocatorClone;
+
+    /// Allocator for ChannelOwner
+    type ChanOwnerAlloc: AllocatorClone;
+}
 
 /// 复用连接的资源策略：环存储、分配器与流控策略。
 ///
@@ -27,9 +36,6 @@ use crate::flow_ctrl::TrFlowCtrlPolicy;
 /// 存储类型，[`TrMuxConfig::channel_capacity`] 给出单条子流每个方向的容量；
 /// 建流时由连接按容量实例化存储并交给 `buffex` 构建器。
 pub trait TrMuxConfig {
-    /// 环存储类型；通常是 `mm_ptr::Owned<[MaybeUninit<u8>], Self::Alloc>`。
-    type Buff: BorrowMut<[MaybeUninit<u8>]> + Send + Sync;
-
     /// 环内存与帧暂存的分配器。
     type Alloc: AllocatorClone + Send + Sync;
 
@@ -41,25 +47,20 @@ pub trait TrMuxConfig {
 
     /// 取流控策略。
     fn policy(&self) -> &Self::Policy;
+}
 
-    /// 单条子流**每个方向**的环容量（字节）。
-    fn channel_capacity(&self) -> usize;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultMuxConfig(crate::flow_ctrl::DefaultPolicy);
 
-    /// 用调用方注入的分配器分配一块长度为 `len` 的**环存储**。
-    ///
-    /// 这是子流收发环唯一的「按容量造存储」入口：`len` 取
-    /// [`TrMuxConfig::channel_capacity`]，返回值随后交给环构建入口（crate 内部的
-    /// 私有模块）。
-    ///
-    /// 连接内部的两处**帧暂存**（读循环的收帧缓冲、写循环的成帧缓冲）不经过本
-    /// 方法，而是同一分配器（[`TrMuxConfig::Alloc`]）上的定长切片——它们要按字节
-    /// 读写已初始化的内容，与「元素为 `MaybeUninit` 的环存储」语义不同。分配来源
-    /// 与预算仍然完全由调用方掌握。
-    ///
-    /// # Panics
-    ///
-    /// 分配失败时如何表现由实现决定（标准库容器的惯例是 panic）。本 crate 不
-    /// 隐式分配，因此调用方可以按 `max_channel_count × channel_capacity` 量级
-    /// 准备分配器。
-    fn make_buff(&self, len: usize) -> Self::Buff;
+impl TrMuxConfig for DefaultMuxConfig {
+    type Alloc = CoreAlloc;
+    type Policy = crate::flow_ctrl::DefaultPolicy;
+
+    fn allocator(&self) -> Self::Alloc {
+        CoreAlloc
+    }
+
+    fn policy(&self) -> &Self::Policy {
+        &self.0
+    }
 }

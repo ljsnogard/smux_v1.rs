@@ -20,23 +20,23 @@ use crate::connection::{
 /// [`TrChannelListener::income_async`] 每次返回一个**待决句柄**
 /// [`ChannelHandle`]；调用方决定 accept 还是 reject，之后该 dock 才能继续接受
 /// 下一个请求（同一 dock 的请求串行化，便于用户侧实现「排队 / 限流」）。
-pub struct ChannelListener<C, S, R, W>
+pub struct ChannelListener<W, R, S, C>
 where
     C: TrMuxConfig,
 {
     /// 连接智能指针：accept 时要用它的配置（`make_buff` / `policy`）建子流环。
-    conn_: MuxConnection<C, S, R, W>,
+    conn_: MuxConnection<W, R, S, C>,
 
     /// 监听的 local_dock。
     local_dock_: Dock,
 }
 
-impl<C, S, R, W> ChannelListener<C, S, R, W>
+impl<W, R, S, C> ChannelListener<W, R, S, C>
 where
     C: TrMuxConfig,
 {
     /// 由连接与监听 `local_dock` 构造（只允许 `listen_async` 调用）。
-    pub(crate) fn new_(conn: MuxConnection<C, S, R, W>, local_dock: Dock) -> Self {
+    pub(crate) fn new_(conn: MuxConnection<W, R, S, C>, local_dock: Dock) -> Self {
         ChannelListener {
             conn_: conn,
             local_dock_: local_dock,
@@ -48,7 +48,7 @@ where
 /// telegraph 使用（见 `ChannelRegistry_::release_listener_`）。
 ///
 /// 注意这不影响该 dock 上已经建立、且在应用手里的子流半部。
-impl<C, S, R, W> Drop for ChannelListener<C, S, R, W>
+impl<W, R, S, C> Drop for ChannelListener<W, R, S, C>
 where
     C: TrMuxConfig,
 {
@@ -60,7 +60,7 @@ where
     }
 }
 
-impl<C, S, R, W> TrChannelListener for ChannelListener<C, S, R, W>
+impl<W, R, S, C> TrChannelListener for ChannelListener<W, R, S, C>
 where
     C: TrMuxConfig,
     R: TrBuffTryRead<u8>,
@@ -70,7 +70,7 @@ where
     type Dock = Dock;
     type Err = MuxError<R, W>;
 
-    type ChannelHandle = ChannelHandle<C, S, R, W>;
+    type ChannelHandle = ChannelHandle<W, R, S, C>;
 
     type IncomeAsync<'f>
         = MuxIncomeAsync<'f, 'f, C, S, R, W>
@@ -89,9 +89,9 @@ where
 /// [`TrChannelListener::income_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxIncome, pub, new(pub(crate)))]
 async fn mux_income_async_<'f, C, S, R, W, K>(
-    listener: &'f mut ChannelListener<C, S, R, W>,
+    listener: &'f mut ChannelListener<W, R, S, C>,
     cancel: K,
-) -> Result<ChannelHandle<C, S, R, W>, MuxError<R, W>>
+) -> Result<ChannelHandle<W, R, S, C>, MuxError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,

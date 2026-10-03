@@ -7,7 +7,7 @@ use abs_buff::{
 };
 use abs_art::{TrJoinHandle, TrLocalScope};
 use abs_cancel::TrCancellationToken;
-use abs_smux::conn::{TrConnection, TrDock};
+use abs_smux::{conn::TrConnection, dock::TrDock};
 use buffex::x_deps::abs_buff;
 use mm_ptr::{Owned, Shared};
 
@@ -73,7 +73,7 @@ use super::{core_::MuxCore, registry_::ChannelRegistry_};
 /// 先于连接消失；但**驱动**队列仍然是调用方的责任：tokio 必须把整段使用期包在
 /// `scope.run_until(..)` 里，compio 由运行时自己驱动，smol 由 `LocalExecutor` 驱动。
 /// 忘记驱动不会有编译错误，症状是两个循环从不推进（连接静默无响应）。
-pub struct MuxConnection<C, S, R, W>
+pub struct MuxConnection<W, R, S, C>
 where
     C: TrMuxConfig,
 {
@@ -86,7 +86,7 @@ where
     _mark_: PhantomData<fn() -> (R, W)>,
 }
 
-impl<C, S, R, W> Clone for MuxConnection<C, S, R, W>
+impl<W, R, S, C> Clone for MuxConnection<W, R, S, C>
 where
     C: TrMuxConfig,
 {
@@ -99,7 +99,7 @@ where
     }
 }
 
-impl<C, S, R, W> MuxConnection<C, S, R, W>
+impl<W, R, S, C> MuxConnection<W, R, S, C>
 where
     C: TrMuxConfig,
 {
@@ -139,7 +139,6 @@ where
         R: TrBuffRead<u8> + 'static,
         W: TrBuffWrite<u8> + 'static,
         C: 'static,
-        C::Buff: 'static,
         C::Alloc: 'static,
     {
         let HandshakeDelivery { opts, tx, rx } = delivery;
@@ -258,7 +257,7 @@ where
 }
 
 #[cfg(test)]
-impl<C, S, RE, WE> MuxConnection<C, S, RE, WE>
+impl<W, R, S, C> MuxConnection<W, R, S, C>
 where
     C: TrMuxConfig,
 {
@@ -279,11 +278,11 @@ where
     }
 }
 
-impl<C, S, R, W> TrConnection for MuxConnection<C, S, R, W>
+impl<W, R, S, C> TrConnection for MuxConnection<W, R, S, C>
 where
     C: TrMuxConfig,
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    R: TrBuffRead<u8>,
+    W: TrBuffWrite<u8>,
 {
     type Data = u8;
     type Dock = Dock;
@@ -293,14 +292,10 @@ where
 
     /// 会话对象是**独立持有者**（自带一份连接克隆），不带 `'f` 之类的生命周期：
     /// 它可以从函数返回、可以存进结构体、可以与连接同处一个结构体。
-    type DockBinding<'f>
-        = DockBinding<C, S, R, W>
-    where
-        Self: 'f;
+    type DockBinding = DockBinding<W, R, S, C>;
 
     /// future 仍然借用 `&self`（调用期间），但**输出是 owned 的**。
-    type BindAsync<'f>
-        = MuxBindAsync<'f, 'f, C, S, R, W>
+    type BindAsync<'f> = MuxBindAsync<'f, 'f, C, S, R, W>
     where
         Self: 'f;
 
@@ -312,10 +307,10 @@ where
 /// [`TrConnection::bind_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxBind, pub, new(pub(crate)))]
 async fn mux_bind_async_<'f, C, S, R, W, K>(
-    conn: &'f MuxConnection<C, S, R, W>,
+    conn: &'f MuxConnection<W, R, S, C>,
     local_dock: Dock,
     _cancel: K,
-) -> Result<DockBinding<C, S, R, W>, MuxError<R, W>>
+) -> Result<DockBinding<W, R, S, C>, MuxError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
