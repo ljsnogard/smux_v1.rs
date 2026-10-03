@@ -41,6 +41,7 @@ use crate::{
         TrConnCfg,
         mux_connection::ChannelRegistry_,
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
+        sync_::CancelToken_,
     },
     handshake::opts::HandshakeOpts,
 };
@@ -79,6 +80,13 @@ where
 
     /// 读事件发送端（接收环注册与释放）。
     r_events_: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
+
+    /// 两个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
+    ///
+    /// 核心自己持一份克隆，**而不是在 `Drop` 里去注册表取**：注册表取锁在跨线程
+    /// 争用时是阻塞等待，而 `Drop` 必须不阻塞。令牌是可克隆的共享句柄，因此这里
+    /// 持有的就是循环在用的那一个。
+    loops_: [CancelToken_<C::Alloc>; 2],
 }
 
 impl<C, S> MuxCore<C, S>
@@ -93,6 +101,7 @@ where
         reg: ChannelRegistry_<C::Alloc>,
         w_events: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
         r_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
+        loops: [CancelToken_<C::Alloc>; 2],
     ) -> Self {
         MuxCore {
             config_: config,
@@ -100,7 +109,8 @@ where
             scope_: scope,
             reg_: reg,
             w_events_: w_events,
-            r_events_: r_events}
+            r_events_: r_events,
+            loops_: loops}
     }
 
     /// 资源策略。
@@ -132,6 +142,11 @@ where
     pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<C::Buff, C::Alloc>> {
         &self.r_events_
     }
+
+    /// 第 `idx` 个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
+    pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<C::Alloc> {
+        self.loops_[idx].clone()
+    }
 }
 
 impl<C, S> Drop for MuxCore<C, S>
@@ -143,7 +158,12 @@ where
     /// 循环在每个 await 点检查令牌并自行退出（读循环的 park 经
     /// `may_cancel_with`、写循环的 park 与取消 future 竞争），因此这里是「丢弃
     /// 连接即关闭连接」的唯一入口，不依赖句柄的 `abort` / `drop` 语义。
+    ///
+    /// 令牌就在核心自己的字段里，因此本 `Drop` **不取注册表锁、不阻塞**——这一点
+    /// 是跨线程收尾的前提：最后一个句柄可能在任意线程上被丢弃。
     fn drop(&mut self) {
-        self.reg_.cancel_loops_();
+        for token in &self.loops_ {
+            token.cancel_();
+        }
     }
 }

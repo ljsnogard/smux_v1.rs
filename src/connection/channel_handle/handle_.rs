@@ -20,7 +20,7 @@ use crate::{
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, ChannelState_, EstablishOutcome_, wait_establish_},
         ring_::new_buffered_channel_,
-        signal_::{ControlFrame_, ReadEvent_, TrEventSender_, WriteEvent_},
+        signal_::{ControlFrame_, ReadEvent_, SessionEvent_, TrEventSender_, WriteEvent_},
         error_::face_error_impls,
         util_::read_available_into_vec_,
     },
@@ -156,6 +156,10 @@ where
 }
 
 /// 裁决失败 / 未裁决就丢弃时的收尾：按**角色**把这条待决子流收拾干净。
+///
+/// **不取注册表锁**（本函数由 `Drop` 调用）：身份表改动一律投成
+/// [`SessionEvent_`]，由核心执行者 drain 后落实。协议帧（响应方的 `REJECT`）本来
+/// 就是投事件，保持原样。
 fn abort_pending_<C, S>(
     conn: &MuxConnection<C, S>,
     local: Dock,
@@ -165,8 +169,14 @@ fn abort_pending_<C, S>(
     C: TrConnCfg,
 {
     let core = conn.core_();
+    let reg = core.reg_();
     if is_initiator {
-        core.reg_().unreserve_channel_(local, remote);
+        // 发起方还没发过 `OPEN`：对端不知道这条子流存在，撤销要**立刻**归还身份与
+        // 配额（不留宽限期）。
+        let _ = reg.post_session_event_(SessionEvent_::UnreserveChannel {
+            local_dock: local,
+            remote_dock: remote,
+        });
         return;
     }
     let _ = core.w_events_().try_send_event_(WriteEvent_::Control {
@@ -179,7 +189,11 @@ fn abort_pending_<C, S>(
             Vec::new(),
         ),
     });
-    core.reg_().release_channel_(local, remote);
+    // 响应方已经回过 `OPEN`：进入拆流宽限期，让在途帧被静默丢弃。
+    let _ = reg.post_session_event_(SessionEvent_::ReleaseChannel {
+        local_dock: local,
+        remote_dock: remote,
+    });
 }
 
 impl<C, S> ChannelHandle<C, S>

@@ -15,7 +15,9 @@
 //! - 对端 `OPEN` 里带过来的窗口通告（被动方在 `accept` 时才建环，需要先把它存住）。
 //!
 //! 所有访问都经 `atomic_sync` **抢占式自旋读写锁**的短闭包：**闭包内不得
-//! `await`**，也不得重入。该锁没有内部堆分配，可内联进 [`Shared`]。
+//! `await`**，也不得重入。该锁没有内部堆分配，可内联进 [`Shared`]；争用时按
+//! [`TrBackoffAcquire_`](crate::connection::sync_::TrBackoffAcquire_) **睡眠重试**
+//! （而不是自旋或 panic），因此同样零 CPU 忙等。
 
 // 本模块的入口尚未被读写循环与 API 面调用（接线进行中），因此保留 `dead_code`
 // 允许；**接线完成后必须移除本行**。
@@ -35,7 +37,7 @@ use crate::{
     connection::{
         error_::MuxError,
         mux_connection::ChannelRegistry_,
-        sync_::{WakerSlot_, on_lock_contended_},
+        sync_::{TrBackoffAcquire_, WakerSlot_},
     },
     flow_ctrl::{FlowCtrl, ReportThresholds_},
 };
@@ -254,23 +256,17 @@ where
     }
 
     /// 持读锁执行 `f`（闭包内不得 `await`、不得重入）。
+    ///
+    /// 争用时**睡眠重试**（`TrBackoffAcquire_`）：零 CPU 忙等、不 panic。
     pub(crate) fn with_<R>(&self, f: impl FnOnce(&ChannelState_) -> R) -> R {
-        let mut session = self.inner_.acquire_session();
-        let guard = match session.try_read() {
-            Result::Ok(guard) => guard,
-            Result::Err(_) => on_lock_contended_(),
-        };
-        f(&guard)
+        self.inner_.with_read_backoff_(f)
     }
 
     /// 持写锁执行 `f`（闭包内不得 `await`、不得重入）。
+    ///
+    /// 争用时**睡眠重试**（`TrBackoffAcquire_`）：零 CPU 忙等、不 panic。
     pub(crate) fn with_mut_<R>(&self, f: impl FnOnce(&mut ChannelState_) -> R) -> R {
-        let mut session = self.inner_.acquire_session();
-        let mut guard = match session.try_write() {
-            Result::Ok(guard) => guard,
-            Result::Err(_) => on_lock_contended_(),
-        };
-        f(&mut guard)
+        self.inner_.with_write_backoff_(f)
     }
 }
 

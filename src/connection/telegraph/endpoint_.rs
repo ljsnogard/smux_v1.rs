@@ -13,7 +13,11 @@ use abs_smux::conn::TrTelegraph;
 use anylr::SomeOf;
 use buffex::x_deps::{abs_buff, anylr};
 
-use crate::connection::{Dock, MuxConnection, MuxError, TrConnCfg, error_::face_error_impls};
+use crate::connection::{
+    Dock, MuxConnection, MuxError, TrConnCfg,
+    error_::face_error_impls,
+    signal_::SessionEvent_,
+};
 
 /// [`TrTelegraph`](abs_smux::conn::TrTelegraph) 的错误类型（`send_async` / `recv_async`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,17 +64,24 @@ where
     }
 }
 
-/// 丢弃端点即**解除 telegraph 身份**，使同一个 `local_dock` 之后可以再作 channel
-/// 或 listener 使用（见 `ChannelRegistry_::release_telegraph_`）。
+/// 丢弃端点即**解除 telegraph 身份**（投递 [`SessionEvent_::ReleaseTelegraph`]，
+/// 由核心落实），使同一个 `local_dock` 之后可以再作 channel 或 listener 使用
+/// （见 `ChannelRegistry_::release_telegraph_`）。
+///
+/// **本 `Drop` 不取锁、不阻塞**；认领身份的 API 操作在动身份表之前会先清空释放
+/// 邮箱。
 impl<C, S> Drop for Telegraph<C, S>
 where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        self.conn_
+        let _ = self
+            .conn_
             .core_()
             .reg_()
-            .release_telegraph_(self.local_dock_);
+            .post_session_event_(SessionEvent_::ReleaseTelegraph {
+                local_dock: self.local_dock_,
+            });
     }
 }
 

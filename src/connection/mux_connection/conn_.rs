@@ -110,7 +110,7 @@ where
                 },
                 alloc_.clone(),
             ),
-            core_.reg_().loop_token_(0usize),
+            core_.loop_token_(0usize),
         );
         scope.spawn_local(read_fut).detach();
 
@@ -119,7 +119,7 @@ where
             shared_,
             w_receiver_,
             core_.r_events_().clone(),
-            core_.reg_().loop_token_(1usize),
+            core_.loop_token_(1usize),
         );
         scope.spawn_local(write_fut).detach();
 
@@ -167,6 +167,10 @@ where
 
         let shared = LoopShared_::new_(reg.clone(), max_packet_size);
 
+        // 核心自持一份两个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
+        // （那会阻塞，而 `Drop` 可能在任意线程上发生）。
+        let loops = [reg.loop_token_(0usize), reg.loop_token_(1usize)];
+
         let core = Shared::new(
             MuxCore::new_(
                 config,
@@ -175,6 +179,7 @@ where
                 reg,
                 w_events,
                 r_events,
+                loops,
             ),
             alloc.clone(),
         );
@@ -237,6 +242,10 @@ where
     if local_dock.is_special() {
         return Result::Err(BindError::ReservedDock);
     }
+    // 先清空释放邮箱：上一个 `DockBinding` 可能刚被丢弃（`Drop` 只投消息），
+    // 不先落实就会把「已解绑」误判成 `DockInUse`——这是「丢弃后立刻重绑」这条
+    // 既有约定的确定性来源。
+    conn.core_().reg_().drain_session_events_();
     // 独占绑定：同一 local_dock 在任意时刻至多一个 `DockBinding`。
     conn.core_()
         .reg_()

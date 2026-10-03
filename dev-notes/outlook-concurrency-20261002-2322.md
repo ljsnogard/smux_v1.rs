@@ -256,39 +256,6 @@
 「谁碰什么」由此变成一条可检查的规则：**跨线程只有 `Send` 的句柄与消息；共享内存单元
 一律属于 reactor 线程。**
 
----
-
-### 5.7 公开泛型参数：传输为主、错误派生（人类已裁决）
-
-同一轮讨论中的第二项裁决：`MuxConnection`（以及四个句柄、两个半部）的参数应当是
-**传输类型 `R` / `W`**，而不是它们的错误类型：
-
-```text
-之前：MuxConnection<C, S, RE, WE>          // 参数是次要信息，且常常不可命名
-现在：MuxConnection<C, S, R, W>            // 参数是「你手里有什么」
-      TrConnection::Err = MuxError<R, W>   // 错误类型同样以传输为参数
-      MuxError::Rx(<R as TrBuffTryRead<u8>>::Err)   // 载荷由传输派生
-```
-
-三条理由（详细记录见 `connection-20261002-0548.md` §18.7）：
-
-1. **错误类型常常不可命名**：可能是私有类型、或只以
-   `<T as TrBuffTryRead<u8>>::Err` 这样的投影存在。旧形状逼调用方在每一个类型别名里
-   写投影——`tests/common/mod.rs` 上一轮就出现过
-   `MuxConnection<SmokeMuxConfig, S, <R as TrBuffTryRead<u8>>::Err, …>`；改后是
-   `MuxConnection<SmokeMuxConfig, S, R, W>`。
-2. **参数应当是「你手里有什么」**：调用方手里是 `Rx` / `Tx`；错误类型他们从没见过。
-3. **`MuxError` 自己也要这样**（否则问题只是从连接搬到错误类型上）：先试过「引擎枚举
-   保持载荷参数 + 公开类型别名」的方案，实测**模式匹配推不出类型**
-   （`MuxError::DockInUse` → `cannot infer type for type parameter R ... on the type alias`），
-   于是改成**枚举自身以传输为参数**。内部「只碰一个方向」的层用一个 crate 内部的占位
-   半边 `NoHalfway_`（不可构造）写成 `MuxError<R, NoHalfway_>`，把「另一侧不可能出错」
-   变成类型事实。
-
-对 b 的意义：会话句柄的类型别名因此可以只写传输（`ChannelTx<Cfg, S, Rx, Tx>`），
-跨线程移交时用户不需要理解任何错误类型细节；而业务代码（错误分类、日志、重试判定）
-可以直接 `match MuxError::Rx(e)`——`error_.rs` 的 doctest 与 `layered_rpc` 的 F9 探针
-把这条能力钉在了编译期。
 
 ## 6. 目标形状速写（仅示意，不是承诺）
 

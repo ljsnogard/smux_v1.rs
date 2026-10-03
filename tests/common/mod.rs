@@ -573,8 +573,8 @@ async fn run_mux_scenario_<RA, WA, RB, WB, S>(
 /// 握手（A 端发起、B 端等待）并由交付物建立两个 [`MuxConnection`]。
 ///
 /// 抽出来给「收发场景」与「绑定独占性场景」共用，保证两者走的是**同一套**
-/// 连接建立路径。
-async fn connect_pair_<RA, WA, RB, WB, S>(
+/// 连接建立路径；`tests/thread_safety.rs` 也直接用它装配连接。
+pub async fn connect_pair_<RA, WA, RB, WB, S>(
     scope: &S,
     rx_a: RA,
     tx_a: WA,

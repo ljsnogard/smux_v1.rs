@@ -246,6 +246,57 @@ where
     },
 }
 
+/// **会话释放消息**：会话句柄的 `Drop` 只投递它，不碰注册表。
+///
+/// # 为什么 `Drop` 不能自己改注册表
+///
+/// 改注册表要取锁；而锁在跨线程争用时是**阻塞等待**
+/// （见 [`TrBlockingAcquire_`](super::sync_::TrBlockingAcquire_)）。`Drop` 只允许
+/// 「不阻塞、不做事」——它投一条消息，由核心执行者（两个循环、或任意下一次 API
+/// 操作）在**异步上下文**里落实：改身份表、按协议进入 `WAIT_CLOSE`，必要时向对端
+/// 通告。
+///
+/// `ChannelTx::drop` / `ChannelRx::drop` 早就是这个形状（只投 [`WriteEvent_`] /
+/// [`ReadEvent_`]）；本枚举把剩下的四处会话身份释放拉回同一条纪律。
+pub(crate) enum SessionEvent_ {
+    /// `DockBinding` 被丢弃：解绑 `local_dock`。
+    ///
+    /// binding 是**纯本地**身份（对端不可见，帧属于 channel 而不属于 binding），
+    /// 因此没有可宽限的对端状态：消息落实即可重绑（不需要定时宽限期）。
+    UnbindDock {
+        /// 被解绑的本地 dock。
+        local_dock: Dock,
+    },
+
+    /// `ChannelListener` 被丢弃：释放 listener 身份。
+    ReleaseListener {
+        /// 被释放的本地 dock。
+        local_dock: Dock,
+    },
+
+    /// `Telegraph` 被丢弃：释放 telegraph 身份。
+    ReleaseTelegraph {
+        /// 被释放的本地 dock。
+        local_dock: Dock,
+    },
+
+    /// 发起方句柄未裁决就丢弃：**撤销**尚未露面的子流登记（不留宽限期）。
+    UnreserveChannel {
+        /// 本端 dock。
+        local_dock: Dock,
+        /// 对端 dock。
+        remote_dock: Dock,
+    },
+
+    /// 已露过面的子流收尾（响应方未裁决就丢弃）：进入拆流宽限期 `WAIT_CLOSE`。
+    ReleaseChannel {
+        /// 本端 dock。
+        local_dock: Dock,
+        /// 对端 dock。
+        remote_dock: Dock,
+    },
+}
+
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 通道
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -315,6 +366,54 @@ impl<E> TrEventReceiver_<E> for EventReceiver_<E> {
 /// 将来换回定容实现时不必再改导入表。
 #[allow(dead_code)]
 type UnusedTrySendError_ = TrySendError<()>;
+
+/// **会话释放邮箱**：`Drop` 投递、核心执行者 drain。
+///
+/// # 与 `WriteEvent_` / `ReadEvent_` 通道的区别
+///
+/// 那两条通道是**单消费者**（各自的循环独占）；本邮箱**允许多个消费者**：
+/// 两个循环与任意 API 面都可以 drain，每条消息只会被其中一个取到。这是「丢弃
+/// binding 后立刻重绑」能否确定成立的关键——重绑的那次 `bind_async` 自己就能
+/// 把积压的释放消息落实掉，而不必等某个特定任务被调度。
+///
+/// 无界（与另两条通道同理）：消息数有天然上界——每个会话句柄最多投一条。
+pub(crate) struct SessionMailbox_ {
+    /// 生产端；`flume::Sender` 可克隆。
+    tx_: Sender<SessionEvent_>,
+
+    /// 消费端；**可克隆**（多消费者）。
+    rx_: Receiver<SessionEvent_>,
+}
+
+impl Clone for SessionMailbox_ {
+    fn clone(&self) -> Self {
+        SessionMailbox_ {
+            tx_: self.tx_.clone(),
+            rx_: self.rx_.clone(),
+        }
+    }
+}
+
+impl SessionMailbox_ {
+    /// 建一个空邮箱。
+    pub(crate) fn new_() -> Self {
+        let (tx_, rx_) = flume::unbounded();
+        SessionMailbox_ { tx_, rx_ }
+    }
+
+    /// 非阻塞投递（`Drop` 用；**不取任何锁、不阻塞**）。
+    ///
+    /// 返回 `false` 表示消费者已全部消失（注册表自己始终持一份消费者，因此只有
+    /// 连接彻底收尾时才会发生）；调用方按「没送出去」处理即可。
+    pub(crate) fn post_(&self, event: SessionEvent_) -> bool {
+        self.tx_.send(event).is_ok()
+    }
+
+    /// 非阻塞取一条；没有积压时返回 `None`。
+    pub(crate) fn try_take_(&self) -> Option<SessionEvent_> {
+        self.rx_.try_recv().ok()
+    }
+}
 
 #[cfg(test)]
 mod tests_ {

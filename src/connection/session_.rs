@@ -356,6 +356,10 @@ pub(crate) async fn read_loop_async_<C, K>(
         if cancel.is_cancelled() {
             return;
         }
+        // 0. 先落实**会话释放**消息：`Drop` 只投消息、不碰身份表，因此处理「未知
+        // 子流」之前必须先让「刚被丢弃的句柄」的释放生效——否则在途帧会被误判成
+        // 协议违例，而不是宽限期（`WAIT_CLOSE`）内的静默丢弃。
+        shared.reg_.drain_session_events_();
         // 1. 先把挂起的 Attach / Release 排空。
         drain_read_events_::<C>(&mut events, &mut table);
 
@@ -630,7 +634,11 @@ pub(crate) async fn write_loop_async_<C, K>(
             return;
         }
 
-        // 0. 先把**已经到达**的事件处理掉（非阻塞）。
+        // 0. 先落实**会话释放**消息（`Drop` 只投消息、不碰身份表）。写循环也做这
+        // 件事，是为了让释放不必等某次 API 操作：两个循环任一被调度即可推进。
+        shared.reg_.drain_session_events_();
+
+        // 1. 先把**已经到达**的事件处理掉（非阻塞）。
         //
         // 这一步的顺序很关键：下面第 2 步会 park 在「最近通知过的那条发送环」上；
         // 若不在 park 之前排空事件队列，其它子流的 `Attach` / `Control`（例如它们

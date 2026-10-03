@@ -11,6 +11,7 @@ use crate::connection::{
     channel_half::{ChannelRx, ChannelTx},
     channel_listener::ChannelListener,
     error_::face_error_impls,
+    signal_::SessionEvent_,
     util_::read_available_into_vec_,
 };
 
@@ -102,8 +103,11 @@ where
     }
 }
 
-/// 丢弃绑定即**解绑**：释放 `local_dock` 的独占占用，使同一个 dock 之后可以再次
-/// `bind_async`（见 `ChannelRegistry_::unbind_dock_`）。
+/// 丢弃绑定即**解绑**：向核心投递一条释放消息，使同一个 dock 之后可以再次
+/// `bind_async`（见 `ChannelRegistry_::unbind_dock_` 与 `SessionEvent_::UnbindDock`）。
+///
+/// **本 `Drop` 不取任何锁、不阻塞**：真正的解绑由核心执行者 drain 后落实。因为
+/// `bind_async` 在动身份表之前会先清空释放邮箱，「丢弃后立刻重绑」仍然是确定的。
 ///
 /// 注意解绑**不**影响已经由该 binding 建立、且仍在应用手里的子流半部：那些
 /// [`ChannelTx`] / [`ChannelRx`] 不借用 binding，`unbind_dock_` 也不会动它们。
@@ -112,7 +116,13 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        self.conn_.core_().reg_().unbind_dock_(self.local_dock_);
+        let _ = self
+            .conn_
+            .core_()
+            .reg_()
+            .post_session_event_(SessionEvent_::UnbindDock {
+                local_dock: self.local_dock_,
+            });
     }
 }
 
@@ -177,6 +187,9 @@ where
 {
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
+    // 先清空释放邮箱：上一位持有者可能刚丢弃它的 listener（Drop 只投消息），
+    // 不先落实就会把「已释放」误判成「已被占用」。
+    conn.core_().reg_().drain_session_events_();
     // 登记 listener 身份（统一身份表里的 `(local, wildcard)`）：它既是「本 dock 在
     // 监听」的事实，也是入向等待者的落点；若该 dock 已作 telegraph 会被拒。
     conn.core_()
@@ -202,6 +215,8 @@ where
 {
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
+    // 同 `listen_async`：先落实积压的释放消息，再认领身份。
+    conn.core_().reg_().drain_session_events_();
     conn.core_()
         .reg_()
         .reserve_telegraph_(local)
@@ -238,6 +253,9 @@ where
     if remote_dock.is_special() {
         return Result::Err(BindingError::ReservedDock);
     }
+    // 先落实积压的释放消息：发起方「未裁决就丢弃」的撤销（`UnreserveChannel`）与
+    // 响应方的宽限登记（`ReleaseChannel`）都可能是同一条 dock 对的上一轮残留。
+    conn.core_().reg_().drain_session_events_();
     // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）。
     conn.core_()
         .reg_()

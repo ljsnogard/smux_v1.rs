@@ -9,6 +9,7 @@ use crate::connection::{
     Dock, MuxConnection, MuxError, TrConnCfg,
     channel_handle::ChannelHandle,
     error_::face_error_impls,
+    signal_::SessionEvent_,
 };
 
 /// [`TrChannelListener`](abs_smux::conn::TrChannelListener) 的错误类型。
@@ -60,8 +61,12 @@ where
     }
 }
 
-/// 丢弃监听器即**解除 listener 身份**，使同一个 `local_dock` 之后可以再作
-/// telegraph 使用（见 `ChannelRegistry_::release_listener_`）。
+/// 丢弃监听器即**解除 listener 身份**（投递 [`SessionEvent_::ReleaseListener`]，
+/// 由核心落实），使同一个 `local_dock` 之后可以再作 telegraph 使用
+/// （见 `ChannelRegistry_::release_listener_`）。
+///
+/// **本 `Drop` 不取锁、不阻塞**；`listen_async` / `open_telegraph_async` 在认领身份
+/// 之前会先清空释放邮箱，因此「丢弃后立刻复用同一 dock」仍然是确定的。
 ///
 /// 注意这不影响该 dock 上已经建立、且在应用手里的子流半部。
 impl<C, S> Drop for ChannelListener<C, S>
@@ -69,10 +74,13 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        self.conn_
+        let _ = self
+            .conn_
             .core_()
             .reg_()
-            .release_listener_(self.local_dock_);
+            .post_session_event_(SessionEvent_::ReleaseListener {
+                local_dock: self.local_dock_,
+            });
     }
 }
 

@@ -97,7 +97,8 @@ use crate::{
     connection::{
         Dock, MuxError,
         owner_::ChannelOwner_,
-        sync_::{CancelToken_, WakerSlot_, on_lock_contended_},
+        signal_::{SessionEvent_, SessionMailbox_},
+        sync_::{CancelToken_, TrBlockingAcquire_, WakerSlot_},
     },
     flow_ctrl::WindowReport,
     handshake::opts::BasicOpts,
@@ -398,8 +399,14 @@ where
 ///
 /// 所有方法都取 `&self`：内部可变性由 `atomic_sync` 的**协作式读写锁**
 /// （`rwlock::cooperative::CooperativeRwLock`）提供。临界区都很短（映射增删与
-/// 计数），且**不跨 `await`**——这里只取它的同步快路径（`try_read` / `try_write`
-/// + 自旋）；保留异步守卫是为了后续把需要跨 `await` 持锁的路径迁进来。
+/// 计数），且**不跨 `await`**；争用时经 [`TrBlockingAcquire_`] **park 等待**，
+/// 因此没有 CPU 忙等，也不会像自旋那样在核间制造 cache line 乒乓。
+///
+/// # 会话释放邮箱
+///
+/// 会话句柄的 `Drop` **不碰注册表**，只向 [`SessionMailbox_`] 投一条
+/// [`SessionEvent_`]；真正的身份表改动由核心执行者在异步上下文里 drain 后落实
+/// （[`ChannelRegistry_::drain_session_events_`]）。因此 `Drop` 既不取锁也不阻塞。
 ///
 /// # 分配
 ///
@@ -407,13 +414,17 @@ where
 /// 条目的分配 / 归还都由该分配器承担，注册表本身不隐式分配。
 ///
 /// 已知例外：外层锁 `CooperativeRwLockOwned` 内部用全局 `Arc` 持有同步核心
-/// （`atomic_sync` 尚未支持 `allocator_api`），即**每次连接一次**的全局分配。
-/// 后续引入 `TrMaxAllocConfig` 时会连同这一处一起记账。
+/// （`atomic_sync` 尚未支持 `allocator_api`），即**每次连接一次**的全局分配；
+/// 释放邮箱走 `flume`，同样是全局分配（已有例外）。后续引入 `TrMaxAllocConfig`
+/// 时会连同这两处一起记账。
 pub(crate) struct ChannelRegistry_<A>
 where
     A: AllocatorClone,
 {
     inner_: Shared<CooperativeRwLockOwned<RegistryInner_<A>>, A>,
+
+    /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
+    mailbox_: SessionMailbox_,
 }
 
 impl<A> Clone for ChannelRegistry_<A>
@@ -423,6 +434,8 @@ where
     fn clone(&self) -> Self {
         ChannelRegistry_ {
             inner_: self.inner_.clone(),
+            // 邮箱按值克隆：生产端共享同一条队列，消费端因此有**多个** drain 者。
+            mailbox_: self.mailbox_.clone(),
         }
     }
 }
@@ -466,6 +479,52 @@ where
                 }),
                 alloc,
             ),
+            mailbox_: SessionMailbox_::new_(),
+        }
+    }
+
+    /// 投递一条**会话释放消息**（会话句柄的 `Drop` 调用）。
+    ///
+    /// **不取锁、不阻塞**：消息由 [`ChannelRegistry_::drain_session_events_`] 落实。
+    /// 返回值表示邮箱是否仍在（连接收尾时为 `false`，按「没送出去」处理）。
+    pub(crate) fn post_session_event_(&self, event: SessionEvent_) -> bool {
+        self.mailbox_.post_(event)
+    }
+
+    /// 取出并落实**全部**积压的会话释放消息。
+    ///
+    /// 这是「核心内部调度」的入口：两个循环每轮调用它；会创建 / 认领身份的 API
+    /// 操作（`bind` / `listen` / `open_telegraph` / `open_channel` / `accept` /
+    /// `reject`）在动身份表之前也调用它，于是「丢弃句柄后立刻复用同一身份」不需要
+    /// 等某个特定任务被调度。
+    ///
+    /// # Panics
+    ///
+    /// **调用方不得正持有本注册表的锁**：落实每条消息都要再取一次锁。
+    pub(crate) fn drain_session_events_(&self) {
+        while let Option::Some(event) = self.mailbox_.try_take_() {
+            self.apply_session_event_(event);
+        }
+    }
+
+    /// 落实一条释放消息（内部方法：只由 drain 调用，**不自行 drain**）。
+    fn apply_session_event_(&self, event: SessionEvent_) {
+        match event {
+            SessionEvent_::UnbindDock { local_dock } => self.unbind_dock_(local_dock),
+            SessionEvent_::ReleaseListener { local_dock } => {
+                self.release_listener_(local_dock)
+            }
+            SessionEvent_::ReleaseTelegraph { local_dock } => {
+                self.release_telegraph_(local_dock)
+            }
+            SessionEvent_::UnreserveChannel {
+                local_dock,
+                remote_dock,
+            } => self.unreserve_channel_(local_dock, remote_dock),
+            SessionEvent_::ReleaseChannel {
+                local_dock,
+                remote_dock,
+            } => self.release_channel_(local_dock, remote_dock),
         }
     }
 
@@ -967,23 +1026,17 @@ where
     }
 
     /// 持读锁执行 `f`（临界区不得 `await`、不得重入）。
+    ///
+    /// 争用时**阻塞等待**而不是自旋或 panic：见 [`TrBlockingAcquire_`]。
     fn with_<R>(&self, f: impl FnOnce(&RegistryInner_<A>) -> R) -> R {
-        let mut session = self.inner_.acquire_session();
-        let guard = match session.try_read() {
-            Result::Ok(guard) => guard,
-            Result::Err(_) => on_lock_contended_(),
-        };
-        f(&guard)
+        self.inner_.with_read_blocking_(f)
     }
 
     /// 持写锁执行 `f`（临界区不得 `await`、不得重入）。
+    ///
+    /// 争用时**阻塞等待**而不是自旋或 panic：见 [`TrBlockingAcquire_`]。
     fn with_mut_<R>(&self, f: impl FnOnce(&mut RegistryInner_<A>) -> R) -> R {
-        let mut session = self.inner_.acquire_session();
-        let mut guard = match session.try_write() {
-            Result::Ok(guard) => guard,
-            Result::Err(_) => on_lock_contended_(),
-        };
-        f(&mut guard)
+        self.inner_.with_write_blocking_(f)
     }
 }
 

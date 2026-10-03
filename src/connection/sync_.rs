@@ -7,22 +7,23 @@
 //!
 //! 注册表（dock / 子流索引与配额）已移到 `mux_connection::registry_`。
 //!
-//! # 共享单元：直接用 `atomic_sync` 的读写锁
+//! # 共享单元：`atomic_sync` 的协作式读写锁 + 阻塞等待
 //!
-//! 本模块不再手搓「内部可变性单元」。需要共享可变状态的两处都直接用
-//! `atomic_sync` 的锁，按各自需求选型：
+//! 本模块不再手搓「内部可变性单元」。需要共享可变状态的地方直接用 `atomic_sync`
+//! 的锁：
 //!
-//! - `mux_connection::registry_` 的注册表用**协作式读写锁**
-//!   （`rwlock::cooperative::CooperativeRwLock`）：临界区同样是短闭包，但它保留
-//!   了 `read_async` / `write_async`，便于后续把需要跨 `await` 持锁的路径迁进来；
-//! - [`CancelToken_`] 的内部状态用**抢占式自旋读写锁**
-//!   （`rwlock::preemptive::SpinningRwLock`）：`TrCancellationToken` 要求
-//!   `Send + Sync`，而该锁零内部堆分配、可内联进 `Shared`，符合本 crate
-//!   「不隐式分配」的纪律；每条子流的 `ChannelOwner_` 也在 `owner_` 里用它。
+//! - `mux_connection::registry_` 的注册表与 [`CancelToken_`] 都用**协作式读写锁**
+//!   （`rwlock::cooperative::CooperativeRwLock`）。它保留 `read_async` /
+//!   `write_async`，因此争用时可以**让出 CPU**：许可释放时锁内部唤醒我们注册的
+//!   waker，而那个 waker 就是 [`std::thread::unpark`]（见 [`TrBlockingAcquire_`]）。
+//! - 每条子流的 `ChannelOwner_` 仍在 `owner_` 里用**抢占式自旋读写锁**：它按子流
+//!   分配，用协作式锁会为每条子流多一次全局 `Arc` 分配。它走
+//!   [`TrBackoffAcquire_`]——争用时**睡眠重试**，因此同样零忙等、不 panic；该处的
+//!   跨线程访问本身属于第 2 期要消除的对象（outlook §5.5）。
 //!
-//! 两者都只取同步快路径（`try_read` / `try_write`），因此**闭包内不得 `await`、
-//! 不得重入**：连接与全部句柄都是单线程对象，取不到锁只可能是重入，因此直接
-//! panic（见 [`on_lock_contended_`]）。
+//! 取锁一律只走同步快路径（`try_read` / `try_write`），失败才进阻塞慢路径；
+//! 因此**闭包内不得 `await`、不得重入**——重入会让本线程永久 park（见
+//! [`TrBlockingAcquire_`] 的 `# Panics`）。
 //!
 //! # 唤醒
 //!
@@ -44,22 +45,173 @@ use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll, Waker},
+    time::Duration,
+};
+use std::{
+    sync::Arc,
+    task::Wake,
+    thread::{self, Thread},
 };
 
 use abs_cancel::TrCancellationToken;
-use atomic_sync::rwlock::preemptive::SpinningRwLockOwned;
+use atomic_sync::rwlock::{
+    cooperative::CooperativeRwLockOwned,
+    preemptive::SpinningRwLockOwned,
+};
 use buffex::x_deps::{abs_cancel, atomic_sync};
 use mm_ptr::Shared;
 
 
 
-/// 同步取锁失败时的统一处理。
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 阻塞式取锁：争用时 park 本线程，零 CPU 忙等
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 退避式重试的睡眠步长。
 ///
-/// 单线程配置下「取不到锁」必然是**临界区重入**这一代码 bug（没有别的执行者），
-/// 因此直接 panic——与旧 `RefCell` 单元一致，便于尽早暴露；多线程配置下则可能
-/// 只是另一线程短暂持锁，自旋等待即可。
-pub(crate) fn on_lock_contended_() -> ! {
-    panic!("共享状态的临界区不可重入");
+/// 受定时器粒度约束（Linux 默认 timer slack 约 50µs），因此这是**争用时的延迟
+/// 下限**；只在自旋锁的争用路径上使用，正常快路径不付这个代价。
+const K_BACKOFF: Duration = Duration::from_micros(50);
+
+/// **抢占式（自旋）锁的退避式获取**。
+///
+/// 自旋锁内部没有等待队列，无法被「许可释放」直接唤醒，因此只能轮询；这里让每次
+/// 失败重试之间 `park_timeout` **睡眠**而不是自旋，所以同样零 CPU 忙等。
+///
+/// # 与 [`TrBlockingAcquire_`] 的分工
+///
+/// 协作式锁能注册 waker，于是许可一释放就把线程叫醒（无额外延迟）；自旋锁没有
+/// 这个能力，只能靠定时重试，因此争用时延迟受定时器粒度约束。当前只有
+/// `owner_::ChannelOwner_` 用本 trait——它按**子流**分配，换协作式锁会为每条子流
+/// 多一次全局 `Arc` 分配；而它按第 2 期计划会被移出跨线程域，届时整个退避路径
+/// 连同这把自旋锁一起消失。
+///
+/// # Panics
+///
+/// 同一线程重入会**永久睡眠重试**。`owner_` 的临界区不调用任何取锁方法（与注册表
+/// 同样检查过），因此这是代码纪律而非运行期条件。
+pub(crate) trait TrBackoffAcquire_<T> {
+    /// 取读许可（必要时睡眠重试）后执行 `f`（`f` 内不得 `await`、不得重入）。
+    fn with_read_backoff_<R>(&self, f: impl FnOnce(&T) -> R) -> R;
+
+    /// 取写许可（必要时睡眠重试）后执行 `f`（`f` 内不得 `await`、不得重入）。
+    fn with_write_backoff_<R>(&self, f: impl FnOnce(&mut T) -> R) -> R;
+}
+
+impl<T> TrBackoffAcquire_<T> for SpinningRwLockOwned<T> {
+    fn with_read_backoff_<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let mut session = self.acquire_session();
+        loop {
+            match session.try_read() {
+                Result::Ok(guard) => return f(&guard),
+                Result::Err(_) => thread::park_timeout(K_BACKOFF),
+            }
+        }
+    }
+
+    fn with_write_backoff_<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut session = self.acquire_session();
+        loop {
+            match session.try_write() {
+                Result::Ok(mut guard) => return f(&mut guard),
+                Result::Err(_) => thread::park_timeout(K_BACKOFF),
+            }
+        }
+    }
+}
+
+/// 「唤醒 = unpark 指定线程」的 waker：把协作式锁的 waker 唤醒接到线程 park 上。
+struct UnparkWake_ {
+    /// 等待取锁的那条线程。
+    thread_: Thread,
+}
+
+impl Wake for UnparkWake_ {
+    fn wake(self: Arc<Self>) {
+        self.thread_.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread_.unpark();
+    }
+}
+
+/// 协作式读写锁的**同步阻塞**获取。
+///
+/// 快路径仍是 `try_read` / `try_write`（无争用时零等待、零调度）；争用时把
+/// `read_async` / `write_async` 的唤醒接到 [`std::thread::park`]：许可释放时锁内部
+/// 调用我们注册的 waker → `unpark` → `park` 返回 → 重新 poll。因此 CPU 不空转，
+/// 也不会像自旋那样在核间制造 cache line 乒乓。
+///
+/// # 为什么不是 `.await`
+///
+/// 取锁点分布在 async 上下文、`Future::poll` 与 `Drop` 三类位置，后两类无法
+/// `await`。用 park 版同步获取把它们统一到**同一条争用策略**上，避免同一把锁出现
+/// 两套等待语义（异步等待与同步等待混用时极易写出活锁）。若将来某条纯 async 路径
+/// 需要「不占用运行时线程」，再为它单独引入 `*_async` 获取即可，语义互补。
+///
+/// # Panics
+///
+/// 同一线程重入同一把锁会**永久 park**：协作式锁的等待队列不会把许可发给尚未释放
+/// 的持有者。本 crate 的临界区从不重入（`registry_` 的闭包内不调用任何取锁方法），
+/// 因此这是一条**代码纪律**；若将来出现重入，应在这里补持有者线程检测。
+pub(crate) trait TrBlockingAcquire_<T> {
+    /// 同步取读许可后执行 `f`（`f` 内不得 `await`、不得重入）。
+    fn with_read_blocking_<R>(&self, f: impl FnOnce(&T) -> R) -> R;
+
+    /// 同步取写许可后执行 `f`（`f` 内不得 `await`、不得重入）。
+    fn with_write_blocking_<R>(&self, f: impl FnOnce(&mut T) -> R) -> R;
+}
+
+impl<T> TrBlockingAcquire_<T> for CooperativeRwLockOwned<T> {
+    fn with_read_blocking_<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let mut session = self.acquire_session();
+        if let Result::Ok(guard) = session.try_read() {
+            return f(&guard);
+        }
+        // 慢路径：**让出 CPU**——登记「unpark 本线程」的 waker 后 park，等许可释放。
+        let current = thread::current();
+        let waker = Waker::from(Arc::new(UnparkWake_ { thread_: current }));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(core::future::IntoFuture::into_future(
+            session.read_async(),
+        ));
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(Result::Ok(guard)) => return f(&guard),
+                // 不可取消的获取 future 只会被取消令牌置为 `Cancelled`，而这里没有令牌。
+                Poll::Ready(Result::Err(err)) => {
+                    unreachable!("不可取消的读获取 future 不应返回错误：{err:?}")
+                }
+                // `park` 允许虚假唤醒，回到循环重新 poll 即可；许可释放时的 `unpark`
+                // 会留下令牌，因此「poll 返回 Pending」与「park」之间不会丢唤醒。
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
+
+    fn with_write_blocking_<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut session = self.acquire_session();
+        if let Result::Ok(mut guard) = session.try_write() {
+            return f(&mut guard);
+        }
+        let current = thread::current();
+        let waker = Waker::from(Arc::new(UnparkWake_ { thread_: current }));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(core::future::IntoFuture::into_future(
+            session.write_async(),
+        ));
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(Result::Ok(mut guard)) => return f(&mut guard),
+                // 同上：不可取消的获取 future 不会返回错误。
+                Poll::Ready(Result::Err(err)) => {
+                    unreachable!("不可取消的写获取 future 不应返回错误：{err:?}")
+                }
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -73,8 +225,9 @@ pub(crate) fn on_lock_contended_() -> ! {
 /// 常量令牌，缺「可触发」的那一个，因此本 crate 补上它。
 ///
 /// 内部状态必须 `Send + Sync`（[`TrCancellationToken`] 的 supertrait 要求），
-/// 因此用 `atomic_sync` 的**抢占式自旋读写锁**（零内部堆分配，可内联进
-/// [`Shared`]），而不是手搓单元。
+/// 因此用 `atomic_sync` 的**协作式读写锁**（可内联进 [`Shared`]，争用时经
+/// [`TrBlockingAcquire_`] park 等待，零 CPU 忙等）。协作式锁内部会多一次
+/// 「每条连接两个令牌」的全局 `Arc` 分配，与注册表同一处已记录的例外。
 ///
 /// # 单等待者
 ///
@@ -86,7 +239,7 @@ pub(crate) struct CancelToken_<A>
 where
     A: AllocatorClone,
 {
-    inner_: Shared<SpinningRwLockOwned<CancelInner_>, A>,
+    inner_: Shared<CooperativeRwLockOwned<CancelInner_>, A>,
 }
 
 /// 取消令牌的内部状态。
@@ -117,7 +270,7 @@ where
     pub(crate) fn new_(alloc: A) -> Self {
         CancelToken_ {
             inner_: Shared::new(
-                SpinningRwLockOwned::new_owned(CancelInner_ {
+                CooperativeRwLockOwned::new_owned(CancelInner_ {
                     cancelled_: false,
                     waker_: Option::None,
                 }),
@@ -141,22 +294,12 @@ where
 
     /// 持读锁执行 `f`（临界区不得 `await`、不得重入）。
     fn with_<R>(&self, f: impl FnOnce(&CancelInner_) -> R) -> R {
-        let mut session = self.inner_.acquire_session();
-        let guard = match session.try_read() {
-            Result::Ok(guard) => guard,
-            Result::Err(_) => on_lock_contended_(),
-        };
-        f(&guard)
+        self.inner_.with_read_blocking_(f)
     }
 
     /// 持写锁执行 `f`（临界区不得 `await`、不得重入）。
     fn with_mut_<R>(&self, f: impl FnOnce(&mut CancelInner_) -> R) -> R {
-        let mut session = self.inner_.acquire_session();
-        let mut guard = match session.try_write() {
-            Result::Ok(guard) => guard,
-            Result::Err(_) => on_lock_contended_(),
-        };
-        f(&mut guard)
+        self.inner_.with_write_blocking_(f)
     }
 }
 
