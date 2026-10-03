@@ -7,17 +7,57 @@ use abs_smux::{conn::TrDockBinding, dock::TrDock};
 use buffex::x_deps::abs_buff;
 
 use crate::connection::{
-    BindingError, ChannelHandle, Dock, MuxConnection, ReserveErr_, TrConnCfg,
+    ChannelHandle, Dock, MuxError, MuxConnection, ReserveErr_, TrConnCfg,
     channel_half::{ChannelRx, ChannelTx},
     channel_listener::ChannelListener,
+    error_::face_error_impls,
     util_::read_available_into_vec_,
 };
 
+/// [`TrDockBinding`](abs_smux::conn::TrDockBinding) 的错误类型。
+///
+/// 一个 binding 上可以做三件事——`listen_async` / `open_telegraph_async` /
+/// `open_channel_async`——它们共用这一个错误类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingError {
+    /// 对端 dock 是协议保留值，不能当身份用（只可能来自 `open_channel`）。
+    ReservedDock,
+
+    /// 同一 dock 对上已有活跃子流（`open_channel`）。
+    Duplicate,
+
+    /// 该 dock 对刚关闭，仍在拆流宽限期内（`open_channel`）。
+    WaitClose,
+
+    /// 该 dock 上的活动子流数已达上限（`open_channel`）。
+    DockChanLimit,
+
+    /// 连接上的活动子流数已达上限（`open_channel`）。
+    ChanLimit,
+
+    /// 该 local_dock 已被占用（listener / telegraph / channel 不得冲突）。
+    DockInUse,
+
+    /// 子流 / 连接已关闭（`open_channel`）。
+    Closed,
+
+    /// 连接级失败。
+    Mux(MuxError),
+}
+
+face_error_impls!(
+    BindingError,
+    BindingError::ReservedDock => "对端 dock 是协议保留值，不能作为身份",
+    BindingError::Duplicate => "同一 dock 对上已有活跃子流",
+    BindingError::WaitClose => "该 dock 对刚关闭，仍在拆流宽限期内",
+    BindingError::DockChanLimit => "该 dock 上的活动子流数已达上限",
+    BindingError::ChanLimit => "连接上的活动子流数已达上限",
+    BindingError::DockInUse => "该 local_dock 已被占用",
+    BindingError::Closed => "子流 / 连接已关闭",
+);
+
 /// 把注册表的预留失败映射进 binding 的错误类型。
-fn map_reserve_err_<C>(err: ReserveErr_) -> BindingError<C>
-where
-    C: TrConnCfg,
-{
+fn map_reserve_err_(err: ReserveErr_) -> BindingError {
     match err {
         ReserveErr_::DockInUse => BindingError::DockInUse,
         ReserveErr_::Duplicate => BindingError::Duplicate,
@@ -80,7 +120,7 @@ impl<C, S> TrDockBinding<C> for DockBinding<C, S>
 where
     C: TrConnCfg,
 {
-    type Err = BindingError<C>;
+    type Err = BindingError;
 
     type ChannelHandle = ChannelHandle<C, S>;
 
@@ -129,7 +169,7 @@ where
 async fn mux_listen_async_<'f, C, S, K>(
     binding: &'f mut DockBinding<C, S>,
     _cancel: K,
-) -> Result<ChannelListener<C, S>, BindingError<C>>
+) -> Result<ChannelListener<C, S>, BindingError>
 where
     C: TrConnCfg + 'f,
     S: 'f,
@@ -154,7 +194,7 @@ where
 async fn mux_open_telegraph_async_<'f, C, S, K>(
     binding: &'f mut DockBinding<C, S>,
     _cancel: K,
-) -> Result<crate::connection::Telegraph<C, S>, BindingError<C>>
+) -> Result<crate::connection::Telegraph<C, S>, BindingError>
 where
     C: TrConnCfg + 'f,
     S: 'f,
@@ -186,7 +226,7 @@ async fn mux_open_channel_async_<'f, C, S, M, K>(
     remote_dock: Dock,
     message: &'f mut M,
     cancel: K,
-) -> Result<ChannelHandle<C, S>, BindingError<C>>
+) -> Result<ChannelHandle<C, S>, BindingError>
 where
     C: TrConnCfg + 'f,
     S: 'f,

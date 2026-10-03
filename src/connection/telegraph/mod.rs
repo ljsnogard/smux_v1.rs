@@ -21,5 +21,5 @@
 mod endpoint_;
 
 pub use endpoint_::{
-    Telegraph,
+    Telegraph, TelegraphError,
 };

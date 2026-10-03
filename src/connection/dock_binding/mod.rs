@@ -6,5 +6,5 @@
 mod binding_;
 
 pub use binding_::{
-    DockBinding,
+    BindingError, DockBinding,
 };

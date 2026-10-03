@@ -104,9 +104,8 @@ use smux_v1::{
 /// tokio 用 `scope.run_until(..)` 包住整段使用期，compio 由运行时自己驱动。
 pub use abs_art::TrLocalScope as TrSmokeScope;
 
-/// 一端连接对象的类型：策略固定为 [`SmokeMuxConfig`]，另外两个参数就是**传输**类型
-/// （`R` / `W`）——连接对外的错误类型由它们派生（`MuxError<R::Err, W::Err>`），
-/// 因此调用方不必（也常常无法）命名错误类型。
+/// 一端连接对象的类型：策略固定为 [`SmokeMuxConfig`]，传输类型由策略的类型参数
+/// `R` / `W` 声明；连接对外的错误类型统一为无泛型的 [`MuxError`]。
 pub type SmokeConn<R, W, S> = MuxConnection<SmokeMuxConfig<W, R>, S>;
 
 /// 测试侧对「闭包造两块缓冲」这一常见写法的适配器。
@@ -145,7 +144,7 @@ where
         &'f mut self,
         welcome: &'f mut W,
         prepare: F,
-    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError<C>>
+    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>
     where
         W: 'f + TrBuffWrite<u8>,
         F: FnOnce() -> (C::Buff, C::Buff);
@@ -159,7 +158,7 @@ where
         &'f mut self,
         welcome: &'f mut W,
         prepare: F,
-    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError<C>>
+    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>
     where
         W: 'f + TrBuffWrite<u8>,
         F: FnOnce() -> (C::Buff, C::Buff),

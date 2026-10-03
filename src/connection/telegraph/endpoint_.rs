@@ -13,7 +13,24 @@ use abs_smux::conn::TrTelegraph;
 use anylr::SomeOf;
 use buffex::x_deps::{abs_buff, anylr};
 
-use crate::connection::{Dock, MuxConnection, TelegraphError, TrConnCfg};
+use crate::connection::{Dock, MuxConnection, MuxError, TrConnCfg, error_::face_error_impls};
+
+/// [`TrTelegraph`](abs_smux::conn::TrTelegraph) 的错误类型（`send_async` / `recv_async`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegraphError {
+    /// 报文超过协商的 `max_packet_size`。
+    ///
+    /// 注意 remote dock 取 `wildcard` / `unspecified` **不是**错误：那是合法目的地址。
+    FrameTooLarge,
+
+    /// 连接级失败。
+    Mux(MuxError),
+}
+
+face_error_impls!(
+    TelegraphError,
+    TelegraphError::FrameTooLarge => "报文超过协商的最大报文长度",
+);
 
 /// 数据报端点。
 ///
@@ -61,7 +78,7 @@ impl<C, S> TrTelegraph<C> for Telegraph<C, S>
 where
     C: TrConnCfg,
 {
-    type Err = TelegraphError<C>;
+    type Err = TelegraphError;
 
     type SendAsync<'f, M> = MuxSendAsync<'f, 'f, C, S, M>
     where
@@ -107,7 +124,7 @@ async fn mux_send_async_<'f, C, S, M, K>(
     remote_dock: Dock,
     packet: &'f mut M,
     _cancel: K,
-) -> SomeOf<usize, TelegraphError<C>>
+) -> SomeOf<usize, TelegraphError>
 where
     C: TrConnCfg + 'f,
     S: 'f,
@@ -124,7 +141,7 @@ async fn mux_recv_async_<'f, C, S, M, K>(
     remote_dock: Dock,
     buffer: &'f mut M,
     _cancel: K,
-) -> SomeOf<usize, TelegraphError<C>>
+) -> SomeOf<usize, TelegraphError>
 where
     C: TrConnCfg + 'f,
     S: 'f,

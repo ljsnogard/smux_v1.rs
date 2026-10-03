@@ -95,13 +95,34 @@ use mm_ptr::Shared;
 
 use crate::{
     connection::{
-        Dock, MuxError, ReserveErr_, TrConnCfg,
+        Dock, MuxError,
         owner_::ChannelOwner_,
-        sync_::{CancelToken_, FailKind_, WakerSlot_, on_lock_contended_},
+        sync_::{CancelToken_, WakerSlot_, on_lock_contended_},
     },
     flow_ctrl::WindowReport,
     handshake::opts::BasicOpts,
 };
+
+/// 注册表在「预留 / 绑定一个身份」时能给出的失败。
+///
+/// 它只在本模块内部使用；不同 API 面会把它映射进各自公开错误枚举。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReserveErr_ {
+    /// 该 local_dock 已被占用（binding / channel / telegraph / listener）。
+    DockInUse,
+
+    /// 同一 dock 对上已有活跃子流。
+    Duplicate,
+
+    /// 该 dock 对刚关闭，仍在拆流宽限期内。
+    WaitClose,
+
+    /// 该 dock 上的活动子流数已达上限。
+    DockChanLimit,
+
+    /// 连接上的活动子流数已达上限。
+    ChanLimit,
+}
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 键的构造与区间
@@ -317,7 +338,7 @@ where
     total_: usize,
 
     /// 连接级失败（**首个**原因保留，之后的失败不再覆盖）。
-    fail_: Option<FailKind_>,
+    fail_: Option<MuxError>,
 
     /// 两个循环各自的取消令牌（见 [`ChannelRegistry_::cancel_loops_`]）。
     loops_: [CancelToken_<A>; 2],
@@ -890,14 +911,10 @@ where
     /// 记下连接级失败（**首个**原因生效），唤醒两个循环的取消令牌，并唤醒所有
     /// 等待中的 API 面 future（监听者的 `income_async` 与建流的
     /// `open_channel_async`），避免它们空等一个已经死掉的循环。
-    pub(crate) fn mark_failed_<C>(&self, err: &MuxError<C>)
-    where
-        C: TrConnCfg,
-    {
-        let kind = FailKind_::of_(err);
+    pub(crate) fn mark_failed_(&self, err: &MuxError) {
         let wakers = self.with_mut_(|inner| {
             if inner.fail_.is_none() {
-                inner.fail_ = Option::Some(kind);
+                inner.fail_ = Option::Some(*err);
             }
             let mut out: Vec<Waker> = Vec::new();
             for binding in inner.bindings_.values_mut() {
@@ -927,7 +944,7 @@ where
     }
 
     /// 连接级失败的原因（若有）。
-    pub(crate) fn failure_(&self) -> Option<FailKind_> {
+    pub(crate) fn failure_(&self) -> Option<MuxError> {
         self.with_(|inner| inner.fail_)
     }
 
@@ -1479,6 +1496,36 @@ use crate::{
             "释放后反向索引必须同步摘除（墓碑不入索引）"
         );
         assert_index_consistent_(&registry);
+    }
+
+    /// 测试连接级失败只保留首个原因，并取消两个循环的令牌。
+    #[test]
+    fn failure_keeps_first_cause_and_cancels_loops() {
+        use buffex::x_deps::abs_cancel::TrCancellationToken;
+
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+        assert!(!registry.is_failed_());
+        let read_loop = registry.loop_token_(0usize);
+        let write_loop = registry.loop_token_(1usize);
+        assert!(
+            !TrCancellationToken::is_cancelled(&read_loop)
+                && !TrCancellationToken::is_cancelled(&write_loop)
+        );
+
+        registry.mark_failed_(&MuxError::PeerClosed);
+        assert!(registry.is_failed_());
+        assert_eq!(registry.failure_(), Option::Some(MuxError::PeerClosed));
+        assert!(
+            TrCancellationToken::is_cancelled(&read_loop)
+                && TrCancellationToken::is_cancelled(&write_loop)
+        );
+
+        registry.mark_failed_(&MuxError::MalformedFrame);
+        assert_eq!(
+            registry.failure_(),
+            Option::Some(MuxError::PeerClosed),
+            "首个失败原因应当保留"
+        );
     }
 
     /// 用 [`ChannelRegistry_::for_each_local_of_remote_`] 收集某个 remote 的 local 集合。

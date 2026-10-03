@@ -16,5 +16,5 @@ mod conn_;
 mod core_;
 mod registry_;
 
-pub use conn_::MuxConnection;
-pub(crate) use registry_::ChannelRegistry_;
+pub use conn_::{BindError, MuxConnection};
+pub(crate) use registry_::{ChannelRegistry_, ReserveErr_};

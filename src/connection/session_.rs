@@ -223,9 +223,9 @@ where
 /// 连接被丢弃时 [`MuxCore::drop`](super::mux_connection::core_::MuxCore) 触发取消
 /// 令牌，循环在 await 点上以「取消错误」的形式收到通知并退出——那是正常关闭，
 /// 不应在注册表上留下失败标志（否则收尾路径会伪造出一个假的连接级失败）。
-fn fail_loop_<C, K>(shared: &LoopShared_<C::Alloc>, cancel: &K, err: &MuxError<C>)
+fn fail_loop_<A, K>(shared: &LoopShared_<A>, cancel: &K, err: &MuxError)
 where
-    C: TrConnCfg,
+    A: AllocatorClone + Send + Sync,
     K: TrCancellationToken,
 {
     if !cancel.is_cancelled() {
@@ -277,7 +277,7 @@ async fn write_frame_<C, K>(
     header: &FrameHeader,
     payload: &[u8],
     cancel: K,
-) -> Result<(), MuxError<C>>
+) -> Result<(), MuxError>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -296,7 +296,7 @@ async fn write_control_<C, K>(
     tx: &mut C::ConnTx,
     frame: &ControlFrame_,
     cancel: K,
-) -> Result<(), MuxError<C>>
+) -> Result<(), MuxError>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -309,14 +309,11 @@ where
         frame.payload_().len(),
         frame.window_(),
     );
-    write_frame_(tx, &header, frame.payload_(), cancel).await
+    write_frame_::<C, _>(tx, &header, frame.payload_(), cancel).await
 }
 
 /// 把**读侧**游标错误映射为连接错误。
-fn map_read_cursor_err_<C, E>(err: CursorError<E, ()>) -> MuxError<C>
-where
-    C: TrConnCfg,
-{
+fn map_read_cursor_err_<E>(err: CursorError<E, ()>) -> MuxError {
     match err {
         CursorError::Read(_) => MuxError::Transport { write: false },
         CursorError::Write(()) => MuxError::Transport { write: true },
@@ -325,10 +322,7 @@ where
 }
 
 /// 把**写侧**游标错误映射为连接错误；语义与 [`map_read_cursor_err_`] 对称。
-fn map_write_cursor_err_<C, E>(err: CursorError<(), E>) -> MuxError<C>
-where
-    C: TrConnCfg,
-{
+fn map_write_cursor_err_<E>(err: CursorError<(), E>) -> MuxError {
     match err {
         CursorError::Write(_) => MuxError::Transport { write: true },
         CursorError::Read(()) => MuxError::Transport { write: false },
@@ -368,7 +362,7 @@ pub(crate) async fn read_loop_async_<C, K>(
         // 2. 读一个帧头（park 在网络读上，并与取消令牌竞争）。
         let header = match race_cancel_(
             &cancel,
-            read_header_async_::<C, _, _>(&mut rx, cancel.child_token()),
+            read_header_async_::<_, _>(&mut rx, cancel.child_token()),
         )
         .await
         {
@@ -387,7 +381,7 @@ pub(crate) async fn read_loop_async_<C, K>(
         // 4. 载荷长度校验。
         let len = header.payload_len();
         if len > shared.max_packet_size_ || len > scratch.len() {
-            fail_loop_(&shared, &cancel, &MuxError::<C>::FrameTooLarge);
+            fail_loop_(&shared, &cancel, &MuxError::FrameTooLarge);
             return;
         }
         if len > 0 {
@@ -401,7 +395,7 @@ pub(crate) async fn read_loop_async_<C, K>(
                 Option::None => return,
                 Option::Some(Result::Ok(())) => {}
                 Option::Some(Result::Err(err)) => {
-                    fail_loop_(&shared, &cancel, &map_read_cursor_err_::<C, _>(err));
+                    fail_loop_(&shared, &cancel, &map_read_cursor_err_::<_>(err));
                     return;
                 }
             }
@@ -427,7 +421,7 @@ pub(crate) async fn read_loop_async_<C, K>(
                     if shared.reg_.is_wait_close_(local, remote) {
                         continue;
                     }
-                    fail_loop_(&shared, &cancel, &MuxError::<C>::MalformedFrame);
+                    fail_loop_(&shared, &cancel, &MuxError::MalformedFrame);
                     return;
                 };
                 entry.owner_.with_mut_(|state| {
@@ -437,7 +431,7 @@ pub(crate) async fn read_loop_async_<C, K>(
                     .owner_
                     .with_mut_(|state| state.flow_mut_().recv_window_mut().on_data(amount));
                 if let Result::Err(err) = counted {
-                    fail_loop_(&shared, &cancel, &MuxError::<C>::FlowCtrl(err));
+                    fail_loop_(&shared, &cancel, &MuxError::FlowCtrl(err));
                     return;
                 }
                 match race_cancel_(
@@ -452,7 +446,7 @@ pub(crate) async fn read_loop_async_<C, K>(
                         fail_loop_(
                             &shared,
                             &cancel,
-                            &MuxError::<C>::Transport { write: true },
+                            &MuxError::Transport { write: true },
                         );
                         return;
                     }
@@ -460,7 +454,7 @@ pub(crate) async fn read_loop_async_<C, K>(
             }
             FrameKind::Open => {
                 let Some(report) = window_report_of_(&header) else {
-                    fail_loop_(&shared, &cancel, &MuxError::<C>::MalformedFrame);
+                    fail_loop_(&shared, &cancel, &MuxError::MalformedFrame);
                     return;
                 };
                 if let Option::Some(entry) = table.get_mut(&pair) {
@@ -825,7 +819,7 @@ async fn handle_write_event_<C, K>(
     read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: &K,
     last_ready: &mut Option<(Dock, Dock)>,
-) -> Result<(), MuxError<C>>
+) -> Result<(), MuxError>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -847,7 +841,7 @@ where
             );
         }
         WriteEvent_::Control { frame_ } => {
-            write_control_(tx, &frame_, cancel.child_token()).await?;
+            write_control_::<C, _>(tx, &frame_, cancel.child_token()).await?;
         }
         WriteEvent_::TxReady {
             local_dock,
@@ -880,7 +874,7 @@ where
                 }
             });
             if let Option::Some(report) = report {
-                send_window_update_(tx, pair, report, cancel.child_token()).await?;
+                send_window_update_::<C, _>(tx, pair, report, cancel.child_token()).await?;
             }
         }
         WriteEvent_::TxClosed {
@@ -889,8 +883,8 @@ where
         } => {
             let pair = (local_dock, remote_dock);
             // 把已缓存数据全部发完，再发 FIN。
-            flush_entry_(tx, table, scratch, pair, cancel).await?;
-            control_close_via_(tx, local_dock, remote_dock, false, cancel.child_token()).await?;
+            flush_entry_::<C, _>(tx, table, scratch, pair, cancel).await?;
+            control_close_via_::<C, _>(tx, local_dock, remote_dock, false, cancel.child_token()).await?;
             if let Option::Some(entry) = table.get_mut(&pair) {
                 entry.owner_.with_mut_(|state| {
                     state.set_app_tx_closed_();
@@ -915,7 +909,7 @@ where
                 remote_dock,
             });
             table.remove(&pair);
-            control_close_via_(tx, local_dock, remote_dock, true, cancel.child_token()).await?;
+            control_close_via_::<C, _>(tx, local_dock, remote_dock, true, cancel.child_token()).await?;
             maybe_release_::<C>(shared, read_events, table, pair);
         }
         WriteEvent_::PeerClosed {
@@ -972,7 +966,7 @@ async fn send_window_update_<C, K>(
     pair: (Dock, Dock),
     report: WindowReport,
     cancel: K,
-) -> Result<(), MuxError<C>>
+) -> Result<(), MuxError>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -989,7 +983,7 @@ where
         0usize,
         Option::Some((report.recv_total(), report.window())),
     );
-    write_frame_(tx, &header, &[], cancel).await
+    write_frame_::<C, _>(tx, &header, &[], cancel).await
 }
 
 /// 发一条 `CLOSE`。用独立的 helper 以便在事件处理里直接 await。
@@ -999,7 +993,7 @@ async fn control_close_via_<C, K>(
     remote_dock: Dock,
     reset: bool,
     cancel: K,
-) -> Result<(), MuxError<C>>
+) -> Result<(), MuxError>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -1010,7 +1004,7 @@ where
         local_dock,
         remote_dock,
     );
-    write_control_(tx, &frame, cancel).await
+    write_control_::<C, _>(tx, &frame, cancel).await
 }
 
 /// 把某条子流发送环里已提交的数据全部写出（直到取空）。
@@ -1020,13 +1014,13 @@ async fn flush_entry_<C, K>(
     scratch: &mut Owned<[u8], C::Alloc>,
     pair: (Dock, Dock),
     cancel: &K,
-) -> Result<(), MuxError<C>>
+) -> Result<(), MuxError>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
     loop {
-        let progressed = drain_one_(&mut *tx, table, scratch, pair, cancel).await?;
+        let progressed = drain_one_::<C, _>(&mut *tx, table, scratch, pair, cancel).await?;
         if !progressed {
             return Result::Ok(());
         }
@@ -1039,7 +1033,7 @@ async fn drain_once_<C, K>(
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
     cancel: &K,
-) -> Result<bool, MuxError<C>>
+) -> Result<bool, MuxError>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -1061,7 +1055,7 @@ where
             return Result::Ok(false);
         };
         cursor = Option::Some(pair);
-        if drain_one_(tx, table, scratch, pair, cancel).await? {
+        if drain_one_::<C, _>(tx, table, scratch, pair, cancel).await? {
             return Result::Ok(true);
         }
     }
@@ -1074,7 +1068,7 @@ async fn drain_one_<C, K>(
     scratch: &mut Owned<[u8], C::Alloc>,
     pair: (Dock, Dock),
     cancel: &K,
-) -> Result<bool, MuxError<C>>
+) -> Result<bool, MuxError>
 where
     C: TrConnCfg,
     K: TrCancellationToken,

@@ -3,5 +3,5 @@
 mod handle_;
 
 pub use handle_::{
-    ChannelHandle,
+    ChannelHandle, HandleError,
 };

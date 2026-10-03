@@ -3,5 +3,5 @@
 mod listener_;
 
 pub use listener_::{
-    ChannelListener,
+    ChannelListener, ListenerError,
 };

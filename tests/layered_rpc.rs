@@ -637,18 +637,16 @@ fn probe_named_half_types_<S>(tx: ChanTx<S>, rx: ChanRx<S>) -> HalfHolder_<S> {
     HalfHolder_ { tx_: tx, rx_: rx }
 }
 
-/// 【F9 ✅ 探针】**为 `MuxError` 写代码**：不必知道任何错误载荷类型。
+/// 【F9 ✅ 探针】**为 `MuxError` 写代码**：它现在是无泛型、可复制的标准枚举。
 ///
-/// 过去 `MuxError` 的参数是错误**载荷**（常常不可命名：私有类型、或只以
-/// `<T as TrBuffTryRead<u8>>::Err` 这样的投影存在），开发者连一个 `match` 都写不
-/// 出来。现在参数是两个**传输**类型——开发者手里本来就有它们——载荷由传输派生并
-/// 在 match 时自动推断。**刻意不执行**，只为把结论钉在编译期。
+/// 底层读写错误已在帧层与循环里按方向统一投影为 [`MuxError::Transport`]，API 面
+/// 不再需要命名不可命名的载荷类型，也不需要额外的中间投影。
+/// **刻意不执行**，只为把结论钉在编译期。
 #[allow(dead_code)]
-fn probe_write_code_against_mux_error_(err: MuxError<SmokeCfg>) -> ErrClass_ {
+fn probe_write_code_against_mux_error_(err: MuxError) -> ErrClass_ {
     match err {
-        MuxError::Rx(_) => ErrClass_::Read,
-        MuxError::Tx(_) => ErrClass_::Write,
-        MuxError::Transport { write } => ErrClass_::Transport { write },
+        MuxError::Transport { write: true } => ErrClass_::Write,
+        MuxError::Transport { write: false } => ErrClass_::Read,
         MuxError::PeerClosed => ErrClass_::Peer,
         _ => ErrClass_::Other,
     }

@@ -6,9 +6,25 @@ use abs_smux::conn::TrChannelListener;
 use buffex::x_deps::abs_buff;
 
 use crate::connection::{
-    Dock, ListenerError, MuxConnection, TrConnCfg,
+    Dock, MuxConnection, MuxError, TrConnCfg,
     channel_handle::ChannelHandle,
+    error_::face_error_impls,
 };
+
+/// [`TrChannelListener`](abs_smux::conn::TrChannelListener) 的错误类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerError {
+    /// 本次等待被取消。
+    Cancelled,
+
+    /// 连接级失败。
+    Mux(MuxError),
+}
+
+face_error_impls!(
+    ListenerError,
+    ListenerError::Cancelled => "本次等待被取消",
+);
 
 /// 某 `local_dock` 上的入向子流监听器（类 `TcpListener`）。
 ///
@@ -64,7 +80,7 @@ impl<C, S> TrChannelListener<C> for ChannelListener<C, S>
 where
     C: TrConnCfg,
 {
-    type Err = ListenerError<C>;
+    type Err = ListenerError;
 
     type ChannelHandle = ChannelHandle<C, S>;
 
@@ -86,7 +102,7 @@ where
 async fn mux_income_async_<'f, C, S, K>(
     listener: &'f mut ChannelListener<C, S>,
     cancel: K,
-) -> Result<ChannelHandle<C, S>, ListenerError<C>>
+) -> Result<ChannelHandle<C, S>, ListenerError>
 where
     C: TrConnCfg + 'f,
     S: 'f,
@@ -98,8 +114,8 @@ where
         if cancel.is_cancelled() {
             return Result::Err(ListenerError::Cancelled);
         }
-        if let Option::Some(kind) = conn.core_().reg_().failure_() {
-            return Result::Err(ListenerError::Mux(kind.into_mux_error_()));
+        if let Option::Some(err) = conn.core_().reg_().failure_() {
+            return Result::Err(ListenerError::Mux(err));
         }
         if let Option::Some(remote) = conn.core_().reg_().take_pending_inbound_(local) {
             return Result::Ok(ChannelHandle::new_(conn, local, remote));

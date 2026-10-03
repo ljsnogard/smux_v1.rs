@@ -3,7 +3,6 @@
 //! 本模块承载三样东西：
 //!
 //! - [`CancelToken_`]：**可主动触发**的取消令牌；
-//! - [`FailKind_`]：连接级失败的「载荷无关」投影，连同失败标志；
 //! - [`WakerSlot_`]：单等待者唤醒槽。
 //!
 //! 注册表（dock / 子流索引与配额）已移到 `mux_connection::registry_`。
@@ -52,10 +51,6 @@ use atomic_sync::rwlock::preemptive::SpinningRwLockOwned;
 use buffex::x_deps::{abs_cancel, atomic_sync};
 use mm_ptr::Shared;
 
-use crate::{
-    connection::{MuxError, TrConnCfg},
-    flow_ctrl::FlowCtrlError,
-};
 
 
 /// 同步取锁失败时的统一处理。
@@ -230,101 +225,6 @@ where
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// 连接级失败
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-/// 连接级失败的**载荷无关**投影。
-///
-/// 循环返回的是 [`MuxError<C>`]，但底层错误值（两个载荷）无法存进共享
-/// 状态（它们只在循环那一侧存在），因此共享状态里只保留「失败的原因种类」，
-/// 由 API 面再映射回 [`MuxError`]。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FailKind_ {
-    /// 底层传输失败（读或写）。原载荷丢失，但**方向**保留。
-    Transport { write: bool },
-
-    /// 对端主动关闭连接 / 子流。
-    PeerClosed,
-
-    /// 子流 / 连接已关闭。
-    Closed,
-
-    /// 子流空闲超时（保活无应答）。
-    IdleTimeout,
-
-    /// dock 是保留取值（`wildcard` / `unspecified`），不能作为子流 dock。
-    ReservedDock,
-
-    /// 帧结构非法。
-    MalformedFrame,
-
-    /// 未知或保留的字段 / 取值。
-    UnsupportedField,
-
-    /// 帧超过协商的 `max_packet_size`。
-    FrameTooLarge,
-
-
-
-
-
-
-
-    /// 流控失败。
-    FlowCtrl(FlowCtrlError),
-
-    /// 操作被取消。
-    Cancelled,
-}
-
-impl FailKind_ {
-    /// 从循环侧的 [`MuxError`] 取出可共享的那部分。
-    ///
-    /// `Rx` / `Tx` 携带的底层错误值无法保存，投影为 [`FailKind_::Transport`]；
-    /// **方向**（读 / 写）保留，因此「网络错误中断」与「对端主动关闭」在 API 面
-    /// 是两种不同的错误。
-    pub(crate) fn of_<C>(err: &MuxError<C>) -> Self
-    where
-        C: TrConnCfg,
-    {
-        match err {
-            MuxError::Rx(_) => FailKind_::Transport { write: false },
-            MuxError::Tx(_) => FailKind_::Transport { write: true },
-            MuxError::Transport { write } => FailKind_::Transport { write: *write },
-            MuxError::Cancelled => FailKind_::Cancelled,
-            MuxError::PeerClosed => FailKind_::PeerClosed,
-            MuxError::Closed => FailKind_::Closed,
-            MuxError::IdleTimeout => FailKind_::IdleTimeout,
-            MuxError::ReservedDock => FailKind_::ReservedDock,
-            MuxError::MalformedFrame => FailKind_::MalformedFrame,
-            MuxError::UnsupportedField => FailKind_::UnsupportedField,
-            MuxError::FrameTooLarge => FailKind_::FrameTooLarge,
-            // 「拒绝接受调用方给的内存」是本地判定，不属于连接级失败状态。
-            MuxError::FlowCtrl(err) => FailKind_::FlowCtrl(*err),
-        }
-    }
-
-    /// 映射回 API 面使用的 [`MuxError`]。`FailKind_` 是 `Copy`，按值取。
-    pub(crate) fn into_mux_error_<C>(self) -> MuxError<C>
-    where
-        C: TrConnCfg,
-    {
-        match self {
-            FailKind_::Transport { write } => MuxError::Transport { write },
-            FailKind_::PeerClosed => MuxError::PeerClosed,
-            FailKind_::Closed => MuxError::Closed,
-            FailKind_::IdleTimeout => MuxError::IdleTimeout,
-            FailKind_::ReservedDock => MuxError::ReservedDock,
-            FailKind_::MalformedFrame => MuxError::MalformedFrame,
-            FailKind_::UnsupportedField => MuxError::UnsupportedField,
-            FailKind_::FrameTooLarge => MuxError::FrameTooLarge,
-            FailKind_::FlowCtrl(err) => MuxError::FlowCtrl(err),
-            FailKind_::Cancelled => MuxError::Cancelled,
-        }
-    }
-}
-
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 唤醒槽
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
@@ -395,14 +295,6 @@ mod tests_ {
 
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
-
-use crate::{
-        connection::{DefaultConnCfg, MuxError, mux_connection::ChannelRegistry_},
-        handshake::opts::BasicOpts,
-    };
-
-    /// 仅用于给 `MuxError<C>` 一个具体配置；切片已经实现 `abs_buff` 的读写半边。
-    type TestCfg = DefaultConnCfg<&'static mut [u8], &'static [u8]>;
 
     use super::*;
 
@@ -477,51 +369,6 @@ use crate::{
         let mut wait = core::pin::pin!(token.cancellation());
         assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
         assert_eq!(probe.count_.load(Ordering::SeqCst), 0usize, "已取消无需唤醒");
-    }
-    /// 测试连接级失败只保留首个原因，并取消两个循环的令牌。
-    /// - 手段：建注册表后先后用 `PeerClosed` 与 `ChanLimit` 标记失败。
-    /// - 判断：`failure_` 始终是第一次的 `PeerClosed`；两个循环令牌在第一次标记后
-    ///   就都已取消。
-    #[test]
-    fn failure_keeps_first_cause_and_cancels_loops() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
-        assert!(!registry.is_failed_());
-        let read_loop = registry.loop_token_(0usize);
-        let write_loop = registry.loop_token_(1usize);
-        assert!(!TrCancellationToken::is_cancelled(&read_loop) && !TrCancellationToken::is_cancelled(&write_loop));
-
-        registry.mark_failed_(&MuxError::<TestCfg>::PeerClosed);
-        assert!(registry.is_failed_());
-        assert_eq!(registry.failure_(), Option::Some(FailKind_::PeerClosed));
-        assert!(TrCancellationToken::is_cancelled(&read_loop) && TrCancellationToken::is_cancelled(&write_loop));
-
-        registry.mark_failed_(&MuxError::<TestCfg>::MalformedFrame);
-        assert_eq!(
-            registry.failure_(),
-            Option::Some(FailKind_::PeerClosed),
-            "首个失败原因应当保留"
-        );
-    }
-    /// 测试底层读写错误被投影为「传输失败」，并保留方向、与「对端主动关闭」区分。
-    /// - 手段：对 `Rx(())` / `Tx(())` 取 `FailKind_` 再映射回 `MuxError`；另取
-    ///   `PeerClosed` 作对照。
-    /// - 判断：读错误映射为 `Transport { write: false }`、写错误映射为
-    ///   `Transport { write: true }`；两者都不等于 `PeerClosed`。
-    #[test]
-    fn transport_failure_keeps_direction_and_differs_from_peer_close() {
-        let read = FailKind_::of_(&MuxError::<TestCfg>::Transport { write: false });
-        let write = FailKind_::of_(&MuxError::<TestCfg>::Transport { write: true });
-        assert_eq!(read, FailKind_::Transport { write: false });
-        assert_eq!(write, FailKind_::Transport { write: true });
-
-        let mapped_read: MuxError<TestCfg> = read.into_mux_error_();
-        let mapped_write: MuxError<TestCfg> = write.into_mux_error_();
-        assert!(matches!(mapped_read, MuxError::Transport { write: false }));
-        assert!(matches!(mapped_write, MuxError::Transport { write: true }));
-
-        let peer = FailKind_::of_(&MuxError::<TestCfg>::PeerClosed);
-        assert_eq!(peer, FailKind_::PeerClosed);
-        assert_ne!(peer, read, "对端主动关闭与传输中断必须是不同的失败原因");
     }
     /// 测试唤醒槽只保留一个等待者，取出后即清空。
     /// - 手段：空槽先 `take_`；登记一个 waker 后检查状态；再 `take_` 两次。

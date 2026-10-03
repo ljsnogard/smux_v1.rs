@@ -275,13 +275,12 @@ where
 }
 
 /// 等待建流完成：等对端的 `OPEN` + `ACCEPT` / `REJECT`，或被取消 / 连接失败打断。
-pub(crate) async fn wait_establish_<C, A, K>(
+pub(crate) async fn wait_establish_<A, K>(
     reg: &ChannelRegistry_<A>,
     owner: &ChannelOwner_<A>,
     cancel: K,
-) -> Result<EstablishOutcome_, MuxError<C>>
+) -> Result<EstablishOutcome_, MuxError>
 where
-    C: crate::connection::TrConnCfg,
     A: AllocatorClone + Send + Sync,
     K: TrCancellationToken,
 {
@@ -289,8 +288,8 @@ where
         if cancel.is_cancelled() {
             return Result::Err(MuxError::Cancelled);
         }
-        if let Option::Some(kind) = reg.failure_() {
-            return Result::Err(kind.into_mux_error_::<C>());
+        if let Option::Some(err) = reg.failure_() {
+            return Result::Err(err);
         }
         if let Option::Some(outcome) = owner.with_(|state| state.establish_.outcome_) {
             return Result::Ok(outcome);

@@ -7,8 +7,9 @@ use mm_ptr::{Owned, Shared};
 
 use crate::{
     connection::{
-        BindError, Dock, TrConnCfg,
+        Dock, MuxError, TrConnCfg,
         dock_binding::DockBinding,
+        error_::face_error_impls,
         session_::{LoopShared_, read_loop_async_, write_loop_async_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
     },
@@ -16,6 +17,26 @@ use crate::{
 };
 
 use super::{core_::MuxCore, registry_::ChannelRegistry_};
+
+
+/// [`TrConnection`](abs_smux::conn::TrConnection) 的错误类型：目前只有 `bind_async`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindError {
+    /// 要绑定的 dock 是协议保留值（`unspecified` / `wildcard`），不能当身份用。
+    ReservedDock,
+
+    /// 该 local_dock 已被占用。
+    DockInUse,
+
+    /// 连接级失败。
+    Mux(MuxError),
+}
+
+face_error_impls!(
+    BindError,
+    BindError::ReservedDock => "要绑定的 dock 是协议保留值，不能作为身份",
+    BindError::DockInUse => "该 local_dock 已被占用",
+);
 
 /// 复用连接：**对一个 `MuxCore` 的智能指针的薄封装**，同时实现
 /// [`TrConnection`]。
@@ -188,7 +209,7 @@ impl<C, S> TrConnection<C> for MuxConnection<C, S>
 where
     C: TrConnCfg,
 {
-    type Err = BindError<C>;
+    type Err = BindError;
 
     type DockBinding = DockBinding<C, S>;
 
@@ -207,7 +228,7 @@ async fn mux_bind_async_<'f, C, S, K>(
     conn: &'f MuxConnection<C, S>,
     local_dock: Dock,
     _cancel: K,
-) -> Result<DockBinding<C, S>, BindError<C>>
+) -> Result<DockBinding<C, S>, BindError>
 where
     C: TrConnCfg + 'f,
     S: 'f,

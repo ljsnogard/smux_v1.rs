@@ -16,15 +16,47 @@ use buffex::x_deps::abs_buff;
 
 use crate::{
     connection::{
-        Dock, FrameKind, HandleError, MuxConnection, MuxError, TrConnCfg,
+        Dock, FrameKind, MuxConnection, MuxError, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, ChannelState_, EstablishOutcome_, wait_establish_},
         ring_::new_buffered_channel_,
         signal_::{ControlFrame_, ReadEvent_, TrEventSender_, WriteEvent_},
+        error_::face_error_impls,
         util_::read_available_into_vec_,
     },
-    flow_ctrl::{Credit, FlowCtrl, RecvTotal, ReportThresholds_, TrFlowCtrlPolicy, WindowReport},
+    flow_ctrl::{
+        Credit, FlowCtrl, FlowCtrlError, RecvTotal, ReportThresholds_, TrFlowCtrlPolicy,
+        WindowReport,
+    },
 };
+
+/// [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) 的错误类型
+/// （`accept_async` / `reject_async` 共用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleError {
+    /// **拒绝接受**调用方给出的环内存：大小不合用。
+    RingRejected,
+
+    /// 对端拒绝建立这条子流（`accept_async` 的发起方一侧）。
+    Refused,
+
+    /// 流控失败（窗口违例或计数溢出）。
+    FlowCtrl(FlowCtrlError),
+
+    /// 本次操作被取消。
+    Cancelled,
+
+    /// 连接级失败。
+    Mux(MuxError),
+}
+
+face_error_impls!(
+    HandleError,
+    HandleError::RingRejected => "调用方给出的环内存大小不合用，已拒绝接受",
+    HandleError::Refused => "对端拒绝建立这条子流",
+    HandleError::FlowCtrl(_) => "流控失败",
+    HandleError::Cancelled => "本次操作被取消",
+);
 
 /// 一个入向建流请求的待决句柄。
 ///
@@ -187,7 +219,7 @@ impl<C, S> TrChannelHandle<C> for ChannelHandle<C, S>
 where
     C: TrConnCfg,
 {
-    type Err = HandleError<C>;
+    type Err = HandleError;
 
     type Tx = ChannelTx<C, S>;
     type Rx = ChannelRx<C, S>;
@@ -322,7 +354,7 @@ where
 }
 
 /// 「接受」这一步的产物：该 channel 的收发半边，或一个连接错误。
-type AcceptOutcomeProj_<C, S> = Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError<C>>;
+type AcceptOutcomeProj_<C, S> = Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>;
 
 /// 建流最终裁决的产物。
 type InstallOutcome_<C, S> = (
@@ -341,7 +373,7 @@ fn install_channel_<C, S>(
     tx_buff: C::Buff,
     mut rx_buff: C::Buff,
     peer_report: Option<WindowReport>,
-) -> Result<InstallOutcome_<C, S>, HandleError<C>>
+) -> Result<InstallOutcome_<C, S>, HandleError>
 where
     C: TrConnCfg,
 {
@@ -433,7 +465,7 @@ async fn mux_reject_async_<'f, C, S, Rb, K>(
     handle: &'f mut ChannelHandle<C, S>,
     reason: &'f mut Rb,
     cancel: K,
-) -> Result<usize, HandleError<C>>
+) -> Result<usize, HandleError>
 where
     C: TrConnCfg + 'f,
     S: 'f,

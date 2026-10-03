@@ -43,9 +43,9 @@
 //! - **[`MuxConnection`]**：**对一个 `MuxCore` 的智能指针的薄封装**
 //!   （`mm_ptr::Shared<MuxCore<C, S>, C::Alloc>`）。`Clone` 一份就是多一个强引用，
 //!   分配走调用方注入的分配器。于是它可以被任意分发：存进结构体、传进函数、跨层
-//!   持有。公开类型因此是 `MuxConnection<C, S, R, W>`——参数是策略、作用域类型与
-//!   **两个传输类型**（收发半边本身不在了，但「这条连接建在什么传输上」这个类型级
-//!   事实留下；连接对外的错误类型由它们派生，见 §6）。
+//!   持有。公开类型因此是 `MuxConnection<C, S>`——参数是策略与作用域类型；
+//!   **两个传输类型**由 `C::ConnTx` / `C::ConnRx` 声明（收发半边本身不在了，但
+//!   「这条连接建在什么传输上」这个类型级事实留下）。
 //!
 //! 会话侧的四个句柄（[`DockBinding`] / [`ChannelListener`] / [`ChannelHandle`] /
 //! [`Telegraph`]）与两个 channel 半部同样**各自持有一份智能指针**，而不是借用上层
@@ -355,26 +355,13 @@
 //!   compio 由运行时自己驱动，smol 由 `LocalExecutor` 驱动。忘记驱动不会有编译
 //!   错误，症状是两个循环从不推进（连接静默无响应）。
 //!
-//! 注意 `R` / `W`（收发半边类型）**不在**公开类型里：它们在 [`MuxConnection::new`]
-//! 里被移进循环 future 并被 `'static` 化，此后不再出现在任何签名中。因此「两个
-//! 连接用不同的传输类型」在类型上是同一个 `MuxConnection<C, S, R, W>`——传输在
-//! `new` 之后不参与行为，只留下类型级的事实。
+//! 注意收发半边类型（`C::ConnTx` / `C::ConnRx`）由 [`TrConnCfg`] 声明，而不是作为
+//! [`MuxConnection`] 的公开泛型参数；它们在 `new` 里被移进循环 future 并被
+//! `'static` 化，此后不再参与公开类型。
 //!
-//! 参数选择 `R` / `W`（**传输**）而不是它们的错误类型，是一条刻意的 API 决定：
-//! 错误是次要信息、且常常不可命名（可能是私有类型、或只以
-//! `<T as TrBuffTryRead<u8>>::Err` 这样的投影存在），把它放到高层泛型参数上会逼
-//! 调用方在**每个**类型别名里写投影，等于「连接是什么」被错误牵着走。现在错误一律
-//! 由传输派生：`TrConnection::Err = MuxError<C>`，而 `MuxError` 自身的两个参数
-//! **也是传输**——它的载荷变体写成 `Rx(<R as TrBuffTryRead<u8>>::Err)` 这样，因此
-//! 开发者写 `match err { MuxError::Rx(e) => .. }` 时载荷类型自动推断，不需要（也
-//! 常常无法）命名它。
-//!
-//! 不过要注意**实际产出的变体**：连接级失败经共享状态回传（`FailKind_`），而底层
-//! 错误值只在循环那一侧存在、跨不过来，所以 API 面上出现的是
-//! [`MuxError::Transport`]（只保留方向）这类载荷无关的变体；`Rx` / `Tx` 两个带载荷
-//! 变体只在连接内部的循环里使用。连接内部有些层只碰一个方向（帧解析只产生读侧
-//! 载荷），那些地方用 `MuxError<R, NoHalfway_>` 这样的**单边形式**精确表达「另一侧
-//! 不可能出错」——`NoHalfway_` 是本 crate 内部的占位半边，载荷类型不可构造。
+//! 连接级错误 [`MuxError`] 是**无载荷、可复制**的标准枚举：底层读写错误在帧层
+//! 与循环里统一投影为 [`MuxError::Transport`]（只保留读写方向），因此同一份失败
+//! 原因可以存进共享注册表，也可以直接返回给 API 面。
 //!
 //! 连接与全部句柄都是 `!Send`（作用域值里含 `Rc`、事件通道与环都绑定本线程），
 //! 面向**单线程 / thread-local 运行时**。由此得到两条实现纪律：
@@ -465,17 +452,15 @@ mod test_support_;
 mod types_;
 mod util_;
 
-pub use channel_handle::ChannelHandle;
+pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
-pub use channel_listener::ChannelListener;
+pub use channel_listener::{ChannelListener, ListenerError};
 pub use config_::{DefaultConnCfg, TrConnCfg};
-pub use dock_binding::DockBinding;
-pub use error_::{
-    BindError, BindingError, HandleError, ListenerError, MuxError, TelegraphError,
-};
-pub(crate) use error_::ReserveErr_;
+pub use dock_binding::{BindingError, DockBinding};
+pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
-pub use mux_connection::MuxConnection;
+pub use mux_connection::{BindError, MuxConnection};
+pub(crate) use mux_connection::ReserveErr_;
 pub use ring_::{BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff};
-pub use telegraph::Telegraph;
+pub use telegraph::{Telegraph, TelegraphError};
 pub use types_::Dock;
