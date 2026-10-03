@@ -18,10 +18,12 @@
 //! [`TrMuxConfig::channel_capacity`](crate::connection::TrMuxConfig::channel_capacity)
 //! 给出的预算，因此构建失败只会是**配置错误**，由调用方决定如何处理。
 
+use alloc::sync::Arc;
 use core::{
-    alloc::AllocatorClone,
-    borrow::BorrowMut,
+    alloc::{AllocError, Allocator, AllocatorClone, Layout},
+    borrow::{Borrow, BorrowMut},
     mem::MaybeUninit,
+    ptr::NonNull,
 };
 
 use buffex::ring::{Ring, RingReader, RingWriter};
@@ -35,6 +37,107 @@ pub type BufferedRx<B, A> = RingReader<Shared<Ring<B>, A>, B, u8>;
 
 /// 一条子流收发环的两个半部：`(写端, 读端)`，共享同一条 [`Ring`]。
 pub type BufferedChannel<B, A> = (BufferedTx<B, A>, BufferedRx<B, A>);
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 环内存的智能指针：把分配器类型擦除成 `dyn Allocator`
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 承载「由**外部**分配器分配、供 channel ring 使用」的内存的智能指针。
+///
+/// # 为什么要把分配器擦除
+///
+/// `accept_async` 那时调用方交来的是一个**分配器**（`A: Allocator`），而连接侧要
+/// 装的环存储类型 `C::Buff` 是**配置里写死**的（半部的类型里没有生命周期、也没有
+/// 多余的泛型位置可以再挂一个 `A`）。于是这里把「指针 + 容量 + **分配器本身**」打包
+/// 成本类型：分配器以 [`Arc<dyn Allocator + Send + Sync>`] 的形式被**拥有**，
+/// 释放时按 vtable 交回去（[`Drop`]）。因此本类型与调用方用的是哪种分配器无关，
+/// 而调用方也**没有**机会指定指针类型——那是连接的安排（见 `accept_async` 的设计）。
+///
+/// 两个方向（Tx / Rx）的缓冲由 [`MuxChanBuff::pair_from_alloc_`] 一次造出，两者
+/// **共用**同一个被擦除的分配器（`Arc`），所以不要求 `A: Clone`。
+///
+/// # 零开销的替代
+///
+/// 能自己声明环存储类型的环境（例如用 `Owned<[MaybeUninit<u8>], 自家分配器>`）可以
+/// 不采用本类型：`C::Buff` 由环境声明，缓冲实例由调用方在 `accept_async` 的
+/// `prepare` 参数里当场交出。
+pub struct MuxChanBuff {
+    /// 环内存首地址，指向 `cap_` 个未初始化的字节（`MaybeUninit<u8>`）。
+    ptr_: NonNull<MaybeUninit<u8>>,
+    /// 容量（`MaybeUninit<u8>` 的个数）。
+    cap_: usize,
+    /// 分配时用的 layout，释放时原样交回分配器。
+    layout_: Layout,
+    /// 类型擦除的分配器；两个方向的缓冲共享同一份。
+    alloc_: Arc<dyn Allocator + Send + Sync>,
+}
+
+impl MuxChanBuff {
+    /// 用调用方给的分配器造出**两块**同容量环内存（Tx、Rx 各一块）。
+    ///
+    /// # Errors
+    ///
+    /// `capacity` 换算 layout 溢出、或分配器拒绝分配时返回 [`AllocError`]；调用方
+    /// （连接侧）把它视为「这份内存不可用」。
+    pub fn pair_from_alloc_<A>(
+        alloc: A,
+        capacity: usize,
+    ) -> Result<(Self, Self), AllocError>
+    where
+        A: Allocator + Send + Sync + 'static,
+    {
+        let erased: Arc<dyn Allocator + Send + Sync> = Arc::new(alloc);
+        Result::Ok((
+            Self::one_from_erased_(erased.clone(), capacity)?,
+            Self::one_from_erased_(erased, capacity)?,
+        ))
+    }
+
+    /// 由一份被擦除的分配器与容量造出**一块**环内存。
+    fn one_from_erased_(
+        alloc: Arc<dyn Allocator + Send + Sync>,
+        capacity: usize,
+    ) -> Result<Self, AllocError> {
+        let layout = Layout::array::<MaybeUninit<u8>>(capacity).map_err(|_| AllocError)?;
+        let raw = alloc.allocate(layout)?;
+        Result::Ok(MuxChanBuff {
+            // SAFETY: `allocate` 返回的非空指针在 `layout` 下有效，`cap_`/`layout_`
+            // 与之对应；本类型独占这块内存，直到 `Drop` 释放。
+            ptr_: raw.cast::<MaybeUninit<u8>>(),
+            cap_: capacity,
+            layout_: layout,
+            alloc_: alloc,
+        })
+    }
+
+    /// 环内存的容量（`MaybeUninit<u8>` 的个数）。
+    pub fn capacity_(&self) -> usize {
+        self.cap_
+    }
+}
+
+impl Borrow<[MaybeUninit<u8>]> for MuxChanBuff {
+    fn borrow(&self) -> &[MaybeUninit<u8>] {
+        // SAFETY: 指针与长度由构造时的分配保证（见 `one_from_erased_`），且 `&self`
+        // 借用期间不会有别的可变借用（`Borrow`/`BorrowMut` 的常规约定）。
+        unsafe { core::slice::from_raw_parts(self.ptr_.as_ptr(), self.cap_) }
+    }
+}
+
+impl BorrowMut<[MaybeUninit<u8>]> for MuxChanBuff {
+    fn borrow_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        // SAFETY: 同 `Borrow::borrow`；`&mut self` 保证独占。
+        unsafe { core::slice::from_raw_parts_mut(self.ptr_.as_ptr(), self.cap_) }
+    }
+}
+
+impl Drop for MuxChanBuff {
+    fn drop(&mut self) {
+        // SAFETY: 指针由 `alloc_` 按 `layout_` 分配而来，且只在本类型独占期间释放一次；
+        // 分配器以 `Arc` 形式被本类型拥有，因此释放时它仍然有效。
+        unsafe { self.alloc_.deallocate(self.ptr_.cast::<u8>(), self.layout_) };
+    }
+}
 
 /// 用调用方注入的存储与分配器建立一条环，并把它切成 `(写端, 读端)`。
 ///

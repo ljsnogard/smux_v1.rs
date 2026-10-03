@@ -92,11 +92,10 @@ use std::{
 use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
 use mm_ptr::Shared;
 
-use buffex::x_deps::abs_buff::{TrBuffTryRead, TrBuffTryWrite};
 
 use crate::{
     connection::{
-        Dock, MuxError, ReserveErr_,
+        Dock, MuxError, ReserveErr_, TrConnCfg,
         owner_::ChannelOwner_,
         sync_::{CancelToken_, FailKind_, WakerSlot_, on_lock_contended_},
     },
@@ -891,10 +890,9 @@ where
     /// 记下连接级失败（**首个**原因生效），唤醒两个循环的取消令牌，并唤醒所有
     /// 等待中的 API 面 future（监听者的 `income_async` 与建流的
     /// `open_channel_async`），避免它们空等一个已经死掉的循环。
-    pub(crate) fn mark_failed_<R, W>(&self, err: &MuxError<R, W>)
+    pub(crate) fn mark_failed_<C>(&self, err: &MuxError<C>)
     where
-        R: TrBuffTryRead<u8>,
-        W: TrBuffTryWrite<u8>,
+        C: TrConnCfg,
     {
         let kind = FailKind_::of_(err);
         let wakers = self.with_mut_(|inner| {

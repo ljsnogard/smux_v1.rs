@@ -1,15 +1,12 @@
 use core::future::poll_fn;
 
-use abs_buff::{
-    TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite, gen_may_cancel_future,
-    x_deps::abs_cancel,
-};
+use abs_buff::{gen_may_cancel_future, x_deps::abs_cancel};
 use abs_cancel::TrCancellationToken;
 use abs_smux::conn::TrChannelListener;
 use buffex::x_deps::abs_buff;
 
 use crate::connection::{
-    Dock, ListenerError, MuxConnection, TrMuxConfig,
+    Dock, ListenerError, MuxConnection, TrConnCfg,
     channel_handle::ChannelHandle,
 };
 
@@ -23,23 +20,23 @@ use crate::connection::{
 /// [`TrChannelListener::income_async`] 每次返回一个**待决句柄**
 /// [`ChannelHandle`]；调用方决定 accept 还是 reject，之后该 dock 才能继续接受
 /// 下一个请求（同一 dock 的请求串行化，便于用户侧实现「排队 / 限流」）。
-pub struct ChannelListener<W, R, S, C>
+pub struct ChannelListener<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 连接智能指针：accept 时要用它的配置（`policy` 等）建子流环。
-    conn_: MuxConnection<W, R, S, C>,
+    conn_: MuxConnection<C, S>,
 
     /// 监听的 local_dock。
     local_dock_: Dock,
 }
 
-impl<W, R, S, C> ChannelListener<W, R, S, C>
+impl<C, S> ChannelListener<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 由连接与监听 `local_dock` 构造（只允许 `listen_async` 调用）。
-    pub(crate) fn new_(conn: MuxConnection<W, R, S, C>, local_dock: Dock) -> Self {
+    pub(crate) fn new_(conn: MuxConnection<C, S>, local_dock: Dock) -> Self {
         ChannelListener {
             conn_: conn,
             local_dock_: local_dock,
@@ -51,9 +48,9 @@ where
 /// telegraph 使用（见 `ChannelRegistry_::release_listener_`）。
 ///
 /// 注意这不影响该 dock 上已经建立、且在应用手里的子流半部。
-impl<W, R, S, C> Drop for ChannelListener<W, R, S, C>
+impl<C, S> Drop for ChannelListener<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     fn drop(&mut self) {
         self.conn_
@@ -63,24 +60,19 @@ where
     }
 }
 
-impl<W, R, S, C> TrChannelListener for ChannelListener<W, R, S, C>
+impl<C, S> TrChannelListener<C> for ChannelListener<C, S>
 where
-    C: TrMuxConfig,
-    R: TrBuffRead<u8> + 'static,
-    W: TrBuffWrite<u8> + 'static,
+    C: TrConnCfg,
 {
-    type Data = u8;
-    type Dock = Dock;
-    type Err = ListenerError<R, W>;
+    type Err = ListenerError<C>;
 
-    type ChannelHandle = ChannelHandle<W, R, S, C>;
+    type ChannelHandle = ChannelHandle<C, S>;
 
-    type IncomeAsync<'f>
-        = MuxIncomeAsync<'f, 'f, C, S, R, W>
+    type IncomeAsync<'f> = MuxIncomeAsync<'f, 'f, C, S>
     where
         Self: 'f;
 
-    fn local_dock(&self) -> &Self::Dock {
+    fn local_dock(&self) -> &C::Dock {
         &self.local_dock_
     }
 
@@ -91,15 +83,13 @@ where
 
 /// [`TrChannelListener::income_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxIncome, pub, new(pub(crate)))]
-async fn mux_income_async_<'f, C, S, R, W, K>(
-    listener: &'f mut ChannelListener<W, R, S, C>,
+async fn mux_income_async_<'f, C, S, K>(
+    listener: &'f mut ChannelListener<C, S>,
     cancel: K,
-) -> Result<ChannelHandle<W, R, S, C>, ListenerError<R, W>>
+) -> Result<ChannelHandle<C, S>, ListenerError<C>>
 where
-    C: TrMuxConfig + 'f,
+    C: TrConnCfg + 'f,
     S: 'f,
-    R: TrBuffTryRead<u8> + 'f + 'static,
-    W: TrBuffTryWrite<u8> + 'f + 'static,
     K: TrCancellationToken,
 {
     let conn = listener.conn_.clone();

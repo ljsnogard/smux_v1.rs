@@ -4,40 +4,38 @@
 #![allow(dead_code, unused_variables)]
 
 use abs_buff::{
-    TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite, gen_may_cancel_future,
+    TrBuffRead, TrBuffWrite,
+    gen_may_cancel_future,
+    x_deps::abs_cancel,
 };
 use abs_cancel::TrCancellationToken;
 use abs_smux::conn::TrTelegraph;
 use anylr::SomeOf;
-use buffex::x_deps::{abs_buff, abs_cancel, anylr};
+use buffex::x_deps::{abs_buff, anylr};
 
-use crate::connection::{Dock, MuxConnection, TelegraphError, TrMuxConfig};
+use crate::connection::{Dock, MuxConnection, TelegraphError, TrConnCfg};
 
 /// 数据报端点。
 ///
 /// **不借用连接**：自己持有一份 [`MuxConnection`] 克隆，因此生命周期参数从公开
 /// 类型上消失，可以存进结构体、可以从函数返回。
-///
-/// 由 [`TrDockBinding::open_telegraph_async`](abs_smux::conn::TrDockBinding::open_telegraph_async)
-/// 在某个 binding 上建立；端点存活期间该 local_dock 被独占，不能再被 channel
-/// 或 listener 使用（反之亦然，见 `ChannelRegistry_::reserve_telegraph_`）。
-pub struct Telegraph<W, R, S, C>
+pub struct Telegraph<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 连接智能指针：端点被 drop 时用它解除身份登记。
-    conn_: MuxConnection<W, R, S, C>,
+    conn_: MuxConnection<C, S>,
 
     /// 本端 dock。
     local_dock_: Dock,
 }
 
-impl<W, R, S, C> Telegraph<W, R, S, C>
+impl<C, S> Telegraph<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 由连接与 `local_dock` 构造（只允许 `open_telegraph_async` 调用）。
-    pub(crate) fn new_(conn: MuxConnection<W, R, S, C>, local_dock: Dock) -> Self {
+    pub(crate) fn new_(conn: MuxConnection<C, S>, local_dock: Dock) -> Self {
         Telegraph {
             conn_: conn,
             local_dock_: local_dock,
@@ -47,9 +45,9 @@ where
 
 /// 丢弃端点即**解除 telegraph 身份**，使同一个 `local_dock` 之后可以再作 channel
 /// 或 listener 使用（见 `ChannelRegistry_::release_telegraph_`）。
-impl<W, R, S, C> Drop for Telegraph<W, R, S, C>
+impl<C, S> Drop for Telegraph<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     fn drop(&mut self) {
         self.conn_
@@ -59,71 +57,60 @@ where
     }
 }
 
-impl<W, R, S, C> TrTelegraph for Telegraph<W, R, S, C>
+impl<C, S> TrTelegraph<C> for Telegraph<C, S>
 where
-    C: TrMuxConfig,
-    R: TrBuffTryRead<u8> + 'static,
-    W: TrBuffTryWrite<u8> + 'static,
+    C: TrConnCfg,
 {
-    type Data = u8;
-    type Dock = Dock;
-    type Err = TelegraphError<R, W>;
+    type Err = TelegraphError<C>;
 
-    type SendAsync<'f, M>
-        = MuxSendAsync<'f, 'f, C, S, R, W, M>
+    type SendAsync<'f, M> = MuxSendAsync<'f, 'f, C, S, M>
     where
         Self: 'f,
-        M: 'f + TrBuffRead<Self::Data>;
+        M: 'f + TrBuffRead<C::Data>;
 
-    type RecvAsync<'f, M>
-        = MuxRecvAsync<'f, 'f, C, S, R, W, M>
+    type RecvAsync<'f, M> = MuxRecvAsync<'f, 'f, C, S, M>
     where
         Self: 'f,
-        M: 'f + TrBuffWrite<Self::Data>;
+        M: 'f + TrBuffWrite<C::Data>;
 
-    fn local_dock(&self) -> Self::Dock {
+    fn local_dock(&self) -> C::Dock {
         self.local_dock_
     }
 
     fn send_async<'f, M>(
         &'f mut self,
-        remote_dock: Self::Dock,
+        remote_dock: C::Dock,
         packet: &'f mut M,
     ) -> Self::SendAsync<'f, M>
     where
-        M: TrBuffRead<Self::Data>,
+        M: TrBuffRead<C::Data>,
     {
         MuxSendAsync::new(self, remote_dock, packet)
     }
 
     fn recv_async<'f, M>(
         &'f mut self,
-        remote_dock: Self::Dock,
+        remote_dock: C::Dock,
         buffer: &'f mut M,
     ) -> Self::RecvAsync<'f, M>
     where
-        M: TrBuffWrite<Self::Data>,
+        M: TrBuffWrite<C::Data>,
     {
         MuxRecvAsync::new(self, remote_dock, buffer)
     }
 }
 
 /// [`TrTelegraph::send_async`] 的 step 函数。
-///
-/// 返回值为**实际写出**的字节数；若 `packet` 短于 `max_packet_size`，就是它的
-/// 全部长度。
 #[gen_may_cancel_future(MuxSend, pub, new(pub(crate)))]
-async fn mux_send_async_<'f, C, S, R, W, M, K>(
-    telegraph: &'f mut Telegraph<W, R, S, C>,
+async fn mux_send_async_<'f, C, S, M, K>(
+    telegraph: &'f mut Telegraph<C, S>,
     remote_dock: Dock,
     packet: &'f mut M,
     _cancel: K,
-) -> SomeOf<usize, TelegraphError<R, W>>
+) -> SomeOf<usize, TelegraphError<C>>
 where
-    C: TrMuxConfig + 'f,
+    C: TrConnCfg + 'f,
     S: 'f,
-    R: TrBuffTryRead<u8> + 'f + 'static,
-    W: TrBuffTryWrite<u8> + 'f + 'static,
     M: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {
@@ -131,20 +118,16 @@ where
 }
 
 /// [`TrTelegraph::recv_async`] 的 step 函数。
-///
-/// 返回值为写入 `buffer` 的字节数。
 #[gen_may_cancel_future(MuxRecv, pub, new(pub(crate)))]
-async fn mux_recv_async_<'f, C, S, R, W, M, K>(
-    telegraph: &'f mut Telegraph<W, R, S, C>,
+async fn mux_recv_async_<'f, C, S, M, K>(
+    telegraph: &'f mut Telegraph<C, S>,
     remote_dock: Dock,
     buffer: &'f mut M,
     _cancel: K,
-) -> SomeOf<usize, TelegraphError<R, W>>
+) -> SomeOf<usize, TelegraphError<C>>
 where
-    C: TrMuxConfig + 'f,
+    C: TrConnCfg + 'f,
     S: 'f,
-    R: TrBuffTryRead<u8> + 'f + 'static,
-    W: TrBuffTryWrite<u8> + 'f + 'static,
     M: TrBuffWrite<u8> + 'f,
     K: TrCancellationToken,
 {

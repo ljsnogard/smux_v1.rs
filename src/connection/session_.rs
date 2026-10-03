@@ -71,8 +71,7 @@ use core::{
 use std::collections::BTreeMap;
 
 use abs_buff::{
-    TrBuffTryRead, TrBuffTryWrite,
-    Demand, TrBuffRead, TrBuffWrite,
+    Demand, TrBuffWrite,
     buffer::TrBuffSegmMut,
     x_deps::abs_cancel,
 };
@@ -82,7 +81,7 @@ use mm_ptr::Owned;
 
 use crate::{
     connection::{
-        Dock, FrameHeader, FrameKind, MuxError, MuxReadErr_, MuxWriteErr_, NoHalfway_, flags,
+        Dock, FrameHeader, FrameKind, MuxError, TrConnCfg, flags,
         frame_::read_header_async_,
         mux_connection::ChannelRegistry_,
         owner_::ChannelOwner_,
@@ -146,8 +145,8 @@ where
 /// `local_dock` / `remote_dock` 不再是字段：dock 对已经是所在表的键。
 struct ReadEntry_<B, A>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
+    B: BorrowMut<[MaybeUninit<u8>]> + 'static,
+    B: BorrowMut<[MaybeUninit<u8>]> + 'static,
     A: AllocatorClone + Send + Sync + 'static,
 {
     owner_: ChannelOwner_<A>,
@@ -157,8 +156,8 @@ where
 /// 写循环本地持有的一条子流：共享状态 + 会话侧**发送环读端**。
 struct WriteEntry_<B, A>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
+    B: BorrowMut<[MaybeUninit<u8>]> + 'static,
+    B: BorrowMut<[MaybeUninit<u8>]> + 'static,
     A: AllocatorClone + Send + Sync + 'static,
 {
     owner_: ChannelOwner_<A>,
@@ -224,11 +223,9 @@ where
 /// 连接被丢弃时 [`MuxCore::drop`](super::mux_connection::core_::MuxCore) 触发取消
 /// 令牌，循环在 await 点上以「取消错误」的形式收到通知并退出——那是正常关闭，
 /// 不应在注册表上留下失败标志（否则收尾路径会伪造出一个假的连接级失败）。
-fn fail_loop_<A, R, W, K>(shared: &LoopShared_<A>, cancel: &K, err: &MuxError<R, W>)
+fn fail_loop_<C, K>(shared: &LoopShared_<C::Alloc>, cancel: &K, err: &MuxError<C>)
 where
-    A: AllocatorClone + Send + Sync,
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     if !cancel.is_cancelled() {
@@ -275,14 +272,14 @@ where
 }
 
 /// 把帧头与载荷依次写出。
-async fn write_frame_<W, K>(
-    tx: &mut W,
+async fn write_frame_<C, K>(
+    tx: &mut C::ConnTx,
     header: &FrameHeader,
     payload: &[u8],
     cancel: K,
-) -> Result<(), MuxWriteErr_<W>>
+) -> Result<(), MuxError<C>>
 where
-    W: TrBuffWrite<u8>,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     crate::connection::frame_::write_header_async_(tx, header, cancel.child_token()).await?;
@@ -295,13 +292,13 @@ where
 }
 
 /// 把控制帧编码后写出。
-async fn write_control_<W, K>(
-    tx: &mut W,
+async fn write_control_<C, K>(
+    tx: &mut C::ConnTx,
     frame: &ControlFrame_,
     cancel: K,
-) -> Result<(), MuxWriteErr_<W>>
+) -> Result<(), MuxError<C>>
 where
-    W: TrBuffWrite<u8>,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     let header = FrameHeader::new_(
@@ -315,30 +312,25 @@ where
     write_frame_(tx, &header, frame.payload_(), cancel).await
 }
 
-/// 把游标错误映射为 [`MuxError`]。
 /// 把**读侧**游标错误映射为连接错误。
-///
-/// 游标层用 `()` 表示「这个方向不存在载荷」（见 `wire_io_`）；本函数把它翻译成
-/// 类型上不可构造的 `NoHalfwayErr_`，于是连接内部「只碰读方向」的错误类型可以精确
-/// 写成 [`MuxReadErr_`]。真出现写侧错误（不可达）时按「写方向传输中断」上报。
-fn map_read_cursor_err_<R>(err: CursorError<R::Err, ()>) -> MuxReadErr_<R>
+fn map_read_cursor_err_<C, E>(err: CursorError<E, ()>) -> MuxError<C>
 where
-    R: TrBuffTryRead<u8>,
+    C: TrConnCfg,
 {
     match err {
-        CursorError::Read(err) => MuxError::Rx(err),
+        CursorError::Read(_) => MuxError::Transport { write: false },
         CursorError::Write(()) => MuxError::Transport { write: true },
         CursorError::PeerClosed => MuxError::PeerClosed,
     }
 }
 
 /// 把**写侧**游标错误映射为连接错误；语义与 [`map_read_cursor_err_`] 对称。
-fn map_write_cursor_err_<W>(err: CursorError<(), W::Err>) -> MuxWriteErr_<W>
+fn map_write_cursor_err_<C, E>(err: CursorError<(), E>) -> MuxError<C>
 where
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     match err {
-        CursorError::Write(err) => MuxError::Tx(err),
+        CursorError::Write(_) => MuxError::Transport { write: true },
         CursorError::Read(()) => MuxError::Transport { write: false },
         CursorError::PeerClosed => MuxError::PeerClosed,
     }
@@ -353,32 +345,30 @@ where
 /// `scratch` 是连接建立时分配一次的载荷暂存（长度 = `max_packet_size`，由调用方
 /// 注入的分配器分配）。
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn read_loop_async_<R, B, A, K>(
-    mut rx: R,
-    shared: LoopShared_<A>,
-    mut events: EventReceiver_<ReadEvent_<B, A>>,
-    events_tx: EventSender_<WriteEvent_<B, A>>,
-    mut scratch: Owned<[u8], A>,
+pub(crate) async fn read_loop_async_<C, K>(
+    mut rx: C::ConnRx,
+    shared: LoopShared_<C::Alloc>,
+    mut events: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
+    events_tx: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
+    mut scratch: Owned<[u8], C::Alloc>,
     cancel: K,
 ) where
-    R: TrBuffRead<u8>,
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
-    let mut table: ReadTable_<B, A> = BTreeMap::new_in(shared.reg_.allocator_());
+    let mut table: ReadTable_<C::Buff, C::Alloc> = BTreeMap::new_in(shared.reg_.allocator_());
 
     loop {
         if cancel.is_cancelled() {
             return;
         }
         // 1. 先把挂起的 Attach / Release 排空。
-        drain_read_events_(&mut events, &mut table);
+        drain_read_events_::<C>(&mut events, &mut table);
 
         // 2. 读一个帧头（park 在网络读上，并与取消令牌竞争）。
         let header = match race_cancel_(
             &cancel,
-            read_header_async_(&mut rx, cancel.child_token()),
+            read_header_async_::<C, _, _>(&mut rx, cancel.child_token()),
         )
         .await
         {
@@ -392,12 +382,12 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
 
         // 3. 读到帧头之后再排空一次：`Attach` 可能就在这段时间里到齐，
         //    而该帧正是它要送进去的那条子流的数据。
-        drain_read_events_(&mut events, &mut table);
+        drain_read_events_::<C>(&mut events, &mut table);
 
         // 4. 载荷长度校验。
         let len = header.payload_len();
         if len > shared.max_packet_size_ || len > scratch.len() {
-            fail_loop_(&shared, &cancel, &MuxError::<R, NoHalfway_>::FrameTooLarge);
+            fail_loop_(&shared, &cancel, &MuxError::<C>::FrameTooLarge);
             return;
         }
         if len > 0 {
@@ -411,7 +401,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                 Option::None => return,
                 Option::Some(Result::Ok(())) => {}
                 Option::Some(Result::Err(err)) => {
-                    fail_loop_(&shared, &cancel, &map_read_cursor_err_::<R>(err));
+                    fail_loop_(&shared, &cancel, &map_read_cursor_err_::<C, _>(err));
                     return;
                 }
             }
@@ -437,7 +427,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     if shared.reg_.is_wait_close_(local, remote) {
                         continue;
                     }
-                    fail_loop_(&shared, &cancel, &MuxError::<R, NoHalfway_>::MalformedFrame);
+                    fail_loop_(&shared, &cancel, &MuxError::<C>::MalformedFrame);
                     return;
                 };
                 entry.owner_.with_mut_(|state| {
@@ -447,7 +437,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     .owner_
                     .with_mut_(|state| state.flow_mut_().recv_window_mut().on_data(amount));
                 if let Result::Err(err) = counted {
-                    fail_loop_(&shared, &cancel, &MuxError::<R, NoHalfway_>::FlowCtrl(err));
+                    fail_loop_(&shared, &cancel, &MuxError::<C>::FlowCtrl(err));
                     return;
                 }
                 match race_cancel_(
@@ -462,7 +452,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                         fail_loop_(
                             &shared,
                             &cancel,
-                            &MuxError::<R, NoHalfway_>::Transport { write: true },
+                            &MuxError::<C>::Transport { write: true },
                         );
                         return;
                     }
@@ -470,7 +460,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
             }
             FrameKind::Open => {
                 let Some(report) = window_report_of_(&header) else {
-                    fail_loop_(&shared, &cancel, &MuxError::<R, NoHalfway_>::MalformedFrame);
+                    fail_loop_(&shared, &cancel, &MuxError::<C>::MalformedFrame);
                     return;
                 };
                 if let Option::Some(entry) = table.get_mut(&pair) {
@@ -580,12 +570,11 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
 }
 
 /// 非阻塞排空读事件（`Attach` / `Release`）。
-fn drain_read_events_<B, A>(
-    events: &mut EventReceiver_<ReadEvent_<B, A>>,
-    table: &mut ReadTable_<B, A>,
+fn drain_read_events_<C>(
+    events: &mut EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
+    table: &mut ReadTable_<C::Buff, C::Alloc>,
 ) where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
+    C: TrConnCfg,
 {
     while let Option::Some(event) = events.try_take_event_() {
         match event {
@@ -620,23 +609,21 @@ fn drain_read_events_<B, A>(
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 /// 写循环：按对端发送窗口调度各子流的发送环，并写出控制帧。
-pub(crate) async fn write_loop_async_<W, B, A, K>(
-    mut tx: W,
-    shared: LoopShared_<A>,
-    mut events: EventReceiver_<WriteEvent_<B, A>>,
-    read_events: EventSender_<ReadEvent_<B, A>>,
+pub(crate) async fn write_loop_async_<C, K>(
+    mut tx: C::ConnTx,
+    shared: LoopShared_<C::Alloc>,
+    mut events: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
+    read_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: K,
 ) where
-    W: TrBuffWrite<u8>,
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
-    let mut table: WriteTable_<B, A> = BTreeMap::new_in(shared.reg_.allocator_());
+    let mut table: WriteTable_<C::Buff, C::Alloc> = BTreeMap::new_in(shared.reg_.allocator_());
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
     // 循环独占的载荷暂存：把环段的字节搬进来（**搬出即消费**，见 `drain_one_`），
     // 再写上网。整条连接只分配一次，且走调用方注入的分配器（`mm_ptr::Owned`）。
-    let mut scratch: Owned<[u8], A> = Owned::new_slice(
+    let mut scratch: Owned<[u8], C::Alloc> = Owned::new_slice(
         K_MAX_DATA_CHUNK,
         |_idx, slot| {
             slot.write(0u8);
@@ -658,7 +645,7 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
         if let Option::Some(event) = events.try_take_event_() {
             match race_cancel_(
                 &cancel,
-                handle_write_event_(
+                handle_write_event_::<C, _>(
                     event,
                     &mut tx,
                     &mut table,
@@ -685,7 +672,7 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
         loop {
             match race_cancel_(
                 &cancel,
-                drain_once_(&mut tx, &mut table, &mut scratch, &cancel),
+                drain_once_::<C, _>(&mut tx, &mut table, &mut scratch, &cancel),
             )
             .await
             {
@@ -709,7 +696,7 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
         if let Option::Some(pair) = last_ready {
             // 这个块把 `entry`（借自 `table`）与事件通道的竞争限制在内部，
             // 出块后 `table` 的可变借用结束，才能交给 `handle_write_event_`。
-            let mut taken: Option<WriteEvent_<B, A>> = Option::None;
+            let mut taken: Option<WriteEvent_<C::Buff, C::Alloc>> = Option::None;
             let mut ring_ready = false;
             let alive = {
                 let Option::Some(entry) = table.get_mut(&pair) else {
@@ -755,7 +742,7 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
             if let Option::Some(event) = taken {
                 match race_cancel_(
                     &cancel,
-                    handle_write_event_(
+                    handle_write_event_::<C, _>(
                         event,
                         &mut tx,
                         &mut table,
@@ -804,7 +791,7 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
         };
         match race_cancel_(
             &cancel,
-            handle_write_event_(
+            handle_write_event_::<C, _>(
                 event,
                 &mut tx,
                 &mut table,
@@ -829,20 +816,18 @@ pub(crate) async fn write_loop_async_<W, B, A, K>(
 
 /// 处理一条写事件；返回 `Err` 表示连接级失败（调用方负责 `mark_failed_` 并退出）。
 #[allow(clippy::too_many_arguments)]
-async fn handle_write_event_<W, B, A, K>(
-    event: WriteEvent_<B, A>,
-    tx: &mut W,
-    table: &mut WriteTable_<B, A>,
-    scratch: &mut Owned<[u8], A>,
-    shared: &LoopShared_<A>,
-    read_events: &EventSender_<ReadEvent_<B, A>>,
+async fn handle_write_event_<C, K>(
+    event: WriteEvent_<C::Buff, C::Alloc>,
+    tx: &mut C::ConnTx,
+    table: &mut WriteTable_<C::Buff, C::Alloc>,
+    scratch: &mut Owned<[u8], C::Alloc>,
+    shared: &LoopShared_<C::Alloc>,
+    read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: &K,
     last_ready: &mut Option<(Dock, Dock)>,
-) -> Result<(), MuxWriteErr_<W>>
+) -> Result<(), MuxError<C>>
 where
-    W: TrBuffWrite<u8>,
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     match event {
@@ -913,7 +898,7 @@ where
                 });
             }
             table.remove(&pair);
-            maybe_release_(shared, read_events, table, pair);
+            maybe_release_::<C>(shared, read_events, table, pair);
         }
         WriteEvent_::RxClosed {
             local_dock,
@@ -931,7 +916,7 @@ where
             });
             table.remove(&pair);
             control_close_via_(tx, local_dock, remote_dock, true, cancel.child_token()).await?;
-            maybe_release_(shared, read_events, table, pair);
+            maybe_release_::<C>(shared, read_events, table, pair);
         }
         WriteEvent_::PeerClosed {
             local_dock,
@@ -943,21 +928,20 @@ where
                 // 对端不再接收：停止发送并释放该方向。
                 table.remove(&pair);
             }
-            maybe_release_(shared, read_events, table, pair);
+            maybe_release_::<C>(shared, read_events, table, pair);
         }
     }
     Result::Ok(())
 }
 
 /// 两个方向都收尾时释放注册表条目与接收环。
-fn maybe_release_<B, A>(
-    shared: &LoopShared_<A>,
-    read_events: &EventSender_<ReadEvent_<B, A>>,
-    table: &WriteTable_<B, A>,
+fn maybe_release_<C>(
+    shared: &LoopShared_<C::Alloc>,
+    read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
+    table: &WriteTable_<C::Buff, C::Alloc>,
     pair: (Dock, Dock),
 ) where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
+    C: TrConnCfg,
 {
     // 找到 owner：表里可能已经移除，因此用注册表兜底。
     let owner = table
@@ -983,14 +967,14 @@ fn maybe_release_<B, A>(
 }
 
 /// 发送一条窗口更新（`WINDOW_UPDATE`）。
-async fn send_window_update_<W, K>(
-    tx: &mut W,
+async fn send_window_update_<C, K>(
+    tx: &mut C::ConnTx,
     pair: (Dock, Dock),
     report: WindowReport,
     cancel: K,
-) -> Result<(), MuxWriteErr_<W>>
+) -> Result<(), MuxError<C>>
 where
-    W: TrBuffWrite<u8>,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     let header = FrameHeader::new_(
@@ -1009,15 +993,15 @@ where
 }
 
 /// 发一条 `CLOSE`。用独立的 helper 以便在事件处理里直接 await。
-async fn control_close_via_<W, K>(
-    tx: &mut W,
+async fn control_close_via_<C, K>(
+    tx: &mut C::ConnTx,
     local_dock: Dock,
     remote_dock: Dock,
     reset: bool,
     cancel: K,
-) -> Result<(), MuxWriteErr_<W>>
+) -> Result<(), MuxError<C>>
 where
-    W: TrBuffWrite<u8>,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     let frame = ControlFrame_::plain_(
@@ -1030,17 +1014,15 @@ where
 }
 
 /// 把某条子流发送环里已提交的数据全部写出（直到取空）。
-async fn flush_entry_<W, B, A, K>(
-    tx: &mut W,
-    table: &mut WriteTable_<B, A>,
-    scratch: &mut Owned<[u8], A>,
+async fn flush_entry_<C, K>(
+    tx: &mut C::ConnTx,
+    table: &mut WriteTable_<C::Buff, C::Alloc>,
+    scratch: &mut Owned<[u8], C::Alloc>,
     pair: (Dock, Dock),
     cancel: &K,
-) -> Result<(), MuxWriteErr_<W>>
+) -> Result<(), MuxError<C>>
 where
-    W: TrBuffWrite<u8>,
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     loop {
@@ -1052,16 +1034,14 @@ where
 }
 
 /// 轮转一遍本地表，最多写出一段数据；返回是否有进展。
-async fn drain_once_<W, B, A, K>(
-    tx: &mut W,
-    table: &mut WriteTable_<B, A>,
-    scratch: &mut Owned<[u8], A>,
+async fn drain_once_<C, K>(
+    tx: &mut C::ConnTx,
+    table: &mut WriteTable_<C::Buff, C::Alloc>,
+    scratch: &mut Owned<[u8], C::Alloc>,
     cancel: &K,
-) -> Result<bool, MuxWriteErr_<W>>
+) -> Result<bool, MuxError<C>>
 where
-    W: TrBuffWrite<u8>,
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     // 逐个 dock 对轮转。这里**不能**先把键收集成 `Vec`：那会在每次轮转时引入一次
@@ -1088,17 +1068,15 @@ where
 }
 
 /// 尝试为 `pair` 写出一段数据；返回是否写出。
-async fn drain_one_<W, B, A, K>(
-    tx: &mut W,
-    table: &mut WriteTable_<B, A>,
-    scratch: &mut Owned<[u8], A>,
+async fn drain_one_<C, K>(
+    tx: &mut C::ConnTx,
+    table: &mut WriteTable_<C::Buff, C::Alloc>,
+    scratch: &mut Owned<[u8], C::Alloc>,
     pair: (Dock, Dock),
     cancel: &K,
-) -> Result<bool, MuxWriteErr_<W>>
+) -> Result<bool, MuxError<C>>
 where
-    W: TrBuffWrite<u8>,
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    A: AllocatorClone + Send + Sync + 'static,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     let token = cancel.child_token();

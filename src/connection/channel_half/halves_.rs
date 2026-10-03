@@ -26,7 +26,7 @@
 //! 不允许为泛型结构体的**某个具体实例化**单独实现 `Drop`，而当时 `ChannelTx<H>`
 //! 对「环半部类型」泛型，`Drop` 只能落到 `ChannelTx<TxRing_<..>>` 上。
 //!
-//! 现在两个半部直接以 `<W, R, S, C>` 参数化（环半部类型由 `C` 决定，是**唯一**
+//! 现在两个半部直接以 `<C, S>` 参数化（环半部类型由 `C` 决定，是**唯一**
 //! 的），E0366 不再适用，因此内层包装被删除：两个半部**各自就是那个具名、可写进
 //! 结构体字段的具体类型**（旧模型下内层包装未导出，下游根本写不出已建立 channel
 //! 的类型，见 `dev-notes` §16.2 F5）。
@@ -41,7 +41,7 @@ use buffex::x_deps::abs_buff;
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, Dock, MuxConnection, TrMuxConfig,
+        BufferedRx, BufferedTx, Dock, MuxConnection, TrConnCfg,
         // config_::TrMuxAllocConfig,
         owner_::ChannelOwner_,
         signal_::{TrEventSender_, WriteEvent_},
@@ -67,9 +67,9 @@ use crate::{
 /// 半部 drop 时置位本端关闭标志）；其 `Drop` 同时通知写循环「排空后发
 /// `CLOSE(FIN)`」。两个方向互不影响，关闭态直接取自环本身（见模块文档
 /// 「关闭态」一节）。
-pub struct ChannelTx<W, R, S, C>
+pub struct ChannelTx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg<Data = u8>,
 {
     /// `buffex` 生产端半部（[`BufferedTx`] 的实例）。
     ring_: BufferedTx<C::Buff, C::Alloc>,
@@ -78,7 +78,7 @@ where
     owner_: ChannelOwner_<C::Alloc>,
 
     /// 连接智能指针：通知写循环 + 保活。
-    conn_: MuxConnection<W, R, S, C>,
+    conn_: MuxConnection<C, S>,
 
     /// 本端 dock。
     local_dock_: Dock,
@@ -86,9 +86,9 @@ where
     /// 对端 dock。
     remote_dock_: Dock}
 
-impl<W, R, S, C> ChannelTx<W, R, S, C>
+impl<C, S> ChannelTx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg<Data = u8>,
 {
     /// 由环生产端、共享状态、连接与 dock 对构造。
     ///
@@ -97,7 +97,7 @@ where
     pub(crate) fn new_(
         ring: BufferedTx<C::Buff, C::Alloc>,
         owner: ChannelOwner_<C::Alloc>,
-        conn: MuxConnection<W, R, S, C>,
+        conn: MuxConnection<C, S>,
         local_dock: Dock,
         remote_dock: Dock,
     ) -> Self {
@@ -131,9 +131,9 @@ where
     }
 }
 
-impl<W, R, S, C> Drop for ChannelTx<W, R, S, C>
+impl<C, S> Drop for ChannelTx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 丢弃发送半边 = 半关闭：显式关闭环的生产端，并通知写循环排空后发 `FIN`。
     fn drop(&mut self) {
@@ -148,9 +148,9 @@ where
     }
 }
 
-impl<W, R, S, C> TrBuffTryWrite<u8> for ChannelTx<W, R, S, C>
+impl<C, S> TrBuffTryWrite<u8> for ChannelTx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     type SegmMut<'f>
         = <BufferedTx<C::Buff, C::Alloc> as TrBuffTryWrite<u8>>::SegmMut<'f>
@@ -168,9 +168,9 @@ where
     }
 }
 
-impl<W, R, S, C> TrBuffWrite<u8> for ChannelTx<W, R, S, C>
+impl<C, S> TrBuffWrite<u8> for ChannelTx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     type WriteAsync<'f>
         = <BufferedTx<C::Buff, C::Alloc> as TrBuffWrite<u8>>::WriteAsync<'f>
@@ -183,18 +183,15 @@ where
     }
 }
 
-impl<W, R, S, C> TrChannelHalf for ChannelTx<W, R, S, C>
+impl<C, S> TrChannelHalf<C> for ChannelTx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
-    type Data = u8;
-    type Dock = Dock;
-
-    fn local_dock(&self) -> Self::Dock {
+    fn local_dock(&self) -> C::Dock {
         self.local_dock_
     }
 
-    fn remote_dock(&self) -> Self::Dock {
+    fn remote_dock(&self) -> C::Dock {
         self.remote_dock_
     }
 
@@ -210,7 +207,7 @@ where
     }
 }
 
-impl<W, R, S, C> TrChannelTx for ChannelTx<W, R, S, C> where C: TrMuxConfig {}
+impl<C, S> TrChannelTx<C> for ChannelTx<C, S> where C: TrConnCfg {}
 
 /// 子流接收半边（应用侧**消费端**）。
 ///
@@ -225,15 +222,15 @@ impl<W, R, S, C> TrChannelTx for ChannelTx<W, R, S, C> where C: TrMuxConfig {}
 ///
 /// 丢弃本类型即关闭接收方向；写端关闭后先把残留数据读走，再 `try_read` 才会
 /// 报 `Closing`（EOF 语义，见模块文档「关闭态」一节）。
-pub struct ChannelRx<W, R, S, C>
+pub struct ChannelRx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// `buffex` 消费端半部（[`BufferedRx`] 的实例）。
     ring_: BufferedRx<C::Buff, C::Alloc>,
 
     /// 连接智能指针：通知写循环 + 保活。
-    conn_: MuxConnection<W, R, S, C>,
+    conn_: MuxConnection<C, S>,
 
     /// 本端 dock。
     local_dock_: Dock,
@@ -244,14 +241,14 @@ where
     /// 上一次观察到的环内数据量（用于算已提交消费的增量）。
     last_data_: usize}
 
-impl<W, R, S, C> ChannelRx<W, R, S, C>
+impl<C, S> ChannelRx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 由环消费端、连接与 dock 对构造；可见性同 [`ChannelTx::new_`]。
     pub(crate) fn new_(
         ring: BufferedRx<C::Buff, C::Alloc>,
-        conn: MuxConnection<W, R, S, C>,
+        conn: MuxConnection<C, S>,
         local_dock: Dock,
         remote_dock: Dock,
     ) -> Self {
@@ -282,9 +279,9 @@ where
     }
 }
 
-impl<W, R, S, C> Drop for ChannelRx<W, R, S, C>
+impl<C, S> Drop for ChannelRx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 丢弃接收半边：关掉环的消费端，并通知写循环发 `RESET` 拆掉该方向。
     fn drop(&mut self) {
@@ -299,9 +296,9 @@ where
     }
 }
 
-impl<W, R, S, C> TrBuffTryRead<u8> for ChannelRx<W, R, S, C>
+impl<C, S> TrBuffTryRead<u8> for ChannelRx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     type SegmRef<'f>
         = <BufferedRx<C::Buff, C::Alloc> as TrBuffTryRead<u8>>::SegmRef<'f>
@@ -319,9 +316,9 @@ where
     }
 }
 
-impl<W, R, S, C> TrBuffRead<u8> for ChannelRx<W, R, S, C>
+impl<C, S> TrBuffRead<u8> for ChannelRx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     type ReadAsync<'f>
         = <BufferedRx<C::Buff, C::Alloc> as TrBuffRead<u8>>::ReadAsync<'f>
@@ -334,18 +331,15 @@ where
     }
 }
 
-impl<W, R, S, C> TrChannelHalf for ChannelRx<W, R, S, C>
+impl<C, S> TrChannelHalf<C> for ChannelRx<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
-    type Data = u8;
-    type Dock = Dock;
-
-    fn local_dock(&self) -> Self::Dock {
+    fn local_dock(&self) -> C::Dock {
         self.local_dock_
     }
 
-    fn remote_dock(&self) -> Self::Dock {
+    fn remote_dock(&self) -> C::Dock {
         self.remote_dock_
     }
 
@@ -361,7 +355,10 @@ where
     }
 }
 
-impl<W, R, S, C> TrChannelRx for ChannelRx<W, R, S, C> where C: TrMuxConfig {}
+impl<C, S> TrChannelRx<C> for ChannelRx<C, S>
+where
+    C: TrConnCfg,
+{}
 
 #[cfg(test)]
 mod tests_ {
@@ -377,7 +374,7 @@ mod tests_ {
         connection::{
             owner_::ChannelState_,
             ring_::test_support_::make_test_channel_,
-            test_support_::{NullScope_, TestMuxConfig_, TestWireRx_, TestWireTx_, make_test_conn_},
+            test_support_::{NullScope_, TestMuxConfig_, make_test_conn_},
         },
         flow_ctrl::{DefaultPolicy, FlowCtrl, ReportThresholds_},
     };
@@ -385,8 +382,8 @@ mod tests_ {
     use super::*;
 
     /// 测试用的子流半边类型（连接未经握手、不含任何循环，只用于检查本地行为）。
-    type TestTx = ChannelTx<TestWireTx_, TestWireRx_, NullScope_, TestMuxConfig_>;
-    type TestRx = ChannelRx<TestWireTx_, TestWireRx_, NullScope_, TestMuxConfig_>;
+    type TestTx = ChannelTx<TestMuxConfig_, NullScope_>;
+    type TestRx = ChannelRx<TestMuxConfig_, NullScope_>;
 
     /// 构造一对包在**内存环**上的子流半边（容量 64，dock 对 `(3, 7)`）。
     /// - 手段：先建一个「无循环连接」（[`make_test_conn_`]，只提供事件发送端与

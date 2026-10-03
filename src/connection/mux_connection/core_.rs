@@ -38,7 +38,7 @@
 
 use crate::{
     connection::{
-        TrMuxConfig,
+        TrConnCfg,
         mux_connection::ChannelRegistry_,
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
     },
@@ -49,7 +49,7 @@ use crate::{
 ///
 /// 泛型参数：
 ///
-/// - `C`：资源策略，见 [`TrMuxConfig`]；
+/// - `C`：资源策略，见 [`TrConnCfg`](crate::connection::TrConnCfg)；
 /// - `S`：调用方注入的本地作用域类型（`abs_art::TrLocalScope` 的实现值）。
 ///   本类型只**保存**它，不要求它在类型上实现任何 trait；`spawn_local` 所需的
 ///   bound 只出现在 [`MuxConnection::new`](super::MuxConnection::new) 上。
@@ -60,7 +60,7 @@ use crate::{
 /// （`ChannelRegistry_::cancel_loops_`），循环随即在下一个 await 点自行退出。
 pub(crate) struct MuxCore<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 资源策略：建子流环与判定窗口时在 API 面就地取用。
     config_: C,
@@ -83,7 +83,7 @@ where
 
 impl<C, S> MuxCore<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 由建连路径展开后的全部量构造（成员私有，构造只能走这里）。
     pub(crate) fn new_(
@@ -136,7 +136,7 @@ where
 
 impl<C, S> Drop for MuxCore<C, S>
 where
-    C: TrMuxConfig,
+    C: TrConnCfg,
 {
     /// 连接收尾：触发两个循环的取消令牌。
     ///

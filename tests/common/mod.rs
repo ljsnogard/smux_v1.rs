@@ -65,7 +65,7 @@
 //!
 #![allow(dead_code)] // 三个测试 target 各自只用到本模块的一部分。
 
-use core::mem::MaybeUninit;
+use core::{borrow::BorrowMut, marker::PhantomData, mem::MaybeUninit};
 
 use buffex::{
     ring::Ring,
@@ -78,11 +78,17 @@ use buffex::{
 };
 use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
 use abs_smux::{
-    chan::{TrChannelHalf, TrChannelHandle},
+    chan::{
+        ChannelBuffAlloc, TrChannelHalf, TrChannelHandle, TrPrepareChannelRing,
+    },
+    conf::TrMuxConfig,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use smux_v1::{
-    connection::{BindError, Dock, HandleError, MuxConnection, TrMuxConfig},
+    connection::{
+        BindError, ChannelHandle, ChannelRx, ChannelTx, Dock, HandleError, MuxConnection,
+        TrConnCfg,
+    },
     flow_ctrl::DefaultPolicy,
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
@@ -101,7 +107,66 @@ pub use abs_art::TrLocalScope as TrSmokeScope;
 /// 一端连接对象的类型：策略固定为 [`SmokeMuxConfig`]，另外两个参数就是**传输**类型
 /// （`R` / `W`）——连接对外的错误类型由它们派生（`MuxError<R::Err, W::Err>`），
 /// 因此调用方不必（也常常无法）命名错误类型。
-pub type SmokeConn<R, W, S> = MuxConnection<W, R, S, SmokeMuxConfig>;
+pub type SmokeConn<R, W, S> = MuxConnection<SmokeMuxConfig<W, R>, S>;
+
+/// 测试侧对「闭包造两块缓冲」这一常见写法的适配器。
+///
+/// 上游 `TrPrepareChannelRing` 由环境自行实现；本测试套件为了不把每个调用点都手写
+/// 一个 prepared 类型，提供一个最小的闭包包装器。
+pub struct ClosurePrepare<F>(F);
+
+impl<F> ClosurePrepare<F> {
+    /// 包住一个 `FnOnce() -> (tx_buff, rx_buff)` 闭包。
+    pub const fn new(inner: F) -> Self {
+        ClosurePrepare(inner)
+    }
+}
+
+impl<F, B> TrPrepareChannelRing<B, u8> for ClosurePrepare<F>
+where
+    F: FnOnce() -> (B, B),
+    B: 'static + BorrowMut<[MaybeUninit<u8>]>,
+{
+    fn prepare(self) -> ChannelBuffAlloc<B, u8> {
+        let (tx_buff, rx_buff) = (self.0)();
+        ChannelBuffAlloc::new(tx_buff, rx_buff)
+    }
+}
+
+/// 给真实 [`ChannelHandle`] 加一个「直接传闭包」的便捷方法，让测试场景保持可读。
+///
+/// 生产路径仍然按上游契约走 `accept_async(welcome, prepare)`；这里只是把闭包包进
+/// [`ClosurePrepare`] 后转发。
+pub trait AcceptAsyncClosureExt<C, S>: Sized
+where
+    C: TrConnCfg,
+{
+    async fn accept_async_closure<'f, W, F>(
+        &'f mut self,
+        welcome: &'f mut W,
+        prepare: F,
+    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError<C>>
+    where
+        W: 'f + TrBuffWrite<u8>,
+        F: FnOnce() -> (C::Buff, C::Buff);
+}
+
+impl<C, S> AcceptAsyncClosureExt<C, S> for ChannelHandle<C, S>
+where
+    C: TrConnCfg,
+{
+    async fn accept_async_closure<'f, W, F>(
+        &'f mut self,
+        welcome: &'f mut W,
+        prepare: F,
+    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError<C>>
+    where
+        W: 'f + TrBuffWrite<u8>,
+        F: FnOnce() -> (C::Buff, C::Buff),
+    {
+        self.accept_async(welcome, ClosurePrepare::new(prepare)).await
+    }
+}
 
 /// 每个端点监听的 dock 数量（dock 取值 `1..=16`）。
 pub const K_DOCK_COUNT: u32 = 16;
@@ -119,16 +184,50 @@ pub const K_CHANNEL_CAPACITY: usize = 4096;
 pub const K_NET_BUFFER_SIZE: usize = 64usize * 1024usize;
 
 /// 测试用复用资源策略：`mm_ptr::Owned` 存储 + `CoreAlloc` 分配器 +
-/// [`DefaultPolicy`] 流控。
-pub struct SmokeMuxConfig;
+/// [`DefaultPolicy`] 流控，两条传输半边由类型参数 `W` / `R` 给出。
+pub struct SmokeMuxConfig<W, R> {
+    _use_w_: PhantomData<fn() -> W>,
+    _use_r_: PhantomData<fn() -> R>,
+}
 
-/// [`DefaultPolicy`] 是 ZST；取静态引用即可满足 `TrMuxConfig::policy`。
+impl<W, R> SmokeMuxConfig<W, R> {
+    /// 由一个 ZST 值构造；类型由调用点的 `HandshakeDelivery` / `MuxConnection` 推断。
+    pub const fn new() -> Self {
+        SmokeMuxConfig {
+            _use_w_: PhantomData,
+            _use_r_: PhantomData,
+        }
+    }
+}
+
+impl<W, R> Default for SmokeMuxConfig<W, R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// [`DefaultPolicy`] 是 ZST；取静态引用即可满足 `TrConnCfg::policy`。
 static SMOKE_POLICY: DefaultPolicy = DefaultPolicy;
 
-impl TrMuxConfig for SmokeMuxConfig {
-    type Buff = Owned<[MaybeUninit<u8>], CoreAlloc>;
+impl<W, R> TrMuxConfig for SmokeMuxConfig<W, R>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+{
+    type Data = u8;
+    type Dock = Dock;
+    type Buff = SmokeBuff;
+}
+
+impl<W, R> TrConnCfg for SmokeMuxConfig<W, R>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+{
     type Alloc = CoreAlloc;
     type Policy = DefaultPolicy;
+    type ConnTx = W;
+    type ConnRx = R;
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
@@ -137,7 +236,6 @@ impl TrMuxConfig for SmokeMuxConfig {
     fn policy(&self) -> &Self::Policy {
         &SMOKE_POLICY
     }
-
 }
 
 /// 环存储的具体类型（元素 `u8` + `CoreAlloc`），避免类型推断歧义。
@@ -311,7 +409,7 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB, S>(
     OA: TrOutput<u8>,
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     run_socket_scenario_with_(input_a, output_a, input_b, output_b, |a_rx, a_tx, b_rx, b_tx| {
         run_smoke_scenario_::<_, _, _, _, S>(scope, a_rx, a_tx, b_rx, b_tx)
@@ -332,7 +430,7 @@ pub async fn run_small_socket_scenario_<IA, OA, IB, OB, S>(
     OA: TrOutput<u8>,
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     run_socket_scenario_with_(
         input_a,
@@ -419,7 +517,7 @@ pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S>(
     WA: TrBuffWrite<u8> + 'static,
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     run_mux_scenario_::<_, _, _, _, S>(
         scope,
@@ -451,7 +549,7 @@ async fn run_mux_scenario_<RA, WA, RB, WB, S>(
     WA: TrBuffWrite<u8> + 'static,
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
         connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
@@ -480,7 +578,7 @@ where
     WA: TrBuffWrite<u8> + 'static,
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     let invite_opts = BasicOpts::default();
     let listen_opts = BasicOpts::default();
@@ -491,8 +589,8 @@ where
     let delivery_b = accepted.expect("等待方握手应当成功");
 
     (
-        MuxConnection::new(scope, delivery_a, SmokeMuxConfig),
-        MuxConnection::new(scope, delivery_b, SmokeMuxConfig),
+        MuxConnection::new(scope, delivery_a, SmokeMuxConfig::new()),
+        MuxConnection::new(scope, delivery_b, SmokeMuxConfig::new()),
     )
 }
 
@@ -518,7 +616,7 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
     WA: TrBuffWrite<u8> + 'static,
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
         connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
@@ -592,7 +690,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
     WA: TrBuffWrite<u8> + 'static,
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
         connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
@@ -630,7 +728,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
     let (opened, incoming) = futures::join!(
         async {
             again
-                .accept_async(&mut welcome, || {
+                .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
                 })
                 .await
@@ -643,7 +741,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
             let mut peer_welcome_buf: [u8; 0] = [];
             let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
             handle
-                .accept_async(&mut peer_welcome, || {
+                .accept_async_closure(&mut peer_welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
                 })
                 .await
@@ -674,7 +772,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
     let (verdict, ()) = futures::join!(
         async {
             waiter
-                .accept_async(&mut welcome2, || {
+                .accept_async_closure(&mut welcome2, || {
                     (make_channel_buff_(), make_channel_buff_())
                 })
                 .await
@@ -714,7 +812,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
     WA: TrBuffWrite<u8> + 'static,
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
         connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
@@ -744,7 +842,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
     let (verdict_a, verdict_b) = futures::join!(
         async {
             handle_a
-                .accept_async(&mut welcome, || {
+                .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
                 })
                 .await
@@ -757,7 +855,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
             let mut peer_welcome_buf: [u8; 0] = [];
             let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
             handle_b
-                .accept_async(&mut peer_welcome, || {
+                .accept_async_closure(&mut peer_welcome, || {
                     // 容量 1 < 环下限 2 ⇒ 连接应当拒绝这两份内存。
                     (make_channel_buff_with_(1), make_channel_buff_with_(1))
                 })
@@ -792,7 +890,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
             let mut welcome2_buf: [u8; 0] = [];
             let mut welcome2: &mut [u8] = &mut welcome2_buf[..];
             let (tx, mut rx) = handle_a2
-                .accept_async(&mut welcome2, || {
+                .accept_async_closure(&mut welcome2, || {
                     (make_channel_buff_(), make_channel_buff_())
                 })
                 .await
@@ -807,7 +905,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
             let mut peer_welcome_buf: [u8; 0] = [];
             let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
             let (tx, mut rx) = handle_b2
-                .accept_async(&mut peer_welcome, || {
+                .accept_async_closure(&mut peer_welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
                 })
                 .await
@@ -816,27 +914,6 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
         },
     );
     let _ = (a_done, b_done);
-}
-
-/// 借用型环存储策略：环存储**类型**是借来的切片（`&'static mut [MaybeUninit<u8>]`）。
-///
-/// 用来演示「类型由使用环境声明，**分配由 accept 端当场决定**」：引用型存储可以来自
-/// 任意地方——静态区、泄漏的堆块、自定义 arena——只要活得够久（这里是 `'static`）。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BorrowedBuffMuxConfig;
-
-impl TrMuxConfig for BorrowedBuffMuxConfig {
-    type Buff = SmokeBuff;
-    type Alloc = CoreAlloc;
-    type Policy = DefaultPolicy;
-
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
-    }
-
-    fn policy(&self) -> &Self::Policy {
-        &SMOKE_POLICY
-    }
 }
 
 /// 逐条子流自行分配场景：**同一条连接**（一种声明的环存储类型）上，两条子流各自
@@ -861,7 +938,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
     WA: TrBuffWrite<u8> + 'static,
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
         connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
@@ -901,7 +978,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
             let mut welcome_buf: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome_buf[..];
             let (tx, mut rx) = handle
-                .accept_async(&mut welcome, move || (make_channel_buff_with_(small), make_channel_buff_with_(small)))
+                .accept_async_closure(&mut welcome, move || (make_channel_buff_with_(small), make_channel_buff_with_(small)))
                 .await
                 .expect("第一条子流裁决应当成功");
             exchange_and_half_close_(tx, &mut rx, 0x4001u32, 0usize).await;
@@ -914,7 +991,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
             let mut welcome_buf: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome_buf[..];
             let (tx, mut rx) = handle
-                .accept_async(&mut welcome, move || (make_channel_buff_with_(small), make_channel_buff_with_(small)))
+                .accept_async_closure(&mut welcome, move || (make_channel_buff_with_(small), make_channel_buff_with_(small)))
                 .await
                 .expect("B 侧第一条子流裁决应当成功");
             exchange_and_half_close_(tx, &mut rx, 0x4001u32, 0usize).await;
@@ -934,7 +1011,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
             let mut welcome_buf: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome_buf[..];
             let (tx, mut rx) = handle
-                .accept_async(&mut welcome, move || (make_channel_buff_with_(large), make_channel_buff_with_(large)))
+                .accept_async_closure(&mut welcome, move || (make_channel_buff_with_(large), make_channel_buff_with_(large)))
                 .await
                 .expect("第二条子流裁决应当成功");
             exchange_and_half_close_(tx, &mut rx, 0x4002u32, 1usize).await;
@@ -947,7 +1024,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
             let mut welcome_buf: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome_buf[..];
             let (tx, mut rx) = handle
-                .accept_async(&mut welcome, move || (make_channel_buff_with_(large), make_channel_buff_with_(large)))
+                .accept_async_closure(&mut welcome, move || (make_channel_buff_with_(large), make_channel_buff_with_(large)))
                 .await
                 .expect("B 侧第二条子流裁决应当成功");
             exchange_and_half_close_(tx, &mut rx, 0x4002u32, 1usize).await;
@@ -973,16 +1050,14 @@ pub const K_SMALL_CHANNELS_PER_DOCK: usize = 2;
 /// # Panics
 ///
 /// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
-async fn drive_side_<C, S, R, W>(
-    conn: &MuxConnection<W, R, S, C>,
+async fn drive_side_<C, S>(
+    conn: &MuxConnection<C, S>,
     side: u32,
     dock_count: u32,
     per_dock: usize,
 ) where
-    // 环存储类型必须与连接声明的一致（`TrPrepareChannelRing<C::Buff, _>`）。
-    C: TrMuxConfig<Buff = SmokeBuff>,
-    R: TrBuffRead<u8> + 'static,
-    W: TrBuffWrite<u8> + 'static,
+    C: TrConnCfg + TrMuxConfig<Buff = SmokeBuff>,
+    S: Clone,
 {
     let conn_ref = conn;
 
@@ -1010,7 +1085,7 @@ async fn drive_side_<C, S, R, W>(
                 let mut welcome_buf: [u8; 0] = [];
                 let mut welcome: &mut [u8] = &mut welcome_buf[..];
                 let (tx, mut rx) = handle
-                    .accept_async(&mut welcome, || {
+                    .accept_async_closure(&mut welcome, || {
                         (make_channel_buff_(), make_channel_buff_())
                     })
                     .await
@@ -1042,7 +1117,7 @@ async fn drive_side_<C, S, R, W>(
                 let mut welcome_buf: [u8; 0] = [];
                 let mut welcome: &mut [u8] = &mut welcome_buf[..];
                 let (tx, mut rx) = handle
-                    .accept_async(&mut welcome, || {
+                    .accept_async_closure(&mut welcome, || {
                         (make_channel_buff_(), make_channel_buff_())
                     })
                     .await
@@ -1253,7 +1328,7 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB, S>(
     WA: TrBuffWrite<u8> + 'static,
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
-    S: TrSmokeScope + Clone,
+    S: TrSmokeScope + Clone + 'static,
 {
     run_mux_scenario_::<_, _, _, _, S>(
         scope,

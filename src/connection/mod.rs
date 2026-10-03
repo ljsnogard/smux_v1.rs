@@ -269,7 +269,7 @@
 //! - 于是两侧的状态机同形：**（本地准备）→ 发送 `OPEN` → 收到对端 `OPEN` →（被动方
 //!   多一步发送 `ACCEPT`）→ 建立完成**；谁都不会先看到对方的数据帧。
 //! - **缓冲归属**：`accept_async` 的 `prepare` 给出的两块缓冲**就是**本条子流的环
-//!   存储。**类型**由使用环境在策略里声明（[`TrMuxConfig::Buff`]），并在 `abs_smux`
+//!   存储。**类型**由使用环境在策略里声明（[`TrMuxConfig::Buff`](abs_smux::conf::TrMuxConfig::Buff)），并在 `abs_smux`
 //!   的 `TrAcceptBuff` 上登记为「本连接接受的唯一一种」——于是两个循环、两条事件通道与
 //!   两个半部都能静态参数化，**零装箱、零间接**；**分配**（每条子流多大、从哪来）由调用
 //!   方在 `prepare` 里当场决定，容量不合适时连接**拒绝接受**
@@ -364,7 +364,7 @@
 //! 错误是次要信息、且常常不可命名（可能是私有类型、或只以
 //! `<T as TrBuffTryRead<u8>>::Err` 这样的投影存在），把它放到高层泛型参数上会逼
 //! 调用方在**每个**类型别名里写投影，等于「连接是什么」被错误牵着走。现在错误一律
-//! 由传输派生：`TrConnection::Err = MuxError<R, W>`，而 `MuxError` 自身的两个参数
+//! 由传输派生：`TrConnection::Err = MuxError<C>`，而 `MuxError` 自身的两个参数
 //! **也是传输**——它的载荷变体写成 `Rx(<R as TrBuffTryRead<u8>>::Err)` 这样，因此
 //! 开发者写 `match err { MuxError::Rx(e) => .. }` 时载荷类型自动推断，不需要（也
 //! 常常无法）命名它。
@@ -432,7 +432,7 @@
 //! | `channel_handle` | [`ChannelHandle`] + accept / reject | `TrChannelHandle` |
 //! | `channel_half` | [`ChannelTx`] / [`ChannelRx`]（各自即环半部的具名包装） | `TrChannelTx` / `TrChannelRx` / `TrChannelHalf` |
 //! | `telegraph` | [`Telegraph`] | `TrTelegraph` |
-//! | `config_` | [`TrMuxConfig`] | —（本 crate 自有） |
+//! | `config_` | [`TrConnCfg`] | —（本 crate 自有） |
 //! | `types_` / `util_` | 公开类型别名 / 控制面小工具 | — |
 //! | `test_support_` | 测试专用：无循环连接、空作用域、测试策略（`#[cfg(test)]`） | — |
 //! | `session_` | 读 / 写两个内部循环（本地表也是 `BTreeMap`） | —（内部） |
@@ -468,15 +468,14 @@ mod util_;
 pub use channel_handle::ChannelHandle;
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::ChannelListener;
-pub use config_::{DefaultMuxConfig, TrMuxConfig};
+pub use config_::{DefaultConnCfg, TrConnCfg};
 pub use dock_binding::DockBinding;
 pub use error_::{
     BindError, BindingError, HandleError, ListenerError, MuxError, TelegraphError,
 };
-pub(crate) use error_::{MuxReadErr_, MuxWriteErr_, NoHalfway_, ReserveErr_};
+pub(crate) use error_::ReserveErr_;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::MuxConnection;
-pub use ring_::{BufferedChannel, BufferedRx, BufferedTx};
+pub use ring_::{BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff};
 pub use telegraph::Telegraph;
 pub use types_::Dock;
-

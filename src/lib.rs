@@ -4,6 +4,8 @@
 #![feature(btreemap_alloc)]
 #![feature(impl_trait_in_assoc_type)]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 

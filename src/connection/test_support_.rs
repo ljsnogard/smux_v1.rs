@@ -19,12 +19,13 @@ use core::{
     task::{Context, Poll},
 };
 
+use abs_smux::conf::TrMuxConfig;
 use abs_art::{TrJoinHandle, TrLocalScope};
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, MuxConnection, TrMuxConfig,
+        BufferedRx, BufferedTx, MuxConnection, TrConnCfg,
         ring_::test_support_::TestBuff,
     },
     flow_ctrl::DefaultPolicy,
@@ -108,9 +109,16 @@ pub(crate) struct TestMuxConfig_;
 static TEST_POLICY_: DefaultPolicy = DefaultPolicy;
 
 impl TrMuxConfig for TestMuxConfig_ {
+    type Data = u8;
+    type Dock = crate::connection::Dock;
     type Buff = TestBuff;
+}
+
+impl TrConnCfg for TestMuxConfig_ {
     type Alloc = CoreAlloc;
     type Policy = DefaultPolicy;
+    type ConnTx = TestWireTx_;
+    type ConnRx = TestWireRx_;
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
@@ -119,7 +127,6 @@ impl TrMuxConfig for TestMuxConfig_ {
     fn policy(&self) -> &Self::Policy {
         &TEST_POLICY_
     }
-
 }
 
 /// 测试连接用的两个传输类型（真实的内存环端；本连接不驱动它们，只为满足类型参数）。
@@ -129,7 +136,7 @@ pub(crate) type TestWireRx_ = BufferedRx<TestBuff, CoreAlloc>;
 pub(crate) type TestWireTx_ = BufferedTx<TestBuff, CoreAlloc>;
 
 /// 建一个**不含任何循环**的测试连接。
-pub(crate) fn make_test_conn_() -> MuxConnection<TestWireTx_, TestWireRx_, NullScope_, TestMuxConfig_> {
+pub(crate) fn make_test_conn_() -> MuxConnection<TestMuxConfig_, NullScope_> {
     MuxConnection::new_test_(
         &NullScope_,
         HandshakeOpts {

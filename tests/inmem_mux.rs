@@ -406,12 +406,12 @@ async fn dropping_connection_stops_both_loops_tokio_() {
         let conn_a = MuxConnection::new(
             &scope,
             invited.expect("发起方握手应当成功"),
-            common::SmokeMuxConfig,
+            common::SmokeMuxConfig::new(),
         );
         let conn_b = MuxConnection::new(
             &scope,
             accepted.expect("等待方握手应当成功"),
-            common::SmokeMuxConfig,
+            common::SmokeMuxConfig::new(),
         );
         // 会话句柄也持有一份连接克隆：逐个丢弃，最后一个消失时核心才析构。
         let binding = conn_a
@@ -480,12 +480,12 @@ async fn dropping_one_side_stops_its_loops_tokio_() {
         let conn_a = MuxConnection::new(
             &scope,
             invited.expect("发起方握手应当成功"),
-            common::SmokeMuxConfig,
+            common::SmokeMuxConfig::new(),
         );
         let conn_b = MuxConnection::new(
             &scope,
             accepted.expect("等待方握手应当成功"),
-            common::SmokeMuxConfig,
+            common::SmokeMuxConfig::new(),
         );
 
         // 只丢 A：B 仍然活着、空闲，其写循环不会关掉 A 的接收环。

@@ -131,11 +131,13 @@
 
 mod common;
 
+use common::AcceptAsyncClosureExt;
+
 use core::mem::MaybeUninit;
 
 use abs_art::TrLocalScope;
 use abs_smux::{
-    chan::{TrChannelHalf, TrChannelHandle},
+    chan::TrChannelHalf,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
     dock::TrDock,
 };
@@ -184,17 +186,20 @@ type WireTx = smux_v1::connection::BufferedTx<WireBuff, CoreAlloc>;
 /// L5 的连接对象。客户端与服务端同型，只是握手角色不同。
 type Mux<S> = common::SmokeConn<WireRx, WireTx, S>;
 
+/// 本测试使用的具体配置类型（传输是 `WireTx` / `WireRx`）。
+type SmokeCfg = common::SmokeMuxConfig<WireTx, WireRx>;
+
 /// 【F5 ✅】已建立 channel 的发送半边：**可以直接写出的具名类型**。
-type ChanTx<S> = ChannelTx<WireTx, WireRx, S, common::SmokeMuxConfig>;
+type ChanTx<S> = ChannelTx<SmokeCfg, S>;
 
 /// 同 [`ChanTx`]，接收半边。
-type ChanRx<S> = ChannelRx<WireTx, WireRx, S, common::SmokeMuxConfig>;
+type ChanRx<S> = ChannelRx<SmokeCfg, S>;
 
 /// 【F3 ✅】listener 也是具名类型，可以作为返回值与结构体字段。
-type Listener<S> = ChannelListener<WireTx, WireRx, S, common::SmokeMuxConfig>;
+type Listener<S> = ChannelListener<SmokeCfg, S>;
 
 /// 【F2 ✅】binding 同上。
-type Binding<S> = DockBinding<WireTx, WireRx, S, common::SmokeMuxConfig>;
+type Binding<S> = DockBinding<SmokeCfg, S>;
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // L4：传输层
@@ -239,7 +244,7 @@ fn loopback_wire_() -> (ClientWire_, ServerWire_) {
 /// 握手失败即 panic（测试专用）。
 async fn client_mux_connect_<S>(scope: &S, wire: ClientWire_) -> Mux<S>
 where
-    S: common::TrSmokeScope + Clone,
+    S: common::TrSmokeScope + Clone + 'static,
 {
     let ClientWire_ { rx_, tx_ } = wire;
     let opts = BasicOpts::default();
@@ -247,7 +252,7 @@ where
         .invite_async(&opts, AcceptAllEntries)
         .await
         .expect("客户端握手应当成功");
-    MuxConnection::new(scope, delivery, common::SmokeMuxConfig)
+    MuxConnection::new(scope, delivery, <SmokeCfg as Default>::default())
 }
 
 /// **L5（服务端）**：等待握手，接管收发，建出连接对象。
@@ -260,7 +265,7 @@ where
 /// 握手失败即 panic（测试专用）。
 async fn server_mux_accept_<S>(scope: &S, wire: ServerWire_) -> Mux<S>
 where
-    S: common::TrSmokeScope + Clone,
+    S: common::TrSmokeScope + Clone + 'static,
 {
     let ServerWire_ { rx_, tx_ } = wire;
     let opts = BasicOpts::default();
@@ -268,7 +273,7 @@ where
         .listen_async(&opts, AcceptAllEntries)
         .await
         .expect("服务端握手应当成功");
-    MuxConnection::new(scope, delivery, common::SmokeMuxConfig)
+    MuxConnection::new(scope, delivery, <SmokeCfg as Default>::default())
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -311,7 +316,7 @@ where
     let mut welcome_buf: [u8; 0] = [];
     let mut welcome: &mut [u8] = &mut welcome_buf[..];
     let (tx, rx) = handle
-        .accept_async(&mut welcome, || {
+        .accept_async_closure(&mut welcome, || {
             (common::make_channel_buff_(), common::make_channel_buff_())
         })
         .await
@@ -349,7 +354,7 @@ impl<S> RpcServer_<S> {
     /// 握手 / 绑定 / 监听任一步失败即 panic（测试专用）。
     async fn bind_and_listen(scope: &S, wire: ServerWire_, dock: Dock) -> Self
     where
-        S: common::TrSmokeScope + Clone,
+        S: common::TrSmokeScope + Clone + 'static,
     {
         let conn_ = server_mux_accept_(scope, wire).await;
         let mut binding_ = conn_
@@ -394,7 +399,7 @@ impl<S> RpcServer_<S> {
             let mut welcome_buf: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome_buf[..];
             let (tx, rx) = handle
-                .accept_async(&mut welcome, || {
+                .accept_async_closure(&mut welcome, || {
                     (common::make_channel_buff_(), common::make_channel_buff_())
                 })
                 .await
@@ -547,7 +552,7 @@ where
 /// 任一层失败、或响应字节与预期不符即 panic。
 async fn layered_rpc_scenario_<S>(scope: &S)
 where
-    S: common::TrSmokeScope + Clone,
+    S: common::TrSmokeScope + Clone + 'static,
 {
     // L4：一条已连接的字节流，两端分头进入各自的协议栈。
     let (client_wire, server_wire) = loopback_wire_();
@@ -639,7 +644,7 @@ fn probe_named_half_types_<S>(tx: ChanTx<S>, rx: ChanRx<S>) -> HalfHolder_<S> {
 /// 出来。现在参数是两个**传输**类型——开发者手里本来就有它们——载荷由传输派生并
 /// 在 match 时自动推断。**刻意不执行**，只为把结论钉在编译期。
 #[allow(dead_code)]
-fn probe_write_code_against_mux_error_(err: MuxError<WireRx, WireTx>) -> ErrClass_ {
+fn probe_write_code_against_mux_error_(err: MuxError<SmokeCfg>) -> ErrClass_ {
     match err {
         MuxError::Rx(_) => ErrClass_::Read,
         MuxError::Tx(_) => ErrClass_::Write,
@@ -651,7 +656,7 @@ fn probe_write_code_against_mux_error_(err: MuxError<WireRx, WireTx>) -> ErrClas
 
 /// 【F9 ✅ 探针】同一段代码也可以直接吃**连接的关联错误类型**。
 #[allow(dead_code)]
-fn probe_classify_connection_error_<S>(err: <Mux<S> as TrConnection>::Err) -> ErrClass_ {
+fn probe_classify_connection_error_<S>(err: <Mux<S> as TrConnection<SmokeCfg>>::Err) -> ErrClass_ {
     // 面自己的错误类型把连接级失败包在 `Mux(..)` 里，内层 `MuxError` 仍然是同一个类型，
     // 因此那段分类代码原样可用。
     match err {

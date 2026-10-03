@@ -73,13 +73,15 @@
 // 因此这里保留 `dead_code` 允许；**第 5 步完成后必须移除本行**。
 
 use abs_buff::{
-    TrBuffTryRead, TrBuffTryWrite,TrBuffRead, TrBuffWrite, x_deps::abs_cancel};
+    TrBuffRead, TrBuffWrite,
+    x_deps::abs_cancel,
+};
 use abs_cancel::TrCancellationToken;
 use abs_smux::dock::TrDock;
 use buffex::x_deps::abs_buff;
 
 use crate::{
-    connection::{Dock, MuxError, MuxReadErr_, MuxWriteErr_},
+    connection::{Dock, MuxError, TrConnCfg},
     flow_ctrl::{Credit, RecvTotal},
     handshake::opts::NegotiationValType as FieldValType,
     wire_io_::{CursorError, ReadCursor, write_all_async_},
@@ -447,15 +449,16 @@ fn encode_field_(id: FieldId, value: usize) -> Option<([u8; 9], usize)> {
 }
 
 /// 写一个字段，值以 `usize` 给出。
-async fn write_field_async_<W, C>(
+async fn write_field_async_<Cfg, W, K>(
     tx: &mut W,
     id: FieldId,
     value: usize,
-    cancel: C,
-) -> Result<(), MuxWriteErr_<W>>
+    cancel: K,
+) -> Result<(), MuxError<Cfg>>
 where
+    Cfg: TrConnCfg,
     W: TrBuffWrite<u8>,
-    C: TrCancellationToken,
+    K: TrCancellationToken,
 {
     let (bytes, len) = encode_field_(id, value).ok_or(MuxError::UnsupportedField)?;
     write_all_async_(tx, &bytes[..len], cancel)
@@ -463,30 +466,26 @@ where
         .map_err(map_write_cursor_err_)
 }
 
-/// 把共享字节游标（[`crate::wire_io_`]）的错误映射为复用帧错误。
-/// 把**读侧**游标错误映射为连接错误。
-///
-/// 游标层用 `()` 表示「这个方向不存在载荷」（见 `wire_io_`）；本函数把它翻译成
-/// 类型上不可构造的 `NoHalfwayErr_`，于是连接内部「只碰读方向」的错误类型可以精确
-/// 写成 [`MuxReadErr_`]。真出现写侧错误（不可达）时按「写方向传输中断」上报。
-fn map_read_cursor_err_<R>(err: CursorError<R::Err, ()>) -> MuxReadErr_<R>
+/// 把**读侧**游标错误映射为连接错误。底层载荷不在这里保留：帧层只关心
+/// 「读方向传输失败 / 对端关闭」这类可共享语义。
+fn map_read_cursor_err_<Cfg, E>(err: CursorError<E, ()>) -> MuxError<Cfg>
 where
-    R: TrBuffTryRead<u8>,
+    Cfg: TrConnCfg,
 {
     match err {
-        CursorError::Read(err) => MuxError::Rx(err),
+        CursorError::Read(_) => MuxError::Transport { write: false },
         CursorError::Write(()) => MuxError::Transport { write: true },
         CursorError::PeerClosed => MuxError::PeerClosed,
     }
 }
 
 /// 把**写侧**游标错误映射为连接错误；语义与 [`map_read_cursor_err_`] 对称。
-fn map_write_cursor_err_<W>(err: CursorError<(), W::Err>) -> MuxWriteErr_<W>
+fn map_write_cursor_err_<Cfg, E>(err: CursorError<(), E>) -> MuxError<Cfg>
 where
-    W: TrBuffTryWrite<u8>,
+    Cfg: TrConnCfg,
 {
     match err {
-        CursorError::Write(err) => MuxError::Tx(err),
+        CursorError::Write(_) => MuxError::Transport { write: true },
         CursorError::Read(()) => MuxError::Transport { write: false },
         CursorError::PeerClosed => MuxError::PeerClosed,
     }
@@ -507,13 +506,14 @@ where
 /// - 未知 / 保留的 `kind` 或字段标识、非法宽度 → [`MuxError::UnsupportedField`]；
 /// - 缺少必需字段、字段重复、字段与 `Kind` 的组合不符 → [`MuxError::MalformedFrame`]；
 /// - 底层读失败 / 对端关闭 → [`MuxError::Rx`] / [`MuxError::PeerClosed`]。
-pub(crate) async fn read_header_async_<R, C>(
+pub(crate) async fn read_header_async_<Cfg, R, K>(
     rx: &mut R,
-    cancel: C,
-) -> Result<FrameHeader, MuxReadErr_<R>>
+    cancel: K,
+) -> Result<FrameHeader, MuxError<Cfg>>
 where
+    Cfg: TrConnCfg,
     R: TrBuffRead<u8>,
-    C: TrCancellationToken,
+    K: TrCancellationToken,
 {
     let mut cursor = ReadCursor::new_(rx);
 
@@ -653,10 +653,9 @@ fn decode_dock_(value: usize) -> Result<Dock, DockDecode_> {
 }
 
 /// 把 [`DockDecode_`] 映射为帧层错误。
-fn map_dock_decode_<R, W>(err: DockDecode_) -> MuxError<R, W>
+fn map_dock_decode_<Cfg>(err: DockDecode_) -> MuxError<Cfg>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    Cfg: TrConnCfg,
 {
     match err {
         DockDecode_::TooLarge => MuxError::MalformedFrame,
@@ -688,14 +687,15 @@ pub(crate) const fn requires_window_report_(kind: FrameKind) -> bool {
 /// - 把 [`flags::K_TOTAL_RESET`] 用在 `PULSE` / `WINDOW_UPDATE` 之外的帧上
 ///   → [`MuxError::MalformedFrame`]；
 /// - 底层写失败 → [`MuxError::Tx`]。
-pub(crate) async fn write_header_async_<W, C>(
+pub(crate) async fn write_header_async_<Cfg, W, K>(
     tx: &mut W,
     header: &FrameHeader,
-    cancel: C,
-) -> Result<(), MuxWriteErr_<W>>
+    cancel: K,
+) -> Result<(), MuxError<Cfg>>
 where
+    Cfg: TrConnCfg,
     W: TrBuffWrite<u8>,
-    C: TrCancellationToken,
+    K: TrCancellationToken,
 {
     // `TOTAL_RESET` 只对窗口通告有意义，且 OPEN 时还没有 epoch。
     if header.flags_ & flags::K_TOTAL_RESET != 0
@@ -752,7 +752,13 @@ where
 mod tests_ {
     use abs_buff::x_deps::abs_cancel::NonCancellableToken;
 
+    use crate::connection::test_support_::TestMuxConfig_;
+
     use super::*;
+
+    /// 帧编解码测试只需要一个具体的连接配置来定型 `MuxError<C>`；实际读写走
+    /// 各个测试自己的切片 / 缓冲。
+    type TestCfg = TestMuxConfig_;
 
     /// 断言用的错误种类：把底层错误折叠掉，只保留协议层语义。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,17 +773,16 @@ mod tests_ {
     /// 取出错误的协议层种类，忽略底层读 / 写错误的细节。
     /// - 手段：对 [`MuxError`] 的变体做匹配；出现测试未覆盖的变体即 panic。
     /// - 判断：返回的 [`ErrKind`] 与被测代码产生的变体一一对应。
-    fn err_kind_<R, W>(err: MuxError<R, W>) -> ErrKind
-    where
-        R: TrBuffTryRead<u8>,
-        W: TrBuffTryWrite<u8>,
-    {
+    fn err_kind_(err: MuxError<TestCfg>) -> ErrKind {
         match err {
             MuxError::UnsupportedField => ErrKind::UnsupportedField,
             MuxError::MalformedFrame => ErrKind::MalformedFrame,
             MuxError::ReservedDock => ErrKind::ReservedDock,
             MuxError::PeerClosed => ErrKind::PeerClosed,
             MuxError::Rx(_) => ErrKind::Rx,
+            // 帧层现在不把任意读半边的错误载荷带出（它可能是切片测试缓冲），
+            // 统一投影成“读方向传输失败”；测试仍按原来的 `Rx` 种类断言。
+            MuxError::Transport { write: false } => ErrKind::Rx,
             other => panic!("测试未覆盖的错误种类：{other}"),
         }
     }
@@ -805,7 +810,7 @@ mod tests_ {
     async fn write_header_into_buf_(buf: &mut [u8], header: &FrameHeader) -> usize {
         let capacity = buf.len();
         let mut cursor: &mut [u8] = buf;
-        write_header_async_(&mut cursor, header, NonCancellableToken::new())
+        write_header_async_::<TestCfg, _, _>(&mut cursor, header, NonCancellableToken::new())
             .await
             .expect("写帧头应当成功");
         capacity - cursor.len()
@@ -816,7 +821,7 @@ mod tests_ {
     /// - 判断：`Ok` 为解析出的帧头；`Err` 为被测代码报出的错误种类。
     async fn read_header_from_buf_(bytes: &[u8]) -> Result<FrameHeader, ErrKind> {
         let mut probe: &[u8] = bytes;
-        read_header_async_(&mut probe, NonCancellableToken::new())
+        read_header_async_::<TestCfg, _, _>(&mut probe, NonCancellableToken::new())
             .await
             .map_err(err_kind_)
     }
@@ -834,7 +839,7 @@ mod tests_ {
     async fn write_header_err_(header: &FrameHeader) -> ErrKind {
         let mut buf = [0u8; 64];
         let mut cursor: &mut [u8] = &mut buf;
-        let err = write_header_async_(&mut cursor, header, NonCancellableToken::new())
+        let err = write_header_async_::<TestCfg, _, _>(&mut cursor, header, NonCancellableToken::new())
             .await
             .expect_err("写帧头应当失败");
         err_kind_(err)

@@ -153,7 +153,7 @@ impl ControlFrame_ {
 /// 送给**写循环**的事件。
 pub(crate) enum WriteEvent_<B, A>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
+    B: BorrowMut<[MaybeUninit<u8>]>,
     A: AllocatorClone + Send + Sync,
 {
     /// 会话侧发送环读端上线：写循环把它存进本地表，此后按 dock 对索引。
@@ -222,7 +222,7 @@ where
 /// 送给**读循环**的事件。
 pub(crate) enum ReadEvent_<B, A>
 where
-    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync,
+    B: BorrowMut<[MaybeUninit<u8>]>,
     A: AllocatorClone + Send + Sync,
 {
     /// 会话侧接收环写端上线：读循环把它存进本地表。

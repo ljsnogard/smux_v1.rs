@@ -10,11 +10,12 @@
 //! `ReadErrTag` / `WriteErrTag`，足以让 `is_drained_closing()` 之类的判定脱离
 //! 具体错误类型工作。
 
-use buffex::x_deps::abs_buff::error::{ReadErrTag, TrTaggedError, WriteErrTag};
-use buffex::x_deps::abs_buff::{Demand, TrBuffTryRead, TrBuffTryWrite};
-use buffex::x_deps::anylr::SomeOf;
+use buffex::x_deps::abs_buff::{TrBuffTryRead, TrBuffTryWrite};
 
-use crate::flow_ctrl::FlowCtrlError;
+use crate::{
+    connection::TrConnCfg,
+    flow_ctrl::FlowCtrlError,
+};
 
 /// 复用连接与子流操作失败的统一类型：**用两个传输半边参数化**，载荷由它们派生。
 ///
@@ -23,10 +24,12 @@ use crate::flow_ctrl::FlowCtrlError;
 /// 载荷类型叫什么，更不必写 `<T as TrBuffTryRead<u8>>::Err` 这样的投影。
 ///
 /// ```
-/// use smux_v1::connection::MuxError;
+/// use smux_v1::connection::{DefaultConnCfg, MuxError};
 ///
-/// // 开发者手里是两个传输半边；这里用切片当例子（它实现了 abs_buff 的两个 try 半边）。
-/// fn classify(err: MuxError<&'static [u8], &'static mut [u8]>) -> u8 {
+/// // 这里用切片当例子（它实现了 abs_buff 的两个 try 半边）。
+/// type Cfg = DefaultConnCfg<&'static mut [u8], &'static [u8]>;
+///
+/// fn classify(err: MuxError<Cfg>) -> u8 {
 ///     match err {
 ///         MuxError::Rx(_) => 1,
 ///         MuxError::Tx(_) => 2,
@@ -36,15 +39,15 @@ use crate::flow_ctrl::FlowCtrlError;
 ///     }
 /// }
 ///
-/// let err = MuxError::<&'static [u8], &'static mut [u8]>::PeerClosed;
+/// let err = MuxError::<Cfg>::PeerClosed;
 /// assert_eq!(classify(err), 0);
 /// ```
 ///
 /// 各 API 面的错误类型都把它包在 `Mux(..)` 里，例如
 /// [`HandleError::Mux`](crate::connection::HandleError::Mux)。
 ///
-/// 注意上面**没有出现**任何错误载荷类型：它们由两个半边派生，写 match 分支时载荷
-/// 的类型会被自动推断出来。
+/// 注意上面**没有出现**任何错误载荷类型：它们由 `C` 声明的那对传输半边派生，
+/// 写 match 分支时载荷的类型会被自动推断出来。
 ///
 /// # 为什么参数是传输而不是载荷
 ///
@@ -69,16 +72,15 @@ use crate::flow_ctrl::FlowCtrlError;
 ///
 /// 本类型自身不 panic；`NoHalfway_` 的占位实现若被调用会 `unreachable!()`（不可能，
 /// 该类型无法构造）。
-pub enum MuxError<R, W>
+pub enum MuxError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     /// 底层网络读失败（本次操作直接遇到）。
-    Rx(<R as TrBuffTryRead<u8>>::Err),
+    Rx(<C::ConnRx as TrBuffTryRead<C::Data>>::Err),
 
     /// 底层网络写失败（本次操作直接遇到）。
-    Tx(<W as TrBuffTryWrite<u8>>::Err),
+    Tx(<C::ConnTx as TrBuffTryWrite<C::Data>>::Err),
 
     /// 连接因底层传输错误而中断，无法继续收发。
     ///
@@ -117,21 +119,14 @@ where
     /// 帧总长超过协商出的 `max_packet_size`。
     FrameTooLarge,
 
-
-
-
-
-
-
     /// 流控失败（窗口违例或计数溢出）。
     FlowCtrl(FlowCtrlError),
 
 }
 
-impl<R, W> core::fmt::Display for MuxError<R, W>
+impl<C> core::fmt::Display for MuxError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -152,17 +147,14 @@ where
     }
 }
 
-impl<R, W> core::error::Error for MuxError<R, W>
+impl<C> core::error::Error for MuxError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
-{
-}
+    C: TrConnCfg + 'static,
+{}
 
-impl<R, W> core::fmt::Debug for MuxError<R, W>
+impl<C> core::fmt::Debug for MuxError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     /// 手写而非派生：派生会给 `R` / `W` 本身加 `Debug` 约束，而实际需要的是
     /// **载荷**可打印（载荷由 `TrTaggedError: core::error::Error` 保证）。
@@ -187,88 +179,87 @@ where
 }
 
 
-
-/// 「不存在的那一半」的错误载荷：**不可构造**（无变体），因此「另一侧出错」这件事
-/// 在类型上不可能发生。
-///
-/// 用途只有一个：让连接内部**只碰一个方向**的层仍能写出精确的错误类型。例如帧解析
-/// 只会产生读侧载荷，它的错误类型是 `MuxError<R, NoHalfway_>`——类型上就注明「写侧
-/// 不可能出错」，而不是含混地写 `MuxError<R, W>` 再假设 `W` 永不出现。
-///
-/// 由于本类型无法构造，它的两个 `try_*` 实现永远不会被调用。
-pub(crate) enum NoHalfwayErr_ {}
-
-impl core::fmt::Debug for NoHalfwayErr_ {
-    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match *self {}
-    }
-}
-
-impl core::fmt::Display for NoHalfwayErr_ {
-    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match *self {}
-    }
-}
-
-impl core::error::Error for NoHalfwayErr_ {}
-
-impl TrTaggedError<ReadErrTag> for NoHalfwayErr_ {
-    fn err_tag(&self) -> ReadErrTag {
-        match *self {}
-    }
-}
-
-impl TrTaggedError<WriteErrTag> for NoHalfwayErr_ {
-    fn err_tag(&self) -> WriteErrTag {
-        match *self {}
-    }
-}
-
-/// 「不存在的那一半」：**永不构造**的传输半边，其载荷类型是 [`NoHalfwayErr_`]。
-///
-/// 它只用于让内部「只碰一个方向」的层写出精确的错误类型，见本模块文档。
-#[derive(Clone, Copy)]
-pub(crate) enum NoHalfway_ {}
-
-impl TrBuffTryRead<u8> for NoHalfway_ {
-    /// 借用「真实半边」的段类型即可：本类型永不构造，段类型只用于满足 trait。
-    type SegmRef<'f>
-        = <&'static [u8] as TrBuffTryRead<u8>>::SegmRef<'f>
-    where
-        Self: 'f;
-
-    type Err = NoHalfwayErr_;
-
-    fn try_read<'f>(
-        &'f mut self,
-        _demand: &'f Demand<usize>,
-    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
-        match *self {}
-    }
-}
-
-impl TrBuffTryWrite<u8> for NoHalfway_ {
-    /// 同 [`NoHalfway_`] 的读侧说明。
-    type SegmMut<'f>
-        = <&'static mut [u8] as TrBuffTryWrite<u8>>::SegmMut<'f>
-    where
-        Self: 'f;
-
-    type Err = NoHalfwayErr_;
-
-    fn try_write<'f>(
-        &'f mut self,
-        _demand: &'f Demand<usize>,
-    ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
-        match *self {}
-    }
-}
-
-/// 只可能出现**读侧**载荷的连接错误（写侧不存在）。内部专用。
-pub(crate) type MuxReadErr_<R> = MuxError<R, NoHalfway_>;
-
-/// 只可能出现**写侧**载荷的连接错误（读侧不存在）。内部专用。
-pub(crate) type MuxWriteErr_<W> = MuxError<NoHalfway_, W>;
+// /// 「不存在的那一半」的错误载荷：**不可构造**（无变体），因此「另一侧出错」这件事
+// /// 在类型上不可能发生。
+// ///
+// /// 用途只有一个：让连接内部**只碰一个方向**的层仍能写出精确的错误类型。例如帧解析
+// /// 只会产生读侧载荷，它的错误类型是 `MuxError<R, NoHalfway_>`——类型上就注明「写侧
+// /// 不可能出错」，而不是含混地写 `MuxError<C>` 再假设 `W` 永不出现。
+// ///
+// /// 由于本类型无法构造，它的两个 `try_*` 实现永远不会被调用。
+// pub(crate) enum NoHalfwayErr_ {}
+//
+// impl core::fmt::Debug for NoHalfwayErr_ {
+//     fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+//         match *self {}
+//     }
+// }
+//
+// impl core::fmt::Display for NoHalfwayErr_ {
+//     fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+//         match *self {}
+//     }
+// }
+//
+// impl core::error::Error for NoHalfwayErr_ {}
+//
+// impl TrTaggedError<ReadErrTag> for NoHalfwayErr_ {
+//     fn err_tag(&self) -> ReadErrTag {
+//         match *self {}
+//     }
+// }
+//
+// impl TrTaggedError<WriteErrTag> for NoHalfwayErr_ {
+//     fn err_tag(&self) -> WriteErrTag {
+//         match *self {}
+//     }
+// }
+//
+// /// 「不存在的那一半」：**永不构造**的传输半边，其载荷类型是 [`NoHalfwayErr_`]。
+// ///
+// /// 它只用于让内部「只碰一个方向」的层写出精确的错误类型，见本模块文档。
+// #[derive(Clone, Copy)]
+// pub(crate) enum NoHalfway_ {}
+//
+// impl TrBuffTryRead<u8> for NoHalfway_ {
+//     /// 借用「真实半边」的段类型即可：本类型永不构造，段类型只用于满足 trait。
+//     type SegmRef<'f>
+//         = <&'static [u8] as TrBuffTryRead<u8>>::SegmRef<'f>
+//     where
+//         Self: 'f;
+//
+//     type Err = NoHalfwayErr_;
+//
+//     fn try_read<'f>(
+//         &'f mut self,
+//         _demand: &'f Demand<usize>,
+//     ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
+//         match *self {}
+//     }
+// }
+//
+// impl TrBuffTryWrite<u8> for NoHalfway_ {
+//     /// 同 [`NoHalfway_`] 的读侧说明。
+//     type SegmMut<'f>
+//         = <&'static mut [u8] as TrBuffTryWrite<u8>>::SegmMut<'f>
+//     where
+//         Self: 'f;
+//
+//     type Err = NoHalfwayErr_;
+//
+//     fn try_write<'f>(
+//         &'f mut self,
+//         _demand: &'f Demand<usize>,
+//     ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
+//         match *self {}
+//     }
+// }
+//
+// /// 只可能出现**读侧**载荷的连接错误（写侧不存在）。内部专用。
+// pub(crate) type MuxReadErr_<R> = MuxError<R, NoHalfway_>;
+//
+// /// 只可能出现**写侧**载荷的连接错误（读侧不存在）。内部专用。
+// pub(crate) type MuxWriteErr_<W> = MuxError<NoHalfway_, W>;
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 注册表内部的「预留 / 绑定」失败
@@ -306,14 +297,13 @@ pub(crate) enum ReserveErr_ {
 /// 为各面错误类型生成公共实现。
 ///
 /// 手写而非派生：派生会给 `R` / `W` 本身加 `Debug` 约束，而这两者只出现在
-/// `MuxError<R, W>` 里（它有自己的手写 `Debug`）。调用点传入「变体 → 中文说明」表；
+/// `MuxError<C>` 里（它有自己的手写 `Debug`）。调用点传入「变体 → 中文说明」表；
 /// `Mux(..)` 一档统一委托给内层 `MuxError`。
 macro_rules! face_error_impls {
     ($name:ident $(, $pat:pat => $text:expr)* $(,)?) => {
-        impl<R, W> core::fmt::Debug for $name<R, W>
+        impl<C> core::fmt::Debug for $name<C>
         where
-            R: TrBuffTryRead<u8>,
-            W: TrBuffTryWrite<u8>,
+            C: TrConnCfg + 'static,
         {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 match self {
@@ -323,10 +313,9 @@ macro_rules! face_error_impls {
             }
         }
 
-        impl<R, W> core::fmt::Display for $name<R, W>
+        impl<C> core::fmt::Display for $name<C>
         where
-            R: TrBuffTryRead<u8>,
-            W: TrBuffTryWrite<u8>,
+            C: TrConnCfg + 'static,
         {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 match self {
@@ -336,20 +325,18 @@ macro_rules! face_error_impls {
             }
         }
 
-        impl<R, W> From<MuxError<R, W>> for $name<R, W>
+        impl<C> From<MuxError<C>> for $name<C>
         where
-            R: TrBuffTryRead<u8>,
-            W: TrBuffTryWrite<u8>,
+            C: TrConnCfg + 'static,
         {
-            fn from(err: MuxError<R, W>) -> Self {
+            fn from(err: MuxError<C>) -> Self {
                 $name::Mux(err)
             }
         }
 
-        impl<R, W> core::error::Error for $name<R, W>
+        impl<C> core::error::Error for $name<C>
         where
-            R: TrBuffTryRead<u8> + 'static,
-            W: TrBuffTryWrite<u8> + 'static,
+            C: TrConnCfg + 'static,
         {
             fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
                 match self {
@@ -362,10 +349,9 @@ macro_rules! face_error_impls {
 }
 
 /// [`TrConnection`](abs_smux::conn::TrConnection) 的错误类型：目前只有 `bind_async`。
-pub enum BindError<R, W>
+pub enum BindError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     /// 要绑定的 dock 是协议保留值（`unspecified` / `wildcard`），不能当身份用。
     ReservedDock,
@@ -374,7 +360,7 @@ where
     DockInUse,
 
     /// 连接级失败。
-    Mux(MuxError<R, W>),
+    Mux(MuxError<C>),
 }
 
 /// [`TrDockBinding`](abs_smux::conn::TrDockBinding) 的错误类型。
@@ -387,10 +373,9 @@ where
 /// - `ReservedDock` 只会来自 `open_channel` 的**对端 dock**（channel 的身份是 dock 对，
 ///   两端都必须是真实 dock）；
 /// - telegraph 的报文目的地址允许保留值，与本类型无关（见 `TelegraphError`）。
-pub enum BindingError<R, W>
+pub enum BindingError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     /// 对端 dock 是协议保留值，不能当身份用（只可能来自 `open_channel`）。
     ReservedDock,
@@ -414,28 +399,26 @@ where
     Closed,
 
     /// 连接级失败。
-    Mux(MuxError<R, W>),
+    Mux(MuxError<C>),
 }
 
 /// [`TrChannelListener`](abs_smux::conn::TrChannelListener) 的错误类型（`income_async`）。
-pub enum ListenerError<R, W>
+pub enum ListenerError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     /// 本次等待被取消。
     Cancelled,
 
     /// 连接级失败。
-    Mux(MuxError<R, W>),
+    Mux(MuxError<C>),
 }
 
 /// [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) 的错误类型
 /// （`accept_async` / `reject_async` 共用）。
-pub enum HandleError<R, W>
+pub enum HandleError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     /// **拒绝接受**调用方给出的环内存：大小不合用（连接不替调用方改尺寸）。
     RingRejected,
@@ -450,14 +433,13 @@ where
     Cancelled,
 
     /// 连接级失败。
-    Mux(MuxError<R, W>),
+    Mux(MuxError<C>),
 }
 
 /// [`TrTelegraph`](abs_smux::conn::TrTelegraph) 的错误类型（`send_async` / `recv_async`）。
-pub enum TelegraphError<R, W>
+pub enum TelegraphError<C>
 where
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    C: TrConnCfg,
 {
     /// 报文超过协商的 `max_packet_size`。
     ///
@@ -466,7 +448,7 @@ where
     FrameTooLarge,
 
     /// 连接级失败。
-    Mux(MuxError<R, W>),
+    Mux(MuxError<C>),
 }
 
 face_error_impls!(
