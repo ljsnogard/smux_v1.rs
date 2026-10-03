@@ -83,7 +83,7 @@ async fn mux_small_inmem_compio_() {
 ///   复用同一个 dock 对；响应方在 `accept` 前丢弃句柄，主动方等它的裁决。场景由
 ///   `scope.run_until` 驱动。
 /// - 判断：丢弃发起方句柄后同一 dock 对**立刻**可复用（报 `WaitClose`/`Duplicate`
-///   即失败）；丢弃响应方句柄后主动方拿到 `MuxError::Refused`（若不发 `REJECT`，
+///   即失败）；丢弃响应方句柄后主动方拿到 `HandleError::Refused`（若不发 `REJECT`，
 ///   主动方会永远悬着，测试超时即失败）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mux_unsettled_handle_tokio_() {
@@ -113,14 +113,14 @@ async fn mux_unsettled_handle_compio_() {
 }
 
 /// 测试目标：tokio 下 `bind_async` 对同一个 `local_dock` 是**独占**的——首次绑定
-/// 成功，第二次绑定报 `MuxError::DockInUse`，丢弃 binding 后可重绑。
+/// 成功，第二次绑定报 `BindError::DockInUse`，丢弃 binding 后可重绑。
 ///
 /// - 手段：两条内存环直连两个端点并完成握手，交给
 ///   [`common::run_bind_exclusivity_scenario_`]；后者在 A 侧对同一个 dock 连续
 ///   `bind_async`、在另一个 dock 上正常绑定、`drop` 首个 binding 后再绑定，并在
 ///   B 侧用同一个 dock 值绑定以证明绑定是每条连接独立的状态。场景由
 ///   `scope.run_until` 驱动（缺省配置下两个循环经作用域 `spawn_local`）。
-/// - 判断：第二次绑定必须是 `MuxError::DockInUse`（不是再次成功）；不同 dock、
+/// - 判断：第二次绑定必须是 `BindError::DockInUse`（不是再次成功）；不同 dock、
 ///   解绑后的重绑、以及对端同名 dock 的绑定都必须成功。任一不满足即 panic。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mux_bind_is_exclusive_tokio_() {
@@ -149,40 +149,40 @@ async fn mux_bind_is_exclusive_compio_() {
     scope.run_until(scenario).await;
 }
 
-/// 测试目标（**本轮验收点**）：同一条连接上的两条子流可以各用**不同的具体缓冲类型**
-/// ——缓冲由使用环境按 channel 决定，连接不规定其类型。
+/// 测试目标（**本轮验收点**）：环存储的**类型**由使用环境声明、**分配**由 accept 端
+/// 当场决定——同一条连接上两条子流可以切不同容量、来自不同段内存，全程零装箱。
 ///
 /// - 手段：两条内存环直连并完成握手，交给
-///   [`common::run_mixed_carrier_scenario_`]：一条子流用
-///   `Owned<[MaybeUninit<u8>], CoreAlloc>`（容量 4096），另一条用
-///   `Box<[MaybeUninit<u8>]>`（容量 8192），两侧的承载者还各自不同；两条子流都双向
-///   收发并半关闭。场景由 `scope.run_until` 驱动。
-/// - 判断：两条子流都成功建立、载荷逐字节相符、半关闭后读到 EOF。若连接被某个固定
-///   的缓冲类型参数化（例如要求 `prepare` 的缓冲类型等于配置声明的类型），本用例
-///   **编译不过**——这正是要钉住的能力。
+///   [`common::run_per_channel_alloc_scenario_`]：策略声明
+///   `Buff = &'static mut [MaybeUninit<u8>]`，测试方先泄漏出一块 arena，两条子流各自
+///   在 `accept_async` 里按 4096 / 8192 切出自己那对缓冲；两条都双向收发并半关闭。
+///   场景由 `scope.run_until` 驱动。
+/// - 判断：两条子流都建立成功、载荷逐字节相符、半关闭后读到 EOF。若把 `prepare` 的
+///   缓冲类型换成别的类型，本用例**编译不过**（连接声明了环类型，因此静态派发）——这
+///   正是「类型归实现方、分配归调用方」的分工。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mux_mixed_carrier_tokio_() {
+async fn mux_per_channel_alloc_tokio_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
     let scope = LocalScope::new();
-    let scenario = common::run_mixed_carrier_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = common::run_per_channel_alloc_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
     scope.run_until(scenario).await;
 }
 
-/// 测试目标：与 tokio 版逐字相同的「混合承载者」验收，改用 **compio 运行时**。
+/// 测试目标：与 tokio 版逐字相同的「逐条子流自行分配」验收，改用 **compio 运行时**。
 ///
 /// - 手段：同样两条内存环直连，交给
-///   [`common::run_mixed_carrier_scenario_`]；作用域换成
+///   [`common::run_per_channel_alloc_scenario_`]；作用域换成
 ///   `abs_art_compio::LocalScope`，队列由运行时驱动。
-/// - 判断：与 tokio 版相同——两条不同承载者的子流都建立成功且数据逐字节相符。
+/// - 判断：与 tokio 版相同——两条子流都建立成功且数据逐字节相符。
 #[compio::test]
-async fn mux_mixed_carrier_compio_() {
+async fn mux_per_channel_alloc_compio_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
     let scope = abs_art_compio::LocalScope::new();
-    let scenario = common::run_mixed_carrier_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = common::run_per_channel_alloc_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
     scope.run_until(scenario).await;
 }
 
@@ -502,5 +502,39 @@ async fn dropping_one_side_stops_its_loops_tokio_() {
         panic!("只丢弃一侧后，该侧两个循环未退出：A 读/写传输析构标志 = {state:?}");
     };
 
+    scope.run_until(scenario).await;
+}
+
+/// 测试目标（**本轮验收点**）：连接**拒绝接受**不合约的环内存，且因此不弄脏连接。
+///
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_ring_rejected_scenario_`]：响应方用容量 `1` 的缓冲裁决（环下限为
+///   `2`），随后在同一条连接上再走一遍正常建流。场景由 `scope.run_until` 驱动。
+/// - 判断：响应方必须得到 `HandleError::RingRejected`，主动方必须得到
+///   `HandleError::Refused`；随后那条子流必须成功（若拒绝路径把连接或注册表弄脏，
+///   这一段会失败）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_ring_rejected_tokio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = LocalScope::new();
+    let scenario = common::run_ring_rejected_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    scope.run_until(scenario).await;
+}
+
+/// 测试目标：与 tokio 版逐字相同的「拒绝环内存」验收，改用 **compio 运行时**。
+///
+/// - 手段：同样两条内存环直连，交给
+///   [`common::run_ring_rejected_scenario_`]；作用域换成 `abs_art_compio::LocalScope`，
+///   队列由运行时驱动。
+/// - 判断：与 tokio 版相同——响应方 `RingRejected`、主动方 `Refused`，随后建流成功。
+#[compio::test]
+async fn mux_ring_rejected_compio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = abs_art_compio::LocalScope::new();
+    let scenario = common::run_ring_rejected_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
     scope.run_until(scenario).await;
 }

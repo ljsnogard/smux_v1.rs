@@ -11,7 +11,7 @@ use abs_smux::conn::TrTelegraph;
 use anylr::SomeOf;
 use buffex::x_deps::{abs_buff, abs_cancel, anylr};
 
-use crate::connection::{Dock, MuxConnection, MuxError, TrMuxConfig};
+use crate::connection::{Dock, MuxConnection, TelegraphError, TrMuxConfig};
 
 /// 数据报端点。
 ///
@@ -62,12 +62,12 @@ where
 impl<W, R, S, C> TrTelegraph for Telegraph<W, R, S, C>
 where
     C: TrMuxConfig,
-    R: TrBuffTryRead<u8>,
-    W: TrBuffTryWrite<u8>,
+    R: TrBuffTryRead<u8> + 'static,
+    W: TrBuffTryWrite<u8> + 'static,
 {
     type Data = u8;
     type Dock = Dock;
-    type Err = MuxError<R, W>;
+    type Err = TelegraphError<R, W>;
 
     type SendAsync<'f, M>
         = MuxSendAsync<'f, 'f, C, S, R, W, M>
@@ -118,12 +118,12 @@ async fn mux_send_async_<'f, C, S, R, W, M, K>(
     remote_dock: Dock,
     packet: &'f mut M,
     _cancel: K,
-) -> SomeOf<usize, MuxError<R, W>>
+) -> SomeOf<usize, TelegraphError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
-    R: TrBuffTryRead<u8> + 'f,
-    W: TrBuffTryWrite<u8> + 'f,
+    R: TrBuffTryRead<u8> + 'f + 'static,
+    W: TrBuffTryWrite<u8> + 'f + 'static,
     M: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {
@@ -139,12 +139,12 @@ async fn mux_recv_async_<'f, C, S, R, W, M, K>(
     remote_dock: Dock,
     buffer: &'f mut M,
     _cancel: K,
-) -> SomeOf<usize, MuxError<R, W>>
+) -> SomeOf<usize, TelegraphError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
-    R: TrBuffTryRead<u8> + 'f,
-    W: TrBuffTryWrite<u8> + 'f,
+    R: TrBuffTryRead<u8> + 'f + 'static,
+    W: TrBuffTryWrite<u8> + 'f + 'static,
     M: TrBuffWrite<u8> + 'f,
     K: TrCancellationToken,
 {

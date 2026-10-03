@@ -147,6 +147,7 @@ where
 struct ReadEntry_<B, A>
 where
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
+    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
     A: AllocatorClone + Send + Sync + 'static,
 {
     owner_: ChannelOwner_<A>,
@@ -156,6 +157,7 @@ where
 /// 写循环本地持有的一条子流：共享状态 + 会话侧**发送环读端**。
 struct WriteEntry_<B, A>
 where
+    B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
     A: AllocatorClone + Send + Sync + 'static,
 {

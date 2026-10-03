@@ -709,7 +709,11 @@ where
         .await
         .map_err(map_write_cursor_err_)?;
 
-    // 所有帧都是子流作用域：dock 对一律写出（保活帧 `PULSE` 也不例外）。
+    // channel 作用域的帧里 dock 对就是身份：两端都必须是真实 dock。
+    //
+    // （`DATAGRAM` 是地址而非身份，它的 remote dock 允许取 `wildcard` / `unspecified`；
+    // 那一条路径的检查必须按帧种类放宽——见 `crate::connection` 模块文档 §4。telegraph
+    // 本轮尚未实现，`DATAGRAM` 的写路径也还没接上。）
     let (local_dock, remote_dock) = (header.local_dock_, header.remote_dock_);
     if local_dock.is_special() || remote_dock.is_special() {
         return Result::Err(MuxError::ReservedDock);

@@ -7,8 +7,23 @@ use abs_cancel::TrCancellationToken;
 use abs_smux::{conn::TrDockBinding, dock::TrDock};
 use buffex::x_deps::abs_buff;
 
+/// 把注册表的预留失败映射进 binding 的错误类型。
+fn map_reserve_err_<R, W>(err: ReserveErr_) -> BindingError<R, W>
+where
+    R: TrBuffRead<u8>,
+    W: TrBuffWrite<u8>,
+{
+    match err {
+        ReserveErr_::DockInUse => BindingError::DockInUse,
+        ReserveErr_::Duplicate => BindingError::Duplicate,
+        ReserveErr_::WaitClose => BindingError::WaitClose,
+        ReserveErr_::DockChanLimit => BindingError::DockChanLimit,
+        ReserveErr_::ChanLimit => BindingError::ChanLimit,
+    }
+}
+
 use crate::connection::{
-    ChannelHandle, Dock, MuxConnection, MuxError, TrMuxConfig,
+    BindingError, ChannelHandle, Dock, MuxConnection, ReserveErr_, TrMuxConfig,
     channel_half::{ChannelRx, ChannelTx},
     channel_listener::ChannelListener,
     util_::read_available_into_vec_,
@@ -75,12 +90,12 @@ where
 impl<W, R, S, C> TrDockBinding for DockBinding<W, R, S, C>
 where
     C: TrMuxConfig,
-    R: TrBuffRead<u8>,
-    W: TrBuffWrite<u8>,
+    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + 'static,
 {
     type Data = u8;
     type Dock = Dock;
-    type Err = MuxError<R, W>;
+    type Err = BindingError<R, W>;
 
     type ChannelHandle = ChannelHandle<W, R, S, C>;
 
@@ -129,12 +144,12 @@ where
 async fn mux_listen_async_<'f, W, R, S, C, K>(
     binding: &'f mut DockBinding<W, R, S, C>,
     _cancel: K,
-) -> Result<ChannelListener<W, R, S, C>, MuxError<R, W>>
+) -> Result<ChannelListener<W, R, S, C>, BindingError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
-    R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
+    R: TrBuffRead<u8> + 'f + 'static,
+    W: TrBuffWrite<u8> + 'f + 'static,
     K: TrCancellationToken,
 {
     let conn = binding.conn_.clone();
@@ -144,7 +159,7 @@ where
     conn.core_()
         .reg_()
         .reserve_listener_(local)
-        .map_err(|err| err.cast_())?;
+        .map_err(map_reserve_err_)?;
     Result::Ok(ChannelListener::new_(conn, local))
 }
 
@@ -156,12 +171,12 @@ where
 async fn mux_open_telegraph_async_<'f, W, R, S, C, K>(
     binding: &'f mut DockBinding<W, R, S, C>,
     _cancel: K,
-) -> Result<crate::connection::Telegraph<W, R, S, C>, MuxError<R, W>>
+) -> Result<crate::connection::Telegraph<W, R, S, C>, BindingError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
-    R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
+    R: TrBuffRead<u8> + 'f + 'static,
+    W: TrBuffWrite<u8> + 'f + 'static,
     K: TrCancellationToken,
 {
     let conn = binding.conn_.clone();
@@ -169,7 +184,7 @@ where
     conn.core_()
         .reg_()
         .reserve_telegraph_(local)
-        .map_err(|err| err.cast_())?;
+        .map_err(map_reserve_err_)?;
     Result::Ok(crate::connection::Telegraph::new_(conn, local))
 }
 
@@ -194,10 +209,10 @@ async fn mux_open_channel_async_<'f, W, R, S, C, M, K>(
     remote_dock: Dock,
     message: &'f mut M,
     cancel: K,
-) -> Result<ChannelHandle<W, R, S, C>, MuxError<R, W>>
+) -> Result<ChannelHandle<W, R, S, C>, BindingError<R, W>>
 where
-    W: TrBuffWrite<u8> + 'f,
-    R: TrBuffRead<u8> + 'f,
+    W: TrBuffWrite<u8> + 'f + 'static,
+    R: TrBuffRead<u8> + 'f + 'static,
     S: 'f,
     C: TrMuxConfig + 'f,
 
@@ -207,13 +222,13 @@ where
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
     if remote_dock.is_special() {
-        return Result::Err(MuxError::ReservedDock);
+        return Result::Err(BindingError::ReservedDock);
     }
     // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）。
     conn.core_()
         .reg_()
         .reserve_channel_(local, remote_dock)
-        .map_err(|err| err.cast_())?;
+        .map_err(map_reserve_err_)?;
 
     // 2. 把开场消息搬进句柄（`OPEN` 要等 `accept_async` 才发）。
     let payload = read_available_into_vec_(

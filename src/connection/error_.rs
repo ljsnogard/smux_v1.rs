@@ -40,6 +40,9 @@ use crate::flow_ctrl::FlowCtrlError;
 /// assert_eq!(classify(err), 0);
 /// ```
 ///
+/// 各 API 面的错误类型都把它包在 `Mux(..)` 里，例如
+/// [`HandleError::Mux`](crate::connection::HandleError::Mux)。
+///
 /// 注意上面**没有出现**任何错误载荷类型：它们由两个半边派生，写 match 分支时载荷
 /// 的类型会被自动推断出来。
 ///
@@ -114,31 +117,15 @@ where
     /// 帧总长超过协商出的 `max_packet_size`。
     FrameTooLarge,
 
-    /// 请求的 local_dock 已被占用：已被某个 `DockBinding` 绑定，或已作 telegraph
-    /// 端点（channel 与 telegraph 不得共用 dock）。
-    DockInUse,
 
-    /// 该 dock 上的活动子流数已达 `max_dock_chan_count`。
-    DockChanLimit,
 
-    /// 连接上的活动子流数已达 `max_channel_count`。
-    ChanLimit,
 
-    /// 对端拒绝或无人监听（收到 `REJECT`）。
-    Refused,
 
-    /// 同一条子流上出现重复的建立 / 应答请求。
-    Duplicate,
 
-    /// 该 dock 对刚关闭，仍在**拆流宽限期**内，暂不可复用。
-    ///
-    /// 宽限期由协商项 `max_channel_wait_close` 决定（见 [`crate::connection`]
-    /// 模块文档 §4.3）：期间到达的在途帧被静默丢弃，同一
-    /// `(local_dock, remote_dock)` 也不允许重新登记。
-    WaitClose,
 
     /// 流控失败（窗口违例或计数溢出）。
     FlowCtrl(FlowCtrlError),
+
 }
 
 impl<R, W> core::fmt::Display for MuxError<R, W>
@@ -160,12 +147,6 @@ where
             MuxError::MalformedFrame => f.write_str("复用帧结构非法"),
             MuxError::UnsupportedField => f.write_str("复用帧包含未知或非法的字段"),
             MuxError::FrameTooLarge => f.write_str("复用帧超过协商的最大报文长度"),
-            MuxError::DockInUse => f.write_str("该 dock 已被绑定或已作其他用途占用"),
-            MuxError::DockChanLimit => f.write_str("该 dock 上的活动子流数已达上限"),
-            MuxError::ChanLimit => f.write_str("连接上的活动子流数已达上限"),
-            MuxError::Refused => f.write_str("对端拒绝建立子流"),
-            MuxError::Duplicate => f.write_str("同一条子流上出现重复请求"),
-            MuxError::WaitClose => f.write_str("该 dock 对刚关闭，仍在拆流宽限期内"),
             MuxError::FlowCtrl(_) => f.write_str("流控失败"),
         }
     }
@@ -200,51 +181,11 @@ where
             MuxError::MalformedFrame => f.write_str("MalformedFrame"),
             MuxError::UnsupportedField => f.write_str("UnsupportedField"),
             MuxError::FrameTooLarge => f.write_str("FrameTooLarge"),
-            MuxError::DockInUse => f.write_str("DockInUse"),
-            MuxError::DockChanLimit => f.write_str("DockChanLimit"),
-            MuxError::ChanLimit => f.write_str("ChanLimit"),
-            MuxError::Refused => f.write_str("Refused"),
-            MuxError::Duplicate => f.write_str("Duplicate"),
-            MuxError::WaitClose => f.write_str("WaitClose"),
             MuxError::FlowCtrl(err) => f.debug_tuple("FlowCtrl").field(err).finish(),
         }
     }
 }
 
-impl MuxError<NoHalfway_, NoHalfway_> {
-    /// 把「载荷无关」的错误搬到目标类型上。
-    ///
-    /// 注册表 / 建流登记这类路径只知道「哪一类错误」，不持有底层错误值，因此它们
-    /// 用 `MuxError<NoHalfway_, NoHalfway_>` 表达（两侧载荷都是 `Infallible`），再由
-    /// API 面 `cast_` 成目标类型。两个载荷变体在这里不可能出现，若出现即退化为保留
-    /// 方向的 [`MuxError::Transport`]。
-    pub(crate) fn cast_<R, W>(self) -> MuxError<R, W>
-    where
-        R: TrBuffTryRead<u8>,
-        W: TrBuffTryWrite<u8>,
-    {
-        match self {
-            MuxError::Rx(never) => match never {},
-            MuxError::Tx(never) => match never {},
-            MuxError::Transport { write } => MuxError::Transport { write },
-            MuxError::Cancelled => MuxError::Cancelled,
-            MuxError::PeerClosed => MuxError::PeerClosed,
-            MuxError::Closed => MuxError::Closed,
-            MuxError::IdleTimeout => MuxError::IdleTimeout,
-            MuxError::ReservedDock => MuxError::ReservedDock,
-            MuxError::MalformedFrame => MuxError::MalformedFrame,
-            MuxError::UnsupportedField => MuxError::UnsupportedField,
-            MuxError::FrameTooLarge => MuxError::FrameTooLarge,
-            MuxError::DockInUse => MuxError::DockInUse,
-            MuxError::DockChanLimit => MuxError::DockChanLimit,
-            MuxError::ChanLimit => MuxError::ChanLimit,
-            MuxError::Refused => MuxError::Refused,
-            MuxError::Duplicate => MuxError::Duplicate,
-            MuxError::WaitClose => MuxError::WaitClose,
-            MuxError::FlowCtrl(err) => MuxError::FlowCtrl(err),
-        }
-    }
-}
 
 
 /// 「不存在的那一半」的错误载荷：**不可构造**（无变体），因此「另一侧出错」这件事
@@ -328,3 +269,237 @@ pub(crate) type MuxReadErr_<R> = MuxError<R, NoHalfway_>;
 
 /// 只可能出现**写侧**载荷的连接错误（读侧不存在）。内部专用。
 pub(crate) type MuxWriteErr_<W> = MuxError<NoHalfway_, W>;
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 注册表内部的「预留 / 绑定」失败
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 注册表在「预留 / 绑定一个身份」时能给出的失败。
+///
+/// 它**不是公开类型**：不同的 API 面会把它映射进各自那个公开错误枚举（哪些面该看到
+/// 哪些失败，由各面自己决定）。这样注册表不必知道公开错误的形状。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReserveErr_ {
+    /// 该 local_dock 已被占用（binding / channel / telegraph / listener）。
+    DockInUse,
+
+    /// 同一 dock 对上已有活跃子流。
+    Duplicate,
+
+    /// 该 dock 对刚关闭，仍在拆流宽限期内。
+    WaitClose,
+
+    /// 该 dock 上的活动子流数已达上限。
+    DockChanLimit,
+
+    /// 连接上的活动子流数已达上限。
+    ChanLimit,
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 各 API 面的错误类型
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+//
+// 每个面只**声明自己会报的失败**，并把连接级失败包在 `Mux(..)` 里；`source()` 指回
+// 内层 `MuxError`，`From<MuxError<..>>` 让 `?` 直通。
+
+/// 为各面错误类型生成公共实现。
+///
+/// 手写而非派生：派生会给 `R` / `W` 本身加 `Debug` 约束，而这两者只出现在
+/// `MuxError<R, W>` 里（它有自己的手写 `Debug`）。调用点传入「变体 → 中文说明」表；
+/// `Mux(..)` 一档统一委托给内层 `MuxError`。
+macro_rules! face_error_impls {
+    ($name:ident $(, $pat:pat => $text:expr)* $(,)?) => {
+        impl<R, W> core::fmt::Debug for $name<R, W>
+        where
+            R: TrBuffTryRead<u8>,
+            W: TrBuffTryWrite<u8>,
+        {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                match self {
+                    $name::Mux(err) => f.debug_tuple("Mux").field(err).finish(),
+                    $( $pat => f.write_str(stringify!($pat)), )*
+                }
+            }
+        }
+
+        impl<R, W> core::fmt::Display for $name<R, W>
+        where
+            R: TrBuffTryRead<u8>,
+            W: TrBuffTryWrite<u8>,
+        {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                match self {
+                    $name::Mux(err) => core::fmt::Display::fmt(err, f),
+                    $( $pat => f.write_str($text), )*
+                }
+            }
+        }
+
+        impl<R, W> From<MuxError<R, W>> for $name<R, W>
+        where
+            R: TrBuffTryRead<u8>,
+            W: TrBuffTryWrite<u8>,
+        {
+            fn from(err: MuxError<R, W>) -> Self {
+                $name::Mux(err)
+            }
+        }
+
+        impl<R, W> core::error::Error for $name<R, W>
+        where
+            R: TrBuffTryRead<u8> + 'static,
+            W: TrBuffTryWrite<u8> + 'static,
+        {
+            fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+                match self {
+                    $name::Mux(err) => Option::Some(err),
+                    _ => Option::None,
+                }
+            }
+        }
+    };
+}
+
+/// [`TrConnection`](abs_smux::conn::TrConnection) 的错误类型：目前只有 `bind_async`。
+pub enum BindError<R, W>
+where
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
+{
+    /// 要绑定的 dock 是协议保留值（`unspecified` / `wildcard`），不能当身份用。
+    ReservedDock,
+
+    /// 该 local_dock 已被占用。
+    DockInUse,
+
+    /// 连接级失败。
+    Mux(MuxError<R, W>),
+}
+
+/// [`TrDockBinding`](abs_smux::conn::TrDockBinding) 的错误类型。
+///
+/// 一个 binding 上可以做三件事——`listen_async` / `open_telegraph_async` /
+/// `open_channel_async`——它们共用这一个错误类型（`abs_smux` 只给了一个 `Err` 槽），
+/// 因此这里放的是三者失败变体的并集：
+///
+/// - `listen` / `open_telegraph` 的 local dock 在绑定时就验过，**不会**报 `ReservedDock`；
+/// - `ReservedDock` 只会来自 `open_channel` 的**对端 dock**（channel 的身份是 dock 对，
+///   两端都必须是真实 dock）；
+/// - telegraph 的报文目的地址允许保留值，与本类型无关（见 `TelegraphError`）。
+pub enum BindingError<R, W>
+where
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
+{
+    /// 对端 dock 是协议保留值，不能当身份用（只可能来自 `open_channel`）。
+    ReservedDock,
+
+    /// 同一 dock 对上已有活跃子流（`open_channel`）。
+    Duplicate,
+
+    /// 该 dock 对刚关闭，仍在拆流宽限期内（`open_channel`）。
+    WaitClose,
+
+    /// 该 dock 上的活动子流数已达上限（`open_channel`）。
+    DockChanLimit,
+
+    /// 连接上的活动子流数已达上限（`open_channel`）。
+    ChanLimit,
+
+    /// 该 local_dock 已被占用（三者都可能：listener / telegraph / channel 不得冲突）。
+    DockInUse,
+
+    /// 子流 / 连接已关闭（`open_channel`）。
+    Closed,
+
+    /// 连接级失败。
+    Mux(MuxError<R, W>),
+}
+
+/// [`TrChannelListener`](abs_smux::conn::TrChannelListener) 的错误类型（`income_async`）。
+pub enum ListenerError<R, W>
+where
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
+{
+    /// 本次等待被取消。
+    Cancelled,
+
+    /// 连接级失败。
+    Mux(MuxError<R, W>),
+}
+
+/// [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) 的错误类型
+/// （`accept_async` / `reject_async` 共用）。
+pub enum HandleError<R, W>
+where
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
+{
+    /// **拒绝接受**调用方给出的环内存：大小不合用（连接不替调用方改尺寸）。
+    RingRejected,
+
+    /// 对端拒绝建立这条子流（`accept_async` 的发起方一侧）。
+    Refused,
+
+    /// 流控失败（窗口违例或计数溢出）。
+    FlowCtrl(FlowCtrlError),
+
+    /// 本次操作被取消。
+    Cancelled,
+
+    /// 连接级失败。
+    Mux(MuxError<R, W>),
+}
+
+/// [`TrTelegraph`](abs_smux::conn::TrTelegraph) 的错误类型（`send_async` / `recv_async`）。
+pub enum TelegraphError<R, W>
+where
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
+{
+    /// 报文超过协商的 `max_packet_size`。
+    ///
+    /// 注意 remote dock 取 `wildcard` / `unspecified` **不是**错误：那是合法目的地址，
+    /// 收不收由对端策略决定。
+    FrameTooLarge,
+
+    /// 连接级失败。
+    Mux(MuxError<R, W>),
+}
+
+face_error_impls!(
+    BindError,
+    BindError::ReservedDock => "要绑定的 dock 是协议保留值，不能作为身份",
+    BindError::DockInUse => "该 local_dock 已被占用",
+);
+
+face_error_impls!(
+    BindingError,
+    BindingError::ReservedDock => "对端 dock 是协议保留值，不能作为身份",
+    BindingError::Duplicate => "同一 dock 对上已有活跃子流",
+    BindingError::WaitClose => "该 dock 对刚关闭，仍在拆流宽限期内",
+    BindingError::DockChanLimit => "该 dock 上的活动子流数已达上限",
+    BindingError::ChanLimit => "连接上的活动子流数已达上限",
+    BindingError::DockInUse => "该 local_dock 已被占用",
+    BindingError::Closed => "子流 / 连接已关闭",
+);
+
+face_error_impls!(
+    ListenerError,
+    ListenerError::Cancelled => "本次等待被取消",
+);
+
+face_error_impls!(
+    HandleError,
+    HandleError::RingRejected => "调用方给出的环内存大小不合用，已拒绝接受",
+    HandleError::Refused => "对端拒绝建立这条子流",
+    HandleError::FlowCtrl(_) => "流控失败",
+    HandleError::Cancelled => "本次操作被取消",
+);
+
+face_error_impls!(
+    TelegraphError,
+    TelegraphError::FrameTooLarge => "报文超过协商的最大报文长度",
+);

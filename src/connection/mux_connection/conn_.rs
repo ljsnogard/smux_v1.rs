@@ -13,7 +13,7 @@ use mm_ptr::{Owned, Shared};
 
 use crate::{
     connection::{
-        MuxChanBuff, Dock, MuxError, TrMuxConfig,
+        BindError, Dock, TrMuxConfig,
         dock_binding::DockBinding,
         session_::{LoopShared_, read_loop_async_, write_loop_async_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
@@ -45,8 +45,10 @@ use super::{core_::MuxCore, registry_::ChannelRegistry_};
 /// 现在主参数是传输，错误一律经 `R::Err` / `W::Err` **推断**得到。
 ///
 /// 注意底层错误**值**只在循环那一侧存在，连接级失败经共享状态回传时只保留方向
-/// （[`MuxError::Transport`]），因此 API 面实际不会产出 `Rx` / `Tx` 两个带载荷变体。
-/// [`MuxError`] 自身的两个参数也**是传输**：它的载荷变体由 `R::Err` / `W::Err` 派生，
+/// （[`MuxError::Transport`](crate::connection::MuxError::Transport)），因此 API 面实际不会产出
+/// `Rx` / `Tx` 两个带载荷变体。
+/// [`MuxError`](crate::connection::MuxError) 自身的两个参数也**是传输**：它的载荷变体由
+/// `R::Err` / `W::Err` 派生，
 /// 因此开发者对错误写代码（含 `match`）时不需要命名载荷类型。
 ///
 /// # 为什么是智能指针
@@ -201,8 +203,8 @@ where
 {
     core_: Shared<MuxCore<C, S>, C::Alloc>,
     shared_: LoopShared_<C::Alloc>,
-    w_receiver_: EventReceiver_<WriteEvent_<MuxChanBuff, C::Alloc>>,
-    r_receiver_: EventReceiver_<ReadEvent_<MuxChanBuff, C::Alloc>>,
+    w_receiver_: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
+    r_receiver_: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
     alloc_: C::Alloc,
 }
 
@@ -280,14 +282,14 @@ where
 impl<W, R, S, C> TrConnection for MuxConnection<W, R, S, C>
 where
     C: TrMuxConfig,
-    R: TrBuffRead<u8>,
-    W: TrBuffWrite<u8>,
+    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + 'static,
 {
     type Data = u8;
     type Dock = Dock;
     /// 载荷类型由两个**传输**类型派生（`TrTaggedError: core::error::Error`，因此
     /// `MuxError<R, W>` 自动满足 `Err: Error`）。
-    type Err = MuxError<R, W>;
+    type Err = BindError<R, W>;
 
     /// 会话对象是**独立持有者**（自带一份连接克隆），不带 `'f` 之类的生命周期：
     /// 它可以从函数返回、可以存进结构体、可以与连接同处一个结构体。
@@ -309,22 +311,23 @@ async fn mux_bind_async_<'f, C, S, R, W, K>(
     conn: &'f MuxConnection<W, R, S, C>,
     local_dock: Dock,
     _cancel: K,
-) -> Result<DockBinding<W, R, S, C>, MuxError<R, W>>
+) -> Result<DockBinding<W, R, S, C>, BindError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
-    R: TrBuffTryRead<u8> + 'f,
-    W: TrBuffTryWrite<u8> + 'f,
+    R: TrBuffTryRead<u8> + 'f + 'static,
+    W: TrBuffTryWrite<u8> + 'f + 'static,
     K: TrCancellationToken,
 {
     if local_dock.is_special() {
-        return Result::Err(MuxError::ReservedDock);
+        return Result::Err(BindError::ReservedDock);
     }
     // 独占绑定：同一 local_dock 在任意时刻至多一个 `DockBinding`（见
     // `ChannelRegistry_::bind_dock_` 与 `DockBinding` 的「绑定的独占性」）。
     conn.core_()
         .reg_()
+        // `bind_dock_` 只可能报「该 dock 已被占用」。
         .bind_dock_(local_dock)
-        .map_err(|err| err.cast_())?;
+        .map_err(|_| BindError::DockInUse)?;
     Result::Ok(DockBinding::new_(conn.clone(), local_dock))
 }

@@ -108,6 +108,7 @@ pub(crate) struct TestMuxConfig_;
 static TEST_POLICY_: DefaultPolicy = DefaultPolicy;
 
 impl TrMuxConfig for TestMuxConfig_ {
+    type Buff = TestBuff;
     type Alloc = CoreAlloc;
     type Policy = DefaultPolicy;
 

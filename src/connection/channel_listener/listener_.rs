@@ -9,7 +9,7 @@ use abs_smux::conn::TrChannelListener;
 use buffex::x_deps::abs_buff;
 
 use crate::connection::{
-    Dock, MuxConnection, MuxError, TrMuxConfig,
+    Dock, ListenerError, MuxConnection, TrMuxConfig,
     channel_handle::ChannelHandle,
 };
 
@@ -66,12 +66,12 @@ where
 impl<W, R, S, C> TrChannelListener for ChannelListener<W, R, S, C>
 where
     C: TrMuxConfig,
-    R: TrBuffRead<u8>,
-    W: TrBuffWrite<u8>,
+    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + 'static,
 {
     type Data = u8;
     type Dock = Dock;
-    type Err = MuxError<R, W>;
+    type Err = ListenerError<R, W>;
 
     type ChannelHandle = ChannelHandle<W, R, S, C>;
 
@@ -94,22 +94,22 @@ where
 async fn mux_income_async_<'f, C, S, R, W, K>(
     listener: &'f mut ChannelListener<W, R, S, C>,
     cancel: K,
-) -> Result<ChannelHandle<W, R, S, C>, MuxError<R, W>>
+) -> Result<ChannelHandle<W, R, S, C>, ListenerError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
-    R: TrBuffTryRead<u8> + 'f,
-    W: TrBuffTryWrite<u8> + 'f,
+    R: TrBuffTryRead<u8> + 'f + 'static,
+    W: TrBuffTryWrite<u8> + 'f + 'static,
     K: TrCancellationToken,
 {
     let conn = listener.conn_.clone();
     let local = listener.local_dock_;
     loop {
         if cancel.is_cancelled() {
-            return Result::Err(MuxError::Cancelled);
+            return Result::Err(ListenerError::Cancelled);
         }
         if let Option::Some(kind) = conn.core_().reg_().failure_() {
-            return Result::Err(kind.into_mux_error_());
+            return Result::Err(ListenerError::Mux(kind.into_mux_error_()));
         }
         if let Option::Some(remote) = conn.core_().reg_().take_pending_inbound_(local) {
             return Result::Ok(ChannelHandle::new_(conn, local, remote));

@@ -142,7 +142,10 @@ use abs_smux::{
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
 use smux_v1::{
-    connection::{ChannelListener, ChannelRx, ChannelTx, Dock, DockBinding, MuxConnection, MuxError},
+    connection::{
+        BindError, ChannelListener, ChannelRx, ChannelTx, Dock, DockBinding, MuxConnection,
+        MuxError,
+    },
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
@@ -649,7 +652,12 @@ fn probe_write_code_against_mux_error_(err: MuxError<WireRx, WireTx>) -> ErrClas
 /// 【F9 ✅ 探针】同一段代码也可以直接吃**连接的关联错误类型**。
 #[allow(dead_code)]
 fn probe_classify_connection_error_<S>(err: <Mux<S> as TrConnection>::Err) -> ErrClass_ {
-    probe_write_code_against_mux_error_(err)
+    // 面自己的错误类型把连接级失败包在 `Mux(..)` 里，内层 `MuxError` 仍然是同一个类型，
+    // 因此那段分类代码原样可用。
+    match err {
+        BindError::Mux(inner) => probe_write_code_against_mux_error_(inner),
+        BindError::ReservedDock | BindError::DockInUse => ErrClass_::Other,
+    }
 }
 
 /// 【F9 ✅ 探针】把 `MuxError` 分类的结果（纯业务类型，与 smux 无关）。

@@ -27,72 +27,6 @@ use core::{
 use buffex::ring::{Ring, RingReader, RingWriter};
 use mm_ptr::Shared;
 
-/// **类型擦除的环载具**：把「这条子流的缓冲由什么承载」交给使用环境决定。
-///
-/// # 为什么它是公开类型（但仍属实现细节）
-///
-/// 它会出现在 [`ChannelTx`](crate::connection::ChannelTx) /
-/// [`ChannelRx`](crate::connection::ChannelRx) 的 `TrBuffTryWrite` / `TrBuffTryRead`
-/// 关联类型里（那些 GAT 就是环自己的段类型），因此不能是 crate 私有；但它**不是**给
-/// 使用者手工构造的类型（构造入口是 `ChanBuff` 的 `prepare` 返回值），所以标
-/// `#[doc(hidden)]`。
-///
-/// 环本身只要求缓冲满足 `BorrowMut<[MaybeUninit<u8>]>`，因此任何存储都能用；但连接
-/// 的两个循环、两条事件通道与两个半部的类型必须先定下来（它们各自只被创建一次），
-/// 所以连接侧需要一个**固定**的缓冲类型。本类型就是这个固定类型：它内部是一个
-/// trait object，于是**每条子流**都可以用**不同的具体存储**（自有所有权、借用切片、
-/// 池分配、`Vec`、静态区……），由 [`TrPrepareChannelBuff`] 在最终裁决时交进来。
-///
-/// 为什么需要一层 newtype：`Box<T>` 只为 `T` 自身实现 `BorrowMut<T>`，`Box<dyn
-/// BorrowMut<[MaybeUninit<u8>]>>` **不是** `BorrowMut<[MaybeUninit<u8>]>`；这里显式
-/// 把 `borrow_mut` 转发给内部 trait object。
-///
-/// 代价：每条子流每方向一次装箱（冷路径，建流时），以及环每次取切片时一次虚调用。
-/// 换来的是连接对缓冲类型**一无所知**——不再需要「传进来的缓冲类型必须等于配置里
-/// 声明的类型」这种等式约束。
-///
-/// [`TrPrepareChannelBuff`]: abs_smux::chan::TrPrepareChannelBuff
-#[doc(hidden)]
-pub struct MuxChanBuff {
-    inner_: Box<dyn BorrowMut<[MaybeUninit<u8>]> + Send + Sync>,
-}
-
-impl MuxChanBuff {
-    /// 把任意满足环要求的存储装箱成载具。
-    pub(crate) fn boxed_<B>(buffer: B) -> Self
-    where
-        B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
-    {
-        MuxChanBuff {
-            inner_: Box::new(buffer),
-        }
-    }
-}
-
-impl MuxChanBuff {
-    /// 底层存储的容量（字节）。
-    ///
-    /// 建流最终裁决用它算接收窗口与环大小；用固有方法而不是 `borrow_mut()`，是因为
-    /// `BorrowMut<Borrowed>` 的 `Borrowed` 在这里只能靠标注推断。
-    pub(crate) fn capacity_(&self) -> usize {
-        core::borrow::Borrow::<[MaybeUninit<u8>]>::borrow(&*self.inner_).len()
-    }
-}
-
-impl core::borrow::Borrow<[MaybeUninit<u8>]> for MuxChanBuff {
-    fn borrow(&self) -> &[MaybeUninit<u8>] {
-        // 显式 UFCS + 解引用：`Box<T>` 自己也有 `Borrow<T>` 实现，直接 `.borrow()`
-        // 会选中 `Box` 那一层（借出 `dyn …` 而不是底层切片）。
-        core::borrow::Borrow::<[MaybeUninit<u8>]>::borrow(&*self.inner_)
-    }
-}
-
-impl BorrowMut<[MaybeUninit<u8>]> for MuxChanBuff {
-    fn borrow_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        BorrowMut::<[MaybeUninit<u8>]>::borrow_mut(&mut *self.inner_)
-    }
-}
-
 /// 子流**发送**半边的环端类型（写端）。
 pub type BufferedTx<B, A> = RingWriter<Shared<Ring<B>, A>, B, u8>;
 
@@ -137,67 +71,16 @@ pub(crate) mod test_support_ {
 
     use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
 
-    use super::{BufferedChannel, MuxChanBuff, new_buffered_channel_};
+    use super::{BufferedChannel, new_buffered_channel_};
 
-    /// 测试用的环存储类型（**具体**类型；生产路径上它会被装箱成 [`MuxChanBuff`]）。
+    /// 测试用的环存储类型。
     pub(crate) type TestBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
 
     /// 建一条容量为 `capacity` 的内存环，返回 `(写端, 读端)`。
     ///
-    /// 缓冲同样经 [`MuxChanBuff`] 装箱：这样半部类型与生产路径一致，测试不会因为
-    /// 「测试用了具体类型、生产用了载具」而在类型上分叉。
-    pub(crate) fn make_test_channel_(capacity: usize) -> BufferedChannel<MuxChanBuff, CoreAlloc> {
-        let buffer = MuxChanBuff::boxed_(Owned::<[MaybeUninit<u8>], CoreAlloc>::new_uninit_slice(
-            capacity, CoreAlloc,
-        ));
+    /// 环存储用与生产路径相同的**借用型**形式（测试里直接泄漏一块内存）。
+    pub(crate) fn make_test_channel_(capacity: usize) -> BufferedChannel<TestBuff, CoreAlloc> {
+        let buffer = Owned::new_uninit_slice(capacity, CoreAlloc);
         new_buffered_channel_(buffer, CoreAlloc).expect("测试容量应当落在 ring 允许区间内")
-    }
-}
-
-#[cfg(test)]
-mod tests_ {
-    use core::{borrow::BorrowMut, mem::MaybeUninit};
-
-    use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
-
-    use super::MuxChanBuff;
-
-    /// 测试目标：擦除载具能把**不同具体类型**的存储装进同一个 `MuxChanBuff`，并如实
-    /// 转发切片。
-    ///
-    /// - 手段：把 `Owned<[MaybeUninit<u8>], CoreAlloc>`（容量 8）与
-    ///   `Box<[MaybeUninit<u8>]>`（容量 16）分别装箱，各自 `borrow_mut()` 取切片并在
-    ///   首字节写入 `0xAB`，再 `borrow()` 取只读切片。
-    /// - 判断：两个载具报告的容量分别是 8 与 16（**容量来自调用方存储**），写入的字节
-    ///   能在同一个载具的只读切片上读到。任一不满足即 panic。
-    ///
-    /// 环级别的读写往返（即 `buffex` 确实接受该载具）由 `tests/` 的 channel 场景覆盖。
-    #[test]
-    fn erased_carrier_forwards_and_reports_capacity_test_() {
-        let mut owned: MuxChanBuff =
-            MuxChanBuff::boxed_(Owned::<[MaybeUninit<u8>], CoreAlloc>::new_uninit_slice(
-                8usize, CoreAlloc,
-            ));
-        let mut boxed: MuxChanBuff =
-            MuxChanBuff::boxed_(vec![MaybeUninit::<u8>::uninit(); 16].into_boxed_slice());
-
-        for (buff, capacity) in [(&mut owned, 8usize), (&mut boxed, 16usize)] {
-            let ptr = {
-                let slice: &mut [MaybeUninit<u8>] = BorrowMut::borrow_mut(buff);
-                assert_eq!(slice.len(), capacity, "载具应当如实报告底层存储容量");
-                slice[0].write(0xABu8);
-                slice.as_ptr()
-            };
-
-            let view: &[MaybeUninit<u8>] =
-                core::borrow::Borrow::<[MaybeUninit<u8>]>::borrow(buff);
-            assert_eq!(view.len(), capacity, "只读切片长度应当与容量一致");
-            assert!(
-                core::ptr::eq(view.as_ptr(), ptr),
-                "只读切片应当指向同一块底层存储"
-            );
-            // SAFETY: 上面刚在同一位置写入 `0xAB`，且 `MaybeUninit<u8>` 无需校验位模式。
-            assert_eq!(unsafe { view[0].assume_init() }, 0xABu8, "写入应当可见");
-        }
     }
 }

@@ -69,7 +69,7 @@
 //! - 读循环据此**静默丢弃**在途帧，而真正的未知子流仍然判协议违例
 //!   （见 [`ChannelRegistry_::is_wait_close_`]）；
 //! - 同一 dock 对在宽限期内**不得复用**，[`ChannelRegistry_::reserve_channel_`]
-//!   报 [`MuxError::WaitClose`]——这是顺带得到的、与 TCP 同形的复用保护。
+//!   报 [`ReserveErr_::WaitClose`]——这是顺带得到的、与 TCP 同形的复用保护。
 //!
 //! 宽限态由 [`ChannelRegistry_::reap_wait_close_`] 按到期时刻回收；到期索引让回收
 //! 是 O(k log n)（k 为本轮到期数）而不是全表 O(n)。
@@ -96,7 +96,7 @@ use buffex::x_deps::abs_buff::{TrBuffTryRead, TrBuffTryWrite};
 
 use crate::{
     connection::{
-        Dock, MuxError, NoHalfway_,
+        Dock, MuxError, ReserveErr_,
         owner_::ChannelOwner_,
         sync_::{CancelToken_, FailKind_, WakerSlot_, on_lock_contended_},
     },
@@ -474,21 +474,21 @@ where
     ///
     /// # Errors
     ///
-    /// - `local_dock` 已作 telegraph → [`MuxError::DockInUse`]；
-    /// - 同一 dock 对上有活跃子流 → [`MuxError::Duplicate`]；
-    /// - 同一 dock 对处于拆流宽限期 → [`MuxError::WaitClose`]；
-    /// - 该 dock 上的在册子流数已达 `max_dock_chan_count` → [`MuxError::DockChanLimit`]；
-    /// - 连接上的在册子流数已达 `max_channel_count` → [`MuxError::ChanLimit`]。
+    /// - `local_dock` 已作 telegraph → [`ReserveErr_::DockInUse`]；
+    /// - 同一 dock 对上有活跃子流 → [`ReserveErr_::Duplicate`]；
+    /// - 同一 dock 对处于拆流宽限期 → [`ReserveErr_::WaitClose`]；
+    /// - 该 dock 上的在册子流数已达 `max_dock_chan_count` → [`ReserveErr_::DockChanLimit`]；
+    /// - 连接上的在册子流数已达 `max_channel_count` → [`ReserveErr_::ChanLimit`]。
     pub(crate) fn reserve_channel_(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
-    ) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
+    ) -> Result<(), ReserveErr_> {
         self.with_mut_(|inner| {
             let now = Instant::now();
             inner.reap_wait_close_(now);
             if inner.total_ >= inner.opts_.max_channel_count {
-                return Result::Err(MuxError::ChanLimit);
+                return Result::Err(ReserveErr_::ChanLimit);
             }
             // 先把限额取出来：下面要可变借用 `docks_`。
             let max_dock = inner.opts_.max_dock_chan_count;
@@ -498,19 +498,19 @@ where
                 inner.bindings_.get(&telegraph_key_(local_dock)),
                 Option::Some(DockBinding_::Telegraph(_))
             ) {
-                return Result::Err(MuxError::DockInUse);
+                return Result::Err(ReserveErr_::DockInUse);
             }
             match inner.bindings_.get(&(local_dock, remote_dock)) {
                 Option::Some(DockBinding_::WaitClose(_)) => {
-                    return Result::Err(MuxError::WaitClose);
+                    return Result::Err(ReserveErr_::WaitClose);
                 }
-                Option::Some(_) => return Result::Err(MuxError::Duplicate),
+                Option::Some(_) => return Result::Err(ReserveErr_::Duplicate),
                 Option::None => {}
             }
             if let Option::Some(dock) = inner.docks_.get(&local_dock)
                 && dock.chan_count_ >= max_dock
             {
-                return Result::Err(MuxError::DockChanLimit);
+                return Result::Err(ReserveErr_::DockChanLimit);
             }
 
             let dock = inner
@@ -644,13 +644,13 @@ where
     /// # Errors
     ///
     /// 与 [`ChannelRegistry_::reserve_channel_`] 相同（含 dock 对已存在时的
-    /// [`MuxError::Duplicate`] / [`MuxError::WaitClose`]）。
+    /// [`ReserveErr_::Duplicate`] / [`ReserveErr_::WaitClose`]）。
     pub(crate) fn reserve_inbound_(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
         peer_report: WindowReport,
-    ) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
+    ) -> Result<(), ReserveErr_> {
         self.reserve_channel_(local_dock, remote_dock)?;
         let marked = self.with_mut_(|inner| {
             match inner.bindings_.get_mut(&(local_dock, remote_dock)) {
@@ -742,18 +742,18 @@ where
     ///
     /// # Errors
     ///
-    /// 该 dock 已被另一个绑定占用 → [`MuxError::DockInUse`]。
+    /// 该 dock 已被另一个绑定占用 → [`ReserveErr_::DockInUse`]。
     ///
     /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
     /// [`DockBinding`]: crate::connection::DockBinding
-    pub(crate) fn bind_dock_(&self, local_dock: Dock) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
+    pub(crate) fn bind_dock_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
         self.with_mut_(|inner| {
             let dock = inner
                 .docks_
                 .entry(local_dock)
                 .or_insert_with(DockCtx_::new_);
             if dock.bound_ {
-                return Result::Err(MuxError::DockInUse);
+                return Result::Err(ReserveErr_::DockInUse);
             }
             dock.bound_ = true;
             Result::Ok(())
@@ -781,18 +781,18 @@ where
     /// # Errors
     ///
     /// 该 dock 已作 telegraph（datagram 与 channel 不得共用 dock）→
-    /// [`MuxError::DockInUse`]。
-    pub(crate) fn reserve_listener_(&self, local_dock: Dock) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
+    /// [`ReserveErr_::DockInUse`]。
+    pub(crate) fn reserve_listener_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
         self.with_mut_(|inner| {
             if matches!(
                 inner.bindings_.get(&telegraph_key_(local_dock)),
                 Option::Some(DockBinding_::Telegraph(_))
             ) {
-                return Result::Err(MuxError::DockInUse);
+                return Result::Err(ReserveErr_::DockInUse);
             }
             match inner.bindings_.get(&listener_key_(local_dock)) {
                 Option::Some(DockBinding_::Listener(_)) => Result::Ok(()),
-                Option::Some(_) => Result::Err(MuxError::DockInUse),
+                Option::Some(_) => Result::Err(ReserveErr_::DockInUse),
                 Option::None => {
                     inner.bindings_.insert(
                         listener_key_(local_dock),
@@ -820,14 +820,14 @@ where
     ///
     /// # Errors
     ///
-    /// 该 dock 上已有其它身份 → [`MuxError::DockInUse`]。
-    pub(crate) fn reserve_telegraph_(&self, local_dock: Dock) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
+    /// 该 dock 上已有其它身份 → [`ReserveErr_::DockInUse`]。
+    pub(crate) fn reserve_telegraph_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
         self.with_mut_(|inner| {
             if inner.bindings_.contains_key(&telegraph_key_(local_dock))
                 || inner.bindings_.contains_key(&listener_key_(local_dock))
                 || inner.has_concrete_identity_(local_dock)
             {
-                return Result::Err(MuxError::DockInUse);
+                return Result::Err(ReserveErr_::DockInUse);
             }
             inner
                 .bindings_
@@ -990,7 +990,7 @@ mod tests_ {
 
 
 use crate::{
-        connection::{Dock, MuxError, owner_::ChannelOwner_},
+        connection::{Dock, ReserveErr_, owner_::ChannelOwner_},
         handshake::opts::BasicOpts,
     };
 
@@ -1119,12 +1119,12 @@ use crate::{
         let err = registry
             .reserve_channel_(Dock::new(1u32), Dock::new(10u32))
             .unwrap_err();
-        assert!(matches!(err, MuxError::DockChanLimit));
+        assert!(matches!(err, ReserveErr_::DockChanLimit));
         assert!(registry.reserve_channel_(Dock::new(2u32), Dock::new(9u32)).is_ok());
         let err = registry
             .reserve_channel_(Dock::new(3u32), Dock::new(9u32))
             .unwrap_err();
-        assert!(matches!(err, MuxError::ChanLimit));
+        assert!(matches!(err, ReserveErr_::ChanLimit));
 
         registry.release_channel_(Dock::new(1u32), Dock::new(9u32));
         assert_eq!(registry.total_channels_(), 1usize, "释放后活跃数应当回落");
@@ -1140,7 +1140,7 @@ use crate::{
     /// - 手段：先在 dock 5 上登记 telegraph，再尝试登记 channel 与 listener；
     ///   换 dock 6 先登记 channel 再尝试 telegraph；换 dock 7 先登记 listener
     ///   再尝试 telegraph。
-    /// - 判断：三次相斥的尝试都报 `MuxError::DockInUse`；释放 telegraph 后
+    /// - 判断：三次相斥的尝试都报 `ReserveErr_::DockInUse`；释放 telegraph 后
     ///   dock 5 可以登记 channel。
     #[test]
     fn telegraph_is_exclusive_on_a_dock() {
@@ -1152,14 +1152,14 @@ use crate::{
                 registry
                     .reserve_channel_(Dock::new(5u32), Dock::new(9u32))
                     .unwrap_err(),
-                MuxError::DockInUse
+                ReserveErr_::DockInUse
             ),
             "telegraph 占用的 dock 不能建 channel"
         );
         assert!(
             matches!(
                 registry.reserve_listener_(Dock::new(5u32)).unwrap_err(),
-                MuxError::DockInUse
+                ReserveErr_::DockInUse
             ),
             "telegraph 占用的 dock 不能监听"
         );
@@ -1168,7 +1168,7 @@ use crate::{
         assert!(
             matches!(
                 registry.reserve_telegraph_(Dock::new(6u32)).unwrap_err(),
-                MuxError::DockInUse
+                ReserveErr_::DockInUse
             ),
             "已有 channel 的 dock 不能开 telegraph"
         );
@@ -1177,7 +1177,7 @@ use crate::{
         assert!(
             matches!(
                 registry.reserve_telegraph_(Dock::new(7u32)).unwrap_err(),
-                MuxError::DockInUse
+                ReserveErr_::DockInUse
             ),
             "已监听的 dock 不能开 telegraph"
         );
@@ -1225,7 +1225,7 @@ use crate::{
     ///
     /// - 手段：对同一 dock 连续 `bind_dock_`；在另一个 dock 上正常绑定；再在一个
     ///   已绑定的 dock 上登记并释放一条子流；最后 `unbind_dock_` 后重绑。
-    /// - 判断：第二次绑定报 `MuxError::DockInUse`；不同 dock 互不影响；子流清零
+    /// - 判断：第二次绑定报 `ReserveErr_::DockInUse`；不同 dock 互不影响；子流清零
     ///   后再次绑定**仍**报 `DockInUse`（绑定是持久占用）；解绑后重绑成功。
     #[test]
     fn dock_binding_is_exclusive_and_persistent() {
@@ -1235,7 +1235,7 @@ use crate::{
         assert!(registry.bind_dock_(Dock::new(7u32)).is_ok());
         let err = registry.bind_dock_(Dock::new(7u32)).unwrap_err();
         assert!(
-            matches!(err, MuxError::DockInUse),
+            matches!(err, ReserveErr_::DockInUse),
             "同一 dock 重复绑定应当报 DockInUse"
         );
 
@@ -1251,7 +1251,7 @@ use crate::{
         registry.release_channel_(Dock::new(7u32), Dock::new(3u32));
         let err = registry.bind_dock_(Dock::new(7u32)).unwrap_err();
         assert!(
-            matches!(err, MuxError::DockInUse),
+            matches!(err, ReserveErr_::DockInUse),
             "子流清零不应解除绑定"
         );
 
@@ -1285,7 +1285,7 @@ use crate::{
     }
     /// 测试同一 dock 对上的第二条并发子流被拒（dock 对即身份）。
     /// - 手段：在 `(1,9)` 上登记一次后重复登记；释放后再登记。
-    /// - 判断：重复登记报 `MuxError::Duplicate`；宽限期为 0 时释放后可重新登记。
+    /// - 判断：重复登记报 `ReserveErr_::Duplicate`；宽限期为 0 时释放后可重新登记。
     #[test]
     fn duplicate_dock_pair_is_rejected() {
         let registry = ChannelRegistry_::new_(opts_zero_grace_(), CoreAlloc);
@@ -1299,7 +1299,7 @@ use crate::{
         let err = registry
             .reserve_channel_(Dock::new(1u32), Dock::new(9u32))
             .unwrap_err();
-        assert!(matches!(err, MuxError::Duplicate));
+        assert!(matches!(err, ReserveErr_::Duplicate));
         assert_eq!(registry.total_channels_(), 1usize);
 
         registry.release_channel_(Dock::new(1u32), Dock::new(9u32));
@@ -1312,7 +1312,7 @@ use crate::{
     /// 测试拆流后键进入宽限态：既保护复用，又为在途帧提供识别依据。
     /// - 手段：登记 `(1,9)` 后释放；查 `is_wait_close_`、尝试重新登记同一 dock 对、
     ///   并登记一个不同 remote 的兄弟子流。
-    /// - 判断：释放后 `is_wait_close_` 为真且重新登记报 `MuxError::WaitClose`；
+    /// - 判断：释放后 `is_wait_close_` 为真且重新登记报 `ReserveErr_::WaitClose`；
     ///   不同 remote 不受影响（宽限是 dock 对级而非 dock 级）。
     #[test]
     fn released_pair_enters_wait_close_and_blocks_reuse() {
@@ -1334,7 +1334,7 @@ use crate::{
                 registry
                     .reserve_channel_(Dock::new(1u32), Dock::new(9u32))
                     .unwrap_err(),
-                MuxError::WaitClose
+                ReserveErr_::WaitClose
             ),
             "宽限期内不得复用同一 dock 对"
         );
@@ -1522,7 +1522,7 @@ use crate::{
         });
         assert!(matches!(
             registry.bind_dock_(Dock::new(21u32)).unwrap_err(),
-            MuxError::DockInUse
+            ReserveErr_::DockInUse
         ));
     }
     /// 测试建好环之后挂上的共享状态句柄能被按 dock 对查回。

@@ -189,10 +189,14 @@
 //! - 线格式支持 1 / 2 / 4 字节三种宽度（由 `LocalDock` / `RemoteDock` 字段的
 //!   `val_type` 决定），由发送方按最小值选宽。
 //!
-//! **`unspecified` 与 `wildcard` 是双方共同保留的取值，不能作为正常子流的 dock**：
-//! 它们只承担 dock 类型自身的特殊语义。任何一帧的 `LocalDock` / `RemoteDock` 取到
-//! 这两个值即协议违例——接收侧报 [`MuxError::ReservedDock`] 并终止该帧（发送侧同样
-//! 拒绝构造这种帧头）。
+//! **`unspecified` 与 `wildcard` 不能充当「身份」**：dock 对是子流的身份，因此
+//! **channel 作用域的帧**（`OPEN` / `ACCEPT` / `REJECT` / `CLOSE` / `PULSE` /
+//! `WINDOW_UPDATE` / 数据帧）的 `LocalDock` / `RemoteDock` 取到这两个值即协议违例
+//! （接收侧报 [`MuxError::ReservedDock`]，发送侧同样拒绝构造这种帧头）。
+//!
+//! 但**`DATAGRAM`（telegraph）不是身份，而是地址**：它的 remote dock 取 `wildcard` /
+//! `unspecified` 是**合法的**——「发到 wildcard / unspecified」由对端自己的策略决定收
+//! 还是不收。发送方的 local dock 来自已绑定的 telegraph，天然是真实 dock。
 //!
 //! ### 4.1 子流身份：dock 对即身份
 //!
@@ -220,13 +224,13 @@
 //!
 //! `channel` 与 `telegraph` **不得共用同一个 local_dock**（见
 //! [`TrTelegraph`](abs_smux::conn::TrTelegraph) 的文档）；绑定期由注册表拒绝，
-//! 报 [`MuxError::DockInUse`]。
+//! 报 [`BindError::DockInUse`]。
 //!
 //! 同样在绑定期：一个 `local_dock` 在任意时刻**至多被一个 `DockBinding` 占用**
 //! ——对已绑定的 dock 再次
 //! [`bind_async`](abs_smux::conn::TrConnection::bind_async) 报
-//! [`MuxError::DockInUse`]，丢弃 binding 即解绑。这是「dock 对即身份」在**绑定层**
-//! 的前置检查：子流层的唯一性检查（`MuxError::Duplicate`）只能发现同一个 dock 对上
+//! [`BindError::DockInUse`]，丢弃 binding 即解绑。这是「dock 对即身份」在**绑定层**
+//! 的前置检查：子流层的唯一性检查（[`BindingError::Duplicate`]）只能发现同一个 dock 对上
 //! 的重复子流，发现不了同一个 dock 上两个独立 binding 各自向不同 `remote_dock`
 //! 建流、却同时对外代表同一个 local_dock 身份。
 //!
@@ -265,12 +269,12 @@
 //! - 于是两侧的状态机同形：**（本地准备）→ 发送 `OPEN` → 收到对端 `OPEN` →（被动方
 //!   多一步发送 `ACCEPT`）→ 建立完成**；谁都不会先看到对方的数据帧。
 //! - **缓冲归属**：`accept_async` 的 `prepare` 给出的两块缓冲**就是**本条子流的环
-//!   存储，而且**每条子流可以各用不同的具体类型**（自有所有权、借用切片、池分配、
-//!   `Vec`、静态区……）。做法是连接侧只认一个**类型擦除载具**
-//!   （[`MuxChanBuff`]）：调用方给的存储被装箱进去，
-//!   于是两个循环、两条事件通道与两个半部的类型固定下来，而「用什么承载」仍是使用
-//!   环境的自由。连接因此**不需要**任何缓冲类型参数，资源策略也只有「分配器 + 流控
-//!   策略」。接收窗口与发送环大小按该子流自己的缓冲容量算出（逐条不同）。
+//!   存储。**类型**由使用环境在策略里声明（[`TrMuxConfig::Buff`]），并在 `abs_smux`
+//!   的 `TrAcceptBuff` 上登记为「本连接接受的唯一一种」——于是两个循环、两条事件通道与
+//!   两个半部都能静态参数化，**零装箱、零间接**；**分配**（每条子流多大、从哪来）由调用
+//!   方在 `prepare` 里当场决定，容量不合适时连接**拒绝接受**
+//!   （[`HandleError::RingRejected`]），不替调用方改尺寸。接收窗口与发送环大小按该子流自己
+//!   的缓冲容量算出（逐条不同）。
 //! - 主动方的 `local_dock` 是为这条子流新分配的临时 dock，`remote_dock` 是对端监听的
 //!   dock；被动方**镜像**过来：自己的 `local_dock` 是监听 dock，`remote_dock` 是主动方
 //!   的临时 dock（见 §4.1）。
@@ -307,7 +311,7 @@
 //! - 宽限期内到达的在途帧被**静默丢弃**；真正的未知子流仍然按协议违例处理
 //!   （[`MuxError::MalformedFrame`]），可检测性不丢；
 //! - 同一 `(local_dock, remote_dock)` 在宽限期内**不得复用**，重新登记报
-//!   [`MuxError::WaitClose`]——这是顺带得到的、与 TCP 同形的复用保护；
+//!   [`BindingError::WaitClose`]——这是顺带得到的、与 TCP 同形的复用保护；
 //! - 宽限期是**dock 对**级而非 dock 级：同一 `local_dock` 上发往其它 `remote_dock`
 //!   的子流不受影响（响应方的共享监听 dock 因此不会被误伤）。
 //!
@@ -466,13 +470,10 @@ pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::ChannelListener;
 pub use config_::{DefaultMuxConfig, TrMuxConfig};
 pub use dock_binding::DockBinding;
-pub use error_::MuxError;
-pub(crate) use error_::{MuxReadErr_, MuxWriteErr_, NoHalfway_};
-// 环存储的类型擦除载具会出现在 `ChannelTx` / `ChannelRx` 的关联类型里，因此必须是
-// **可达的公开类型**（否则使用者既写不出那些类型，rustdoc 也无法链接）；它不是给
-// 手工构造的入口，故 `doc(hidden)`。
-#[doc(hidden)]
-pub use ring_::MuxChanBuff;
+pub use error_::{
+    BindError, BindingError, HandleError, ListenerError, MuxError, TelegraphError,
+};
+pub(crate) use error_::{MuxReadErr_, MuxWriteErr_, NoHalfway_, ReserveErr_};
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::MuxConnection;
 pub use ring_::{BufferedChannel, BufferedRx, BufferedTx};

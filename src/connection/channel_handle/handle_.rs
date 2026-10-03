@@ -6,12 +6,14 @@ use abs_buff::{
     x_deps::abs_cancel,
 };
 use abs_cancel::TrCancellationToken;
-use abs_smux::chan::{ChannelBuff, TrChannelHalf, TrChannelHandle, TrPrepareChannelBuff};
+use abs_smux::chan::{
+    ChannelBuff, TrAcceptBuff, TrChannelHalf, TrChannelHandle, TrPrepareChannelRing,
+};
 use buffex::x_deps::abs_buff;
 
 use crate::{
     connection::{
-        MuxChanBuff, Dock, FrameKind, MuxConnection, MuxError, TrMuxConfig,
+        Dock, FrameKind, HandleError, MuxConnection, MuxError, TrMuxConfig,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, ChannelState_, EstablishOutcome_, wait_establish_},
         ring_::new_buffered_channel_,
@@ -52,7 +54,7 @@ where
     /// 两个角色的「最终裁决」不同：
     ///
     /// - **发起方**：此刻还没在线上发过任何帧；`accept_async` 才发 `OPEN`，并等对端
-    ///   的 `OPEN` + `ACCEPT`（对端拒绝则报 [`MuxError::Refused`]）。
+    ///   的 `OPEN` + `ACCEPT`（对端拒绝则报 [`HandleError::Refused`]）。
     /// - **响应方**：对端 `OPEN` 已到并已登记；`accept_async` 回自己的 `OPEN` +
     ///   `ACCEPT`，不等任何东西。
     ///
@@ -61,6 +63,15 @@ where
 
     /// 发起方暂存的开场消息（响应方恒为空）：`OPEN` 要等 `accept_async` 才发。
     message_: Vec<u8>,
+
+    /// `TrAcceptBuff::accept_buff` 成功后的**子流共享状态**。
+    ///
+    /// 发起方还要拿它等待对端的 `OPEN` + `ACCEPT`（见 `accept_async` 的 step 函数），
+    /// 因此由句柄暂存；响应方不用，保持 `None`。
+    accepted_owner_: Option<ChannelOwner_<C::Alloc>>,
+
+    /// `accept_buff` 之后本端要通告的**接收窗口**（由接收环实际容量算出）。
+    accepted_initial_window_: Credit,
 
     /// 是否已经裁决完毕（接受 / 拒绝 / 已拆）。
     ///
@@ -85,6 +96,8 @@ where
             remote_dock_: remote_dock,
             is_initiator_: false,
             message_: Vec::new(),
+            accepted_owner_: Option::None,
+            accepted_initial_window_: 0u64 as Credit,
             settled_: false,
         }
     }
@@ -102,6 +115,8 @@ where
             remote_dock_: remote_dock,
             is_initiator_: true,
             message_: message,
+            accepted_owner_: Option::None,
+            accepted_initial_window_: 0u64 as Credit,
             settled_: false,
         }
     }
@@ -168,22 +183,75 @@ fn abort_pending_<W, R, S, C>(
     core.reg_().release_channel_(local, remote);
 }
 
-impl<W, R, S, C> TrChannelHandle for ChannelHandle<W, R, S, C>
+impl<W, R, S, C> ChannelHandle<W, R, S, C>
 where
     C: TrMuxConfig,
     R: TrBuffRead<u8>,
     W: TrBuffWrite<u8>,
 {
-    type Err = MuxError<R, W>;
+    /// 「接受」这一步：校验调用方给的两块内存、建两条环、把会话侧半部交给两个循环。
+    ///
+    /// 类型是**本连接声明的那一种**（`C::Buff`）——`TrAcceptBuff<C::Buff, _>` 这个标记
+    /// 就是这个声明的落点。
+    fn accept_buff_(
+        &mut self,
+        tx_buff: C::Buff,
+        rx_buff: C::Buff,
+    ) -> AcceptOutcome_<W, R, S, C> {
+        let conn = self.conn_.clone();
+        let local = self.local_dock_;
+        let remote = self.remote_dock_;
+
+        // 1) 校验：容量至少要够建出环（不替调用方改尺寸，不合格就拒绝）。
+        let mut tx_buff = tx_buff;
+        let mut rx_buff = rx_buff;
+        let tx_cap = BorrowMut::<[MaybeUninit<u8>]>::borrow_mut(&mut tx_buff).len();
+        let rx_cap = BorrowMut::<[MaybeUninit<u8>]>::borrow_mut(&mut rx_buff).len();
+        if tx_cap < K_MIN_RING_CAPACITY_ || rx_cap < K_MIN_RING_CAPACITY_ {
+            return Result::Err(HandleError::RingRejected);
+        }
+
+        // 2) 对端的窗口通告：发起方还没有（对端 `OPEN` 未到，读循环稍后写进发送窗口），
+        //    响应方在登记时已存下。
+        let peer_report = if self.is_initiator_ {
+            Option::None
+        } else {
+            match conn.core_().reg_().take_inbound_report_(local, remote) {
+                Option::Some(report) => Option::Some(report),
+                Option::None => return Result::Err(HandleError::Mux(MuxError::Closed)),
+            }
+        };
+
+        // 3) 建环 + 登记 + 移交会话侧半部。
+        let (owner, tx, rx, initial) = install_channel_(
+            &conn,
+            local,
+            remote,
+            ChannelBuff::new(tx_buff, rx_buff),
+            peer_report,
+        )?;
+        self.accepted_initial_window_ = initial;
+        self.accepted_owner_ = Option::Some(owner);
+        Result::Ok((tx, rx))
+    }
+}
+
+impl<W, R, S, C> TrChannelHandle for ChannelHandle<W, R, S, C>
+where
+    C: TrMuxConfig,
+    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + 'static,
+{
+    type Err = HandleError<R, W>;
 
     type Tx = ChannelTx<W, R, S, C>;
     type Rx = ChannelRx<W, R, S, C>;
 
-    type AcceptAsync<'f, Wb, P> = MuxAcceptAsync<'f, 'f, W, R, S, C, Wb, P>
+    type AcceptAsync<'f, Wb, P> = MuxAcceptAsync<'f, 'f, W, R, S, C, Wb>
     where
         Self: 'f,
         Wb: 'f + TrBuffWrite,
-        P: 'f + TrPrepareChannelBuff<Buff: BorrowMut<[MaybeUninit<u8>]>>;
+        P: TrPrepareChannelRing<C::Buff, u8>;
 
     type RejectAsync<'f, Rb> = MuxRejectAsync<'f, 'f, W, R, S, C, Rb>
     where
@@ -196,10 +264,27 @@ where
         prepare: P,
     ) -> Self::AcceptAsync<'f, Wb, P>
     where
-        Wb: TrBuffWrite,
-        P: TrPrepareChannelBuff<Buff: BorrowMut<[MaybeUninit<u8>]>>,
+        Wb: TrBuffWrite<u8>,
+        P: TrPrepareChannelRing<C::Buff, u8>,
     {
-        MuxAcceptAsync::new(self, welcome, prepare)
+        // 调用方给的智能指针类型是否正确，由 trait 的
+        // `Self: TrAcceptBuff<P::Buff>` 约束保证；**接受**（校验 + 建环 + 移交给循环）
+        // 在这里同步完成，future 只负责剩下的握手。
+        let accept_result: AcceptOutcomeProj_<W, R, S, C> = {
+            let (tx_buff, rx_buff) = prepare.prepare().into_inner();
+            self.accept_buff_(tx_buff, rx_buff)
+        };
+        if accept_result.is_err() {
+            // 拒绝接受这两份内存：按角色收尾（响应方补 `REJECT`，发起方撤销登记）。
+            self.settled_ = true;
+            abort_pending_(
+                &self.conn_,
+                self.local_dock_,
+                self.remote_dock_,
+                self.is_initiator_,
+            );
+        }
+        MuxAcceptAsync::new(self, welcome, accept_result)
     }
 
     fn reject_async<'f, Rb>(&'f mut self, reason: &'f mut Rb) -> Self::RejectAsync<'f, Rb>
@@ -248,55 +333,48 @@ where
 ///
 /// # 缓冲归属
 ///
-/// `prepare` 给的两块存储**就是**本条子流的环存储：类型由
-/// [`TrChannelHandle::Buff`](abs_smux::chan::TrChannelHandle::Buff) 的等式约束与
-/// `MuxChanBuff` 钉在一起，因此这里直接把它们交给 `buffex` 建环；容量也由它们决定
-/// （本端通告的接收窗口由此算出）。
+/// `prepare` 给的两块存储**就是**本条子流的环存储：类型由本连接声明的
+/// [`TrChannelHandle::Buff`](abs_smux::chan::TrChannelHandle::Buff)（即 `C::Buff`）
+/// 决定，**分配方式与容量由调用方在这一次调用里决定**。因此这里直接把它们交给
+/// `buffex` 建环，没有任何装箱或间接层。
 #[gen_may_cancel_future(MuxAccept, pub, new(pub(crate)))]
-async fn mux_accept_async_<'f, W, R, S, C, Wb, P, K>(
+async fn mux_accept_async_<'f, W, R, S, C, Wb, K>(
     handle: &'f mut ChannelHandle<W, R, S, C>,
     welcome: &'f mut Wb,
-    prepare: P,
+    accepted: AcceptOutcomeProj_<W, R, S, C>,
     cancel: K,
-) -> Result<(ChannelTx<W, R, S, C>, ChannelRx<W, R, S, C>), MuxError<R, W>>
+) -> Result<(
+    <ChannelHandle<W, R, S, C> as TrChannelHandle>::Tx,
+    <ChannelHandle<W, R, S, C> as TrChannelHandle>::Rx,
+), <ChannelHandle<W, R, S, C> as TrChannelHandle>::Err>
 where
-    W: 'f + TrBuffWrite<u8>,
-    R: 'f + TrBuffRead<u8>,
+    W: 'f + TrBuffWrite<u8> + 'static,
+    R: 'f + TrBuffRead<u8> + 'static,
     S: 'f,
     C: 'f + TrMuxConfig,
     Wb: 'f + TrBuffWrite<u8>,
-    P: 'f + TrPrepareChannelBuff<Buff: BorrowMut<[MaybeUninit<u8>]>>,
     K: TrCancellationToken,
 {
     let conn = handle.conn_.clone();
     let local = handle.local_dock_;
     let remote = handle.remote_dock_;
 
-    // 1. 调用方给的两块缓冲就是**本条子流的环存储**：容量由它们决定（本端接收窗口
-    //    由此算出），存储本身装箱进内部载具——连接侧类型固定，承载者自由。
-    let mut buffs = prepare.prepare();
-    let tx_cap = BorrowMut::<[MaybeUninit<u8>]>::borrow_mut(&mut buffs.tx_buff).len();
-    let rx_cap = BorrowMut::<[MaybeUninit<u8>]>::borrow_mut(&mut buffs.rx_buff).len();
-    let buffs: ChannelBuff<MuxChanBuff> = ChannelBuff {
-        tx_buff: MuxChanBuff::boxed_(buffs.tx_buff),
-        rx_buff: MuxChanBuff::boxed_(buffs.rx_buff),
-    };
-    if tx_cap == 0usize || rx_cap == 0usize {
-        // 容量为 0 的环建不出来（也没有意义）：按「拒绝」处理，不惊动连接。
-        let _ = welcome;
-        handle.settled_ = true;
-        abort_pending_(&conn, local, remote, handle.is_initiator_);
-        return Result::Err(MuxError::Closed);
-    }
+    // 「准备 + 接受」已经在 `accept_async` 的方法体里同步做完；这里只处理结果，然后
+    // 完成剩下的握手（发起方发 `OPEN` 并等对端，响应方回自己的 `OPEN` + `ACCEPT`）。
+    let (tx, rx) = accepted?;
 
     if handle.is_initiator_ {
-        // 发起方：此刻才发 `OPEN`（通告的接收窗口取决于 `rx_cap`）。
+        // 发起方：此刻才发 `OPEN`（通告的接收窗口取决于接收环容量）。
         let message = core::mem::take(&mut handle.message_);
-        let (owner, tx, rx, initial) =
-            install_channel_(&conn, local, remote, buffs, Option::None)?;
+        let initial = handle.accepted_initial_window_;
         send_open_(&conn, local, remote, initial, message);
         // 对端的 `OPEN` 到达时，读循环会把它的接收窗口写进发送窗口；`ACCEPT` /
         // `REJECT` 到达时唤醒这里。
+        let Some(owner) = handle.accepted_owner_.clone() else {
+            // `accept_buff` 成功就一定会把 owner 存进句柄；这里是不可达分支。
+            handle.settled_ = true;
+            return Result::Err(HandleError::Mux(MuxError::Closed));
+        };
         match wait_establish_(conn.core_().reg_(), &owner, cancel.child_token()).await? {
             EstablishOutcome_::Accepted => {
                 handle.settled_ = true;
@@ -307,18 +385,12 @@ where
                 // 释放——宽限期用来吸收可能的在途帧。
                 conn.core_().reg_().release_channel_(local, remote);
                 handle.settled_ = true;
-                Result::Err(MuxError::Refused)
+                Result::Err(HandleError::Refused)
             }
         }
     } else {
         // 响应方：对端 `OPEN` 的窗口通告已在登记时存下（读循环存的）。
-        let Some(report) = conn.core_().reg_().take_inbound_report_(local, remote) else {
-            handle.settled_ = true;
-            abort_pending_(&conn, local, remote, false);
-            return Result::Err(MuxError::Closed);
-        };
-        let (_owner, tx, rx, initial) =
-            install_channel_(&conn, local, remote, buffs, Option::Some(report))?;
+        let initial = handle.accepted_initial_window_;
         // 先回自己的 `OPEN`（通告本端接收窗口，发起方的发送额度由此而来），再发
         // `ACCEPT`（裁决）。
         send_open_(&conn, local, remote, initial, Vec::new());
@@ -343,6 +415,36 @@ where
     }
 }
 
+/// 环能构造的**最小**容量（`buffex::Ring` 要求容量落在 `[2, MAX]`，这里取同一口径）。
+const K_MIN_RING_CAPACITY_: usize = 2usize;
+
+/// **本连接只接受一种环存储智能指针**：使用环境在 [`TrMuxConfig::Buff`] 里声明的那一种。
+///
+/// `TrAcceptBuff` 只是**声明**：它不做事，只说明「这一种 `B` 我能用起来」。因此
+/// 「一条连接只能用一种环存储」这条约束落在 smux 的实现里，而不是写进 `abs_smux` 的
+/// 类型定义里——能同时应付多种智能指针的实现可以声明一个自己的载体类型在内部消化。
+impl<W, R, S, C> TrAcceptBuff<u8> for ChannelHandle<W, R, S, C>
+where
+    C: TrMuxConfig,
+{
+    type Buff = C::Buff;
+}
+
+/// 「接受」这一步的产物：该 channel 的收发半边，或一个连接错误。
+type AcceptOutcome_<W, R, S, C> = Result<
+    (ChannelTx<W, R, S, C>, ChannelRx<W, R, S, C>),
+    HandleError<R, W>,
+>;
+
+/// 同上，但按 `TrChannelHandle` 的**关联类型投影**书写（用于与 trait 声明的类型对齐）。
+type AcceptOutcomeProj_<W, R, S, C> = Result<
+    (
+        <ChannelHandle<W, R, S, C> as TrChannelHandle>::Tx,
+        <ChannelHandle<W, R, S, C> as TrChannelHandle>::Rx,
+    ),
+    <ChannelHandle<W, R, S, C> as TrChannelHandle>::Err,
+>;
+
 /// 建流最终裁决的产物：`(子流共享状态, 应用侧发送半部, 应用侧接收半部, 本端通告的接收窗口)`。
 type InstallOutcome_<W, R, S, C> = (
     ChannelOwner_<<C as TrMuxConfig>::Alloc>,
@@ -360,9 +462,9 @@ fn install_channel_<W, R, S, C>(
     conn: &MuxConnection<W, R, S, C>,
     local: Dock,
     remote: Dock,
-    buffs: ChannelBuff<MuxChanBuff>,
+    buffs: ChannelBuff<C::Buff, u8>,
     peer_report: Option<WindowReport>,
-) -> Result<InstallOutcome_<W, R, S, C>, MuxError<R, W>>
+) -> Result<InstallOutcome_<W, R, S, C>, HandleError<R, W>>
 where
     C: TrMuxConfig,
     R: TrBuffRead<u8>,
@@ -372,8 +474,8 @@ where
     let alloc = core.config_().allocator();
     let policy = core.config_().policy();
     // 两块存储就是调用方给的那两块（0 号位 Tx、1 号位 Rx）。
-    let ChannelBuff { tx_buff, rx_buff } = buffs;
-    let rx_cap = rx_buff.capacity_();
+    let (tx_buff, mut rx_buff) = buffs.into_inner();
+    let rx_cap = BorrowMut::<[MaybeUninit<u8>]>::borrow_mut(&mut rx_buff).len();
 
     // 本端接收窗口由**接收环容量**决定；发送窗口先按同一初值起算，随后被对端 `OPEN`
     // 的通告覆盖（响应方在此就地覆盖，发起方由读循环覆盖）。
@@ -386,7 +488,7 @@ where
         && let Result::Err(err) = flow.send_window_mut().on_report(report)
     {
         core.reg_().release_channel_(local, remote);
-        return Result::Err(MuxError::FlowCtrl(err));
+        return Result::Err(HandleError::FlowCtrl(err));
     }
 
     // 两条环：应用写 / 循环读的是发送环，循环写 / 应用读的是接收环。
@@ -394,14 +496,14 @@ where
         Result::Ok(pair) => pair,
         Result::Err(_) => {
             core.reg_().release_channel_(local, remote);
-            return Result::Err(MuxError::Closed);
+            return Result::Err(HandleError::Mux(MuxError::Closed));
         }
     };
     let (rx_w, rx_r) = match new_buffered_channel_(rx_buff, alloc.clone()) {
         Result::Ok(pair) => pair,
         Result::Err(_) => {
             core.reg_().release_channel_(local, remote);
-            return Result::Err(MuxError::Closed);
+            return Result::Err(HandleError::Mux(MuxError::Closed));
         }
     };
 
@@ -460,12 +562,12 @@ async fn mux_reject_async_<'f, W, R, S, C, Rb, K>(
     handle: &'f mut ChannelHandle<W, R, S, C>,
     reason: &'f mut Rb,
     cancel: K,
-) -> Result<usize, MuxError<R, W>>
+) -> Result<usize, HandleError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
-    R: TrBuffTryRead<u8> + 'f,
-    W: TrBuffTryWrite<u8> + 'f,
+    R: TrBuffTryRead<u8> + 'f + 'static,
+    W: TrBuffTryWrite<u8> + 'f + 'static,
     Rb: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {

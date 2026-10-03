@@ -38,7 +38,7 @@
 
 use crate::{
     connection::{
-        MuxChanBuff, TrMuxConfig,
+        TrMuxConfig,
         mux_connection::ChannelRegistry_,
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
     },
@@ -75,10 +75,10 @@ where
     reg_: ChannelRegistry_<C::Alloc>,
 
     /// 写事件发送端（控制帧、建流注册、水位与拆流通知）。
-    w_events_: EventSender_<WriteEvent_<MuxChanBuff, C::Alloc>>,
+    w_events_: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
 
     /// 读事件发送端（接收环注册与释放）。
-    r_events_: EventSender_<ReadEvent_<MuxChanBuff, C::Alloc>>,
+    r_events_: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
 }
 
 impl<C, S> MuxCore<C, S>
@@ -91,8 +91,8 @@ where
         opts: HandshakeOpts,
         scope: S,
         reg: ChannelRegistry_<C::Alloc>,
-        w_events: EventSender_<WriteEvent_<MuxChanBuff, C::Alloc>>,
-        r_events: EventSender_<ReadEvent_<MuxChanBuff, C::Alloc>>,
+        w_events: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
+        r_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     ) -> Self {
         MuxCore {
             config_: config,
@@ -124,12 +124,12 @@ where
     }
 
     /// 写事件发送端。
-    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<MuxChanBuff, C::Alloc>> {
+    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<C::Buff, C::Alloc>> {
         &self.w_events_
     }
 
     /// 读事件发送端。
-    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<MuxChanBuff, C::Alloc>> {
+    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<C::Buff, C::Alloc>> {
         &self.r_events_
     }
 }

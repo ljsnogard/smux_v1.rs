@@ -266,23 +266,11 @@ pub(crate) enum FailKind_ {
     /// 帧超过协商的 `max_packet_size`。
     FrameTooLarge,
 
-    /// dock 已被 channel 或 telegraph 占用。
-    DockInUse,
 
-    /// 该 dock 上的活动子流数已达上限。
-    DockChanLimit,
 
-    /// 连接上的活动子流数已达上限。
-    ChanLimit,
 
-    /// 对端拒绝建立子流。
-    Refused,
 
-    /// 同一条子流上出现重复请求。
-    Duplicate,
 
-    /// 该 dock 对刚关闭，仍在拆流宽限期内。
-    WaitClose,
 
     /// 流控失败。
     FlowCtrl(FlowCtrlError),
@@ -314,12 +302,7 @@ impl FailKind_ {
             MuxError::MalformedFrame => FailKind_::MalformedFrame,
             MuxError::UnsupportedField => FailKind_::UnsupportedField,
             MuxError::FrameTooLarge => FailKind_::FrameTooLarge,
-            MuxError::DockInUse => FailKind_::DockInUse,
-            MuxError::DockChanLimit => FailKind_::DockChanLimit,
-            MuxError::ChanLimit => FailKind_::ChanLimit,
-            MuxError::Refused => FailKind_::Refused,
-            MuxError::Duplicate => FailKind_::Duplicate,
-            MuxError::WaitClose => FailKind_::WaitClose,
+            // 「拒绝接受调用方给的内存」是本地判定，不属于连接级失败状态。
             MuxError::FlowCtrl(err) => FailKind_::FlowCtrl(*err),
         }
     }
@@ -339,12 +322,6 @@ impl FailKind_ {
             FailKind_::MalformedFrame => MuxError::MalformedFrame,
             FailKind_::UnsupportedField => MuxError::UnsupportedField,
             FailKind_::FrameTooLarge => MuxError::FrameTooLarge,
-            FailKind_::DockInUse => MuxError::DockInUse,
-            FailKind_::DockChanLimit => MuxError::DockChanLimit,
-            FailKind_::ChanLimit => MuxError::ChanLimit,
-            FailKind_::Refused => MuxError::Refused,
-            FailKind_::Duplicate => MuxError::Duplicate,
-            FailKind_::WaitClose => MuxError::WaitClose,
             FailKind_::FlowCtrl(err) => MuxError::FlowCtrl(err),
             FailKind_::Cancelled => MuxError::Cancelled,
         }
@@ -519,7 +496,7 @@ use crate::{
         assert_eq!(registry.failure_(), Option::Some(FailKind_::PeerClosed));
         assert!(TrCancellationToken::is_cancelled(&read_loop) && TrCancellationToken::is_cancelled(&write_loop));
 
-        registry.mark_failed_(&MuxError::<NoHalfway_, NoHalfway_>::ChanLimit);
+        registry.mark_failed_(&MuxError::<NoHalfway_, NoHalfway_>::MalformedFrame);
         assert_eq!(
             registry.failure_(),
             Option::Some(FailKind_::PeerClosed),
