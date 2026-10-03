@@ -24,7 +24,7 @@ use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
 
 use crate::{
     connection::{
-        MuxConnection, TrMuxConfig,
+        BufferedRx, BufferedTx, MuxConnection, TrMuxConfig,
         ring_::test_support_::TestBuff,
     },
     flow_ctrl::DefaultPolicy,
@@ -129,8 +129,14 @@ impl TrMuxConfig for TestMuxConfig_ {
     }
 }
 
-/// 建一个**不含任何循环**的测试连接（错误载荷类型取 `()`）。
-pub(crate) fn make_test_conn_() -> MuxConnection<TestMuxConfig_, NullScope_, (), ()> {
+/// 测试连接用的两个传输类型（真实的内存环端；本连接不驱动它们，只为满足类型参数）。
+pub(crate) type TestWireRx_ = BufferedRx<TestBuff, CoreAlloc>;
+
+/// 同 [`TestWireRx_`]，写半边。
+pub(crate) type TestWireTx_ = BufferedTx<TestBuff, CoreAlloc>;
+
+/// 建一个**不含任何循环**的测试连接。
+pub(crate) fn make_test_conn_() -> MuxConnection<TestMuxConfig_, NullScope_, TestWireRx_, TestWireTx_> {
     MuxConnection::new_test_(
         &NullScope_,
         HandshakeOpts {

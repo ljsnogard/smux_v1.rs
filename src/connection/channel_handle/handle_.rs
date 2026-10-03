@@ -1,5 +1,5 @@
 use abs_buff::{
-    TrBuffRead, TrBuffWrite,
+    TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
     gen_may_cancel_future,
     x_deps::abs_cancel,
 };
@@ -32,12 +32,12 @@ use crate::{
 /// 句柄上的 `(local_dock, remote_dock)` 就是这条待决子流的身份：响应方在自己的
 /// `local_dock` 上用 `remote_dock` 区分不同请求端的连接（见
 /// [`crate::connection`] 模块文档 §4.1）。
-pub struct ChannelHandle<C, S, RE, WE>
+pub struct ChannelHandle<C, S, R, W>
 where
     C: TrMuxConfig,
 {
     /// 连接智能指针：`accept_async` 用它建子流环并登记会话侧半部。
-    conn_: MuxConnection<C, S, RE, WE>,
+    conn_: MuxConnection<C, S, R, W>,
 
     /// 本端 dock。
     local_dock_: Dock,
@@ -46,13 +46,13 @@ where
     remote_dock_: Dock,
 }
 
-impl<C, S, RE, WE> ChannelHandle<C, S, RE, WE>
+impl<C, S, R, W> ChannelHandle<C, S, R, W>
 where
     C: TrMuxConfig,
 {
     /// 由连接与 dock 对构造（只允许 `income_async` 调用）。
     pub(crate) fn new_(
-        conn: MuxConnection<C, S, RE, WE>,
+        conn: MuxConnection<C, S, R, W>,
         local_dock: Dock,
         remote_dock: Dock,
     ) -> Self {
@@ -64,25 +64,25 @@ where
     }
 }
 
-impl<C, S, RE, WE> TrChannelHandle for ChannelHandle<C, S, RE, WE>
+impl<C, S, R, W> TrChannelHandle for ChannelHandle<C, S, R, W>
 where
     C: TrMuxConfig,
-    RE: core::error::Error,
-    WE: core::error::Error,
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
 {
-    type Err = MuxError<RE, WE>;
+    type Err = MuxError<R, W>;
 
-    type Tx = ChannelTx<C, S, RE, WE>;
-    type Rx = ChannelRx<C, S, RE, WE>;
+    type Tx = ChannelTx<C, S, R, W>;
+    type Rx = ChannelRx<C, S, R, W>;
 
     type AcceptAsync<'f, Wb>
-        = MuxAcceptAsync<'f, 'f, C, S, RE, WE, Wb>
+        = MuxAcceptAsync<'f, 'f, C, S, R, W, Wb>
     where
         Self: 'f,
         Wb: 'f + TrBuffWrite;
 
     type RejectAsync<'f, Rb>
-        = MuxRejectAsync<'f, 'f, C, S, RE, WE, Rb>
+        = MuxRejectAsync<'f, 'f, C, S, R, W, Rb>
     where
         Self: 'f,
         Rb: 'f + TrBuffRead;
@@ -102,7 +102,7 @@ where
     }
 }
 
-impl<C, S, RE, WE> TrChannelHalf for ChannelHandle<C, S, RE, WE>
+impl<C, S, R, W> TrChannelHalf for ChannelHandle<C, S, R, W>
 where
     C: TrMuxConfig,
 {
@@ -130,14 +130,16 @@ where
 
 /// [`TrChannelHandle::accept_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxAccept, pub, new(pub(crate)))]
-async fn mux_accept_async_<'f, C, S, RE, WE, Wb, K>(
-    handle: &'f mut ChannelHandle<C, S, RE, WE>,
+async fn mux_accept_async_<'f, C, S, R, W, Wb, K>(
+    handle: &'f mut ChannelHandle<C, S, R, W>,
     welcome: &'f mut Wb,
     _cancel: K,
-) -> Result<(ChannelTx<C, S, RE, WE>, ChannelRx<C, S, RE, WE>), MuxError<RE, WE>>
+) -> Result<(ChannelTx<C, S, R, W>, ChannelRx<C, S, R, W>), MuxError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
+    R: TrBuffTryRead<u8> + 'f,
+    W: TrBuffTryWrite<u8> + 'f,
     Wb: TrBuffWrite<u8> + 'f,
     K: TrCancellationToken,
 {
@@ -223,14 +225,16 @@ where
 
 /// [`TrChannelHandle::reject_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxReject, pub, new(pub(crate)))]
-async fn mux_reject_async_<'f, C, S, RE, WE, Rb, K>(
-    handle: &'f mut ChannelHandle<C, S, RE, WE>,
+async fn mux_reject_async_<'f, C, S, R, W, Rb, K>(
+    handle: &'f mut ChannelHandle<C, S, R, W>,
     reason: &'f mut Rb,
     cancel: K,
-) -> Result<usize, MuxError<RE, WE>>
+) -> Result<usize, MuxError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
+    R: TrBuffTryRead<u8> + 'f,
+    W: TrBuffTryWrite<u8> + 'f,
     Rb: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {

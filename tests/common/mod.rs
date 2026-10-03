@@ -97,11 +97,10 @@ use smux_v1::{
 /// tokio 用 `scope.run_until(..)` 包住整段使用期，compio 由运行时自己驱动。
 pub use abs_art::TrLocalScope as TrSmokeScope;
 
-/// 一端连接对象的类型：策略固定为 [`SmokeMuxConfig`]，作用域与两个错误载荷类型由
-/// 调用方给出（错误载荷取自传输半部——收发半边本身已从公开类型上消失，但连接对外
-/// 的错误类型仍如实带上它们）。
-pub type SmokeConn<R, W, S> =
-    MuxConnection<SmokeMuxConfig, S, <R as TrBuffTryRead<u8>>::Err, <W as TrBuffTryWrite<u8>>::Err>;
+/// 一端连接对象的类型：策略固定为 [`SmokeMuxConfig`]，另外两个参数就是**传输**类型
+/// （`R` / `W`）——连接对外的错误类型由它们派生（`MuxError<R::Err, W::Err>`），
+/// 因此调用方不必（也常常无法）命名错误类型。
+pub type SmokeConn<R, W, S> = MuxConnection<SmokeMuxConfig, S, R, W>;
 
 /// 每个端点监听的 dock 数量（dock 取值 `1..=16`）。
 pub const K_DOCK_COUNT: u32 = 16;
@@ -569,15 +568,15 @@ pub const K_SMALL_CHANNELS_PER_DOCK: usize = 2;
 /// # Panics
 ///
 /// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
-async fn drive_side_<C, S, RE, WE>(
-    conn: &MuxConnection<C, S, RE, WE>,
+async fn drive_side_<C, S, R, W>(
+    conn: &MuxConnection<C, S, R, W>,
     side: u32,
     dock_count: u32,
     per_dock: usize,
 ) where
     C: TrMuxConfig,
-    RE: core::error::Error,
-    WE: core::error::Error,
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
 {
     let conn_ref = conn;
 

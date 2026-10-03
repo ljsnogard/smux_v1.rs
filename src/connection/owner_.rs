@@ -27,7 +27,7 @@ use core::{
 use std::time::Instant;
 
 use atomic_sync::rwlock::preemptive::SpinningRwLockOwned;
-use buffex::x_deps::abs_buff;
+use buffex::x_deps::abs_buff::{self, TrBuffTryRead, TrBuffTryWrite};
 use abs_buff::x_deps::abs_cancel::TrCancellationToken;
 use mm_ptr::Shared;
 
@@ -263,13 +263,15 @@ where
 }
 
 /// 等待建流完成：等对端的 `OPEN` + `ACCEPT` / `REJECT`，或被取消 / 连接失败打断。
-pub(crate) async fn wait_establish_<RE, WE, A, K>(
+pub(crate) async fn wait_establish_<R, W, A, K>(
     reg: &ChannelRegistry_<A>,
     owner: &ChannelOwner_<A>,
     cancel: K,
-) -> Result<EstablishOutcome_, MuxError<RE, WE>>
+) -> Result<EstablishOutcome_, MuxError<R, W>>
 where
     A: AllocatorClone + Send + Sync,
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
     K: TrCancellationToken,
 {
     loop {

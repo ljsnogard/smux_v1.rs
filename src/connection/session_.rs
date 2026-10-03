@@ -71,6 +71,7 @@ use core::{
 use std::collections::BTreeMap;
 
 use abs_buff::{
+    TrBuffTryRead, TrBuffTryWrite,
     Demand, TrBuffRead, TrBuffWrite,
     buffer::TrBuffSegmMut,
     x_deps::abs_cancel,
@@ -81,7 +82,7 @@ use mm_ptr::Owned;
 
 use crate::{
     connection::{
-        Dock, FrameHeader, FrameKind, MuxError, flags,
+        Dock, FrameHeader, FrameKind, MuxError, MuxReadErr_, MuxWriteErr_, NoHalfway_, flags,
         frame_::read_header_async_,
         mux_connection::ChannelRegistry_,
         owner_::ChannelOwner_,
@@ -229,9 +230,11 @@ where
 /// 连接被丢弃时 [`MuxCore::drop`](super::mux_connection::core_::MuxCore) 触发取消
 /// 令牌，循环在 await 点上以「取消错误」的形式收到通知并退出——那是正常关闭，
 /// 不应在注册表上留下失败标志（否则收尾路径会伪造出一个假的连接级失败）。
-fn fail_loop_<A, RE, WE, K>(shared: &LoopShared_<A>, cancel: &K, err: &MuxError<RE, WE>)
+fn fail_loop_<A, R, W, K>(shared: &LoopShared_<A>, cancel: &K, err: &MuxError<R, W>)
 where
     A: AllocatorClone + Send + Sync,
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
     K: TrCancellationToken,
 {
     if !cancel.is_cancelled() {
@@ -283,7 +286,7 @@ async fn write_frame_<W, K>(
     header: &FrameHeader,
     payload: &[u8],
     cancel: K,
-) -> Result<(), MuxError<(), W::Err>>
+) -> Result<(), MuxWriteErr_<W>>
 where
     W: TrBuffWrite<u8>,
     K: TrCancellationToken,
@@ -292,7 +295,7 @@ where
     if !payload.is_empty() {
         write_all_async_(tx, payload, cancel.child_token())
             .await
-            .map_err(map_cursor_err_)?;
+            .map_err(map_write_cursor_err_)?;
     }
     Result::Ok(())
 }
@@ -302,7 +305,7 @@ async fn write_control_<W, K>(
     tx: &mut W,
     frame: &ControlFrame_,
     cancel: K,
-) -> Result<(), MuxError<(), W::Err>>
+) -> Result<(), MuxWriteErr_<W>>
 where
     W: TrBuffWrite<u8>,
     K: TrCancellationToken,
@@ -319,10 +322,30 @@ where
 }
 
 /// 把游标错误映射为 [`MuxError`]。
-fn map_cursor_err_<RE, WE>(err: CursorError<RE, WE>) -> MuxError<RE, WE> {
+/// 把**读侧**游标错误映射为连接错误。
+///
+/// 游标层用 `()` 表示「这个方向不存在载荷」（见 `wire_io_`）；本函数把它翻译成
+/// 类型上不可构造的 `NoHalfwayErr_`，于是连接内部「只碰读方向」的错误类型可以精确
+/// 写成 [`MuxReadErr_`]。真出现写侧错误（不可达）时按「写方向传输中断」上报。
+fn map_read_cursor_err_<R>(err: CursorError<R::Err, ()>) -> MuxReadErr_<R>
+where
+    R: TrBuffTryRead<u8>,
+{
     match err {
         CursorError::Read(err) => MuxError::Rx(err),
+        CursorError::Write(()) => MuxError::Transport { write: true },
+        CursorError::PeerClosed => MuxError::PeerClosed,
+    }
+}
+
+/// 把**写侧**游标错误映射为连接错误；语义与 [`map_read_cursor_err_`] 对称。
+fn map_write_cursor_err_<W>(err: CursorError<(), W::Err>) -> MuxWriteErr_<W>
+where
+    W: TrBuffTryWrite<u8>,
+{
+    match err {
         CursorError::Write(err) => MuxError::Tx(err),
+        CursorError::Read(()) => MuxError::Transport { write: false },
         CursorError::PeerClosed => MuxError::PeerClosed,
     }
 }
@@ -403,7 +426,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
         // 4. 载荷长度校验。
         let len = header.payload_len();
         if len > shared.max_packet_size_ || len > scratch.len() {
-            fail_loop_(&shared, &cancel, &MuxError::<R::Err, ()>::FrameTooLarge);
+            fail_loop_(&shared, &cancel, &MuxError::<R, NoHalfway_>::FrameTooLarge);
             return;
         }
         if len > 0 {
@@ -417,7 +440,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                 Option::None => return,
                 Option::Some(Result::Ok(())) => {}
                 Option::Some(Result::Err(err)) => {
-                    fail_loop_(&shared, &cancel, &map_cursor_err_(err));
+                    fail_loop_(&shared, &cancel, &map_read_cursor_err_::<R>(err));
                     return;
                 }
             }
@@ -443,7 +466,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     if shared.reg_.is_wait_close_(local, remote) {
                         continue;
                     }
-                    fail_loop_(&shared, &cancel, &MuxError::<R::Err, ()>::MalformedFrame);
+                    fail_loop_(&shared, &cancel, &MuxError::<R, NoHalfway_>::MalformedFrame);
                     return;
                 };
                 entry.owner_.with_mut_(|state| {
@@ -453,7 +476,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                     .owner_
                     .with_mut_(|state| state.flow_mut_().recv_window_mut().on_data(amount));
                 if let Result::Err(err) = counted {
-                    fail_loop_(&shared, &cancel, &MuxError::<R::Err, ()>::FlowCtrl(err));
+                    fail_loop_(&shared, &cancel, &MuxError::<R, NoHalfway_>::FlowCtrl(err));
                     return;
                 }
                 match race_cancel_(
@@ -468,7 +491,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
                         fail_loop_(
                             &shared,
                             &cancel,
-                            &MuxError::<R::Err, ()>::Transport { write: true },
+                            &MuxError::<R, NoHalfway_>::Transport { write: true },
                         );
                         return;
                     }
@@ -476,7 +499,7 @@ pub(crate) async fn read_loop_async_<R, B, A, K>(
             }
             FrameKind::Open => {
                 let Some(report) = window_report_of_(&header) else {
-                    fail_loop_(&shared, &cancel, &MuxError::<R::Err, ()>::MalformedFrame);
+                    fail_loop_(&shared, &cancel, &MuxError::<R, NoHalfway_>::MalformedFrame);
                     return;
                 };
                 if let Option::Some(entry) = table.get_mut(&pair) {
@@ -847,7 +870,7 @@ async fn handle_write_event_<W, B, A, K>(
     read_events: &EventSender_<ReadEvent_<B, A>>,
     cancel: &K,
     last_ready: &mut Option<(Dock, Dock)>,
-) -> Result<(), MuxError<(), W::Err>>
+) -> Result<(), MuxWriteErr_<W>>
 where
     W: TrBuffWrite<u8>,
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
@@ -996,7 +1019,7 @@ async fn send_window_update_<W, K>(
     pair: (Dock, Dock),
     report: WindowReport,
     cancel: K,
-) -> Result<(), MuxError<(), W::Err>>
+) -> Result<(), MuxWriteErr_<W>>
 where
     W: TrBuffWrite<u8>,
     K: TrCancellationToken,
@@ -1023,7 +1046,7 @@ async fn control_close_via_<W, K>(
     remote_dock: Dock,
     reset: bool,
     cancel: K,
-) -> Result<(), MuxError<(), W::Err>>
+) -> Result<(), MuxWriteErr_<W>>
 where
     W: TrBuffWrite<u8>,
     K: TrCancellationToken,
@@ -1044,7 +1067,7 @@ async fn flush_entry_<W, B, A, K>(
     scratch: &mut Owned<[u8], A>,
     pair: (Dock, Dock),
     cancel: &K,
-) -> Result<(), MuxError<(), W::Err>>
+) -> Result<(), MuxWriteErr_<W>>
 where
     W: TrBuffWrite<u8>,
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
@@ -1065,7 +1088,7 @@ async fn drain_once_<W, B, A, K>(
     table: &mut WriteTable_<B, A>,
     scratch: &mut Owned<[u8], A>,
     cancel: &K,
-) -> Result<bool, MuxError<(), W::Err>>
+) -> Result<bool, MuxWriteErr_<W>>
 where
     W: TrBuffWrite<u8>,
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
@@ -1102,7 +1125,7 @@ async fn drain_one_<W, B, A, K>(
     scratch: &mut Owned<[u8], A>,
     pair: (Dock, Dock),
     cancel: &K,
-) -> Result<bool, MuxError<(), W::Err>>
+) -> Result<bool, MuxWriteErr_<W>>
 where
     W: TrBuffWrite<u8>,
     B: BorrowMut<[MaybeUninit<u8>]> + Send + Sync + 'static,
@@ -1186,7 +1209,7 @@ where
     }
     write_all_async_(tx, &scratch[..moved], token.child_token())
         .await
-        .map_err(map_cursor_err_)?;
+        .map_err(map_write_cursor_err_)?;
     // `outcome` 在此 drop：提交消费，唤醒环的写端（若有 park 者）。
     owner.with_mut_(|state| state.touch_());
     Result::Ok(true)

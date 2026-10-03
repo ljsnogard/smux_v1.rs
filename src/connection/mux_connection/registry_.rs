@@ -92,9 +92,11 @@ use std::{
 use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
 use mm_ptr::Shared;
 
+use buffex::x_deps::abs_buff::{TrBuffTryRead, TrBuffTryWrite};
+
 use crate::{
     connection::{
-        Dock, MuxError,
+        Dock, MuxError, NoHalfway_,
         owner_::ChannelOwner_,
         sync_::{CancelToken_, FailKind_, WakerSlot_, on_lock_contended_},
     },
@@ -481,7 +483,7 @@ where
         &self,
         local_dock: Dock,
         remote_dock: Dock,
-    ) -> Result<(), MuxError<(), ()>> {
+    ) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
         self.with_mut_(|inner| {
             let now = Instant::now();
             inner.reap_wait_close_(now);
@@ -621,7 +623,7 @@ where
         local_dock: Dock,
         remote_dock: Dock,
         peer_report: WindowReport,
-    ) -> Result<(), MuxError<(), ()>> {
+    ) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
         self.reserve_channel_(local_dock, remote_dock)?;
         let marked = self.with_mut_(|inner| {
             match inner.bindings_.get_mut(&(local_dock, remote_dock)) {
@@ -717,7 +719,7 @@ where
     ///
     /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
     /// [`DockBinding`]: crate::connection::DockBinding
-    pub(crate) fn bind_dock_(&self, local_dock: Dock) -> Result<(), MuxError<(), ()>> {
+    pub(crate) fn bind_dock_(&self, local_dock: Dock) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
         self.with_mut_(|inner| {
             let dock = inner
                 .docks_
@@ -753,7 +755,7 @@ where
     ///
     /// 该 dock 已作 telegraph（datagram 与 channel 不得共用 dock）→
     /// [`MuxError::DockInUse`]。
-    pub(crate) fn reserve_listener_(&self, local_dock: Dock) -> Result<(), MuxError<(), ()>> {
+    pub(crate) fn reserve_listener_(&self, local_dock: Dock) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
         self.with_mut_(|inner| {
             if matches!(
                 inner.bindings_.get(&telegraph_key_(local_dock)),
@@ -792,7 +794,7 @@ where
     /// # Errors
     ///
     /// 该 dock 上已有其它身份 → [`MuxError::DockInUse`]。
-    pub(crate) fn reserve_telegraph_(&self, local_dock: Dock) -> Result<(), MuxError<(), ()>> {
+    pub(crate) fn reserve_telegraph_(&self, local_dock: Dock) -> Result<(), MuxError<NoHalfway_, NoHalfway_>> {
         self.with_mut_(|inner| {
             if inner.bindings_.contains_key(&telegraph_key_(local_dock))
                 || inner.bindings_.contains_key(&listener_key_(local_dock))
@@ -862,7 +864,11 @@ where
     /// 记下连接级失败（**首个**原因生效），唤醒两个循环的取消令牌，并唤醒所有
     /// 等待中的 API 面 future（监听者的 `income_async` 与建流的
     /// `open_channel_async`），避免它们空等一个已经死掉的循环。
-    pub(crate) fn mark_failed_<RE, WE>(&self, err: &MuxError<RE, WE>) {
+    pub(crate) fn mark_failed_<R, W>(&self, err: &MuxError<R, W>)
+    where
+        R: TrBuffTryRead<u8>,
+        W: TrBuffTryWrite<u8>,
+    {
         let kind = FailKind_::of_(err);
         let wakers = self.with_mut_(|inner| {
             if inner.fail_.is_none() {
@@ -955,7 +961,8 @@ mod tests_ {
 
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
-    use crate::{
+
+use crate::{
         connection::{Dock, MuxError, owner_::ChannelOwner_},
         handshake::opts::BasicOpts,
     };

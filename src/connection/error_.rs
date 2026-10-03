@@ -10,37 +10,72 @@
 //! `ReadErrTag` / `WriteErrTag`，足以让 `is_drained_closing()` 之类的判定脱离
 //! 具体错误类型工作。
 
+use buffex::x_deps::abs_buff::error::{ReadErrTag, TrTaggedError, WriteErrTag};
+use buffex::x_deps::abs_buff::{Demand, TrBuffTryRead, TrBuffTryWrite};
+use buffex::x_deps::anylr::SomeOf;
+
 use crate::flow_ctrl::FlowCtrlError;
 
-/// 复用连接与子流操作失败的统一类型。
+/// 复用连接与子流操作失败的统一类型：**用两个传输半边参数化**，载荷由它们派生。
 ///
-/// # 泛型参数
+/// 参数是**传输**（`R` / `W`）而不是它们的错误类型：开发者手里就是两个半边，
+/// 因此 `MuxError<WireRx, WireTx>` 可以直接写出来——不必（也常常无法）知道两个错误
+/// 载荷类型叫什么，更不必写 `<T as TrBuffTryRead<u8>>::Err` 这样的投影。
 ///
-/// - `RE`：底层网络读半边的错误类型；
-/// - `WE`：底层网络写半边的错误类型。
+/// ```
+/// use smux_v1::connection::MuxError;
 ///
-/// 数据面不复用本类型直接作为 `Err`：子流半边的错误就是 `buffex` 端半部的
-/// `ConsumerError` / `ProducerError`（已携带方向标签），见模块文档。
+/// // 开发者手里是两个传输半边；这里用切片当例子（它实现了 abs_buff 的两个 try 半边）。
+/// fn classify(err: MuxError<&'static [u8], &'static mut [u8]>) -> u8 {
+///     match err {
+///         MuxError::Rx(_) => 1,
+///         MuxError::Tx(_) => 2,
+///         MuxError::Transport { write: true } => 3,
+///         MuxError::Transport { write: false } => 4,
+///         _ => 0,
+///     }
+/// }
+///
+/// let err = MuxError::<&'static [u8], &'static mut [u8]>::PeerClosed;
+/// assert_eq!(classify(err), 0);
+/// ```
+///
+/// 注意上面**没有出现**任何错误载荷类型：它们由两个半边派生，写 match 分支时载荷
+/// 的类型会被自动推断出来。
+///
+/// # 为什么参数是传输而不是载荷
+///
+/// 连接内部有些层只碰一个方向（帧解析只会产生读侧载荷），那些地方无法提供
+/// 「另一侧的传输类型」；本枚举为此保留一个**不可能存在的半边**占位
+/// （`NoHalfway_`，其载荷是 `Infallible`），于是单边形式可以写成
+/// `MuxError<R, NoHalfway_>`——**类型上精确表达「另一侧不可能出错」**，而不必给整条
+/// 调用链塞进一个用不到的传输类型参数。它只在本 crate 内部使用。
 ///
 /// # 为什么既有带载荷的变体又有不带载荷的变体
 ///
 /// `Rx` / `Tx` 只表示**本次操作直接遇到**的底层读写错误，载荷因此可以原样给出。
-/// 但连接级失败要经共享状态回传给 API 面，而底层错误值（`RE` / `WE`）只存在于
-/// 驱动循环那一侧、无法跨过去，所以另外给出载荷无关的
-/// [`MuxError::Transport`]——它只保留**方向**，用于表达「连接因传输错误中断」，
-/// 与「对端主动关闭」（[`MuxError::PeerClosed`]）是两件不同的事。
+/// 但连接级失败要经共享状态回传给 API 面，而底层错误值只存在于驱动循环那一侧、
+/// 跨不过来，所以另外给出载荷无关的 [`MuxError::Transport`]——它只保留**方向**，
+/// 用于表达「连接因传输错误中断」，与「对端主动关闭」（[`MuxError::PeerClosed`]）
+/// 是两件不同的事。
 ///
-/// 因此：`Rx` / `Tx` 实际上只在连接内部的循环里构造（循环把错误投影成
-/// `FailKind_` 再回传），API 面上产出的一律是载荷无关的变体。两个载荷参数留在
-/// [`MuxConnection`](crate::connection::MuxConnection) 的类型上是为了如实表达
-/// 「这条连接的底层错误是什么」。
-#[derive(Debug)]
-pub enum MuxError<RE, WE> {
+/// 因此：`Rx` / `Tx` 只在连接内部的循环里构造（循环把错误投影成 `FailKind_` 再
+/// 回传），API 面上产出的一律是载荷无关的变体。
+///
+/// # Panics
+///
+/// 本类型自身不 panic；`NoHalfway_` 的占位实现若被调用会 `unreachable!()`（不可能，
+/// 该类型无法构造）。
+pub enum MuxError<R, W>
+where
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
+{
     /// 底层网络读失败（本次操作直接遇到）。
-    Rx(RE),
+    Rx(<R as TrBuffTryRead<u8>>::Err),
 
     /// 底层网络写失败（本次操作直接遇到）。
-    Tx(WE),
+    Tx(<W as TrBuffTryWrite<u8>>::Err),
 
     /// 连接因底层传输错误而中断，无法继续收发。
     ///
@@ -106,7 +141,11 @@ pub enum MuxError<RE, WE> {
     FlowCtrl(FlowCtrlError),
 }
 
-impl<RE, WE> core::fmt::Display for MuxError<RE, WE> {
+impl<R, W> core::fmt::Display for MuxError<R, W>
+where
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             MuxError::Rx(_) => f.write_str("复用连接读取失败"),
@@ -132,23 +171,61 @@ impl<RE, WE> core::fmt::Display for MuxError<RE, WE> {
     }
 }
 
-impl<RE, WE> core::error::Error for MuxError<RE, WE>
+impl<R, W> core::error::Error for MuxError<R, W>
 where
-    RE: core::error::Error,
-    WE: core::error::Error,
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
 {
 }
 
-impl MuxError<(), ()> {
-    /// 把「载荷无关」的错误搬到另一个底层错误类型上。
+impl<R, W> core::fmt::Debug for MuxError<R, W>
+where
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
+{
+    /// 手写而非派生：派生会给 `R` / `W` 本身加 `Debug` 约束，而实际需要的是
+    /// **载荷**可打印（载荷由 `TrTaggedError: core::error::Error` 保证）。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MuxError::Rx(e) => f.debug_tuple("Rx").field(e).finish(),
+            MuxError::Tx(e) => f.debug_tuple("Tx").field(e).finish(),
+            MuxError::Transport { write } => {
+                f.debug_struct("Transport").field("write", write).finish()
+            }
+            MuxError::Cancelled => f.write_str("Cancelled"),
+            MuxError::PeerClosed => f.write_str("PeerClosed"),
+            MuxError::Closed => f.write_str("Closed"),
+            MuxError::IdleTimeout => f.write_str("IdleTimeout"),
+            MuxError::ReservedDock => f.write_str("ReservedDock"),
+            MuxError::MalformedFrame => f.write_str("MalformedFrame"),
+            MuxError::UnsupportedField => f.write_str("UnsupportedField"),
+            MuxError::FrameTooLarge => f.write_str("FrameTooLarge"),
+            MuxError::DockInUse => f.write_str("DockInUse"),
+            MuxError::DockChanLimit => f.write_str("DockChanLimit"),
+            MuxError::ChanLimit => f.write_str("ChanLimit"),
+            MuxError::Refused => f.write_str("Refused"),
+            MuxError::Duplicate => f.write_str("Duplicate"),
+            MuxError::WaitClose => f.write_str("WaitClose"),
+            MuxError::FlowCtrl(err) => f.debug_tuple("FlowCtrl").field(err).finish(),
+        }
+    }
+}
+
+impl MuxError<NoHalfway_, NoHalfway_> {
+    /// 把「载荷无关」的错误搬到目标类型上。
     ///
     /// 注册表 / 建流登记这类路径只知道「哪一类错误」，不持有底层错误值，因此它们
-    /// 用 `MuxError<(), ()>` 表达，再由 API 面 `cast_` 成目标类型。`Rx(())` /
-    /// `Tx(())` 没有可搬运的载荷，退化为保留方向的 [`MuxError::Transport`]。
-    pub(crate) fn cast_<RE, WE>(self) -> MuxError<RE, WE> {
+    /// 用 `MuxError<NoHalfway_, NoHalfway_>` 表达（两侧载荷都是 `Infallible`），再由
+    /// API 面 `cast_` 成目标类型。两个载荷变体在这里不可能出现，若出现即退化为保留
+    /// 方向的 [`MuxError::Transport`]。
+    pub(crate) fn cast_<R, W>(self) -> MuxError<R, W>
+    where
+        R: TrBuffTryRead<u8>,
+        W: TrBuffTryWrite<u8>,
+    {
         match self {
-            MuxError::Rx(()) => MuxError::Transport { write: false },
-            MuxError::Tx(()) => MuxError::Transport { write: true },
+            MuxError::Rx(never) => match never {},
+            MuxError::Tx(never) => match never {},
             MuxError::Transport { write } => MuxError::Transport { write },
             MuxError::Cancelled => MuxError::Cancelled,
             MuxError::PeerClosed => MuxError::PeerClosed,
@@ -168,3 +245,86 @@ impl MuxError<(), ()> {
         }
     }
 }
+
+
+/// 「不存在的那一半」的错误载荷：**不可构造**（无变体），因此「另一侧出错」这件事
+/// 在类型上不可能发生。
+///
+/// 用途只有一个：让连接内部**只碰一个方向**的层仍能写出精确的错误类型。例如帧解析
+/// 只会产生读侧载荷，它的错误类型是 `MuxError<R, NoHalfway_>`——类型上就注明「写侧
+/// 不可能出错」，而不是含混地写 `MuxError<R, W>` 再假设 `W` 永不出现。
+///
+/// 由于本类型无法构造，它的两个 `try_*` 实现永远不会被调用。
+pub(crate) enum NoHalfwayErr_ {}
+
+impl core::fmt::Debug for NoHalfwayErr_ {
+    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {}
+    }
+}
+
+impl core::fmt::Display for NoHalfwayErr_ {
+    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {}
+    }
+}
+
+impl core::error::Error for NoHalfwayErr_ {}
+
+impl TrTaggedError<ReadErrTag> for NoHalfwayErr_ {
+    fn err_tag(&self) -> ReadErrTag {
+        match *self {}
+    }
+}
+
+impl TrTaggedError<WriteErrTag> for NoHalfwayErr_ {
+    fn err_tag(&self) -> WriteErrTag {
+        match *self {}
+    }
+}
+
+/// 「不存在的那一半」：**永不构造**的传输半边，其载荷类型是 [`NoHalfwayErr_`]。
+///
+/// 它只用于让内部「只碰一个方向」的层写出精确的错误类型，见本模块文档。
+#[derive(Clone, Copy)]
+pub(crate) enum NoHalfway_ {}
+
+impl TrBuffTryRead<u8> for NoHalfway_ {
+    /// 借用「真实半边」的段类型即可：本类型永不构造，段类型只用于满足 trait。
+    type SegmRef<'f>
+        = <&'static [u8] as TrBuffTryRead<u8>>::SegmRef<'f>
+    where
+        Self: 'f;
+
+    type Err = NoHalfwayErr_;
+
+    fn try_read<'f>(
+        &'f mut self,
+        _demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
+        match *self {}
+    }
+}
+
+impl TrBuffTryWrite<u8> for NoHalfway_ {
+    /// 同 [`NoHalfway_`] 的读侧说明。
+    type SegmMut<'f>
+        = <&'static mut [u8] as TrBuffTryWrite<u8>>::SegmMut<'f>
+    where
+        Self: 'f;
+
+    type Err = NoHalfwayErr_;
+
+    fn try_write<'f>(
+        &'f mut self,
+        _demand: &'f Demand<usize>,
+    ) -> SomeOf<Self::SegmMut<'f>, Self::Err> {
+        match *self {}
+    }
+}
+
+/// 只可能出现**读侧**载荷的连接错误（写侧不存在）。内部专用。
+pub(crate) type MuxReadErr_<R> = MuxError<R, NoHalfway_>;
+
+/// 只可能出现**写侧**载荷的连接错误（读侧不存在）。内部专用。
+pub(crate) type MuxWriteErr_<W> = MuxError<NoHalfway_, W>;

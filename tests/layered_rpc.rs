@@ -137,10 +137,10 @@ use abs_art::TrLocalScope;
 use abs_smux::conn::{
     TrChannelHalf, TrChannelHandle, TrChannelListener, TrConnection, TrDock, TrDockBinding,
 };
-use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite};
+use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
 use smux_v1::{
-    connection::{ChannelListener, ChannelRx, ChannelTx, Dock, DockBinding, MuxConnection},
+    connection::{ChannelListener, ChannelRx, ChannelTx, Dock, DockBinding, MuxConnection, MuxError},
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
@@ -176,24 +176,20 @@ type WireRx = smux_v1::connection::BufferedRx<WireBuff, CoreAlloc>;
 /// L4 的写半边。
 type WireTx = smux_v1::connection::BufferedTx<WireBuff, CoreAlloc>;
 
-/// 两个传输半边的错误类型：连接对外的错误类型就是 `MuxError<读错误, 写错误>`。
-type WireRxErr = <WireRx as TrBuffTryRead<u8>>::Err;
-type WireTxErr = <WireTx as TrBuffTryWrite<u8>>::Err;
-
 /// L5 的连接对象。客户端与服务端同型，只是握手角色不同。
 type Mux<S> = common::SmokeConn<WireRx, WireTx, S>;
 
 /// 【F5 ✅】已建立 channel 的发送半边：**可以直接写出的具名类型**。
-type ChanTx<S> = ChannelTx<common::SmokeMuxConfig, S, WireRxErr, WireTxErr>;
+type ChanTx<S> = ChannelTx<common::SmokeMuxConfig, S, WireRx, WireTx>;
 
 /// 同 [`ChanTx`]，接收半边。
-type ChanRx<S> = ChannelRx<common::SmokeMuxConfig, S, WireRxErr, WireTxErr>;
+type ChanRx<S> = ChannelRx<common::SmokeMuxConfig, S, WireRx, WireTx>;
 
 /// 【F3 ✅】listener 也是具名类型，可以作为返回值与结构体字段。
-type Listener<S> = ChannelListener<common::SmokeMuxConfig, S, WireRxErr, WireTxErr>;
+type Listener<S> = ChannelListener<common::SmokeMuxConfig, S, WireRx, WireTx>;
 
 /// 【F2 ✅】binding 同上。
-type Binding<S> = DockBinding<common::SmokeMuxConfig, S, WireRxErr, WireTxErr>;
+type Binding<S> = DockBinding<common::SmokeMuxConfig, S, WireRx, WireTx>;
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // L4：传输层
@@ -618,6 +614,51 @@ where
 #[allow(dead_code)]
 fn probe_named_half_types_<S>(tx: ChanTx<S>, rx: ChanRx<S>) -> HalfHolder_<S> {
     HalfHolder_ { tx_: tx, rx_: rx }
+}
+
+/// 【F9 ✅ 探针】**为 `MuxError` 写代码**：不必知道任何错误载荷类型。
+///
+/// 过去 `MuxError` 的参数是错误**载荷**（常常不可命名：私有类型、或只以
+/// `<T as TrBuffTryRead<u8>>::Err` 这样的投影存在），开发者连一个 `match` 都写不
+/// 出来。现在参数是两个**传输**类型——开发者手里本来就有它们——载荷由传输派生并
+/// 在 match 时自动推断。**刻意不执行**，只为把结论钉在编译期。
+#[allow(dead_code)]
+fn probe_write_code_against_mux_error_(err: MuxError<WireRx, WireTx>) -> ErrClass_ {
+    match err {
+        MuxError::Rx(_) => ErrClass_::Read,
+        MuxError::Tx(_) => ErrClass_::Write,
+        MuxError::Transport { write } => ErrClass_::Transport { write },
+        MuxError::PeerClosed => ErrClass_::Peer,
+        _ => ErrClass_::Other,
+    }
+}
+
+/// 【F9 ✅ 探针】同一段代码也可以直接吃**连接的关联错误类型**。
+#[allow(dead_code)]
+fn probe_classify_connection_error_<S>(err: <Mux<S> as TrConnection>::Err) -> ErrClass_ {
+    probe_write_code_against_mux_error_(err)
+}
+
+/// 【F9 ✅ 探针】把 `MuxError` 分类的结果（纯业务类型，与 smux 无关）。
+#[allow(dead_code)]
+enum ErrClass_ {
+    /// 读方向直接失败。
+    Read,
+
+    /// 写方向直接失败。
+    Write,
+
+    /// 连接因传输错误中断。
+    Transport {
+        /// 是否为写方向。
+        write: bool,
+    },
+
+    /// 对端主动关闭。
+    Peer,
+
+    /// 其它。
+    Other,
 }
 
 /// 【F5 ✅ 探针】两个具名半部作为**结构体字段**。

@@ -32,12 +32,23 @@ use super::{core_::MuxCore, registry_::ChannelRegistry_};
 /// - `C`：资源策略，见 [`TrMuxConfig`]；
 /// - `S`：调用方注入的本地作用域类型（`abs_art::TrLocalScope` 的实现值，
 ///   tokio 的 `LocalScope` / compio 的 `LocalScope`）；
-/// - `RE` / `WE`：网络读 / 写半边的**错误类型**。收发半边本身（`R` / `W`）在
-///   [`MuxConnection::new`] 里被移进循环，此后不出现在任何签名里；但连接对外的
-///   错误类型 [`MuxError<RE, WE>`] 仍然如实带上它们，类型形状不因封装而降级。
-///   注意底层错误**值**只在循环那一侧存在，连接级失败经共享状态回传时只保留
-///   方向（[`MuxError::Transport`]），因此 API 面实际不会产出 `Rx` / `Tx` 两个
-///   带载荷变体。
+/// - `R` / `W`：网络读 / 写半边的**类型**（传输本身）。它们在建连时被移进循环，
+///   此后不参与任何行为，只作为「这条连接是在什么传输上建的」的**类型级事实**；
+///   连接对外的错误类型由它们**派生**：[`TrConnection::Err`] 是
+///   `MuxError<R, W>`。
+///
+/// # 为什么参数是 `R` / `W` 而不是它们的错误类型
+///
+/// 早先的形状把两个**错误类型**直接放在公开类型上（`MuxConnection<C, S, RE, WE>`）。
+/// 那是个坏味道：错误是**次要信息**，产生错误的传输才是主要信息；而且错误类型常常
+/// **不可命名**（可能是私有的、或只以 `<T as TrBuffTryRead<u8>>::Err` 这样的投影
+/// 存在），于是调用方被迫在每一个类型别名里写投影——「连接是什么」反而由错误牵着走。
+/// 现在主参数是传输，错误一律经 `R::Err` / `W::Err` **推断**得到。
+///
+/// 注意底层错误**值**只在循环那一侧存在，连接级失败经共享状态回传时只保留方向
+/// （[`MuxError::Transport`]），因此 API 面实际不会产出 `Rx` / `Tx` 两个带载荷变体。
+/// [`MuxError`] 自身的两个参数也**是传输**：它的载荷变体由 `R::Err` / `W::Err` 派生，
+/// 因此开发者对错误写代码（含 `match`）时不需要命名载荷类型。
 ///
 /// # 为什么是智能指针
 ///
@@ -62,19 +73,20 @@ use super::{core_::MuxCore, registry_::ChannelRegistry_};
 /// 先于连接消失；但**驱动**队列仍然是调用方的责任：tokio 必须把整段使用期包在
 /// `scope.run_until(..)` 里，compio 由运行时自己驱动，smol 由 `LocalExecutor` 驱动。
 /// 忘记驱动不会有编译错误，症状是两个循环从不推进（连接静默无响应）。
-pub struct MuxConnection<C, S, RE, WE>
+pub struct MuxConnection<C, S, R, W>
 where
     C: TrMuxConfig,
 {
     /// 指向演员核心的强引用；最后一个强引用消失时核心析构（并触发收尾）。
     core_: Shared<MuxCore<C, S>, C::Alloc>,
 
-    /// 两个底层错误类型只以类型形式参与 [`TrConnection::Err`]；用 `fn() -> (..)`
-    /// 占位，使它们不影响本类型的 auto trait（`Send` / `Sync` / `Unpin`）。
-    _err_: PhantomData<fn() -> (RE, WE)>,
+    /// 两个传输类型只以类型形式参与 [`TrConnection::Err`]（`MuxError<R, W>`）
+    /// ——收发半边本身已在 [`MuxConnection::new`] 里移进循环。用 `fn() -> (..)` 占位，
+    /// 使它们不影响本类型的 auto trait（`Send` / `Sync` / `Unpin`）。
+    _mark_: PhantomData<fn() -> (R, W)>,
 }
 
-impl<C, S, RE, WE> Clone for MuxConnection<C, S, RE, WE>
+impl<C, S, R, W> Clone for MuxConnection<C, S, R, W>
 where
     C: TrMuxConfig,
 {
@@ -82,12 +94,12 @@ where
     fn clone(&self) -> Self {
         MuxConnection {
             core_: self.core_.clone(),
-            _err_: PhantomData,
+            _mark_: PhantomData,
         }
     }
 }
 
-impl<C, S, RE, WE> MuxConnection<C, S, RE, WE>
+impl<C, S, R, W> MuxConnection<C, S, R, W>
 where
     C: TrMuxConfig,
 {
@@ -119,11 +131,13 @@ where
     ///
     /// 对外不提供任何驱动 API：用户只使用 `abs_smux` 的 trait。后端运行时由最终
     /// 二进制经 `abs_art` 选择（本 crate 不依赖 `abs_art-bridge`）。
-    pub fn new<R, W>(scope: &S, delivery: HandshakeDelivery<W, R>, config: C) -> Self
+    /// 这里的 `R` / `W` 就是类型参数本身（不是方法级泛型）：**传输类型决定
+    /// `Self`**，而错误类型由它们派生，调用方不需要（也常常无法）命名错误类型。
+    pub fn new(scope: &S, delivery: HandshakeDelivery<W, R>, config: C) -> Self
     where
         S: TrLocalScope + Clone,
-        R: TrBuffRead<u8> + TrBuffTryRead<u8, Err = RE> + 'static,
-        W: TrBuffWrite<u8> + TrBuffTryWrite<u8, Err = WE> + 'static,
+        R: TrBuffRead<u8> + 'static,
+        W: TrBuffWrite<u8> + 'static,
         C: 'static,
         C::Buff: 'static,
         C::Alloc: 'static,
@@ -169,7 +183,7 @@ where
 
         MuxConnection {
             core_,
-            _err_: PhantomData,
+            _mark_: PhantomData,
         }
     }
 
@@ -260,31 +274,33 @@ where
     {
         MuxConnection {
             core_: CoreBundle_::build_(scope, opts, config).core_,
-            _err_: PhantomData,
+            _mark_: PhantomData,
         }
     }
 }
 
-impl<C, S, RE, WE> TrConnection for MuxConnection<C, S, RE, WE>
+impl<C, S, R, W> TrConnection for MuxConnection<C, S, R, W>
 where
     C: TrMuxConfig,
-    RE: core::error::Error,
-    WE: core::error::Error,
+    R: TrBuffTryRead<u8>,
+    W: TrBuffTryWrite<u8>,
 {
     type Data = u8;
     type Dock = Dock;
-    type Err = MuxError<RE, WE>;
+    /// 载荷类型由两个**传输**类型派生（`TrTaggedError: core::error::Error`，因此
+    /// `MuxError<R, W>` 自动满足 `Err: Error`）。
+    type Err = MuxError<R, W>;
 
     /// 会话对象是**独立持有者**（自带一份连接克隆），不带 `'f` 之类的生命周期：
     /// 它可以从函数返回、可以存进结构体、可以与连接同处一个结构体。
     type DockBinding<'f>
-        = DockBinding<C, S, RE, WE>
+        = DockBinding<C, S, R, W>
     where
         Self: 'f;
 
     /// future 仍然借用 `&self`（调用期间），但**输出是 owned 的**。
     type BindAsync<'f>
-        = MuxBindAsync<'f, 'f, C, S, RE, WE>
+        = MuxBindAsync<'f, 'f, C, S, R, W>
     where
         Self: 'f;
 
@@ -295,14 +311,16 @@ where
 
 /// [`TrConnection::bind_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxBind, pub, new(pub(crate)))]
-async fn mux_bind_async_<'f, C, S, RE, WE, K>(
-    conn: &'f MuxConnection<C, S, RE, WE>,
+async fn mux_bind_async_<'f, C, S, R, W, K>(
+    conn: &'f MuxConnection<C, S, R, W>,
     local_dock: Dock,
     _cancel: K,
-) -> Result<DockBinding<C, S, RE, WE>, MuxError<RE, WE>>
+) -> Result<DockBinding<C, S, R, W>, MuxError<R, W>>
 where
     C: TrMuxConfig + 'f,
     S: 'f,
+    R: TrBuffTryRead<u8> + 'f,
+    W: TrBuffTryWrite<u8> + 'f,
     K: TrCancellationToken,
 {
     if local_dock.is_special() {

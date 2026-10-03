@@ -52,6 +52,8 @@ use atomic_sync::rwlock::preemptive::SpinningRwLockOwned;
 use buffex::x_deps::{abs_cancel, atomic_sync};
 use mm_ptr::Shared;
 
+use buffex::x_deps::abs_buff::{TrBuffTryRead, TrBuffTryWrite};
+
 use crate::{
     connection::MuxError,
     flow_ctrl::FlowCtrlError,
@@ -235,7 +237,7 @@ where
 
 /// 连接级失败的**载荷无关**投影。
 ///
-/// 循环返回的是 [`MuxError<RE, WE>`]，但底层错误值（`RE` / `WE`）无法存进共享
+/// 循环返回的是 [`MuxError<R, W>`]，但底层错误值（两个载荷）无法存进共享
 /// 状态（它们只在循环那一侧存在），因此共享状态里只保留「失败的原因种类」，
 /// 由 API 面再映射回 [`MuxError`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +297,11 @@ impl FailKind_ {
     /// `Rx` / `Tx` 携带的底层错误值无法保存，投影为 [`FailKind_::Transport`]；
     /// **方向**（读 / 写）保留，因此「网络错误中断」与「对端主动关闭」在 API 面
     /// 是两种不同的错误。
-    pub(crate) fn of_<RE, WE>(err: &MuxError<RE, WE>) -> Self {
+    pub(crate) fn of_<R, W>(err: &MuxError<R, W>) -> Self
+    where
+        R: TrBuffTryRead<u8>,
+        W: TrBuffTryWrite<u8>,
+    {
         match err {
             MuxError::Rx(_) => FailKind_::Transport { write: false },
             MuxError::Tx(_) => FailKind_::Transport { write: true },
@@ -319,7 +325,11 @@ impl FailKind_ {
     }
 
     /// 映射回 API 面使用的 [`MuxError`]。`FailKind_` 是 `Copy`，按值取。
-    pub(crate) fn into_mux_error_<RE, WE>(self) -> MuxError<RE, WE> {
+    pub(crate) fn into_mux_error_<R, W>(self) -> MuxError<R, W>
+    where
+        R: TrBuffTryRead<u8>,
+        W: TrBuffTryWrite<u8>,
+    {
         match self {
             FailKind_::Transport { write } => MuxError::Transport { write },
             FailKind_::PeerClosed => MuxError::PeerClosed,
@@ -412,8 +422,9 @@ mod tests_ {
 
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
-    use crate::{
-        connection::{MuxError, mux_connection::ChannelRegistry_},
+
+use crate::{
+        connection::{MuxError, NoHalfway_, mux_connection::ChannelRegistry_},
         handshake::opts::BasicOpts,
     };
 
@@ -503,12 +514,12 @@ mod tests_ {
         let write_loop = registry.loop_token_(1usize);
         assert!(!TrCancellationToken::is_cancelled(&read_loop) && !TrCancellationToken::is_cancelled(&write_loop));
 
-        registry.mark_failed_(&MuxError::<(), ()>::PeerClosed);
+        registry.mark_failed_(&MuxError::<NoHalfway_, NoHalfway_>::PeerClosed);
         assert!(registry.is_failed_());
         assert_eq!(registry.failure_(), Option::Some(FailKind_::PeerClosed));
         assert!(TrCancellationToken::is_cancelled(&read_loop) && TrCancellationToken::is_cancelled(&write_loop));
 
-        registry.mark_failed_(&MuxError::<(), ()>::ChanLimit);
+        registry.mark_failed_(&MuxError::<NoHalfway_, NoHalfway_>::ChanLimit);
         assert_eq!(
             registry.failure_(),
             Option::Some(FailKind_::PeerClosed),
@@ -522,17 +533,17 @@ mod tests_ {
     ///   `Transport { write: true }`；两者都不等于 `PeerClosed`。
     #[test]
     fn transport_failure_keeps_direction_and_differs_from_peer_close() {
-        let read = FailKind_::of_(&MuxError::<(), ()>::Rx(()));
-        let write = FailKind_::of_(&MuxError::<(), ()>::Tx(()));
+        let read = FailKind_::of_(&MuxError::<NoHalfway_, NoHalfway_>::Transport { write: false });
+        let write = FailKind_::of_(&MuxError::<NoHalfway_, NoHalfway_>::Transport { write: true });
         assert_eq!(read, FailKind_::Transport { write: false });
         assert_eq!(write, FailKind_::Transport { write: true });
 
-        let mapped_read: MuxError<(), ()> = read.into_mux_error_();
-        let mapped_write: MuxError<(), ()> = write.into_mux_error_();
+        let mapped_read: MuxError<NoHalfway_, NoHalfway_> = read.into_mux_error_();
+        let mapped_write: MuxError<NoHalfway_, NoHalfway_> = write.into_mux_error_();
         assert!(matches!(mapped_read, MuxError::Transport { write: false }));
         assert!(matches!(mapped_write, MuxError::Transport { write: true }));
 
-        let peer = FailKind_::of_(&MuxError::<(), ()>::PeerClosed);
+        let peer = FailKind_::of_(&MuxError::<NoHalfway_, NoHalfway_>::PeerClosed);
         assert_eq!(peer, FailKind_::PeerClosed);
         assert_ne!(peer, read, "对端主动关闭与传输中断必须是不同的失败原因");
     }
