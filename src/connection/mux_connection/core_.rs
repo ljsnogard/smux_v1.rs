@@ -36,13 +36,17 @@
 //! compio 由运行时驱动）；本槽位只保证队列不被提前回收。两个循环也是经同一个
 //! 字段投递的（[`MuxCore::scope_`]），因此「谁提供队列」在核心上只有一处。
 
+use buffex::x_deps::abs_cancel::TrCancellationToken;
+
 use crate::{
     connection::{
-        TrConnCfg,
-        mux_connection::ChannelRegistry_,
+        Dock, TrConnCfg,
+        mux_connection::{ChannelRegistry_, ReserveErr_},
+        owner_::ChannelOwner_,
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
         sync_::CancelToken_,
     },
+    flow_ctrl::WindowReport,
     handshake::opts::HandshakeOpts,
 };
 
@@ -146,6 +150,146 @@ where
     /// 第 `idx` 个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
     pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<C::Alloc> {
         self.loops_[idx].clone()
+    }
+}
+
+/// # 身份表的唯一入口：会话句柄只能经 `MuxCore` 访问注册表
+///
+/// 注册表是**核心的内部实现细节**：会话句柄（`DockBinding` / `ChannelListener` /
+/// `ChannelHandle` / `Telegraph`）不直接持有它，而是经这里的方法转达。两个循环是
+/// 例外——它们持有 [`LoopShared_`](crate::connection::session_)（核心在循环侧的
+/// 展开），因此直接访问注册表句柄。
+///
+/// 每个方法都是**异步且可取消**的：等锁走协作式锁的异步获取，取消经调用方传进来的
+/// token 生效（见 `sync_::acquire_read_` / `acquire_write_`）。
+impl<C, S> MuxCore<C, S>
+where
+    C: TrConnCfg,
+{
+    /// 投递一条会话释放消息（**同步、不取锁**；`Drop` 与错误清理路径用）。
+    pub(crate) fn post_session_event_(
+        &self,
+        event: crate::connection::signal_::SessionEvent_,
+    ) -> bool {
+        self.reg_.post_session_event_(event)
+    }
+
+    /// 落实积压的会话释放消息（`Drop` 只投消息，见 `signal_::SessionEvent_`）。
+    pub(crate) async fn drain_session_events_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        self.reg_.drain_session_events_(cancel).await
+    }
+
+    /// 独占绑定一个 `local_dock`（[`TrConnection::bind_async`] 的登记点）。
+    ///
+    /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
+    pub(crate) async fn bind_dock_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        self.reg_.bind_dock_(local_dock, cancel).await
+    }
+
+    /// 登记 listener 身份。
+    pub(crate) async fn reserve_listener_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        notify_tx_: flume::Sender<()>,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        self.reg_
+            .reserve_listener_(local_dock, notify_tx_, cancel)
+            .await
+    }
+
+    /// 登记 telegraph 身份。
+    pub(crate) async fn reserve_telegraph_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        self.reg_.reserve_telegraph_(local_dock, cancel).await
+    }
+
+    /// 为一条子流登记身份（dock 对即身份）。
+    pub(crate) async fn reserve_channel_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        self.reg_
+            .reserve_channel_(local_dock, remote_dock, cancel)
+            .await
+    }
+
+    /// 撤销一条尚未露面的子流登记。
+    pub(crate) async fn unreserve_channel_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        self.reg_
+            .unreserve_channel_(local_dock, remote_dock, cancel)
+            .await
+    }
+
+    /// 把一条已露面的子流放进拆流宽限期。
+    pub(crate) async fn release_channel_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        self.reg_
+            .release_channel_(local_dock, remote_dock, cancel)
+            .await
+    }
+
+    /// 取走入向请求保存的对端窗口通告。
+    pub(crate) async fn take_inbound_report_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        cancel: K,
+    ) -> Result<Option<WindowReport>, ReserveErr_> {
+        self.reg_
+            .take_inbound_report_(local_dock, remote_dock, cancel)
+            .await
+    }
+
+    /// 取走一个待决入向请求。
+    pub(crate) async fn take_pending_inbound_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<Option<Dock>, ReserveErr_> {
+        self.reg_.take_pending_inbound_(local_dock, cancel).await
+    }
+
+    /// 连接级失败原因（若有）。
+    pub(crate) async fn failure_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<Option<crate::connection::MuxError>, ReserveErr_> {
+        self.reg_.failure_(cancel).await
+    }
+
+    /// 把建好环之后的共享状态句柄挂到已有 channel 上。
+    pub(crate) async fn attach_owner_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        owner: ChannelOwner_<C::Alloc>,
+        cancel: K,
+    ) -> Result<bool, ReserveErr_> {
+        self.reg_
+            .attach_owner_(local_dock, remote_dock, owner, cancel)
+            .await
     }
 }
 

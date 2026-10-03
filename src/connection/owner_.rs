@@ -15,29 +15,29 @@
 //! - 对端 `OPEN` 里带过来的窗口通告（被动方在 `accept` 时才建环，需要先把它存住）。
 //!
 //! 所有访问都经 `atomic_sync` **抢占式自旋读写锁**的短闭包：**闭包内不得
-//! `await`**，也不得重入。该锁没有内部堆分配，可内联进 [`Shared`]；争用时按
-//! [`TrBackoffAcquire_`](crate::connection::sync_::TrBackoffAcquire_) **睡眠重试**
-//! （而不是自旋或 panic），因此同样零 CPU 忙等。
+//! `await`**，也不得重入。争用时按 `with_async_` / `with_mut_async_` **异步等待**
+//! （可被外部 cancel token 取消），因此零 CPU 忙等。
 
 // 本模块的入口尚未被读写循环与 API 面调用（接线进行中），因此保留 `dead_code`
 // 允许；**接线完成后必须移除本行**。
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
-    task::{Poll, Waker},
+    sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
 };
+use buffex::x_deps::abs_cancel::TrCancellationToken;
 use std::time::Instant;
 
-use atomic_sync::rwlock::preemptive::SpinningRwLockOwned;
-use buffex::x_deps::abs_buff;
-use abs_buff::x_deps::abs_cancel::TrCancellationToken;
+use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
+use flume::{Receiver, Sender};
 use mm_ptr::Shared;
 
 use crate::{
     connection::{
         error_::MuxError,
         mux_connection::ChannelRegistry_,
-        sync_::{TrBackoffAcquire_, WakerSlot_},
+        sync_::{LockCancelled_, acquire_read_, acquire_write_},
     },
     flow_ctrl::{FlowCtrl, ReportThresholds_},
 };
@@ -46,8 +46,14 @@ use crate::{
 ///
 /// 两侧状态机同形（见 `crate::connection` 模块文档 §4.2）：主动方要等对端的
 /// `OPEN`（拿到对端接收窗口）与 `ACCEPT` / `REJECT`；`peer_opened_` 与 `outcome_`
-/// 就是这两件事的落点，读循环收到相应帧时置位并唤醒 [`Establish_::waker_`]。
-#[derive(Debug, Default)]
+/// 就是这两件事的落点，读循环收到相应帧时置位并[`Establish_::notify_`]。
+///
+/// # 通知用通道而不是 waker 槽
+///
+/// 等待方是 async 上下文（[`wait_establish_`]），它拿不到 `cx` 去登记 waker；
+/// 而通道是**持久**的：「先通知、后等待」不会丢（消息留在队列里），因此等待方
+/// 只要先查状态、再 `recv_async().await` 即可，不需要手写 `poll`。
+#[derive(Debug)]
 pub(crate) struct Establish_ {
     /// 是否已收到对端的 `OPEN`（其中携带对端接收窗口）。
     peer_opened_: bool,
@@ -55,8 +61,36 @@ pub(crate) struct Establish_ {
     /// 建流结果；`None` 表示仍在等待。
     outcome_: Option<EstablishOutcome_>,
 
-    /// `open_channel_async` 的等待者（至多一个：该 future 独占 `&mut DockBinding`）。
-    waker_: WakerSlot_,
+    /// 通知生产端。
+    notify_tx_: Sender<()>,
+
+    /// 通知消费端（等待方克隆一份去 await）。
+    notify_rx_: Receiver<()>,
+}
+
+impl Default for Establish_ {
+    fn default() -> Self {
+        // 容量 1：通知是「状态可能变了」的幂等提示。
+        let (notify_tx_, notify_rx_) = flume::bounded(1usize);
+        Establish_ {
+            peer_opened_: false,
+            outcome_: Option::None,
+            notify_tx_,
+            notify_rx_,
+        }
+    }
+}
+
+impl Establish_ {
+    /// 提示等待方「建流状态可能变了」（幂等；队列满时投递失败是无害的）。
+    pub(crate) fn notify_(&self) {
+        let _ = self.notify_tx_.try_send(());
+    }
+
+    /// 取一份通知消费端（等待方持有它去 `recv_async`）。
+    pub(crate) fn notify_rx_(&self) -> Receiver<()> {
+        self.notify_rx_.clone()
+    }
 }
 
 /// 建流的最终结果。
@@ -78,9 +112,6 @@ pub(crate) struct ChannelState_ {
 
     /// 建流三步的进展。
     establish_: Establish_,
-
-    /// 该子流的发送环是否已经有「有数据」事件在队列里（每条子流至多一条）。
-    tx_queued_: bool,
 
     /// 应用已丢弃发送半边（[`ChannelTx`](super::ChannelTx)）。
     app_tx_closed_: bool,
@@ -119,7 +150,6 @@ impl ChannelState_ {
         ChannelState_ {
             flow_: flow,
             establish_: Establish_::default(),
-            tx_queued_: false,
             app_tx_closed_: false,
             app_rx_closed_: false,
             local_fin_sent_: false,
@@ -171,9 +201,10 @@ impl ChannelState_ {
         &mut self.flow_
     }
 
-    /// 取出建流等待者（若有）；读循环在收到 `OPEN` / `ACCEPT` / `REJECT` 后唤醒它。
-    pub(crate) fn take_establish_waker_(&mut self) -> Option<Waker> {
-        self.establish_.waker_.take_()
+    /// 提示建流等待方「状态可能变了」；读循环在收到 `OPEN` / `ACCEPT` / `REJECT`
+    /// 后调用（幂等、不阻塞）。
+    pub(crate) fn notify_establish_(&self) {
+        self.establish_.notify_();
     }
 
     /// 记录「已收到对端 `OPEN`」。
@@ -211,26 +242,31 @@ impl ChannelState_ {
         self.local_fin_sent_ = true;
     }
 
-    /// 该子流的发送环是否已有「有数据」事件在队列里。
-    pub(crate) fn tx_queued_(&self) -> bool {
-        self.tx_queued_
-    }
-
-    /// 设置「该子流的发送环已有事件入队」位。
-    pub(crate) fn set_tx_queued_(&mut self, queued: bool) {
-        self.tx_queued_ = queued;
-    }
 }
 
-/// 一条子流的共享句柄：`Shared<SpinningRwLock<ChannelState_>>`。
+/// 一条子流的共享句柄：协作式锁 + 一个锁外的去重位。
 ///
 /// 参与方有三处：应用侧半边（发事件、读关闭态）、读循环与写循环（各自持有同一
 /// 句柄，经事件通道移交）、以及注册表节点。三者都只 clone 这个句柄。
+///
+/// # 两处同步原语，按「能否 await」分工
+///
+/// - 热状态（窗口、建流状态机、关闭位）经**协作式读写锁**：只在 async 上下文访问，
+///   因此争用时可以 `read_async` / `write_async().may_cancel_with(cancel).await`
+///   ——异步等待、可被外部 cancel token 取消（[`ChannelOwner_::with_async_`]）。
+/// - `tx_queued_` 去重位在**锁外**的原子里：它是唯一会被**同步**路径访问的状态
+///   （`ChannelTx::try_write` / `write_async` 的入口，见
+///   [`ChannelOwner_::mark_tx_queued_`]），同步路径没有 `await` 可用，因此这里用
+///   一次 `swap` 表达「我是不是第一个置位者」，完全不取锁。
 pub(crate) struct ChannelOwner_<A>
 where
     A: AllocatorClone,
 {
-    inner_: Shared<SpinningRwLockOwned<ChannelState_>, A>,
+    /// 子流热状态（协作式锁：异步、可取消获取）。
+    inner_: Shared<CooperativeRwLockOwned<ChannelState_>, A>,
+
+    /// 「发送环有数据」去重位；**锁外**，供同步路径无锁使用。
+    tx_queued_: Shared<AtomicBool, A>,
 }
 
 impl<A> Clone for ChannelOwner_<A>
@@ -240,6 +276,7 @@ where
     fn clone(&self) -> Self {
         ChannelOwner_ {
             inner_: self.inner_.clone(),
+            tx_queued_: self.tx_queued_.clone(),
         }
     }
 }
@@ -251,22 +288,79 @@ where
     /// 以调用方注入的分配器建立一条子流的共享状态。
     pub(crate) fn new_(state: ChannelState_, alloc: A) -> Self {
         ChannelOwner_ {
-            inner_: Shared::new(SpinningRwLockOwned::new_owned(state), alloc),
+            inner_: Shared::new(CooperativeRwLockOwned::new_owned(state), alloc.clone()),
+            tx_queued_: Shared::new(AtomicBool::new(false), alloc),
         }
     }
 
-    /// 持读锁执行 `f`（闭包内不得 `await`、不得重入）。
+    /// 「发送环可能有数据」去重位：**第一个**置位者返回 `true`。
     ///
-    /// 争用时**睡眠重试**（`TrBackoffAcquire_`）：零 CPU 忙等、不 panic。
-    pub(crate) fn with_<R>(&self, f: impl FnOnce(&ChannelState_) -> R) -> R {
-        self.inner_.with_read_backoff_(f)
+    /// 同步路径（`try_write` / `write_async` 的入口）专用：不取锁、不等待。
+    pub(crate) fn mark_tx_queued_(&self) -> bool {
+        !self.tx_queued_.swap(true, Ordering::AcqRel)
     }
 
-    /// 持写锁执行 `f`（闭包内不得 `await`、不得重入）。
-    ///
-    /// 争用时**睡眠重试**（`TrBackoffAcquire_`）：零 CPU 忙等、不 panic。
+    /// 写循环排空后清去重位（同步路径，不取锁）。
+    pub(crate) fn clear_tx_queued_(&self) {
+        self.tx_queued_.store(false, Ordering::Release);
+    }
+
+    /// **异步**取读状态：`try_read` 快路径；失败则等，等待可被 `cancel` 取消。
+    pub(crate) async fn with_async_<K, R>(
+        &self,
+        cancel: K,
+        f: impl FnOnce(&ChannelState_) -> R,
+    ) -> Result<R, LockCancelled_>
+    where
+        K: TrCancellationToken,
+    {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(f(&guard))
+    }
+
+    /// **异步**取写状态：语义与 [`ChannelOwner_::with_async_`] 对称。
+    pub(crate) async fn with_mut_async_<K, R>(
+        &self,
+        cancel: K,
+        f: impl FnOnce(&mut ChannelState_) -> R,
+    ) -> Result<R, LockCancelled_>
+    where
+        K: TrCancellationToken,
+    {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        Result::Ok(f(&mut guard))
+    }
+}
+
+
+/// # 测试专用同步壳
+///
+/// 生产代码一律走 `with_async_` / `with_mut_async_`（异步、可取消）；单元测试是
+/// 单线程、无争用场景，因此这里用「不可取消令牌 + `block_on`」把一次访问压成同步，
+/// 保持测试正文的旧形状。
+#[cfg(test)]
+impl<A> ChannelOwner_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 测试用同步读。
+    pub(crate) fn with_<R>(&self, f: impl FnOnce(&ChannelState_) -> R) -> R {
+        futures::executor::block_on(self.with_async_(
+            buffex::x_deps::abs_cancel::NonCancellableToken::new(),
+            f,
+        ))
+        .expect("测试里不该被取消")
+    }
+
+    /// 测试用同步写。
     pub(crate) fn with_mut_<R>(&self, f: impl FnOnce(&mut ChannelState_) -> R) -> R {
-        self.inner_.with_write_backoff_(f)
+        futures::executor::block_on(self.with_mut_async_(
+            buffex::x_deps::abs_cancel::NonCancellableToken::new(),
+            f,
+        ))
+        .expect("测试里不该被取消")
     }
 }
 
@@ -284,22 +378,34 @@ where
         if cancel.is_cancelled() {
             return Result::Err(MuxError::Cancelled);
         }
-        if let Option::Some(err) = reg.failure_() {
+        // 1. 连接级失败优先（取注册表锁，可取消）。
+        if let Result::Ok(Option::Some(err)) = reg.failure_(cancel.child_token()).await {
             return Result::Err(err);
         }
-        if let Option::Some(outcome) = owner.with_(|state| state.establish_.outcome_) {
+        // 2. 拿到结果了吗？顺带取一份通知端（在**持锁期间**取，保证不漏通知）。
+        let (outcome, notify_rx) = owner
+            .with_mut_async_(cancel.child_token(), |state| {
+                (state.establish_.outcome_, state.establish_.notify_rx_())
+            })
+            .await
+            .map_err(|_| MuxError::Cancelled)?;
+        if let Option::Some(outcome) = outcome {
             return Result::Ok(outcome);
         }
-        // 先登记 waker，再复检；读循环在建流事件到达时会唤醒它。
-        poll_fn(|cx| {
-            owner.with_mut_(|state| state.establish_.waker_.register_(cx.waker()));
-            if owner.with_(|state| state.establish_.outcome_.is_some()) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
+        // 3. 等一条通知；与取消令牌竞争。
+        //    通道是持久的：第 2 步与这里之间的通知不会丢。
+        let mut notified = core::pin::pin!(notify_rx.recv_async());
+        let mut cancelled = core::pin::pin!(cancel.child_token().cancellation());
+        let notified = poll_fn(|cx| {
+            if core::future::Future::poll(cancelled.as_mut(), cx).is_ready() {
+                return Poll::Ready(false);
             }
+            core::future::Future::poll(notified.as_mut(), cx).map(|_| true)
         })
         .await;
+        if !notified {
+            return Result::Err(MuxError::Cancelled);
+        }
     }
 }
 
@@ -308,7 +414,6 @@ mod tests_ {
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
     use crate::{
-        connection::sync_::WakerSlot_,
         flow_ctrl::DefaultPolicy,
     };
 
@@ -330,9 +435,13 @@ mod tests_ {
     fn owner_handles_share_state() {
         let a = make_owner_();
         let b = a.clone();
-        assert!(!a.with_(|s| s.tx_queued_));
-        a.with_mut_(|s| s.tx_queued_ = true);
-        assert!(b.with_(|s| s.tx_queued_), "clone 出的句柄应看到同一份状态");
+        assert!(a.mark_tx_queued_(), "首次置位应当是 fresh");
+        assert!(
+            !b.mark_tx_queued_(),
+            "clone 出的句柄应看到同一份锁外去重位"
+        );
+        a.clear_tx_queued_();
+        assert!(b.mark_tx_queued_(), "清位在共享句柄上也可见");
     }
 
     /// 测试建流状态初始为空、可被置位并唤醒等待者。
@@ -345,7 +454,6 @@ mod tests_ {
         let owner = make_owner_();
         assert!(!owner.with_(|s| s.establish_.peer_opened_));
         assert!(owner.with_(|s| s.establish_.outcome_.is_none()));
-        assert!(!owner.with_(|s| s.establish_.waker_.is_registered_()));
 
         owner.with_mut_(|s| {
             s.establish_.peer_opened_ = true;
@@ -356,6 +464,21 @@ mod tests_ {
             owner.with_(|s| s.establish_.outcome_),
             Option::Some(EstablishOutcome_::Accepted)
         );
+    }
+
+    /// 测试建流通知通道：`notify_establish_` 投一条，「先通知后等待」也不会丢。
+    /// - 手段：先 `notify_establish_`，再从共享的通知消费端 `try_recv`。
+    /// - 判断：能取到一条通知；重复通知时通道满，投递失败是无害的。
+    #[test]
+    fn establish_notification_is_persistent() {
+        let owner = make_owner_();
+        owner.with_mut_(|s| s.notify_establish_());
+        let rx = owner.with_(|s| s.establish_.notify_rx_());
+        assert!(rx.try_recv().is_ok(), "先通知后等待不应当丢唤醒");
+        owner.with_mut_(|s| s.notify_establish_());
+        owner.with_mut_(|s| s.notify_establish_());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "通道容量 1：重复通知不堆积");
     }
 
     /// 测试 `ChannelState_::touch_` 会推进活跃时间。
@@ -374,12 +497,4 @@ mod tests_ {
         assert!(second >= first, "活跃时间只能前进");
     }
 
-    /// 测试 `WakerSlot_` 能作为建流等待者被取出（结构可用性检查）。
-    /// - 手段：直接构造一个空槽并 `take_`。
-    /// - 判断：空槽取出为 `None`，不 panic。
-    #[test]
-    fn establish_waker_slot_is_empty_by_default() {
-        let mut slot = WakerSlot_::new_();
-        assert!(slot.take_().is_none());
-    }
 }

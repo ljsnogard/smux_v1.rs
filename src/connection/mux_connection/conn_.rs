@@ -16,7 +16,7 @@ use crate::{
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
 };
 
-use super::{core_::MuxCore, registry_::ChannelRegistry_};
+use super::{core_::MuxCore, registry_::{ChannelRegistry_, ReserveErr_}};
 
 
 /// [`TrConnection`](abs_smux::conn::TrConnection) 的错误类型：目前只有 `bind_async`。
@@ -28,6 +28,9 @@ pub enum BindError {
     /// 该 local_dock 已被占用。
     DockInUse,
 
+    /// **等锁期间被取消**（cancel token 触发）。
+    Cancelled,
+
     /// 连接级失败。
     Mux(MuxError),
 }
@@ -36,6 +39,7 @@ face_error_impls!(
     BindError,
     BindError::ReservedDock => "要绑定的 dock 是协议保留值，不能作为身份",
     BindError::DockInUse => "该 local_dock 已被占用",
+    BindError::Cancelled => "本次操作被取消",
 );
 
 /// 复用连接：**对一个 `MuxCore` 的智能指针的薄封装**，同时实现
@@ -232,7 +236,7 @@ where
 async fn mux_bind_async_<'f, C, S, K>(
     conn: &'f MuxConnection<C, S>,
     local_dock: Dock,
-    _cancel: K,
+    cancel: K,
 ) -> Result<DockBinding<C, S>, BindError>
 where
     C: TrConnCfg + 'f,
@@ -245,11 +249,18 @@ where
     // 先清空释放邮箱：上一个 `DockBinding` 可能刚被丢弃（`Drop` 只投消息），
     // 不先落实就会把「已解绑」误判成 `DockInUse`——这是「丢弃后立刻重绑」这条
     // 既有约定的确定性来源。
-    conn.core_().reg_().drain_session_events_();
+    conn.core_()
+        .drain_session_events_(cancel.child_token())
+        .await
+        .map_err(|_| BindError::Cancelled)?;
     // 独占绑定：同一 local_dock 在任意时刻至多一个 `DockBinding`。
     conn.core_()
-        .reg_()
-        .bind_dock_(local_dock)
-        .map_err(|_| BindError::DockInUse)?;
+        .bind_dock_(local_dock, cancel.child_token())
+        .await
+        .map_err(|err| match err {
+            ReserveErr_::Cancelled => BindError::Cancelled,
+            // `bind_dock_` 只有这两种失败：被占用，或等锁被取消。
+            _ => BindError::DockInUse,
+        })?;
     Result::Ok(DockBinding::new_(conn.clone(), local_dock))
 }

@@ -659,7 +659,7 @@ fn probe_classify_connection_error_<S>(err: <Mux<S> as TrConnection<SmokeCfg>>::
     // 因此那段分类代码原样可用。
     match err {
         BindError::Mux(inner) => probe_write_code_against_mux_error_(inner),
-        BindError::ReservedDock | BindError::DockInUse => ErrClass_::Other,
+        BindError::ReservedDock | BindError::DockInUse | BindError::Cancelled => ErrClass_::Other,
     }
 }
 

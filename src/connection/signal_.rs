@@ -251,7 +251,7 @@ where
 /// # 为什么 `Drop` 不能自己改注册表
 ///
 /// 改注册表要取锁；而锁在跨线程争用时是**阻塞等待**
-/// （见 [`TrBlockingAcquire_`](super::sync_::TrBlockingAcquire_)）。`Drop` 只允许
+/// （见 `sync_::acquire_write_`）。`Drop` 只允许
 /// 「不阻塞、不做事」——它投一条消息，由核心执行者（两个循环、或任意下一次 API
 /// 操作）在**异步上下文**里落实：改身份表、按协议进入 `WAIT_CLOSE`，必要时向对端
 /// 通告。

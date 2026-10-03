@@ -115,11 +115,8 @@ where
     /// 每条子流至多一条待处理事件：只有 `tx_queued_` 由假变真时才真正投递
     /// （顺序与去重协议见 `dev-notes` §11.4）。
     fn notify_tx_ready_(&self) {
-        let fresh = self.owner_.with_mut_(|state| {
-            let fresh = !state.tx_queued_();
-            state.set_tx_queued_(true);
-            fresh
-        });
+        // 去重位在锁外（原子）：同步路径没有 `await` 可用，因此这里不取锁。
+        let fresh = self.owner_.mark_tx_queued_();
         if fresh {
             let _ = self
                 .conn_

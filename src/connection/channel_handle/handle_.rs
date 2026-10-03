@@ -16,7 +16,7 @@ use buffex::x_deps::abs_buff;
 
 use crate::{
     connection::{
-        Dock, FrameKind, MuxConnection, MuxError, TrConnCfg,
+        Dock, FrameKind, MuxConnection, MuxError, ReserveErr_, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, ChannelState_, EstablishOutcome_, wait_establish_},
         ring_::new_buffered_channel_,
@@ -26,7 +26,6 @@ use crate::{
     },
     flow_ctrl::{
         Credit, FlowCtrl, FlowCtrlError, RecvTotal, ReportThresholds_, TrFlowCtrlPolicy,
-        WindowReport,
     },
 };
 
@@ -210,6 +209,9 @@ where
     }
 
     /// 已经拿到两块 `C::Buff` 之后的公共安装逻辑。
+    ///
+    /// **不取任何锁**：建环与注册表登记都在这里完成不了——注册表登记挪到 step 函数
+    /// （那里才有可取消的异步上下文）。因此本函数只做纯本地构造。
     fn accept_buffs_(
         &mut self,
         buffs: ChannelBuffAlloc<C::Buff, C::Data>,
@@ -221,20 +223,9 @@ where
         // 调用方 / managed 路径已经给出本子流的环存储。
         let ChannelBuffAlloc { tx_buff, rx_buff, .. } = buffs;
 
-        // 对端的窗口通告：发起方还没有（对端 `OPEN` 未到，读循环稍后写进发送
-        // 窗口），响应方在登记时已存下。
-        let peer_report = if self.is_initiator_ {
-            Option::None
-        } else {
-            match conn.core_().reg_().take_inbound_report_(local, remote) {
-                Option::Some(report) => Option::Some(report),
-                Option::None => return Result::Err(HandleError::Mux(MuxError::Closed)),
-            }
-        };
-
-        // 建环 + 登记 + 移交会话侧半部。
+        // 建环（纯本地；注册表登记在 step 函数里做）。
         let (owner, tx, rx, initial) =
-            install_channel_(&conn, local, remote, tx_buff, rx_buff, peer_report)?;
+            install_channel_(&conn, local, remote, tx_buff, rx_buff)?;
         self.accepted_initial_window_ = initial;
         self.accepted_owner_ = Option::Some(owner);
         Result::Ok((tx, rx))
@@ -363,7 +354,47 @@ where
     let local = handle.local_dock_;
     let remote = handle.remote_dock_;
 
+    // 环已经建好（同步、不取锁）；下面**取注册表锁的两步都在可取消的异步上下文里**。
     let (tx, rx) = accepted?;
+
+    // 1. 对端窗口通告：响应方在登记入向请求时已由读循环存下。
+    if !handle.is_initiator_ {
+        let report = match conn
+            .core_()
+            .take_inbound_report_(local, remote, cancel.child_token())
+            .await
+        {
+            Result::Ok(Option::Some(report)) => report,
+            Result::Err(ReserveErr_::Cancelled) => {
+                return Result::Err(HandleError::Cancelled);
+            }
+            _ => return Result::Err(HandleError::Mux(MuxError::Closed)),
+        };
+        let Some(owner) = handle.accepted_owner_.clone() else {
+            return Result::Err(HandleError::Mux(MuxError::Closed));
+        };
+        let applied = owner
+            .with_mut_async_(cancel.child_token(), |state| {
+                state.flow_mut_().send_window_mut().on_report(report)
+            })
+            .await;
+        if let Result::Ok(Result::Err(err)) = applied {
+            let _ = conn
+                .core_()
+                .release_channel_(local, remote, cancel.child_token())
+                .await;
+            handle.settled_ = true;
+            return Result::Err(HandleError::FlowCtrl(err));
+        }
+    }
+
+    // 2. 把共享状态句柄挂到身份表上（失败由调用方按内部错误处理，与旧行为一致）。
+    if let Some(owner) = handle.accepted_owner_.clone() {
+        let _ = conn
+            .core_()
+            .attach_owner_(local, remote, owner, cancel.child_token())
+            .await;
+    }
 
     if handle.is_initiator_ {
         // 发起方：此刻才发 `OPEN`（通告的接收窗口取决于接收环容量）。
@@ -382,7 +413,10 @@ where
                 Result::Ok((tx, rx))
             }
             EstablishOutcome_::Refused => {
-                conn.core_().reg_().release_channel_(local, remote);
+                let _ = conn
+                    .core_()
+                    .release_channel_(local, remote, cancel.child_token())
+                    .await;
                 handle.settled_ = true;
                 Result::Err(HandleError::Refused)
             }
@@ -415,6 +449,7 @@ where
 /// 「接受」这一步的产物：该 channel 的收发半边，或一个连接错误。
 type AcceptOutcomeProj_<C, S> = Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>;
 
+
 /// 建流最终裁决的产物。
 type InstallOutcome_<C, S> = (
     ChannelOwner_<<C as TrConnCfg>::Alloc>,
@@ -431,7 +466,6 @@ fn install_channel_<C, S>(
     remote: Dock,
     tx_buff: C::Buff,
     mut rx_buff: C::Buff,
-    peer_report: Option<WindowReport>,
 ) -> Result<InstallOutcome_<C, S>, HandleError>
 where
     C: TrConnCfg,
@@ -447,31 +481,31 @@ where
     let thresholds = ReportThresholds_::new_(policy, initial);
     let mut flow = FlowCtrl::new(policy, rx_cap);
     flow.recv_window_mut().report();
-    if let Option::Some(report) = peer_report
-        && let Result::Err(err) = flow.send_window_mut().on_report(report)
-    {
-        core.reg_().release_channel_(local, remote);
-        return Result::Err(HandleError::FlowCtrl(err));
-    }
 
     // 两条环：应用写 / 循环读的是发送环，循环写 / 应用读的是接收环。
+    // 环被拒时**投一条释放消息**（不取锁）：身份由核心在下一轮 drain 里归还。
     let (tx_w, tx_r) = match new_buffered_channel_(tx_buff, alloc.clone()) {
         Result::Ok(pair) => pair,
         Result::Err(_) => {
-            core.reg_().release_channel_(local, remote);
+            let _ = core.post_session_event_(SessionEvent_::ReleaseChannel {
+                local_dock: local,
+                remote_dock: remote,
+            });
             return Result::Err(HandleError::RingRejected);
         }
     };
     let (rx_w, rx_r) = match new_buffered_channel_(rx_buff, alloc.clone()) {
         Result::Ok(pair) => pair,
         Result::Err(_) => {
-            core.reg_().release_channel_(local, remote);
+            let _ = core.post_session_event_(SessionEvent_::ReleaseChannel {
+                local_dock: local,
+                remote_dock: remote,
+            });
             return Result::Err(HandleError::RingRejected);
         }
     };
 
     let owner = ChannelOwner_::new_(ChannelState_::new_(flow, thresholds), alloc.clone());
-    core.reg_().attach_owner_(local, remote, owner.clone());
     let _ = core.w_events_().try_send_event_(WriteEvent_::Attach {
         local_dock: local,
         remote_dock: remote,
@@ -542,7 +576,10 @@ where
     .await;
     let written = payload.len();
     if handle.is_initiator_ {
-        conn.core_().reg_().unreserve_channel_(local, remote);
+        let _ = conn
+            .core_()
+            .unreserve_channel_(local, remote, cancel.child_token())
+            .await;
     } else {
         let _ = conn
             .core_()
@@ -557,7 +594,10 @@ where
                     payload,
                 ),
             });
-        conn.core_().reg_().release_channel_(local, remote);
+        let _ = conn
+            .core_()
+            .release_channel_(local, remote, cancel.child_token())
+            .await;
     }
     handle.settled_ = true;
     Result::Ok(written)
@@ -605,10 +645,13 @@ mod tests_ {
         let mut welcome: [u8; 0] = [];
         let mut welcome_slice: &mut [u8] = &mut welcome[..];
 
-        conn.core_()
-            .reg_()
-            .reserve_inbound_(local, remote, WindowReport::new(0u64, 64u32))
-            .expect("登记入向请求应当成功");
+        futures::executor::block_on(conn.core_().reg_().reserve_inbound_(
+            local,
+            remote,
+            WindowReport::new(0u64, 64u32),
+            buffex::x_deps::abs_cancel::NonCancellableToken::new(),
+        ))
+        .expect("登记入向请求应当成功");
         let mut handle = ChannelHandle::new_(conn.clone(), local, remote);
 
         let t0 = Instant::now();

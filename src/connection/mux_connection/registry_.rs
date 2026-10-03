@@ -93,12 +93,15 @@ use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
 use mm_ptr::Shared;
 
 
+use buffex::x_deps::abs_cancel::TrCancellationToken;
+use flume::Sender;
+
 use crate::{
     connection::{
         Dock, MuxError,
         owner_::ChannelOwner_,
         signal_::{SessionEvent_, SessionMailbox_},
-        sync_::{CancelToken_, TrBlockingAcquire_, WakerSlot_},
+        sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
     },
     flow_ctrl::WindowReport,
     handshake::opts::BasicOpts,
@@ -123,6 +126,18 @@ pub(crate) enum ReserveErr_ {
 
     /// 连接上的活动子流数已达上限。
     ChanLimit,
+
+    /// **等锁期间被取消**（cancel token 触发）。
+    ///
+    /// 它不是业务规则的拒绝，而是调用方主动放弃；各 API 面把它映射成各自的
+    /// `Cancelled` 变体。
+    Cancelled,
+}
+
+impl From<LockCancelled_> for ReserveErr_ {
+    fn from(_: LockCancelled_) -> Self {
+        ReserveErr_::Cancelled
+    }
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -228,16 +243,17 @@ struct TgCtx_;
 
 /// 一个 listener 的身份状态：持有该 `local_dock` 上的入向等待者。
 struct LsnCtx_ {
-    /// 「本 dock 上有入向事件」的等待者（listener 的 `income_async`）。
-    inbound_waker_: WakerSlot_,
+    /// 「本 dock 上有入向事件」的通知端（listener 的 `income_async` 在等它）。
+    ///
+    /// 通道是**持久**的：投递与等待之间不需要 `cx` 登记，因此等待方（async 上下文）
+    /// 只要先查状态、再 `recv_async().await` 即可；「先通知、后等待」也不会丢。
+    notify_tx_: Sender<()>,
 }
 
 impl LsnCtx_ {
-    /// 空监听器身份。
-    const fn new_() -> Self {
-        LsnCtx_ {
-            inbound_waker_: WakerSlot_::new_(),
-        }
+    /// 监听器身份（生产端由 `listen_async` 建通道时给出）。
+    const fn new_(notify_tx_: Sender<()>) -> Self {
+        LsnCtx_ { notify_tx_ }
     }
 }
 
@@ -340,9 +356,6 @@ where
 
     /// 连接级失败（**首个**原因保留，之后的失败不再覆盖）。
     fail_: Option<MuxError>,
-
-    /// 两个循环各自的取消令牌（见 [`ChannelRegistry_::cancel_loops_`]）。
-    loops_: [CancelToken_<A>; 2],
 }
 
 impl<A> RegistryInner_<A>
@@ -399,8 +412,9 @@ where
 ///
 /// 所有方法都取 `&self`：内部可变性由 `atomic_sync` 的**协作式读写锁**
 /// （`rwlock::cooperative::CooperativeRwLock`）提供。临界区都很短（映射增删与
-/// 计数），且**不跨 `await`**；争用时经 [`TrBlockingAcquire_`] **park 等待**，
-/// 因此没有 CPU 忙等，也不会像自旋那样在核间制造 cache line 乒乓。
+/// 计数），且**不跨 `await`**；取锁一律 `acquire_session` + 异步获取
+/// （`read_async` / `write_async().may_cancel_with(cancel).await`），因此争用时
+/// 让出执行权、可被外部 cancel token 取消，也没有 CPU 忙等。
 ///
 /// # 会话释放邮箱
 ///
@@ -423,6 +437,12 @@ where
 {
     inner_: Shared<CooperativeRwLockOwned<RegistryInner_<A>>, A>,
 
+    /// 两个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
+    ///
+    /// **放在锁外**：构造后不再变化，因此取用与触发都无需取锁（`Drop` 路径要的
+    /// 正是这一点）。
+    loops_: [CancelToken_<A>; 2],
+
     /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
     mailbox_: SessionMailbox_,
 }
@@ -434,6 +454,7 @@ where
     fn clone(&self) -> Self {
         ChannelRegistry_ {
             inner_: self.inner_.clone(),
+            loops_: self.loops_.clone(),
             // 邮箱按值克隆：生产端共享同一条队列，消费端因此有**多个** drain 者。
             mailbox_: self.mailbox_.clone(),
         }
@@ -445,8 +466,13 @@ where
     A: AllocatorClone + Send + Sync,
 {
     /// 取分配器（读 / 写循环为自己的本地表按需分配）。
-    pub(crate) fn allocator_(&self) -> A {
-        self.with_(|inner| inner.alloc_.clone())
+    pub(crate) async fn allocator_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<A, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(guard.alloc_.clone())
     }
 
     /// 建立注册表：分配根对象与四本索引，并为两个循环建好取消令牌。
@@ -475,10 +501,10 @@ where
                     wait_close_expiry_,
                     total_: 0usize,
                     fail_: Option::None,
-                    loops_: loops,
                 }),
                 alloc,
             ),
+            loops_: loops,
             mailbox_: SessionMailbox_::new_(),
         }
     }
@@ -501,52 +527,77 @@ where
     /// # Panics
     ///
     /// **调用方不得正持有本注册表的锁**：落实每条消息都要再取一次锁。
-    pub(crate) fn drain_session_events_(&self) {
+    pub(crate) async fn drain_session_events_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
         while let Option::Some(event) = self.mailbox_.try_take_() {
-            self.apply_session_event_(event);
+            self.apply_session_event_(event, cancel.child_token()).await?;
         }
+        Result::Ok(())
     }
 
     /// 落实一条释放消息（内部方法：只由 drain 调用，**不自行 drain**）。
-    fn apply_session_event_(&self, event: SessionEvent_) {
+    async fn apply_session_event_<K: TrCancellationToken>(
+        &self,
+        event: SessionEvent_,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
         match event {
-            SessionEvent_::UnbindDock { local_dock } => self.unbind_dock_(local_dock),
+            SessionEvent_::UnbindDock { local_dock } => {
+                self.unbind_dock_(local_dock, cancel).await
+            }
             SessionEvent_::ReleaseListener { local_dock } => {
-                self.release_listener_(local_dock)
+                self.release_listener_(local_dock, cancel).await
             }
             SessionEvent_::ReleaseTelegraph { local_dock } => {
-                self.release_telegraph_(local_dock)
+                self.release_telegraph_(local_dock, cancel).await
             }
             SessionEvent_::UnreserveChannel {
                 local_dock,
                 remote_dock,
-            } => self.unreserve_channel_(local_dock, remote_dock),
+            } => self.unreserve_channel_(local_dock, remote_dock, cancel).await,
             SessionEvent_::ReleaseChannel {
                 local_dock,
                 remote_dock,
-            } => self.release_channel_(local_dock, remote_dock),
+            } => self.release_channel_(local_dock, remote_dock, cancel).await,
         }
     }
 
     /// 协商出的「整条连接最多同时在册子流数」。
     // 仅供单元测试与尚未实现的 telegraph 路径使用；telegraph 落地后即可移除本行。
     #[allow(dead_code)]
-    pub(crate) fn max_channel_count_(&self) -> usize {
-        self.with_(|inner| inner.opts_.max_channel_count)
+    pub(crate) async fn max_channel_count_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<usize, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(guard.opts_.max_channel_count)
     }
 
     /// 协商出的「单个 dock 最多同时在册子流数」。
     // 仅供单元测试与尚未实现的 telegraph 路径使用；telegraph 落地后即可移除本行。
     #[allow(dead_code)]
-    pub(crate) fn max_dock_chan_count_(&self) -> usize {
-        self.with_(|inner| inner.opts_.max_dock_chan_count)
+    pub(crate) async fn max_dock_chan_count_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<usize, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(guard.opts_.max_dock_chan_count)
     }
 
     /// 当前在册的**活跃子流**总数（不含宽限态）。
     // 仅供单元测试与尚未实现的 telegraph 路径使用；telegraph 落地后即可移除本行。
     #[allow(dead_code)]
-    pub(crate) fn total_channels_(&self) -> usize {
-        self.with_(|inner| inner.total_)
+    pub(crate) async fn total_channels_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<usize, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(guard.total_)
     }
 
     /// 为 `(local_dock, remote_dock)` 登记一条 channel。
@@ -558,52 +609,54 @@ where
     /// - 同一 dock 对处于拆流宽限期 → [`ReserveErr_::WaitClose`]；
     /// - 该 dock 上的在册子流数已达 `max_dock_chan_count` → [`ReserveErr_::DockChanLimit`]；
     /// - 连接上的在册子流数已达 `max_channel_count` → [`ReserveErr_::ChanLimit`]。
-    pub(crate) fn reserve_channel_(
+    pub(crate) async fn reserve_channel_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
+        cancel: K,
     ) -> Result<(), ReserveErr_> {
-        self.with_mut_(|inner| {
-            let now = Instant::now();
-            inner.reap_wait_close_(now);
-            if inner.total_ >= inner.opts_.max_channel_count {
-                return Result::Err(ReserveErr_::ChanLimit);
-            }
-            // 先把限额取出来：下面要可变借用 `docks_`。
-            let max_dock = inner.opts_.max_dock_chan_count;
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        let now = Instant::now();
+        inner.reap_wait_close_(now);
+        if inner.total_ >= inner.opts_.max_channel_count {
+            return Result::Err(ReserveErr_::ChanLimit);
+        }
+        // 先把限额取出来：下面要可变借用 `docks_`。
+        let max_dock = inner.opts_.max_dock_chan_count;
 
-            // 检查顺序与旧链表实现一致：用途 → 重复 → dock 限额。
-            if matches!(
-                inner.bindings_.get(&telegraph_key_(local_dock)),
-                Option::Some(DockBinding_::Telegraph(_))
-            ) {
-                return Result::Err(ReserveErr_::DockInUse);
+        // 检查顺序与旧链表实现一致：用途 → 重复 → dock 限额。
+        if matches!(
+            inner.bindings_.get(&telegraph_key_(local_dock)),
+            Option::Some(DockBinding_::Telegraph(_))
+        ) {
+            return Result::Err(ReserveErr_::DockInUse);
+        }
+        match inner.bindings_.get(&(local_dock, remote_dock)) {
+            Option::Some(DockBinding_::WaitClose(_)) => {
+                return Result::Err(ReserveErr_::WaitClose);
             }
-            match inner.bindings_.get(&(local_dock, remote_dock)) {
-                Option::Some(DockBinding_::WaitClose(_)) => {
-                    return Result::Err(ReserveErr_::WaitClose);
-                }
-                Option::Some(_) => return Result::Err(ReserveErr_::Duplicate),
-                Option::None => {}
-            }
-            if let Option::Some(dock) = inner.docks_.get(&local_dock)
-                && dock.chan_count_ >= max_dock
-            {
-                return Result::Err(ReserveErr_::DockChanLimit);
-            }
+            Option::Some(_) => return Result::Err(ReserveErr_::Duplicate),
+            Option::None => {}
+        }
+        if let Option::Some(dock) = inner.docks_.get(&local_dock)
+            && dock.chan_count_ >= max_dock
+        {
+            return Result::Err(ReserveErr_::DockChanLimit);
+        }
 
-            let dock = inner
-                .docks_
-                .entry(local_dock)
-                .or_insert_with(DockCtx_::new_);
-            dock.chan_count_ += 1usize;
-            inner
-                .bindings_
-                .insert((local_dock, remote_dock), DockBinding_::Channel(ChanCtx_::new_()));
-            inner.remote_index_.insert((remote_dock, local_dock));
-            inner.total_ += 1usize;
-            Result::Ok(())
-        })
+        let dock = inner
+            .docks_
+            .entry(local_dock)
+            .or_insert_with(DockCtx_::new_);
+        dock.chan_count_ += 1usize;
+        inner
+            .bindings_
+            .insert((local_dock, remote_dock), DockBinding_::Channel(ChanCtx_::new_()));
+        inner.remote_index_.insert((remote_dock, local_dock));
+        inner.total_ += 1usize;
+        Result::Ok(())
     }
 
     /// 拆掉一条 channel：**不删键**，改成宽限态 [`DockBinding_::WaitClose`]；不存在
@@ -620,65 +673,70 @@ where
     /// - `unreserve_channel_`：用于**发起方还没发出 `OPEN`** 就放弃的情形。对端根本
     ///   不知道这条子流存在、没有任何在途帧，因此身份与配额**立即**归还，同一 dock
     ///   对可以马上再用（否则「打开后反悔」会白白占住 dock 对一整个宽限期）。
-    pub(crate) fn unreserve_channel_(&self, local_dock: Dock, remote_dock: Dock) {
-        self.with_mut_(|inner| {
-            let removed = inner
-                .bindings_
-                .remove(&(local_dock, remote_dock));
-            if !matches!(removed, Option::Some(DockBinding_::Channel(_))) {
-                // 不是活跃子流（已拆、已宽限、或从来不是子流）：无事可做。
-                return;
-            }
-            inner.remote_index_.remove(&(remote_dock, local_dock));
-            inner.total_ = inner.total_.saturating_sub(1usize);
-            if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
-                dock.chan_count_ = dock.chan_count_.saturating_sub(1usize);
-            }
-            inner.prune_dock_(local_dock);
-        })
+    pub(crate) async fn unreserve_channel_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, cancel: K) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        let removed = inner
+            .bindings_
+            .remove(&(local_dock, remote_dock));
+        if !matches!(removed, Option::Some(DockBinding_::Channel(_))) {
+            // 不是活跃子流（已拆、已宽限、或从来不是子流）：无事可做。
+            return Result::Ok(());
+        }
+        inner.remote_index_.remove(&(remote_dock, local_dock));
+        inner.total_ = inner.total_.saturating_sub(1usize);
+        if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
+            dock.chan_count_ = dock.chan_count_.saturating_sub(1usize);
+        }
+        inner.prune_dock_(local_dock);
+        Result::Ok(())
     }
 
-    pub(crate) fn release_channel_(&self, local_dock: Dock, remote_dock: Dock) {
-        self.with_mut_(|inner| {
-            let now = Instant::now();
-            inner.reap_wait_close_(now);
-            if !matches!(
-                inner.bindings_.get(&(local_dock, remote_dock)),
-                Option::Some(DockBinding_::Channel(_))
-            ) {
-                return;
-            }
-            let until = now + inner.opts_.max_channel_wait_close;
-            inner.bindings_.insert(
-                (local_dock, remote_dock),
-                DockBinding_::WaitClose(WaitCloseCtx_),
-            );
-            inner
-                .wait_close_expiry_
-                .insert((until, local_dock, remote_dock));
-            // 反向索引只跟活跃子流；宽限态不再登记。
-            inner.remote_index_.remove(&(remote_dock, local_dock));
-            inner.total_ = inner.total_.saturating_sub(1usize);
-            if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
-                dock.chan_count_ = dock.chan_count_.saturating_sub(1usize);
-            }
-            inner.prune_dock_(local_dock);
-        })
+    pub(crate) async fn release_channel_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, cancel: K) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        let now = Instant::now();
+        inner.reap_wait_close_(now);
+        if !matches!(
+            inner.bindings_.get(&(local_dock, remote_dock)),
+            Option::Some(DockBinding_::Channel(_))
+        ) {
+            return Result::Ok(());
+        }
+        let until = now + inner.opts_.max_channel_wait_close;
+        inner.bindings_.insert(
+            (local_dock, remote_dock),
+            DockBinding_::WaitClose(WaitCloseCtx_),
+        );
+        inner
+            .wait_close_expiry_
+            .insert((until, local_dock, remote_dock));
+        // 反向索引只跟活跃子流；宽限态不再登记。
+        inner.remote_index_.remove(&(remote_dock, local_dock));
+        inner.total_ = inner.total_.saturating_sub(1usize);
+        if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
+            dock.chan_count_ = dock.chan_count_.saturating_sub(1usize);
+        }
+        inner.prune_dock_(local_dock);
+        Result::Ok(())
     }
 
     /// 该 dock 对是否处于「已关闭、宽限期内」。
     ///
     /// 读循环用它区分两类「本地表里查不到」的帧：命中 → 刚关闭，静默丢弃；
     /// 未命中 → 真正的未知子流，按协议违例处理。查询顺带回收已到期的宽限态。
-    pub(crate) fn is_wait_close_(&self, local_dock: Dock, remote_dock: Dock) -> bool {
-        self.with_mut_(|inner| {
-            let now = Instant::now();
-            inner.reap_wait_close_(now);
-            matches!(
-                inner.bindings_.get(&(local_dock, remote_dock)),
-                Option::Some(DockBinding_::WaitClose(_))
-            )
-        })
+    pub(crate) async fn is_wait_close_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, cancel: K) -> Result<bool, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        let now = Instant::now();
+        inner.reap_wait_close_(now);
+        Result::Ok(matches!(
+            inner.bindings_.get(&(local_dock, remote_dock)),
+            Option::Some(DockBinding_::WaitClose(_))
+        ))
     }
 
     /// 把建好环之后的共享状态句柄挂到已有 channel 上。
@@ -686,34 +744,38 @@ where
     /// 主动方在 `open_channel_async`、被动方在 `accept_async` 调用；节点必须已经由
     /// [`ChannelRegistry_::reserve_channel_`] 登记过，否则返回 `false`（调用方按
     /// 内部错误处理）。
-    pub(crate) fn attach_owner_(
+    pub(crate) async fn attach_owner_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
         owner: ChannelOwner_<A>,
-    ) -> bool {
-        self.with_mut_(|inner| {
-            match inner.bindings_.get_mut(&(local_dock, remote_dock)) {
-                Option::Some(DockBinding_::Channel(ctx)) => {
-                    ctx.owner_ = Option::Some(owner);
-                    true
-                }
-                _ => false,
+        cancel: K,
+    ) -> Result<bool, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        Result::Ok(match inner.bindings_.get_mut(&(local_dock, remote_dock)) {
+            Option::Some(DockBinding_::Channel(ctx)) => {
+                ctx.owner_ = Option::Some(owner);
+                true
             }
+            _ => false,
         })
     }
 
     /// 取一条子流的共享状态句柄（克隆）；不存在或尚未挂上时返回 `None`。
-    pub(crate) fn channel_owner_(
+    pub(crate) async fn channel_owner_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
-    ) -> Option<ChannelOwner_<A>> {
-        self.with_(|inner| {
-            match inner.bindings_.get(&(local_dock, remote_dock)) {
-                Option::Some(DockBinding_::Channel(ctx)) => ctx.owner_.clone(),
-                _ => Option::None,
-            }
+        cancel: K,
+    ) -> Result<Option<ChannelOwner_<A>>, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        let inner = &*guard;
+        Result::Ok(match inner.bindings_.get(&(local_dock, remote_dock)) {
+            Option::Some(DockBinding_::Channel(ctx)) => ctx.owner_.clone(),
+            _ => Option::None,
         })
     }
 
@@ -724,43 +786,31 @@ where
     ///
     /// 与 [`ChannelRegistry_::reserve_channel_`] 相同（含 dock 对已存在时的
     /// [`ReserveErr_::Duplicate`] / [`ReserveErr_::WaitClose`]）。
-    pub(crate) fn reserve_inbound_(
+    pub(crate) async fn reserve_inbound_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
         peer_report: WindowReport,
+        cancel: K,
     ) -> Result<(), ReserveErr_> {
-        self.reserve_channel_(local_dock, remote_dock)?;
-        let marked = self.with_mut_(|inner| {
-            match inner.bindings_.get_mut(&(local_dock, remote_dock)) {
+        // 先登记身份（自带配额与重复检查），再标成「待决入向请求」。
+        self.reserve_channel_(local_dock, remote_dock, cancel.child_token())
+            .await?;
+        let marked = {
+            let mut session = self.inner_.acquire_session();
+            let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
+            match guard.bindings_.get_mut(&(local_dock, remote_dock)) {
                 Option::Some(DockBinding_::Channel(ctx)) => {
                     ctx.inbound_ = Inbound_::Pending(peer_report);
                     true
                 }
                 _ => false,
             }
-        });
+        };
         if marked {
-            self.notify_inbound_(local_dock);
+            self.notify_inbound_(local_dock, cancel.child_token()).await?;
         }
         Result::Ok(())
-    }
-
-    /// 是否有**尚未被 `income_async` 取走**的入向请求。
-    ///
-    /// 只扫具体子流（[`channel_range_`] 排除两个哨兵行），因此 listener / telegraph
-    /// 身份不会被误当成入向请求。
-    pub(crate) fn has_pending_inbound_(&self, local_dock: Dock) -> bool {
-        self.with_(|inner| {
-            let (start, end) = channel_range_(local_dock);
-            inner.bindings_.range((start, end)).any(|(_, binding)| {
-                matches!(
-                    binding,
-                    DockBinding_::Channel(ctx)
-                        if matches!(ctx.inbound_, Inbound_::Pending(_))
-                )
-            })
-        })
     }
 
     /// 取走 `local_dock` 上最早的一个待决入向请求（改成 `HandedOut`），返回对端 dock。
@@ -771,39 +821,42 @@ where
     /// 的取出顺序不同；协议不要求入向请求按到达顺序配对（每条请求各自独立），
     /// 但**同一 dock 上的请求本就串行化**（`income_async` 取一个、处理完再取下一个），
     /// 因此顺序变化不影响语义。
-    pub(crate) fn take_pending_inbound_(&self, local_dock: Dock) -> Option<Dock> {
-        self.with_mut_(|inner| {
-            let (start, end) = channel_range_(local_dock);
-            let mut found = Option::None;
-            for (key, binding) in inner.bindings_.range_mut((start, end)) {
-                if let DockBinding_::Channel(ctx) = binding
-                    && let Inbound_::Pending(report) = ctx.inbound_
-                {
-                    ctx.inbound_ = Inbound_::HandedOut(report);
-                    found = Option::Some(key.1);
-                    break;
-                }
+    pub(crate) async fn take_pending_inbound_<K: TrCancellationToken>(&self, local_dock: Dock, cancel: K) -> Result<Option<Dock>, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        let (start, end) = channel_range_(local_dock);
+        let mut found = Option::None;
+        for (key, binding) in inner.bindings_.range_mut((start, end)) {
+            if let DockBinding_::Channel(ctx) = binding
+                && let Inbound_::Pending(report) = ctx.inbound_
+            {
+                ctx.inbound_ = Inbound_::HandedOut(report);
+                found = Option::Some(key.1);
+                break;
             }
-            found
-        })
+        }
+        Result::Ok(found)
     }
 
     /// `accept_async` 取走该入向请求保存的对端窗口通告（状态归为 `None`）。
-    pub(crate) fn take_inbound_report_(
+    pub(crate) async fn take_inbound_report_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
-    ) -> Option<WindowReport> {
-        self.with_mut_(|inner| {
-            let Option::Some(DockBinding_::Channel(ctx)) =
-                inner.bindings_.get_mut(&(local_dock, remote_dock))
-            else {
-                return Option::None;
-            };
-            match core::mem::replace(&mut ctx.inbound_, Inbound_::None) {
-                Inbound_::HandedOut(report) | Inbound_::Pending(report) => Option::Some(report),
-                Inbound_::None => Option::None,
-            }
+        cancel: K,
+    ) -> Result<Option<WindowReport>, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        let Option::Some(DockBinding_::Channel(ctx)) =
+            inner.bindings_.get_mut(&(local_dock, remote_dock))
+        else {
+            return Result::Ok(Option::None);
+        };
+        Result::Ok(match core::mem::replace(&mut ctx.inbound_, Inbound_::None) {
+            Inbound_::HandedOut(report) | Inbound_::Pending(report) => Option::Some(report),
+            Inbound_::None => Option::None,
         })
     }
 
@@ -825,31 +878,42 @@ where
     ///
     /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
     /// [`DockBinding`]: crate::connection::DockBinding
-    pub(crate) fn bind_dock_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
-        self.with_mut_(|inner| {
-            let dock = inner
-                .docks_
-                .entry(local_dock)
-                .or_insert_with(DockCtx_::new_);
-            if dock.bound_ {
-                return Result::Err(ReserveErr_::DockInUse);
-            }
-            dock.bound_ = true;
-            Result::Ok(())
-        })
+    pub(crate) async fn bind_dock_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        let dock = inner
+            .docks_
+            .entry(local_dock)
+            .or_insert_with(DockCtx_::new_);
+        if dock.bound_ {
+            return Result::Err(ReserveErr_::DockInUse);
+        }
+        dock.bound_ = true;
+        Result::Ok(())
     }
 
     /// 解除 [`ChannelRegistry_::bind_dock_`] 的独占绑定；不存在时是空操作。
     ///
     /// 由 `DockBinding` 的 `Drop` 调用。解绑只清 `bound_`；条目回收交给
     /// `prune_dock_` 判空，因此「解绑后该 dock 上还有活动子流」不会影响这些子流。
-    pub(crate) fn unbind_dock_(&self, local_dock: Dock) {
-        self.with_mut_(|inner| {
-            if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
-                dock.bound_ = false;
-            }
-            inner.prune_dock_(local_dock);
-        })
+    pub(crate) async fn unbind_dock_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
+            dock.bound_ = false;
+        }
+        inner.prune_dock_(local_dock);
+        Result::Ok(())
     }
 
     /// 在 `local_dock` 上登记**监听器身份**（`TrDockBinding::listen_async` 的登记点）。
@@ -861,35 +925,47 @@ where
     ///
     /// 该 dock 已作 telegraph（datagram 与 channel 不得共用 dock）→
     /// [`ReserveErr_::DockInUse`]。
-    pub(crate) fn reserve_listener_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
-        self.with_mut_(|inner| {
-            if matches!(
-                inner.bindings_.get(&telegraph_key_(local_dock)),
-                Option::Some(DockBinding_::Telegraph(_))
-            ) {
-                return Result::Err(ReserveErr_::DockInUse);
+    pub(crate) async fn reserve_listener_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        notify_tx_: Sender<()>,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        if matches!(
+            inner.bindings_.get(&telegraph_key_(local_dock)),
+            Option::Some(DockBinding_::Telegraph(_))
+        ) {
+            return Result::Err(ReserveErr_::DockInUse);
+        }
+        match inner.bindings_.get(&listener_key_(local_dock)) {
+            Option::Some(DockBinding_::Listener(_)) => Result::Ok(()),
+            Option::Some(_) => Result::Err(ReserveErr_::DockInUse),
+            Option::None => {
+                inner.bindings_.insert(
+                    listener_key_(local_dock),
+                    DockBinding_::Listener(LsnCtx_::new_(notify_tx_)),
+                );
+                Result::Ok(())
             }
-            match inner.bindings_.get(&listener_key_(local_dock)) {
-                Option::Some(DockBinding_::Listener(_)) => Result::Ok(()),
-                Option::Some(_) => Result::Err(ReserveErr_::DockInUse),
-                Option::None => {
-                    inner.bindings_.insert(
-                        listener_key_(local_dock),
-                        DockBinding_::Listener(LsnCtx_::new_()),
-                    );
-                    Result::Ok(())
-                }
-            }
-        })
+        }
     }
 
     /// 解除 [`ChannelRegistry_::reserve_listener_`] 的登记；不存在时是空操作。
     ///
     /// 由 `ChannelListener` 的 `Drop` 调用。
-    pub(crate) fn release_listener_(&self, local_dock: Dock) {
-        self.with_mut_(|inner| {
-            inner.bindings_.remove(&listener_key_(local_dock));
-        })
+    pub(crate) async fn release_listener_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        inner.bindings_.remove(&listener_key_(local_dock));
+        Result::Ok(())
     }
 
     /// 在 `local_dock` 上登记**telegraph 端点身份**（`open_telegraph_async` 的登记点）。
@@ -900,28 +976,39 @@ where
     /// # Errors
     ///
     /// 该 dock 上已有其它身份 → [`ReserveErr_::DockInUse`]。
-    pub(crate) fn reserve_telegraph_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
-        self.with_mut_(|inner| {
-            if inner.bindings_.contains_key(&telegraph_key_(local_dock))
-                || inner.bindings_.contains_key(&listener_key_(local_dock))
-                || inner.has_concrete_identity_(local_dock)
-            {
-                return Result::Err(ReserveErr_::DockInUse);
-            }
-            inner
-                .bindings_
-                .insert(telegraph_key_(local_dock), DockBinding_::Telegraph(TgCtx_));
-            Result::Ok(())
-        })
+    pub(crate) async fn reserve_telegraph_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        if inner.bindings_.contains_key(&telegraph_key_(local_dock))
+            || inner.bindings_.contains_key(&listener_key_(local_dock))
+            || inner.has_concrete_identity_(local_dock)
+        {
+            return Result::Err(ReserveErr_::DockInUse);
+        }
+        inner
+            .bindings_
+            .insert(telegraph_key_(local_dock), DockBinding_::Telegraph(TgCtx_));
+        Result::Ok(())
     }
 
     /// 解除 [`ChannelRegistry_::reserve_telegraph_`] 的登记；不存在时是空操作。
     ///
     /// 由 `Telegraph` 的 `Drop` 调用。
-    pub(crate) fn release_telegraph_(&self, local_dock: Dock) {
-        self.with_mut_(|inner| {
-            inner.bindings_.remove(&telegraph_key_(local_dock));
-        })
+    pub(crate) async fn release_telegraph_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        inner.bindings_.remove(&telegraph_key_(local_dock));
+        Result::Ok(())
     }
 
     /// 与 `remote_dock` 建立过**活跃子流**的全部 `local_dock`（按 `local` 升序逐个回调）。
@@ -931,163 +1018,271 @@ where
     /// 索引守卫逃出锁外。宽限态不入索引，因此这里只反映活跃子流。
     // 仅供单元测试与后续「只知 remote_dock」的查询（telegraph 路由 / 排查）使用。
     #[allow(dead_code)]
-    pub(crate) fn for_each_local_of_remote_(&self, remote_dock: Dock, mut f: impl FnMut(Dock)) {
-        self.with_(|inner| {
-            let (start, end) = remote_range_(remote_dock);
-            for (_, local) in inner.remote_index_.range((start, end)) {
-                f(*local);
-            }
-        })
-    }
-
-    /// 登记 `local_dock` 上的入向等待者（listener 的 `income_async`）。
-    ///
-    /// 等待者挂在 listener 身份上；若该身份不存在（理论上不可达：只有活着的
-    /// `ChannelListener` 才会调用 `income_async`）则不做任何事。
-    pub(crate) fn register_inbound_waker_(&self, local_dock: Dock, waker: &Waker) {
-        self.with_mut_(|inner| {
-            if let Option::Some(DockBinding_::Listener(ctx)) =
-                inner.bindings_.get_mut(&listener_key_(local_dock))
-            {
-                ctx.inbound_waker_.register_(waker);
-            }
-        })
+    pub(crate) async fn for_each_local_of_remote_<K: TrCancellationToken>(
+        &self,
+        remote_dock: Dock,
+        mut f: impl FnMut(Dock),
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        let inner = &*guard;
+        let (start, end) = remote_range_(remote_dock);
+        for (_, local) in inner.remote_index_.range((start, end)) {
+            f(*local);
+        }
+        Result::Ok(())
     }
 
     /// 唤醒 `local_dock` 上的入向等待者（若有）；唤醒在释放锁之后进行。
-    pub(crate) fn notify_inbound_(&self, local_dock: Dock) {
-        let waker = self.with_mut_(|inner| {
-            match inner.bindings_.get_mut(&listener_key_(local_dock)) {
-                Option::Some(DockBinding_::Listener(ctx)) => ctx.inbound_waker_.take_(),
-                _ => Option::None,
-            }
-        });
-        if let Option::Some(waker) = waker {
-            waker.wake();
+    pub(crate) async fn notify_inbound_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        if let Option::Some(DockBinding_::Listener(ctx)) =
+            guard.bindings_.get_mut(&listener_key_(local_dock))
+        {
+            let _ = ctx.notify_tx_.try_send(());
         }
+        Result::Ok(())
     }
 
     /// 记下连接级失败（**首个**原因生效），唤醒两个循环的取消令牌，并唤醒所有
     /// 等待中的 API 面 future（监听者的 `income_async` 与建流的
     /// `open_channel_async`），避免它们空等一个已经死掉的循环。
-    pub(crate) fn mark_failed_(&self, err: &MuxError) {
-        let wakers = self.with_mut_(|inner| {
-            if inner.fail_.is_none() {
-                inner.fail_ = Option::Some(*err);
+    pub(crate) async fn mark_failed_<K: TrCancellationToken>(
+        &self,
+        err: &MuxError,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        // 1. 记下首个失败原因，并收集要唤醒的「建流等待者」句柄。
+        //    子流热状态有**自己的**锁，因此不能在第一把锁里取它：先把 owner 收集出来。
+        let (wakers, owners) = {
+            let mut session = self.inner_.acquire_session();
+            let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
+            if guard.fail_.is_none() {
+                guard.fail_ = Option::Some(*err);
             }
-            let mut out: Vec<Waker> = Vec::new();
-            for binding in inner.bindings_.values_mut() {
+            let wakers: Vec<Waker> = Vec::new();
+            let mut owners: Vec<ChannelOwner_<A>> = Vec::new();
+            for binding in guard.bindings_.values_mut() {
                 match binding {
                     DockBinding_::Listener(ctx) => {
-                        if let Option::Some(waker) = ctx.inbound_waker_.take_() {
-                            out.push(waker);
-                        }
+                        // 连接失败也要唤醒监听者（否则它会一直等入向）。
+                        let _ = ctx.notify_tx_.try_send(());
                     }
                     DockBinding_::Channel(ctx) => {
-                        if let Option::Some(owner) = ctx.owner_.as_ref()
-                            && let Option::Some(waker) =
-                                owner.with_mut_(|state| state.take_establish_waker_())
-                        {
-                            out.push(waker);
+                        if let Option::Some(owner) = ctx.owner_.as_ref() {
+                            owners.push(owner.clone());
                         }
                     }
                     _ => {}
                 }
             }
-            out
-        });
+            (wakers, owners)
+        };
+        // 2. 逐个通知子流热状态里的建流等待者（各自取锁，可取消）。
+        for owner in owners {
+            let _ = owner
+                .with_mut_async_(cancel.child_token(), |state| state.notify_establish_())
+                .await;
+        }
+        // 3. 唤醒监听者 + 取消两个循环。
         for waker in wakers {
             waker.wake();
         }
         self.cancel_loops_();
+        Result::Ok(())
     }
 
     /// 连接级失败的原因（若有）。
-    pub(crate) fn failure_(&self) -> Option<MuxError> {
-        self.with_(|inner| inner.fail_)
+    pub(crate) async fn failure_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<Option<MuxError>, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(guard.fail_)
     }
 
     /// 连接是否已经失败。
-    pub(crate) fn is_failed_(&self) -> bool {
-        self.with_(|inner| inner.fail_.is_some())
+    #[allow(dead_code)]
+    pub(crate) async fn is_failed_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<bool, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(guard.fail_.is_some())
     }
 
     /// 取第 `idx` 个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
+    ///
+    /// 令牌在锁外，因此本方法**不取锁**（构造路径与 `Drop` 路径都依赖这一点）。
     pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<A> {
-        self.with_(|inner| inner.loops_[idx].clone())
+        self.loops_[idx].clone()
     }
 
     /// 触发两个循环的取消令牌（连接关闭或失败时调用）。
+    ///
+    /// 令牌在锁外，因此本方法**不取锁**。
     pub(crate) fn cancel_loops_(&self) {
-        let tokens = self.with_(|inner| inner.loops_.clone());
-        for token in tokens.iter() {
+        for token in &self.loops_ {
             token.cancel_();
         }
     }
 
-    /// 持读锁执行 `f`（临界区不得 `await`、不得重入）。
-    ///
-    /// 争用时**阻塞等待**而不是自旋或 panic：见 [`TrBlockingAcquire_`]。
-    fn with_<R>(&self, f: impl FnOnce(&RegistryInner_<A>) -> R) -> R {
-        self.inner_.with_read_blocking_(f)
-    }
-
-    /// 持写锁执行 `f`（临界区不得 `await`、不得重入）。
-    ///
-    /// 争用时**阻塞等待**而不是自旋或 panic：见 [`TrBlockingAcquire_`]。
-    fn with_mut_<R>(&self, f: impl FnOnce(&mut RegistryInner_<A>) -> R) -> R {
-        self.inner_.with_write_blocking_(f)
-    }
 }
 
 #[cfg(test)]
 mod tests_ {
-    use std::{
-        collections::BTreeMap,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        task::Wake,
-        time::Duration,
-    };
-
-    use core::task::Waker;
+    use std::{collections::BTreeMap, time::Duration};
 
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
-
-use crate::{
+    use crate::{
         connection::{Dock, ReserveErr_, owner_::ChannelOwner_},
         handshake::opts::BasicOpts,
     };
 
     use super::*;
 
-    /// 计数唤醒器：统计 `wake` 被调用次数，用来断言唤醒确实发生。
-    struct CountingWake_ {
-        count_: AtomicUsize,
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // 测试用的同步壳
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    // 生产代码一律走**异步可取消**的取锁；单元测试是单线程、无争用的场景，因此这里
+    // 用「不可取消令牌 + `block_on`」把一次调用压成同步，保持测试正文的旧形状。
+
+    use futures::executor::block_on;
+    use buffex::x_deps::abs_cancel::NonCancellableToken;
+    use flume::Receiver;
+
+    /// 不可取消令牌（测试里不需要取消语义）。
+    fn nc_() -> NonCancellableToken {
+        NonCancellableToken::new()
     }
 
-    impl Wake for CountingWake_ {
-        fn wake(self: Arc<Self>) {
-            self.count_.fetch_add(1usize, Ordering::SeqCst);
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.count_.fetch_add(1usize, Ordering::SeqCst);
-        }
+    /// 把一次异步调用跑完（测试里不允许挂起）。
+    fn run_<T>(fut: impl core::future::Future<Output = T>) -> T {
+        block_on(fut)
     }
 
-    /// 造一个带计数的 `Waker`。
-    /// - 手段：把 [`CountingWake_`] 包进 `Arc` 再转成 `Waker`。
-    /// - 判断：返回的 `Waker` 每次被 `wake` 都会让计数加一。
-    fn counting_waker_() -> (Waker, Arc<CountingWake_>) {
-        let probe = Arc::new(CountingWake_ {
-            count_: AtomicUsize::new(0),
-        });
-        let waker = Waker::from(probe.clone());
-        (waker, probe)
+    impl ChannelRegistry_<CoreAlloc> {
+        fn reserve_channel_t_(&self, local_dock: Dock, remote_dock: Dock) -> Result<(), ReserveErr_> {
+            run_(self.reserve_channel_(local_dock, remote_dock, nc_()))
+        }
+
+        fn release_channel_t_(&self, local_dock: Dock, remote_dock: Dock) {
+            let _ = run_(self.release_channel_(local_dock, remote_dock, nc_()));
+        }
+
+        fn reserve_listener_t_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
+            let (notify_tx_, _notify_rx_) = flume::bounded(1usize);
+            run_(self.reserve_listener_(local_dock, notify_tx_, nc_()))
+        }
+
+        /// 登记 listener 并交回通知消费端（用于断言「入向事件确实通知了 listener」）。
+        fn reserve_listener_with_t_(&self, local_dock: Dock) -> Result<Receiver<()>, ReserveErr_> {
+            let (notify_tx_, notify_rx_) = flume::bounded(1usize);
+            run_(self.reserve_listener_(local_dock, notify_tx_, nc_()))?;
+            Result::Ok(notify_rx_)
+        }
+
+        fn reserve_telegraph_t_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
+            run_(self.reserve_telegraph_(local_dock, nc_()))
+        }
+
+        fn release_telegraph_t_(&self, local_dock: Dock) {
+            let _ = run_(self.release_telegraph_(local_dock, nc_()));
+        }
+
+        fn bind_dock_t_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
+            run_(self.bind_dock_(local_dock, nc_()))
+        }
+
+        fn unbind_dock_t_(&self, local_dock: Dock) {
+            let _ = run_(self.unbind_dock_(local_dock, nc_()));
+        }
+
+        fn is_wait_close_t_(&self, local_dock: Dock, remote_dock: Dock) -> bool {
+            run_(self.is_wait_close_(local_dock, remote_dock, nc_())).expect("测试里不该被取消")
+        }
+
+        fn attach_owner_t_(&self, local_dock: Dock, remote_dock: Dock, owner: ChannelOwner_<CoreAlloc>) -> bool {
+            run_(self.attach_owner_(local_dock, remote_dock, owner, nc_())).expect("测试里不该被取消")
+        }
+
+        fn channel_owner_t_(&self, local_dock: Dock, remote_dock: Dock) -> Option<ChannelOwner_<CoreAlloc>> {
+            run_(self.channel_owner_(local_dock, remote_dock, nc_())).expect("测试里不该被取消")
+        }
+
+        fn reserve_inbound_t_(&self, local_dock: Dock, remote_dock: Dock, report: WindowReport) -> Result<(), ReserveErr_> {
+            run_(self.reserve_inbound_(local_dock, remote_dock, report, nc_()))
+        }
+
+        fn take_pending_inbound_t_(&self, local_dock: Dock) -> Option<Dock> {
+            run_(self.take_pending_inbound_(local_dock, nc_())).expect("测试里不该被取消")
+        }
+
+        fn take_inbound_report_t_(&self, local_dock: Dock, remote_dock: Dock) -> Option<WindowReport> {
+            run_(self.take_inbound_report_(local_dock, remote_dock, nc_())).expect("测试里不该被取消")
+        }
+
+        fn max_channel_count_t_(&self) -> usize {
+            run_(self.max_channel_count_(nc_())).expect("测试里不该被取消")
+        }
+
+        fn max_dock_chan_count_t_(&self) -> usize {
+            run_(self.max_dock_chan_count_(nc_())).expect("测试里不该被取消")
+        }
+
+        fn total_channels_t_(&self) -> usize {
+            run_(self.total_channels_(nc_())).expect("测试里不该被取消")
+        }
+
+        fn mark_failed_t_(&self, err: &MuxError) {
+            let _ = run_(self.mark_failed_(err, nc_()));
+        }
+
+        fn failure_t_(&self) -> Option<MuxError> {
+            run_(self.failure_(nc_())).expect("测试里不该被取消")
+        }
+
+        fn is_failed_t_(&self) -> bool {
+            run_(self.is_failed_(nc_())).expect("测试里不该被取消")
+        }
+
+        fn for_each_local_of_remote_t_(&self, remote_dock: Dock, f: impl FnMut(Dock)) {
+            let _ = run_(self.for_each_local_of_remote_(remote_dock, f, nc_()));
+        }
+
+        fn notify_inbound_t_(&self, local_dock: Dock) {
+            let _ = run_(self.notify_inbound_(local_dock, nc_()));
+        }
+
+        /// 只读地检查是否待决（等价于旧 `has_pending_inbound_`；测试单线程，直接取快路径）。
+        fn has_pending_inbound_t_(&self, local_dock: Dock) -> bool {
+            let mut session = self.inner_.acquire_session();
+            let guard = session.try_read().expect("测试里不该争用");
+            let (start, end) = channel_range_(local_dock);
+            guard.bindings_.range((start, end)).any(|(_, binding)| {
+                matches!(
+                    binding,
+                    DockBinding_::Channel(ctx) if matches!(ctx.inbound_, Inbound_::Pending(_))
+                )
+            })
+        }
+
+        /// 持读锁执行断言（等价于旧 `with_`；测试单线程，直接取快路径）。
+        fn with_t_<R>(&self, f: impl FnOnce(&RegistryInner_<CoreAlloc>) -> R) -> R {
+            let mut session = self.inner_.acquire_session();
+            let guard = session.try_read().expect("测试里不该争用");
+            f(&guard)
+        }
     }
 
     /// 造一份「宽限期为 0」的协商结果，便于在不睡眠的前提下测到期回收。
@@ -1110,7 +1305,7 @@ use crate::{
     ///   的 `chan_count_` 等于该 local 的活跃 channel 数；每条 `WaitClose` 都能在
     ///   到期索引里找到，且二者规模相等；每条活跃 channel 都能在反向索引里找到。
     fn assert_index_consistent_(registry: &ChannelRegistry_<CoreAlloc>) {
-        registry.with_(|inner| {
+        registry.with_t_(|inner| {
             let mut active = 0usize;
             let mut wait_close = 0usize;
             let mut per_local: BTreeMap<Dock, usize> = BTreeMap::new();
@@ -1178,30 +1373,30 @@ use crate::{
             ..opts_zero_grace_()
         };
         let registry = ChannelRegistry_::new_(opts, CoreAlloc);
-        assert_eq!(registry.max_channel_count_(), 2usize);
-        assert_eq!(registry.max_dock_chan_count_(), 1usize);
+        assert_eq!(registry.max_channel_count_t_(), 2usize);
+        assert_eq!(registry.max_dock_chan_count_t_(), 1usize);
 
-        assert!(registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok());
-        assert_eq!(registry.total_channels_(), 1usize);
+        assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32)).is_ok());
+        assert_eq!(registry.total_channels_t_(), 1usize);
 
         let err = registry
-            .reserve_channel_(Dock::new(1u32), Dock::new(10u32))
+            .reserve_channel_t_(Dock::new(1u32), Dock::new(10u32))
             .unwrap_err();
         assert!(matches!(err, ReserveErr_::DockChanLimit));
-        assert!(registry.reserve_channel_(Dock::new(2u32), Dock::new(9u32)).is_ok());
+        assert!(registry.reserve_channel_t_(Dock::new(2u32), Dock::new(9u32)).is_ok());
         let err = registry
-            .reserve_channel_(Dock::new(3u32), Dock::new(9u32))
+            .reserve_channel_t_(Dock::new(3u32), Dock::new(9u32))
             .unwrap_err();
         assert!(matches!(err, ReserveErr_::ChanLimit));
 
-        registry.release_channel_(Dock::new(1u32), Dock::new(9u32));
-        assert_eq!(registry.total_channels_(), 1usize, "释放后活跃数应当回落");
+        registry.release_channel_t_(Dock::new(1u32), Dock::new(9u32));
+        assert_eq!(registry.total_channels_t_(), 1usize, "释放后活跃数应当回落");
         // 宽限期为 0，下一次访问即回收，因此同一 dock 可以重新登记。
         assert!(
-            registry.reserve_channel_(Dock::new(1u32), Dock::new(11u32)).is_ok(),
+            registry.reserve_channel_t_(Dock::new(1u32), Dock::new(11u32)).is_ok(),
             "释放配额后同一 dock 应当可以重新登记"
         );
-        assert_eq!(registry.total_channels_(), 2usize);
+        assert_eq!(registry.total_channels_t_(), 2usize);
         assert_index_consistent_(&registry);
     }
     /// 测试 telegraph 与 channel / listener 在同一个 local_dock 上互斥。
@@ -1214,11 +1409,11 @@ use crate::{
     fn telegraph_is_exclusive_on_a_dock() {
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
 
-        assert!(registry.reserve_telegraph_(Dock::new(5u32)).is_ok());
+        assert!(registry.reserve_telegraph_t_(Dock::new(5u32)).is_ok());
         assert!(
             matches!(
                 registry
-                    .reserve_channel_(Dock::new(5u32), Dock::new(9u32))
+                    .reserve_channel_t_(Dock::new(5u32), Dock::new(9u32))
                     .unwrap_err(),
                 ReserveErr_::DockInUse
             ),
@@ -1226,33 +1421,33 @@ use crate::{
         );
         assert!(
             matches!(
-                registry.reserve_listener_(Dock::new(5u32)).unwrap_err(),
+                registry.reserve_listener_t_(Dock::new(5u32)).unwrap_err(),
                 ReserveErr_::DockInUse
             ),
             "telegraph 占用的 dock 不能监听"
         );
 
-        assert!(registry.reserve_channel_(Dock::new(6u32), Dock::new(9u32)).is_ok());
+        assert!(registry.reserve_channel_t_(Dock::new(6u32), Dock::new(9u32)).is_ok());
         assert!(
             matches!(
-                registry.reserve_telegraph_(Dock::new(6u32)).unwrap_err(),
+                registry.reserve_telegraph_t_(Dock::new(6u32)).unwrap_err(),
                 ReserveErr_::DockInUse
             ),
             "已有 channel 的 dock 不能开 telegraph"
         );
 
-        assert!(registry.reserve_listener_(Dock::new(7u32)).is_ok());
+        assert!(registry.reserve_listener_t_(Dock::new(7u32)).is_ok());
         assert!(
             matches!(
-                registry.reserve_telegraph_(Dock::new(7u32)).unwrap_err(),
+                registry.reserve_telegraph_t_(Dock::new(7u32)).unwrap_err(),
                 ReserveErr_::DockInUse
             ),
             "已监听的 dock 不能开 telegraph"
         );
 
-        registry.release_telegraph_(Dock::new(5u32));
+        registry.release_telegraph_t_(Dock::new(5u32));
         assert!(
-            registry.reserve_channel_(Dock::new(5u32), Dock::new(9u32)).is_ok(),
+            registry.reserve_channel_t_(Dock::new(5u32), Dock::new(9u32)).is_ok(),
             "释放 telegraph 后该 dock 应当可用"
         );
         assert_index_consistent_(&registry);
@@ -1266,11 +1461,11 @@ use crate::{
     #[test]
     fn bindings_express_three_kinds_on_one_table() {
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
-        assert!(registry.reserve_listener_(Dock::new(1u32)).is_ok());
-        assert!(registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok());
-        assert!(registry.reserve_telegraph_(Dock::new(2u32)).is_ok());
+        assert!(registry.reserve_listener_t_(Dock::new(1u32)).is_ok());
+        assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32)).is_ok());
+        assert!(registry.reserve_telegraph_t_(Dock::new(2u32)).is_ok());
 
-        registry.with_(|inner| {
+        registry.with_t_(|inner| {
             assert!(matches!(
                 inner.bindings_.get(&(Dock::new(1u32), Dock::wildcard())),
                 Option::Some(DockBinding_::Listener(_))
@@ -1300,33 +1495,33 @@ use crate::{
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
 
         // 首次绑定成功；同一 dock 第二次绑定必须失败。
-        assert!(registry.bind_dock_(Dock::new(7u32)).is_ok());
-        let err = registry.bind_dock_(Dock::new(7u32)).unwrap_err();
+        assert!(registry.bind_dock_t_(Dock::new(7u32)).is_ok());
+        let err = registry.bind_dock_t_(Dock::new(7u32)).unwrap_err();
         assert!(
             matches!(err, ReserveErr_::DockInUse),
             "同一 dock 重复绑定应当报 DockInUse"
         );
 
         // 不同 dock 互不影响。
-        assert!(registry.bind_dock_(Dock::new(8u32)).is_ok());
+        assert!(registry.bind_dock_t_(Dock::new(8u32)).is_ok());
 
         // 绑定状态不因该 dock 上子流清零而丢失。
         assert!(
             registry
-                .reserve_channel_(Dock::new(7u32), Dock::new(3u32))
+                .reserve_channel_t_(Dock::new(7u32), Dock::new(3u32))
                 .is_ok()
         );
-        registry.release_channel_(Dock::new(7u32), Dock::new(3u32));
-        let err = registry.bind_dock_(Dock::new(7u32)).unwrap_err();
+        registry.release_channel_t_(Dock::new(7u32), Dock::new(3u32));
+        let err = registry.bind_dock_t_(Dock::new(7u32)).unwrap_err();
         assert!(
             matches!(err, ReserveErr_::DockInUse),
             "子流清零不应解除绑定"
         );
 
         // 解绑后可重新绑定。
-        registry.unbind_dock_(Dock::new(7u32));
+        registry.unbind_dock_t_(Dock::new(7u32));
         assert!(
-            registry.bind_dock_(Dock::new(7u32)).is_ok(),
+            registry.bind_dock_t_(Dock::new(7u32)).is_ok(),
             "解绑后应当可以重新绑定"
         );
     }
@@ -1337,19 +1532,18 @@ use crate::{
     #[test]
     fn notify_inbound_wakes_registered_listener_once() {
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
-        let (waker, probe) = counting_waker_();
-        assert!(registry.reserve_listener_(Dock::new(4u32)).is_ok());
+        let rx = registry
+            .reserve_listener_with_t_(Dock::new(4u32))
+            .expect("登记 listener 应当成功");
 
-        registry.register_inbound_waker_(Dock::new(4u32), &waker);
-        registry.notify_inbound_(Dock::new(4u32));
-        assert_eq!(probe.count_.load(Ordering::SeqCst), 1usize);
+        registry.notify_inbound_t_(Dock::new(4u32));
+        assert!(rx.try_recv().is_ok(), "入向事件应当通知 listener");
 
-        registry.notify_inbound_(Dock::new(4u32));
-        assert_eq!(
-            probe.count_.load(Ordering::SeqCst),
-            1usize,
-            "没有登记等待者时不应再唤醒"
-        );
+        // 容量 1：未被取走时重复投递直接失败（无害），至多留一条待取通知。
+        registry.notify_inbound_t_(Dock::new(4u32));
+        registry.notify_inbound_t_(Dock::new(4u32));
+        assert!(rx.try_recv().is_ok(), "仍能取到一条通知");
+        assert!(rx.try_recv().is_err(), "通道容量 1：不应堆积多条通知");
     }
     /// 测试同一 dock 对上的第二条并发子流被拒（dock 对即身份）。
     /// - 手段：在 `(1,9)` 上登记一次后重复登记；释放后再登记。
@@ -1357,22 +1551,22 @@ use crate::{
     #[test]
     fn duplicate_dock_pair_is_rejected() {
         let registry = ChannelRegistry_::new_(opts_zero_grace_(), CoreAlloc);
-        assert!(registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok());
+        assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32)).is_ok());
         assert_eq!(
-            registry.total_channels_(),
+            registry.total_channels_t_(),
             1usize,
             "重复登记不应计入第二条"
         );
 
         let err = registry
-            .reserve_channel_(Dock::new(1u32), Dock::new(9u32))
+            .reserve_channel_t_(Dock::new(1u32), Dock::new(9u32))
             .unwrap_err();
         assert!(matches!(err, ReserveErr_::Duplicate));
-        assert_eq!(registry.total_channels_(), 1usize);
+        assert_eq!(registry.total_channels_t_(), 1usize);
 
-        registry.release_channel_(Dock::new(1u32), Dock::new(9u32));
+        registry.release_channel_t_(Dock::new(1u32), Dock::new(9u32));
         assert!(
-            registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok(),
+            registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32)).is_ok(),
             "宽限期到期后同一 dock 对应当可以重新登记"
         );
         assert_index_consistent_(&registry);
@@ -1390,28 +1584,28 @@ use crate::{
         };
         let registry = ChannelRegistry_::new_(opts, CoreAlloc);
 
-        assert!(registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok());
-        registry.release_channel_(Dock::new(1u32), Dock::new(9u32));
+        assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32)).is_ok());
+        registry.release_channel_t_(Dock::new(1u32), Dock::new(9u32));
 
         assert!(
-            registry.is_wait_close_(Dock::new(1u32), Dock::new(9u32)),
+            registry.is_wait_close_t_(Dock::new(1u32), Dock::new(9u32)),
             "刚释放的 dock 对应当处于宽限态"
         );
         assert!(
             matches!(
                 registry
-                    .reserve_channel_(Dock::new(1u32), Dock::new(9u32))
+                    .reserve_channel_t_(Dock::new(1u32), Dock::new(9u32))
                     .unwrap_err(),
                 ReserveErr_::WaitClose
             ),
             "宽限期内不得复用同一 dock 对"
         );
         assert!(
-            registry.reserve_channel_(Dock::new(1u32), Dock::new(10u32)).is_ok(),
+            registry.reserve_channel_t_(Dock::new(1u32), Dock::new(10u32)).is_ok(),
             "宽限是 dock 对级：同一 local 上的其它 remote 不受影响"
         );
         assert!(
-            !registry.is_wait_close_(Dock::new(1u32), Dock::new(10u32)),
+            !registry.is_wait_close_t_(Dock::new(1u32), Dock::new(10u32)),
             "活跃子流不是宽限态"
         );
         assert_index_consistent_(&registry);
@@ -1423,16 +1617,16 @@ use crate::{
     #[test]
     fn wait_close_is_reaped_after_expiry() {
         let registry = ChannelRegistry_::new_(opts_zero_grace_(), CoreAlloc);
-        assert!(registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok());
-        registry.release_channel_(Dock::new(1u32), Dock::new(9u32));
+        assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32)).is_ok());
+        registry.release_channel_t_(Dock::new(1u32), Dock::new(9u32));
 
         // 宽限期为 0 ⇒ `until_ <= now`，任何一次访问都会顺带回收它。
         assert!(
-            !registry.is_wait_close_(Dock::new(1u32), Dock::new(9u32)),
+            !registry.is_wait_close_t_(Dock::new(1u32), Dock::new(9u32)),
             "已到期的宽限态应当被回收"
         );
         assert!(
-            registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok(),
+            registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32)).is_ok(),
             "回收后同一 dock 对应当可以复用"
         );
         assert_index_consistent_(&registry);
@@ -1446,31 +1640,31 @@ use crate::{
     #[test]
     fn inbound_request_is_handed_out_with_report() {
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
-        let (waker, probe) = counting_waker_();
-        assert!(registry.reserve_listener_(Dock::new(2u32)).is_ok());
-        registry.register_inbound_waker_(Dock::new(2u32), &waker);
+        let rx = registry
+            .reserve_listener_with_t_(Dock::new(2u32))
+            .expect("登记 listener 应当成功");
 
         let report = WindowReport::new(0u64, 64u32);
         assert!(
             registry
-                .reserve_inbound_(Dock::new(2u32), Dock::new(7u32), report)
+                .reserve_inbound_t_(Dock::new(2u32), Dock::new(7u32), report)
                 .is_ok()
         );
-        assert_eq!(probe.count_.load(Ordering::SeqCst), 1usize, "登记入向请求应唤醒监听者");
-        assert!(registry.has_pending_inbound_(Dock::new(2u32)));
+        assert!(rx.try_recv().is_ok(), "登记入向请求应通知监听者");
+        assert!(registry.has_pending_inbound_t_(Dock::new(2u32)));
 
         assert_eq!(
-            registry.take_pending_inbound_(Dock::new(2u32)),
+            registry.take_pending_inbound_t_(Dock::new(2u32)),
             Option::Some(Dock::new(7u32))
         );
         assert!(
-            !registry.has_pending_inbound_(Dock::new(2u32)),
+            !registry.has_pending_inbound_t_(Dock::new(2u32)),
             "取走之后不应再报告有待决请求"
         );
-        assert_eq!(registry.take_pending_inbound_(Dock::new(2u32)), Option::None);
+        assert_eq!(registry.take_pending_inbound_t_(Dock::new(2u32)), Option::None);
 
         assert_eq!(
-            registry.take_inbound_report_(Dock::new(2u32), Dock::new(7u32)),
+            registry.take_inbound_report_t_(Dock::new(2u32), Dock::new(7u32)),
             Option::Some(report)
         );
     }
@@ -1485,35 +1679,35 @@ use crate::{
     fn per_local_range_covers_only_concrete_channels() {
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
         let report = WindowReport::new(0u64, 64u32);
-        assert!(registry.reserve_listener_(Dock::new(2u32)).is_ok());
-        assert!(registry.reserve_listener_(Dock::new(3u32)).is_ok());
+        assert!(registry.reserve_listener_t_(Dock::new(2u32)).is_ok());
+        assert!(registry.reserve_listener_t_(Dock::new(3u32)).is_ok());
 
-        assert!(registry.reserve_inbound_(Dock::new(2u32), Dock::new(9u32), report).is_ok());
-        assert!(registry.reserve_inbound_(Dock::new(2u32), Dock::new(7u32), report).is_ok());
-        assert!(registry.reserve_inbound_(Dock::new(2u32), Dock::new(11u32), report).is_ok());
-        assert!(registry.reserve_inbound_(Dock::new(3u32), Dock::new(7u32), report).is_ok());
+        assert!(registry.reserve_inbound_t_(Dock::new(2u32), Dock::new(9u32), report).is_ok());
+        assert!(registry.reserve_inbound_t_(Dock::new(2u32), Dock::new(7u32), report).is_ok());
+        assert!(registry.reserve_inbound_t_(Dock::new(2u32), Dock::new(11u32), report).is_ok());
+        assert!(registry.reserve_inbound_t_(Dock::new(3u32), Dock::new(7u32), report).is_ok());
 
-        assert!(registry.has_pending_inbound_(Dock::new(2u32)));
-        assert!(registry.has_pending_inbound_(Dock::new(3u32)));
+        assert!(registry.has_pending_inbound_t_(Dock::new(2u32)));
+        assert!(registry.has_pending_inbound_t_(Dock::new(3u32)));
         // dock 1 只有 listener 身份，没有具体子流。
-        assert!(registry.reserve_listener_(Dock::new(1u32)).is_ok());
-        assert!(!registry.has_pending_inbound_(Dock::new(1u32)));
+        assert!(registry.reserve_listener_t_(Dock::new(1u32)).is_ok());
+        assert!(!registry.has_pending_inbound_t_(Dock::new(1u32)));
 
         assert_eq!(
-            registry.take_pending_inbound_(Dock::new(2u32)),
+            registry.take_pending_inbound_t_(Dock::new(2u32)),
             Option::Some(Dock::new(7u32)),
             "dock 2 上应当按 remote_dock 升序先取到 7"
         );
         assert_eq!(
-            registry.take_pending_inbound_(Dock::new(2u32)),
+            registry.take_pending_inbound_t_(Dock::new(2u32)),
             Option::Some(Dock::new(9u32))
         );
         assert_eq!(
-            registry.take_pending_inbound_(Dock::new(3u32)),
+            registry.take_pending_inbound_t_(Dock::new(3u32)),
             Option::Some(Dock::new(7u32)),
             "dock 3 自己的待决请求不应被 dock 2 的取走影响"
         );
-        assert!(!registry.has_pending_inbound_(Dock::new(3u32)));
+        assert!(!registry.has_pending_inbound_t_(Dock::new(3u32)));
         assert_index_consistent_(&registry);
     }
     /// 测试反向索引随活跃 channel 同步增删，且宽限态不入索引。
@@ -1526,9 +1720,9 @@ use crate::{
     fn remote_index_tracks_active_channels_only() {
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
 
-        assert!(registry.reserve_channel_(Dock::new(1u32), Dock::new(9u32)).is_ok());
-        assert!(registry.reserve_channel_(Dock::new(2u32), Dock::new(9u32)).is_ok());
-        assert!(registry.reserve_channel_(Dock::new(1u32), Dock::new(10u32)).is_ok());
+        assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32)).is_ok());
+        assert!(registry.reserve_channel_t_(Dock::new(2u32), Dock::new(9u32)).is_ok());
+        assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(10u32)).is_ok());
         assert_index_consistent_(&registry);
 
         assert_eq!(
@@ -1542,7 +1736,7 @@ use crate::{
         );
         assert!(collect_locals_(&registry, Dock::new(99u32)).is_empty());
 
-        registry.release_channel_(Dock::new(1u32), Dock::new(9u32));
+        registry.release_channel_t_(Dock::new(1u32), Dock::new(9u32));
         assert_eq!(
             collect_locals_(&registry, Dock::new(9u32)),
             vec![Dock::new(2u32)],
@@ -1557,7 +1751,7 @@ use crate::{
         use buffex::x_deps::abs_cancel::TrCancellationToken;
 
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
-        assert!(!registry.is_failed_());
+        assert!(!registry.is_failed_t_());
         let read_loop = registry.loop_token_(0usize);
         let write_loop = registry.loop_token_(1usize);
         assert!(
@@ -1565,17 +1759,17 @@ use crate::{
                 && !TrCancellationToken::is_cancelled(&write_loop)
         );
 
-        registry.mark_failed_(&MuxError::PeerClosed);
-        assert!(registry.is_failed_());
-        assert_eq!(registry.failure_(), Option::Some(MuxError::PeerClosed));
+        registry.mark_failed_t_(&MuxError::PeerClosed);
+        assert!(registry.is_failed_t_());
+        assert_eq!(registry.failure_t_(), Option::Some(MuxError::PeerClosed));
         assert!(
             TrCancellationToken::is_cancelled(&read_loop)
                 && TrCancellationToken::is_cancelled(&write_loop)
         );
 
-        registry.mark_failed_(&MuxError::MalformedFrame);
+        registry.mark_failed_t_(&MuxError::MalformedFrame);
         assert_eq!(
-            registry.failure_(),
+            registry.failure_t_(),
             Option::Some(MuxError::PeerClosed),
             "首个失败原因应当保留"
         );
@@ -1586,7 +1780,7 @@ use crate::{
     /// - 判断：返回的 `Vec` 就是该 remote 关联的全部 local（按回调顺序）。
     fn collect_locals_(registry: &ChannelRegistry_<CoreAlloc>, remote: Dock) -> Vec<Dock> {
         let mut out: Vec<Dock> = Vec::new();
-        registry.for_each_local_of_remote_(remote, |local| out.push(local));
+        registry.for_each_local_of_remote_t_(remote, |local| out.push(local));
         out
     }
 
@@ -1600,26 +1794,26 @@ use crate::{
     fn empty_dock_entry_is_pruned_unless_bound() {
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
 
-        assert!(registry.reserve_channel_(Dock::new(20u32), Dock::new(1u32)).is_ok());
-        registry.release_channel_(Dock::new(20u32), Dock::new(1u32));
-        registry.with_(|inner| {
+        assert!(registry.reserve_channel_t_(Dock::new(20u32), Dock::new(1u32)).is_ok());
+        registry.release_channel_t_(Dock::new(20u32), Dock::new(1u32));
+        registry.with_t_(|inner| {
             assert!(
                 !inner.docks_.contains_key(&Dock::new(20u32)),
                 "无活跃子流、未绑定的 dock 条目应当被回收"
             );
         });
 
-        assert!(registry.bind_dock_(Dock::new(21u32)).is_ok());
-        assert!(registry.reserve_channel_(Dock::new(21u32), Dock::new(1u32)).is_ok());
-        registry.release_channel_(Dock::new(21u32), Dock::new(1u32));
-        registry.with_(|inner| {
+        assert!(registry.bind_dock_t_(Dock::new(21u32)).is_ok());
+        assert!(registry.reserve_channel_t_(Dock::new(21u32), Dock::new(1u32)).is_ok());
+        registry.release_channel_t_(Dock::new(21u32), Dock::new(1u32));
+        registry.with_t_(|inner| {
             assert!(
                 inner.docks_.contains_key(&Dock::new(21u32)),
                 "绑定态是持久占用，条目不可被回收"
             );
         });
         assert!(matches!(
-            registry.bind_dock_(Dock::new(21u32)).unwrap_err(),
+            registry.bind_dock_t_(Dock::new(21u32)).unwrap_err(),
             ReserveErr_::DockInUse
         ));
     }
@@ -1632,8 +1826,8 @@ use crate::{
         use crate::flow_ctrl::{DefaultPolicy, FlowCtrl};
 
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
-        assert!(registry.reserve_channel_(Dock::new(3u32), Dock::new(8u32)).is_ok());
-        assert!(registry.channel_owner_(Dock::new(3u32), Dock::new(8u32)).is_none());
+        assert!(registry.reserve_channel_t_(Dock::new(3u32), Dock::new(8u32)).is_ok());
+        assert!(registry.channel_owner_t_(Dock::new(3u32), Dock::new(8u32)).is_none());
 
         let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
         let owner = ChannelOwner_::new_(
@@ -1643,13 +1837,18 @@ use crate::{
             ),
             CoreAlloc,
         );
-        assert!(registry.attach_owner_(Dock::new(3u32), Dock::new(8u32), owner.clone()));
+        assert!(registry.attach_owner_t_(Dock::new(3u32), Dock::new(8u32), owner.clone()));
 
         let found = registry
-            .channel_owner_(Dock::new(3u32), Dock::new(8u32))
+            .channel_owner_t_(Dock::new(3u32), Dock::new(8u32))
             .expect("挂上之后应当能查到");
-        owner.with_mut_(|state| state.set_tx_queued_(true));
-        assert!(found.with_(|state| state.tx_queued_()), "查回的应是同一个共享句柄");
+        assert!(owner.mark_tx_queued_(), "首次置位应当是 fresh");
+        assert!(
+            !found.mark_tx_queued_(),
+            "查回的应是同一个共享句柄（去重位在共享的锁外单元上）"
+        );
+        found.clear_tx_queued_();
+        assert!(owner.mark_tx_queued_(), "清位对同一份共享单元可见");
         assert_index_consistent_(&registry);
     }
 }

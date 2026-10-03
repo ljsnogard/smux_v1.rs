@@ -42,6 +42,9 @@ pub enum BindingError {
     /// 子流 / 连接已关闭（`open_channel`）。
     Closed,
 
+    /// **等锁期间被取消**（cancel token 触发）。
+    Cancelled,
+
     /// 连接级失败。
     Mux(MuxError),
 }
@@ -55,6 +58,7 @@ face_error_impls!(
     BindingError::ChanLimit => "连接上的活动子流数已达上限",
     BindingError::DockInUse => "该 local_dock 已被占用",
     BindingError::Closed => "子流 / 连接已关闭",
+    BindingError::Cancelled => "本次操作被取消",
 );
 
 /// 把注册表的预留失败映射进 binding 的错误类型。
@@ -65,6 +69,7 @@ fn map_reserve_err_(err: ReserveErr_) -> BindingError {
         ReserveErr_::WaitClose => BindingError::WaitClose,
         ReserveErr_::DockChanLimit => BindingError::DockChanLimit,
         ReserveErr_::ChanLimit => BindingError::ChanLimit,
+        ReserveErr_::Cancelled => BindingError::Cancelled,
     }
 }
 
@@ -178,7 +183,7 @@ where
 #[gen_may_cancel_future(MuxListen, pub, new(pub(crate)))]
 async fn mux_listen_async_<'f, C, S, K>(
     binding: &'f mut DockBinding<C, S>,
-    _cancel: K,
+    cancel: K,
 ) -> Result<ChannelListener<C, S>, BindingError>
 where
     C: TrConnCfg + 'f,
@@ -189,14 +194,20 @@ where
     let local = binding.local_dock_;
     // 先清空释放邮箱：上一位持有者可能刚丢弃它的 listener（Drop 只投消息），
     // 不先落实就会把「已释放」误判成「已被占用」。
-    conn.core_().reg_().drain_session_events_();
+    conn.core_()
+        .drain_session_events_(cancel.child_token())
+        .await
+        .map_err(map_reserve_err_)?;
     // 登记 listener 身份（统一身份表里的 `(local, wildcard)`）：它既是「本 dock 在
     // 监听」的事实，也是入向等待者的落点；若该 dock 已作 telegraph 会被拒。
+    // 「本 dock 上有入向事件」的通知通道：生产端进注册表，消费端进 listener。
+    // 容量 1：通知是幂等的「可能有请求」提示。
+    let (notify_tx_, notify_rx_) = flume::bounded(1usize);
     conn.core_()
-        .reg_()
-        .reserve_listener_(local)
+        .reserve_listener_(local, notify_tx_, cancel.child_token())
+        .await
         .map_err(map_reserve_err_)?;
-    Result::Ok(ChannelListener::new_(conn, local))
+    Result::Ok(ChannelListener::new_(conn, local, notify_rx_))
 }
 
 /// [`TrDockBinding::open_telegraph_async`] 的 step 函数。
@@ -206,7 +217,7 @@ where
 #[gen_may_cancel_future(MuxOpenTelegraph, pub, new(pub(crate)))]
 async fn mux_open_telegraph_async_<'f, C, S, K>(
     binding: &'f mut DockBinding<C, S>,
-    _cancel: K,
+    cancel: K,
 ) -> Result<crate::connection::Telegraph<C, S>, BindingError>
 where
     C: TrConnCfg + 'f,
@@ -216,10 +227,13 @@ where
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
     // 同 `listen_async`：先落实积压的释放消息，再认领身份。
-    conn.core_().reg_().drain_session_events_();
     conn.core_()
-        .reg_()
-        .reserve_telegraph_(local)
+        .drain_session_events_(cancel.child_token())
+        .await
+        .map_err(map_reserve_err_)?;
+    conn.core_()
+        .reserve_telegraph_(local, cancel.child_token())
+        .await
         .map_err(map_reserve_err_)?;
     Result::Ok(crate::connection::Telegraph::new_(conn, local))
 }
@@ -255,11 +269,14 @@ where
     }
     // 先落实积压的释放消息：发起方「未裁决就丢弃」的撤销（`UnreserveChannel`）与
     // 响应方的宽限登记（`ReleaseChannel`）都可能是同一条 dock 对的上一轮残留。
-    conn.core_().reg_().drain_session_events_();
+    conn.core_()
+        .drain_session_events_(cancel.child_token())
+        .await
+        .map_err(map_reserve_err_)?;
     // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）。
     conn.core_()
-        .reg_()
-        .reserve_channel_(local, remote_dock)
+        .reserve_channel_(local, remote_dock, cancel.child_token())
+        .await
         .map_err(map_reserve_err_)?;
 
     // 2. 把开场消息搬进句柄（`OPEN` 要等 `accept_async` 才发）。

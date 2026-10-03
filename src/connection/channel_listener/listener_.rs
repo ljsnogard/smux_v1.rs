@@ -3,6 +3,7 @@ use core::future::poll_fn;
 use abs_buff::{gen_may_cancel_future, x_deps::abs_cancel};
 use abs_cancel::TrCancellationToken;
 use abs_smux::conn::TrChannelListener;
+use flume::Receiver;
 use buffex::x_deps::abs_buff;
 
 use crate::connection::{
@@ -46,17 +47,27 @@ where
 
     /// 监听的 local_dock。
     local_dock_: Dock,
+
+    /// 「本 dock 上有入向事件（新请求 / 连接失败）」的通知消费端。
+    ///
+    /// 由 `listen_async` 与注册表同时建立：注册表持生产端，本对象持消费端。
+    notify_rx_: Receiver<()>,
 }
 
 impl<C, S> ChannelListener<C, S>
 where
     C: TrConnCfg,
 {
-    /// 由连接与监听 `local_dock` 构造（只允许 `listen_async` 调用）。
-    pub(crate) fn new_(conn: MuxConnection<C, S>, local_dock: Dock) -> Self {
+    /// 由连接、监听 `local_dock` 与通知消费端构造（只允许 `listen_async` 调用）。
+    pub(crate) fn new_(
+        conn: MuxConnection<C, S>,
+        local_dock: Dock,
+        notify_rx_: Receiver<()>,
+    ) -> Self {
         ChannelListener {
             conn_: conn,
             local_dock_: local_dock,
+            notify_rx_,
         }
     }
 }
@@ -122,30 +133,37 @@ where
         if cancel.is_cancelled() {
             return Result::Err(ListenerError::Cancelled);
         }
-        if let Option::Some(err) = conn.core_().reg_().failure_() {
-            return Result::Err(ListenerError::Mux(err));
+        // 1. 连接失败优先；取注册表锁是**异步且可取消**的。
+        match conn.core_().failure_(cancel.child_token()).await {
+            Result::Ok(Option::Some(err)) => return Result::Err(ListenerError::Mux(err)),
+            Result::Err(_) => return Result::Err(ListenerError::Cancelled),
+            Result::Ok(Option::None) => {}
         }
-        if let Option::Some(remote) = conn.core_().reg_().take_pending_inbound_(local) {
-            return Result::Ok(ChannelHandle::new_(conn, local, remote));
+        // 2. 有已到达的入向请求就当场取走。
+        match conn
+            .core_()
+            .take_pending_inbound_(local, cancel.child_token())
+            .await
+        {
+            Result::Ok(Option::Some(remote)) => {
+                return Result::Ok(ChannelHandle::new_(conn, local, remote));
+            }
+            Result::Err(_) => return Result::Err(ListenerError::Cancelled),
+            Result::Ok(Option::None) => {}
         }
-        // 先登记 waker，再复检一次：避免「检查完、还没登记」之间丢唤醒。
-        poll_fn(|cx| {
-            if conn.core_().reg_().has_pending_inbound_(local)
-                || conn.core_().reg_().is_failed_()
-            {
-                return core::task::Poll::Ready(());
+        // 3. 等一条通知（新请求或连接失败），与取消令牌竞争。
+        //    通道是持久的：第 1、2 步与这里之间的通知已经排在队列里，不会丢。
+        let mut notified = core::pin::pin!(listener.notify_rx_.recv_async());
+        let mut cancelled = core::pin::pin!(cancel.child_token().cancellation());
+        let got = poll_fn(|cx| {
+            if core::future::Future::poll(cancelled.as_mut(), cx).is_ready() {
+                return core::task::Poll::Ready(false);
             }
-            conn.core_()
-                .reg_()
-                .register_inbound_waker_(local, cx.waker());
-            if conn.core_().reg_().has_pending_inbound_(local)
-                || conn.core_().reg_().is_failed_()
-            {
-                core::task::Poll::Ready(())
-            } else {
-                core::task::Poll::Pending
-            }
+            core::future::Future::poll(notified.as_mut(), cx).map(|_| true)
         })
         .await;
+        if !got {
+            return Result::Err(ListenerError::Cancelled);
+        }
     }
 }
