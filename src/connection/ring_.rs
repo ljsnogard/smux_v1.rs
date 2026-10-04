@@ -13,7 +13,7 @@
 //!
 //! # 容量约束
 //!
-//! [`Ring::try_new`] 要求容量落在 `[2, MAX]` 区间内（见 buffex 的
+//! [`Ring::try_new`] 要求容量落在 `[1, MAX]` 区间内（见 buffex 的
 //! `Ring::check_buffer_size`）；容量来自调用方通过
 //! [`TrMuxConfig::channel_capacity`](crate::connection::TrMuxConfig::channel_capacity)
 //! 给出的预算，因此构建失败只会是**配置错误**，由调用方决定如何处理。

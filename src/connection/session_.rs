@@ -118,7 +118,8 @@ use mm_ptr::Owned;
 use crate::{
     connection::{
         Dock, FrameHeader, FrameKind, MuxError, TrConnCfg, flags,
-        frame_::{encode_header_into_, read_header_async_},
+        frame_::encode_header_into_,
+        frame_parser_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
         owner_::ChannelOwner_,
         ring_::{BufferedRx, BufferedTx},
@@ -544,13 +545,15 @@ pub(crate) async fn demux_loop_async_<C, K>(
             continue;
         }
 
-        // 3. 读到帧头（可能消耗环读指针，因此必须与第 2 步合起来看：环里此刻至少有
-        //    一帧的**前若干字节**，帧头解析不会因为「环空」而永久 park——外侧读泵
-        //    会继续填充；而「环满 + 解析器还需要更多字节」这条互等由容量约束排除了
-        //    （见模块文档「连接级环的硬约束」）。
+        // 3. 读到帧头。解复用一律走 `frame_parser_` 的 **sans-IO 逐字节状态机**：
+        //    它每次只向环索要 `Demand::exactly(1)`，于是 `min_len == 1` 不可能超过任何
+        //    合法环容量，旧入口「按字段索要 `width` 字节」在容量 < width 时拿到终态
+        //    `Unsatisfiable` 而整条连接失败的路径**从构造上消失**。
+        //    帧头可能消耗环读指针，因此必须与第 2 步合起来看：环里此刻至少有一帧的
+        //    **前若干字节**，帧头解析不会因为「环空」而永久 park——外侧读泵会继续填充。
         let header = match race_cancel_(
             &cancel,
-            read_header_async_::<_, _>(&mut rx_stage, cancel.child_token()),
+            frame_parser_::read_header_async_::<_, _>(&mut rx_stage, cancel.child_token()),
         )
         .await
         {

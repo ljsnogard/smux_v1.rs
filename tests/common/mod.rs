@@ -915,8 +915,8 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
 /// 场景：**拒绝接受环内存**（容量不足以建环）时连接的行为。
 ///
 /// - 目标：连接对「不合约的内存」只**拒绝接受**，不替调用方改尺寸，也不因此拆掉连接。
-/// - 手段：A 发起一条子流到 `remote_b`；B 取到待决句柄后用容量 `1` 的缓冲裁决
-///   （环的下限是 `2`），A 用正常容量的缓冲裁决；随后在**同一条连接**上再走一遍
+/// - 手段：A 发起一条子流到 `remote_b`；B 取到待决句柄后用容量 `0` 的缓冲裁决
+///   （环的下限是 `1`），A 用正常容量的缓冲裁决；随后在**同一条连接**上再走一遍
 ///   正常的建流。
 /// - 判断：B 侧裁决必须得到 [`HandleError::RingRejected`]；A 侧必须得到
 ///   [`HandleError::Refused`]（拒绝发生在发出任何帧之前，B 按角色补 `REJECT`）；
@@ -960,7 +960,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
         .await
         .expect("B 侧开始监听应当成功");
 
-    // -- 第 1 段：B 给一块容量 1 的缓冲 ⇒ 必须被拒绝。
+    // -- 第 1 段：B 给一块容量 0 的缓冲 ⇒ 必须被拒绝。
     let mut message: &[u8] = &[];
     let mut handle_a = binding_a
         .open_channel_async(remote_b, &mut message)
@@ -985,15 +985,15 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
             let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
             handle_b
                 .accept_async_closure(&mut peer_welcome, || {
-                    // 容量 1 < 环下限 2 ⇒ 连接应当拒绝这两份内存。
-                    (make_channel_buff_with_(1), make_channel_buff_with_(1))
+                    // 容量 0 < 环下限 1 ⇒ 连接应当拒绝这两份内存。
+                    (make_channel_buff_with_(0), make_channel_buff_with_(0))
                 })
                 .await
         },
     );
     assert!(
         matches!(verdict_b, Result::Err(HandleError::RingRejected)),
-        "容量不足以建环时，accept_async 必须报 RingRejected"
+        "容量 0 不足以建环时，accept_async 必须报 RingRejected"
     );
     assert!(
         matches!(verdict_a, Result::Err(HandleError::Refused)),

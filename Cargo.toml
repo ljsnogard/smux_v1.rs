@@ -38,7 +38,6 @@ default = ["test-tokio-runtime", "test-compio-runtime"]
 # 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在
 # dev-dependencies 中出现（`buffex` 已是正式依赖，不在此重复）。
 abs_art-bridge = { version = "0.2.2", default-features = false, features = ["backend-compio"] }
-compio = { version = "0.19.*", features = ["fs", "macros", "time", "net", "runtime"] }
 
 # 集成冒烟测试（tests/）用两个运行时各跑一遍同一场景，且都跑真实 UNIX socket：
 # - 两个运行时都用「调用方驱动的泵 + 全被动 buffex 环」搬运 socket 数据；
@@ -57,6 +56,7 @@ abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch =
 # 场景并发用与运行时无关的组合子（join! / join_all / select），因此只需要
 # `futures`，不需要为两个运行时各写一份并发代码。
 futures = "0.3.*"
+compio = { version = "0.19.*", features = ["fs", "macros", "time", "net", "runtime"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 
 # 冒烟测试的两个 target：**同一份场景**（`tests/smoke_common.inc`）在两个运行时下各

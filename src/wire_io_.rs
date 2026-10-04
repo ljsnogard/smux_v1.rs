@@ -76,6 +76,17 @@ where
     /// [`TrBuffRead::read_async`] 借出的段可能比请求的更长，这里只取需要的
     /// 部分，多出的字节留在底层缓冲里。
     ///
+    /// # 为什么索取粒度是「至少 1 字节」而不是「正好 `rest`」
+    ///
+    /// `buffex::ring` 在 `Demand` 的下限大于环容量时返回**终态**的
+    /// `Unsatisfiable`（见 [`ReadCursor::read_byte_async_`] 的说明）。若这里按剩余
+    /// 长度索要，则「环容量 < 本次要读的长度」会直接判连接失败——而这是**调用方注入
+    /// 的环容量**（`ConnRx`、帧暂存环），不该由一次性读取的粒度决定成败。
+    ///
+    /// 改为每次只要 1 字节起步、按底层实际给出的段长推进后，`min_len == 1` 不超过任何
+    /// 合法容量，`Unsatisfiable` 这条路径从构造上消失；语义不变（要么读满 `out`，
+    /// 要么在中途遇到读错误 / 对端关闭而失败）。
+    ///
     /// # Errors
     ///
     /// 同 [`ReadCursor::read_byte_async_`]。
@@ -93,7 +104,8 @@ where
         let mut offset = 0usize;
         while offset < out.len() {
             let rest = out.len() - offset;
-            let demand = Demand::exactly(rest);
+            // 下限只用 1：环容量再小也满足。段可能比 `rest` 更长，下面按 `rest` 截断。
+            let demand = Demand::at_least(1usize);
             let got;
             {
                 // 段只提供只读视图；消费量由 `move_items_to_buff` 提交，

@@ -347,14 +347,17 @@
 //!   [`TrConnCfg::make_stage_buffs`] 造出**两块**缓冲、[`MuxConnection::new`]
 //!   建环并切半。
 //!
-//! **连接读环的容量下限是硬约束**：它必须能整块驻留一个满帧（帧头 +
-//! `max_packet_size` 载荷），否则外侧读泵（环满而 park）与内侧解复用（还差几字节
-//! 才判得完这一帧而 park）会互等。默认实现给出的容量与「怎么按自己的
-//! `max_packet_size` 放大」见 [`K_STAGE_RING_CAPACITY`]。
+//! **两块帧暂存环都没有「必须装下整帧」的容量下限**：读侧帧头由逐字节状态机解析
+//! （`frame_parser_`，每次只要 1 字节），载荷按底层实际给出的段长分次搬入
+//! （`ReadCursor::read_async_`），写侧入环写入按空闲空间**分块**推进
+//! （`session_.rs` 的 `enqueue_frame_`）。因此容量取到环原语的下限（1 字节）也能跑通，
+//! [`K_STAGE_RING_CAPACITY`] 只是吞吐 / 时延上的选择。
 //!
-//! 连接写环**不要求**整帧空间：入环写入按环当前能给的段**分块**推进
-//! （`session_.rs` 的 `enqueue_frame_`）。这条同样来自踩过的坑——写环与传输环容量
-//! 互相钳制时，「等环形装得下整帧」可能永远不成立。
+//! 这两条**曾经**都是硬约束，成因值得记下来：只要某一侧的索取粒度是「正好要一整块」，
+//! 就会出现「外侧泵环满而 park」与「内侧还差几字节而 park」互等；写环与传输环容量互相
+//! 钳制时同理。收紧索取粒度（每次只索要 1 字节起步、按底层实际给出的段长推进）之后，
+//! 互等从构造上不再可能。`tests/inmem_mux.rs` 的 `mux_min_stage_inmem_dual_` 用 1 字节
+//! 帧暂存环钉住这一点。
 //!
 //! [`TrConnCfg::StageBuff`]: crate::connection::TrConnCfg::StageBuff
 //! [`TrConnCfg::make_stage_buffs`]: crate::connection::TrConnCfg::make_stage_buffs

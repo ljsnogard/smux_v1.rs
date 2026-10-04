@@ -68,23 +68,24 @@
 //! - 帧总长（头 + 载荷）不得超过协商出的 `max_packet_size`。校验由中心循环的读路径完成
 //!   （帧长上限来自 [`BasicOpts`](crate::handshake::opts::BasicOpts)，而本模块的
 //!   编解码入口只管子结构），超限即 [`MuxError::FrameTooLarge`]。
+//!
+//! # 本模块现在只管**编码**与字段级公共件
+//!
+//! 帧头**解析**已迁到 [`crate::connection::frame_parser_`] 的 sans-IO 逐字节状态机
+//! （原因见 `dev-notes/frame-parser-20261004-0600.md` §1：旧入口按字段索要 `width`
+//! 字节，环容量小于 `width` 时会拿到终态的 `Unsatisfiable` 而整条连接失败）。
+//! 本模块保留 `encode_header_into_`、`FieldId` / `FrameKind` / `flags` 等公共件，以及
+//! 两个状态机共用的 `decode_dock_field_`。
 
-// 本模块的实现尚未被中心循环调用（循环落地见 `dev-notes/` §11.6 第 6 步），
-// 因此这里保留 `dead_code` 允许；**第 5 步完成后必须移除本行**。
-
-use abs_buff::{
-    TrBuffRead,
-    x_deps::abs_cancel,
-};
-use abs_cancel::TrCancellationToken;
 use abs_smux::dock::TrDock;
+// 测试夹具用 `abs_buff` 的 `NonCancellableToken` 驱动解析器；非测试构建用不到。
+#[cfg(test)]
 use buffex::x_deps::abs_buff;
 
 use crate::{
     connection::{Dock, MuxError},
     flow_ctrl::{Credit, RecvTotal},
     handshake::opts::NegotiationValType as FieldValType,
-    wire_io_::{CursorError, ReadCursor},
 };
 
 /// `kind` 在帧首字节中的掩码（低 4 位）。
@@ -424,16 +425,6 @@ fn pick_val_type_(id: FieldId, value: usize) -> Option<FieldValType> {
         .find(|val_type| (*val_type as u8) >= (min as u8) && id.accepts_val_type_(*val_type))
 }
 
-/// 把大端 `width` 字节无符号数解码为 `usize`；超出 `usize` 表示范围返回 `None`。
-fn decode_value_(width: usize, bytes: &[u8]) -> Option<usize> {
-    debug_assert_eq!(width, bytes.len());
-    let mut value = 0u64;
-    for &byte in bytes {
-        value = (value << 8) | byte as u64;
-    }
-    usize::try_from(value).ok()
-}
-
 /// 编码一个字段：自描述头字节 + 大端值，使用能容纳该值的最小合法宽度。
 ///
 /// 返回字段总字节数与栈缓冲（最长 1 + 8 字节）；`None` 表示该字段不接受任何能
@@ -446,154 +437,6 @@ fn encode_field_(id: FieldId, value: usize) -> Option<([u8; 9], usize)> {
     let all = (value as u64).to_be_bytes();
     out[1..1 + width].copy_from_slice(&all[8 - width..]);
     Option::Some((out, 1 + width))
-}
-
-/// 写一个字段，值以 `usize` 给出。
-/// 把**读侧**游标错误映射为连接错误。底层载荷不在这里保留：帧层只关心
-/// 「读方向传输失败 / 对端关闭」这类可共享语义。
-fn map_read_cursor_err_<E>(err: CursorError<E, ()>) -> MuxError {
-    match err {
-        CursorError::Read(_) => MuxError::Transport { write: false },
-        CursorError::Write(()) => MuxError::Transport { write: true },
-        CursorError::PeerClosed => MuxError::PeerClosed,
-    }
-}
-
-/// 从网络读半边解析出一个帧头。
-///
-/// 先读固定首字节（`kind` + `flags`），再逐个解析自描述字段，直到
-/// `PayloadLen` 出现为止；随后由调用方按 [`FrameHeader::payload_len`] 读取载荷。
-/// 任一步失败即整帧失败（不保留部分状态）。
-///
-/// 注意：`PayloadLen` **必须**是最后一个头字段（模块文档 §帧形状）；若发送方把它
-/// 放在中间，接收方会把后续头字段当作载荷，帧随之错位——字节流上无法回退，因此
-/// 这是本格式对发送方的硬约束，而不是可以补救的解析细节。
-///
-/// # Errors
-///
-/// - 未知 / 保留的 `kind` 或字段标识、非法宽度 → [`MuxError::UnsupportedField`]；
-/// - 缺少必需字段、字段重复、字段与 `Kind` 的组合不符 → [`MuxError::MalformedFrame`]；
-/// - 底层读失败 / 对端关闭 → [`MuxError::Transport`] / [`MuxError::PeerClosed`]。
-pub(crate) async fn read_header_async_<R, K>(
-    rx: &mut R,
-    cancel: K,
-) -> Result<FrameHeader, MuxError>
-where
-    R: TrBuffRead<u8>,
-    K: TrCancellationToken,
-{
-    let mut cursor = ReadCursor::new_(rx);
-
-    // 1. 固定首字节：`kind` 与 `flags`。
-    let head = cursor
-        .read_byte_async_(cancel.child_token())
-        .await
-        .map_err(map_read_cursor_err_)?;
-    let kind = FrameKind::try_from(head).map_err(|_| MuxError::UnsupportedField)?;
-    let flags = flags_from_frame_head_(head);
-
-    // 2. 自描述字段序列，直到 `PayloadLen` 收尾。
-    let mut local_dock: Option<Dock> = Option::None;
-    let mut remote_dock: Option<Dock> = Option::None;
-    let mut recv_window: Option<Credit> = Option::None;
-    let mut recv_total: Option<RecvTotal> = Option::None;
-    let mut reason_seen = false;
-
-    let payload_len = loop {
-        let header = cursor
-            .read_byte_async_(cancel.child_token())
-            .await
-            .map_err(map_read_cursor_err_)?;
-        let id = FieldId::from_header_(header).ok_or(MuxError::UnsupportedField)?;
-        let val_type =
-            FieldValType::try_from(header).map_err(|_| MuxError::UnsupportedField)?;
-        if !id.accepts_val_type_(val_type) {
-            return Result::Err(MuxError::UnsupportedField);
-        }
-
-        // 值宽度由自描述字节给出，最多 8 字节；先读进栈缓冲再解码。
-        let width = val_type.value_len();
-        let mut raw = [0u8; 8];
-        cursor
-            .read_async_(&mut raw[..width], cancel.child_token())
-            .await
-            .map_err(map_read_cursor_err_)?;
-        let value = decode_value_(width, &raw[..width]).ok_or(MuxError::MalformedFrame)?;
-
-        match id {
-            FieldId::LocalDock => {
-                if local_dock.is_some() {
-                    return Result::Err(MuxError::MalformedFrame);
-                }
-                local_dock = Option::Some(decode_dock_(value).map_err(map_dock_decode_)?);
-            }
-            FieldId::RemoteDock => {
-                if remote_dock.is_some() {
-                    return Result::Err(MuxError::MalformedFrame);
-                }
-                remote_dock = Option::Some(decode_dock_(value).map_err(map_dock_decode_)?);
-            }
-            FieldId::RecvWindow => {
-                if recv_window.is_some() {
-                    return Result::Err(MuxError::MalformedFrame);
-                }
-                recv_window =
-                    Option::Some(Credit::try_from(value).map_err(|_| MuxError::MalformedFrame)?);
-            }
-            FieldId::RecvTotal => {
-                if recv_total.is_some() {
-                    return Result::Err(MuxError::MalformedFrame);
-                }
-                // 累计字节数是 `u64`：`usize` 只有 32 位时也容得下 `u32` 以上的取值。
-                recv_total = Option::Some(value as RecvTotal);
-            }
-            FieldId::ReasonCode => {
-                if reason_seen {
-                    return Result::Err(MuxError::MalformedFrame);
-                }
-                // 只校验取值域，不保存：拒绝理由由 `REJECT` 的载荷承载（模块文档）。
-                if u8::try_from(value).is_err() {
-                    return Result::Err(MuxError::MalformedFrame);
-                }
-                reason_seen = true;
-            }
-            FieldId::PayloadLen => break value,
-        }
-    };
-
-    // 3. 字段与 `Kind` 的组合校验：本版本的帧都是子流作用域，dock 对一律必需。
-    let (local_dock, remote_dock) = match (local_dock, remote_dock) {
-        (Option::Some(local), Option::Some(remote)) => (local, remote),
-        _ => return Result::Err(MuxError::MalformedFrame),
-    };
-
-    // 窗口通告（`RecvWindow` + `RecvTotal` 两个字段）只在 OPEN / PULSE /
-    // WINDOW_UPDATE 上出现，且必须成对齐全；其余帧上一律禁止。
-    match (requires_window_report_(kind), recv_window, recv_total) {
-        (true, Option::Some(_), Option::Some(_)) | (false, Option::None, Option::None) => {}
-        _ => return Result::Err(MuxError::MalformedFrame),
-    }
-
-    if reason_seen && kind != FrameKind::Reject {
-        return Result::Err(MuxError::MalformedFrame);
-    }
-
-    // `TOTAL_RESET` 只对窗口通告有意义，且 OPEN 时还没有 epoch。
-    if flags & flags::K_TOTAL_RESET != 0
-        && !matches!(kind, FrameKind::Pulse | FrameKind::WindowUpdate)
-    {
-        return Result::Err(MuxError::MalformedFrame);
-    }
-
-    Result::Ok(FrameHeader {
-        kind_: kind,
-        flags_: flags,
-        local_dock_: local_dock,
-        remote_dock_: remote_dock,
-        payload_len_: payload_len,
-        recv_window_: recv_window,
-        recv_total_: recv_total,
-    })
 }
 
 /// dock 字段解析失败的原因（载荷无关，便于调用点映射到自己的错误类型）。
@@ -780,13 +623,22 @@ mod tests_ {
     }
 
     /// 从 `bytes` 读出一个帧头，失败时返回错误的协议层种类。
-    /// - 手段：用切片实现 [`TrBuffRead`]，把 [`MuxError`] 折叠为 [`ErrKind`]。
+    /// - 手段：用切片实现 [`TrBuffRead`]，交给**连接实际使用的**逐字节状态机
+    ///   （[`crate::connection::frame_parser_::read_header_async_`]），把 [`MuxError`]
+    ///   折叠为 [`ErrKind`]。
     /// - 判断：`Ok` 为解析出的帧头；`Err` 为被测代码报出的错误种类。
+    ///
+    /// 本模块原先自带一个「按字段索要 `width` 字节」的解析器；切换解复用路径后它已删除，
+    /// 整套用例（字段组合、重复字段、保留 dock、`ReasonCode` 位置、乱序字段、逐字节边界）
+    /// 直接压在实际使用的状态机上。
     async fn read_header_from_buf_(bytes: &[u8]) -> Result<FrameHeader, ErrKind> {
         let mut probe: &[u8] = bytes;
-        read_header_async_::<_, _>(&mut probe, NonCancellableToken::new())
-            .await
-            .map_err(err_kind_)
+        crate::connection::frame_parser_::read_header_async_::<_, _>(
+            &mut probe,
+            NonCancellableToken::new(),
+        )
+        .await
+        .map_err(err_kind_)
     }
 
     /// 读一个帧头并只取错误，便于对失败原因做断言。
@@ -1320,20 +1172,23 @@ mod tests_ {
     }
     dual_runtime_test_!(payload_len_terminates_the_header);
 
-    /// 测试帧中途截断时如实上报底层读错误，而不是解析出一半成功。
+    /// 测试帧中途截断时如实上报错误，而不是解析出一半成功。
     /// - 手段：给空缓冲，以及「`LocalDock` 头字节之后缺值字节」两种截断输入。
-    /// - 判断：两种情况都返回错误（切片夹具把「读不够」表现为底层读错误，
-    ///   因此这里断言 [`ErrKind::Rx`]）。
-    async fn truncated_header_reports_read_error() {
+    /// - 判断：两种情况都**必须报错**（不允许把半截头当成成功）。具体种类是
+    ///   [`ErrKind::PeerClosed`]：字节流在帧头读完之前就结束了，逐字节状态机把它
+    ///   归为「对端关闭」——这是切到新解析器后的**有意细化**，旧实现把所有读侧错误
+    ///   一律折成读方向传输错误（[`ErrKind::Rx`]）。真正的传输故障仍映射到 `Rx`
+    ///   （见 `err_kind_`），只是切片夹具表现不出那种情形。
+    async fn truncated_header_is_not_a_partial_success() {
         assert_eq!(
             read_err_(&[]).await,
-            Option::Some(ErrKind::Rx)
+            Option::Some(ErrKind::PeerClosed)
         );
         // 0x00 只声明了 LocalDock 的字段头，值字节缺失。
         assert_eq!(
             read_err_(&[0x05u8, 0x00]).await,
-            Option::Some(ErrKind::Rx)
+            Option::Some(ErrKind::PeerClosed)
         );
     }
-    dual_runtime_test_!(truncated_header_reports_read_error);
+    dual_runtime_test_!(truncated_header_is_not_a_partial_success);
 }
