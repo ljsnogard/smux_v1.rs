@@ -1,4 +1,4 @@
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 // `BTreeMap` / `BTreeSet` 的分配器参数（`new_in`）另有独立 feature 门；注册表的三张
 // 索引表都要用它指定分配器，因此与 `allocator_api` 一并打开。
 #![feature(btreemap_alloc)]

@@ -476,6 +476,7 @@ mod config_;
 mod dock_binding;
 mod error_;
 mod frame_;
+mod frame_parser_;
 mod mux_connection;
 mod owner_;
 pub(crate) mod ring_;

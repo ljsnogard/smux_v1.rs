@@ -517,7 +517,7 @@ mod tests_ {
     ///   仍为假；关闭消费端后两个半边的 `is_rx_closed` 也变为真——证明两个方向
     ///   互不影响、且状态由环共享。
     async fn close_flags_track_both_ends_independently() {
-        let (tx, rx) = make_halves_();
+        let (mut tx, mut rx) = make_halves_();
 
         assert!(!tx.is_tx_closed());
         assert!(!tx.is_rx_closed());

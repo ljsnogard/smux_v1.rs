@@ -627,6 +627,19 @@ fn map_dock_decode_(err: DockDecode_) -> MuxError {
     }
 }
 
+/// 把一个已解码的 dock 字段数值收窄为 [`Dock`]，并做与帧头解析一致的校验。
+///
+/// 本函数是 `frame_parser_` 的逐字节状态机与旧入口 [`read_header_async_`] 共用的
+/// **唯一** dock 校验出处：两处都不再各写一份「保留值 / 超宽」判断，避免它们漂移。
+///
+/// # Errors
+///
+/// - 数值超出 `u32` → [`MuxError::MalformedFrame`]；
+/// - 取到保留值（`wildcard` / `unspecified`）→ [`MuxError::ReservedDock`]。
+pub(crate) fn decode_dock_field_(value: usize) -> Result<Dock, MuxError> {
+    decode_dock_(value).map_err(map_dock_decode_)
+}
+
 /// 该帧种类是否必需携带接收窗口通告（`RecvWindow` + `RecvTotal` 两个字段）。
 pub(crate) const fn requires_window_report_(kind: FrameKind) -> bool {
     matches!(
