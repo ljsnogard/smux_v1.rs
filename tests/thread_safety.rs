@@ -146,7 +146,7 @@ fn mux_bind_cross_thread_is_exclusive_compio_() {
     let rt = compio::runtime::Runtime::new().expect("compio 运行时应当创建成功");
     let (conn_a, _conn_b) =
         rt.block_on(common::connect_pair_::<SmokeCfg_, SmokeCfg_, _, _, _, _, _>(
-            &scope, a_rx, a_tx, b_rx, b_tx,
+            &scope, a_tx, a_rx, b_tx, b_rx,
         ));
 
     for round in 0..K_RACE_ROUNDS {
@@ -236,7 +236,7 @@ fn mux_rebind_after_cross_thread_drop_compio_() {
     let rt = compio::runtime::Runtime::new().expect("compio 运行时应当创建成功");
     let (conn_a, _conn_b) =
         rt.block_on(common::connect_pair_::<SmokeCfg_, SmokeCfg_, _, _, _, _, _>(
-            &scope, a_rx, a_tx, b_rx, b_tx,
+            &scope, a_tx, a_rx, b_tx, b_rx,
         ));
 
     let dock = Dock::new(K_FIRST_DOCK);

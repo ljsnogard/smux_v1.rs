@@ -228,8 +228,10 @@ where
     }
 
     /// **由 `MuxConnection` 管理内存的 `accept` 路径**：不需要调用方实现
-    /// `TrPrepareChannelRing`，连接按 [`TrConnCfg::RING_CAPACITY`] 从自身分配器申请
-    /// 两块缓冲，具体类型由 `C::Buff` 决定。
+    /// `TrPrepareChannelRing`，连接按调用方给出的 `ring_cap` 从自身分配器申请两块缓冲，
+    /// 具体类型由 `C::Buff` 决定。欢迎消息也要由调用方给（不需要就传一个空切片）。
+    ///
+    /// 连「空欢迎消息 + 缺省容量」都不想写时用 [`Self::accept_async_default`]。
     pub async fn accept_async_managed<'f, W>(
         &'f mut self,
         welcome: &'f mut W,
@@ -258,6 +260,30 @@ where
             );
         }
         MuxAcceptAsync::new(self, welcome, accept_result).await
+    }
+
+    /// **`accept` 的省事形式**：空欢迎消息 + [`TrConnCfg::RING_CAPACITY`] 缺省容量。
+    ///
+    /// 等价于 `self.accept_async_managed(&mut [], <C as TrConnCfg>::RING_CAPACITY)`。
+    ///
+    /// # 为什么不直接叫 `accept_async`
+    ///
+    /// [`TrChannelHandle::accept_async`]（`abs_smux` 的 trait 方法）已经占了这个名字，
+    /// 而且**收两个参数**（欢迎消息 + 环准备策略）。在 `ChannelHandle` 上再加一个同名的
+    /// 固有方法会把 trait 方法**遮蔽**掉——它就只能用全限定语法调用，泛型下游代码
+    /// （`handle.accept_async(&mut w, prep)`）会直接编不过。因此这里另起一个名字，
+    /// 与同族的 [`Self::accept_async_managed`] / [`Self::accept_async_closure`] 保持
+    /// 同样的「加后缀」惯例。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Self::accept_async_managed`] 相同。
+    pub async fn accept_async_default(
+        &mut self,
+    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError> {
+        let ring_cap = <C as TrConnCfg>::RING_CAPACITY;
+        let mut empty: &mut [u8] = &mut [];
+        self.accept_async_managed(&mut empty, ring_cap).await
     }
 }
 

@@ -37,7 +37,10 @@ use abs_buff::{
 };
 use abs_smux::chan::{TrChannelHalf, TrChannelRx, TrChannelTx};
 use anylr::SomeOf;
-use buffex::x_deps::abs_buff;
+use buffex::{
+    ring::{ConsumerError, ProducerError},
+    x_deps::abs_buff,
+};
 
 use crate::{
     connection::{
@@ -126,6 +129,56 @@ where
                     local_dock: self.local_dock_,
                     remote_dock: self.remote_dock_});
         }
+    }
+
+    /// 把 `bytes` 全部写进发送环。
+    ///
+    /// 段级循环的省事封装：借一段、能写多少写多少、段 drop 时按写入量提交，直到写完。
+    /// 每次只按「至少 1 字节」索要，因此**与子流环容量无关**——写多大的字节串都行，
+    /// 环小就多借几次。
+    ///
+    /// # 取消
+    ///
+    /// 这是一个普通 `async fn`：**丢弃它就等于取消**。环的 park future 在 drop 时撤回
+    /// 登记，因此不会留下悬挂的等待者。
+    ///
+    /// # Errors
+    ///
+    /// 发送方向已关闭（[_Closing_](ProducerError::Closing)）或底层写失败时返回错误；
+    /// 已经写出去的部分**不会回滚**。
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// tx.write_all(b"hello").await?;
+    /// drop(tx);   // 半关闭：对端读到 EOF
+    /// ```
+    pub async fn write_all(&mut self, bytes: &[u8]) -> Result<(), ProducerError<usize>> {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            // 下限只用 1：环容量再小也满足（见 `wire_io_` 同款说明）。
+            let demand = Demand::at_least(1usize);
+            let mut outcome = TrBuffWrite::write_async(self, &demand).await;
+            let put = match outcome.as_mut().pick_left() {
+                Option::Some(segm) => {
+                    segm.as_segm_mut().clone_items_from_buff(&bytes[offset..])
+                }
+                Option::None => {
+                    return Result::Err(match outcome.pick_right() {
+                        Option::Some(err) => err,
+                        // 既没有段也没有错误：环已不可用。
+                        Option::None => ProducerError::Closing,
+                    });
+                }
+            };
+            // 借出的段至少有一格空闲，而 `bytes[offset..]` 非空，因此 `put >= 1`。
+            debug_assert!(put > 0usize, "借出的空段不可能写进 0 字节");
+            if put == 0usize {
+                return Result::Err(ProducerError::Closing);
+            }
+            offset += put;
+        }
+        Result::Ok(())
     }
 }
 
@@ -274,6 +327,60 @@ where
                     remote_dock: self.remote_dock_,
                     amount_: amount});
         }
+    }
+
+    /// 从接收环读满 `out`。
+    ///
+    /// 与 [`ChannelTx::write_all`] 对称：段级循环的省事封装，每次只按「至少 1 字节」
+    /// 索要，因此**与子流环容量无关**——要读多大都行，环小就多借几次。
+    ///
+    /// # 取消
+    ///
+    /// 同 [`ChannelTx::write_all`]：丢弃 future 即取消。
+    ///
+    /// # Errors
+    ///
+    /// 对端已半关闭（[_Closing_](ConsumerError::Closing)，即读到 EOF）或底层读失败时
+    /// 返回错误；**已经读到的部分不会回滚**，因此调用方可以按已填充的前缀处理。
+    pub async fn read_exact(&mut self, out: &mut [u8]) -> Result<(), ConsumerError<usize>> {
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let rest = out.len() - offset;
+            let demand = Demand::at_least(1usize);
+            let mut outcome = TrBuffRead::read_async(self, &demand).await;
+            let got = match outcome.as_mut().pick_left() {
+                Option::Some(segm) => {
+                    let mut child = segm.as_segm_ref();
+                    let limit = core::cmp::min(rest, child.least_count());
+                    let dst = &mut out[offset..offset + limit];
+                    // SAFETY: `MaybeUninit<u8>` 与 `u8` 布局相同（同尺寸、同对齐、
+                    // 无 niche），且 `dst` 是本函数独占的可写切片；
+                    // `move_items_to_buff` 只写入其中已初始化的前缀并返回写入长度，
+                    // 因此不会读到未初始化内存，也不会越界。
+                    let uninit = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            dst.as_mut_ptr() as *mut core::mem::MaybeUninit<u8>,
+                            dst.len(),
+                        )
+                    };
+                    unsafe { child.move_items_to_buff(uninit) }
+                }
+                Option::None => {
+                    return Result::Err(match outcome.pick_right() {
+                        Option::Some(err) => err,
+                        // 既没有段也没有错误：环已不可用。
+                        Option::None => ConsumerError::Closing,
+                    });
+                }
+            };
+            // 借出的段至少有 1 个字节可读，因此 `got >= 1`。
+            debug_assert!(got > 0usize, "有数据的段不可能搬出 0 字节");
+            if got == 0usize {
+                return Result::Err(ConsumerError::Closing);
+            }
+            offset += got;
+        }
+        Result::Ok(())
     }
 }
 

@@ -476,6 +476,7 @@ mod channel_handle;
 mod channel_half;
 mod channel_listener;
 mod config_;
+mod connect_;
 mod dock_binding;
 mod error_;
 mod frame_;

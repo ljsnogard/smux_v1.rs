@@ -28,8 +28,8 @@ use crate::common;
 /// 场景本体与断言完全共用。
 #[cfg(feature = "test-tokio-runtime")]
 pub async fn smoke_socket_body_(scope: &abs_art_tokio::LocalScope) {
-    common::run_socket_scenario_on_runtime_(scope, |a_rx, a_tx, b_rx, b_tx| async move {
-        common::run_smoke_scenario_(scope, a_rx, a_tx, b_rx, b_tx).await;
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_smoke_scenario_(scope, a_tx, a_rx, b_tx, b_rx).await;
     })
     .await;
 }
@@ -37,8 +37,8 @@ pub async fn smoke_socket_body_(scope: &abs_art_tokio::LocalScope) {
 /// 见 tokio 版说明。
 #[cfg(not(feature = "test-tokio-runtime"))]
 pub async fn smoke_socket_body_(scope: &abs_art_compio::LocalScope) {
-    common::run_socket_scenario_on_runtime_(scope, |a_rx, a_tx, b_rx, b_tx| async move {
-        common::run_smoke_scenario_(scope, a_rx, a_tx, b_rx, b_tx).await;
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_smoke_scenario_(scope, a_tx, a_rx, b_tx, b_rx).await;
     })
     .await;
 }
@@ -51,8 +51,8 @@ pub async fn smoke_socket_body_(scope: &abs_art_compio::LocalScope) {
 /// - 判断：4 条子流的 open / accept / 双向收发 / 半关闭全部成功；失败即 panic。
 #[cfg(feature = "test-tokio-runtime")]
 pub async fn small_socket_body_(scope: &abs_art_tokio::LocalScope) {
-    common::run_socket_scenario_on_runtime_(scope, |a_rx, a_tx, b_rx, b_tx| async move {
-        common::run_small_mux_scenario_(scope, a_rx, a_tx, b_rx, b_tx).await;
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_small_mux_scenario_(scope, a_tx, a_rx, b_tx, b_rx).await;
     })
     .await;
 }
@@ -60,8 +60,8 @@ pub async fn small_socket_body_(scope: &abs_art_tokio::LocalScope) {
 /// 见 tokio 版说明。
 #[cfg(not(feature = "test-tokio-runtime"))]
 pub async fn small_socket_body_(scope: &abs_art_compio::LocalScope) {
-    common::run_socket_scenario_on_runtime_(scope, |a_rx, a_tx, b_rx, b_tx| async move {
-        common::run_small_mux_scenario_(scope, a_rx, a_tx, b_rx, b_tx).await;
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_small_mux_scenario_(scope, a_tx, a_rx, b_tx, b_rx).await;
     })
     .await;
 }

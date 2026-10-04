@@ -31,7 +31,7 @@ use core::{
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use abs_smux::conf::TrMuxConfig;
-use mm_ptr::x_deps::abs_mm::CoreAlloc;
+use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
 
 use crate::{
     connection::{Dock, MuxChanBuff},
@@ -127,16 +127,62 @@ where
         &self,
         alloc: Self::Alloc,
     ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError>;
+
+    /// 子流环的**缺省容量**：`accept` 那条「连接替你管内存」的省事路径用它。
+    ///
+    /// 它只是省事路径的缺省值，不是协议或实现的下限——子流环容量本身由调用方逐条
+    /// 决定（[`Self::make_ring_buffs`] 收的就是逐条传进来的容量），本项给默认值，
+    /// 因此实现者不必关心它。
+    const RING_CAPACITY: usize = K_DEFAULT_CHANNEL_RING_CAPACITY;
 }
 
+/// [`TrConnCfg::RING_CAPACITY`] 的缺省值：4 KiB。
+///
+/// 取这个值的理由与「子流环是逐条可调的」这件事无关——它只是「调用方没说要多大时
+/// 给一个够用的数」；想逐条控制的调用方走 `accept_async_managed(.., cap)` 或自己实现
+/// [`TrPrepareChannelRing`](abs_smux::chan::TrPrepareChannelRing)。
+pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
+
 /// 默认配置：`u8` 数据、[`Dock`] dock、[`CoreAlloc`] 分配、[`DefaultPolicy`]
-/// 流控，环存储用把分配器擦除掉的 [`MuxChanBuff`]。
-#[derive(Clone, Copy, Debug)]
+/// 流控；**帧暂存**用不经类型擦除的 [`Owned`]，**子流环**用把分配器擦除掉的
+/// [`MuxChanBuff`]（`accept_async_managed` 那条路要求缓冲类型与调用方给出的分配器
+/// 无关）。
+///
+/// # 为什么两块缓冲用不同的类型
+///
+/// [`MuxConnection::new`] 要求 `C::StageBuff: Send + Sync`（帧暂存环的存储会在建连时
+/// 被搬进循环），而 [`MuxChanBuff`] 内部持有裸指针、没有这两个 impl。帧暂存的分配器
+/// 本就是配置自己定的（[`CoreAlloc`]），用 [`Owned`] 既满足约束又不必引入新的
+/// `unsafe impl`；子流环则需要「分配器擦除」这一点，那条路不要求 `Send + Sync`。
+///
+/// [`MuxConnection::new`]: crate::connection::MuxConnection::new
 pub struct DefaultConnCfg<W, R, P = DefaultPolicy> {
     policy_: P,
     /// 连接侧两条半边的类型占位（它们只以类型形式参与）。
     _use_w_: PhantomData<fn() -> W>,
     _use_r_: PhantomData<fn() -> R>,
+}
+
+// `Clone` / `Copy` / `Debug` **手写**：结构里只有 `PhantomData` 与策略值，不该给
+// `W` / `R` 加上这些约束（环半部既不 `Clone` 也不 `Debug`）。
+impl<W, R, P: Clone> Clone for DefaultConnCfg<W, R, P> {
+    fn clone(&self) -> Self {
+        DefaultConnCfg {
+            policy_: self.policy_.clone(),
+            _use_w_: PhantomData,
+            _use_r_: PhantomData,
+        }
+    }
+}
+
+impl<W, R, P: Copy> Copy for DefaultConnCfg<W, R, P> {}
+
+impl<W, R, P: core::fmt::Debug> core::fmt::Debug for DefaultConnCfg<W, R, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DefaultConnCfg")
+            .field("policy_", &self.policy_)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<W, R, P> DefaultConnCfg<W, R, P>
@@ -181,7 +227,7 @@ where
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
-    type StageBuff = MuxChanBuff;
+    type StageBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
@@ -203,7 +249,9 @@ where
         &self,
         alloc: Self::Alloc,
     ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        MuxChanBuff::pair_from_alloc_(alloc, K_STAGE_RING_CAPACITY)
-            .map_err(|_| BuffAllocError)
+        let cap = K_STAGE_RING_CAPACITY;
+        let read = Owned::try_new_uninit_slice(cap, alloc).map_err(|_| BuffAllocError)?;
+        let write = Owned::try_new_uninit_slice(cap, alloc).map_err(|_| BuffAllocError)?;
+        Result::Ok((read, write))
     }
 }

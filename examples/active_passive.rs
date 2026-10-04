@@ -1,0 +1,255 @@
+//! README §2 那两段示例代码的落地：**主动端**与**被动端**各跑一遍，走完整链路。
+//!
+//! ```text
+//! UNIX socket 对 ──┬── 主动端：invite → bind → open   → accept → write_all → 半关闭
+//!                  └── 被动端：listen → bind → listen → income → accept → read_exact
+//! ```
+//!
+//! # 本文件唯一允许感知后端的地方
+//!
+//! `MuxConnection` 只吃 `abs_buff` 的两条半边（`TrBuffRead` / `TrBuffWrite`），**不认识
+//! 任何具体运行时**。把 tokio 的 `UnixStream` 变成这两条半边——设备级适配 + 两条全被动
+//! 环 + 两条调用方驱动的泵——是后端相关的活，因此放在本文件里（`transport_` 与两个泵），
+//! 与 `abs_art-demo` 的「业务库零改动、二进制负责选后端」是同一个分工。
+//!
+//! 运行：`cargo run --example active_passive`
+
+use core::mem::MaybeUninit;
+
+use abs_art::TrLocalScope;
+use abs_art_tokio::LocalScope;
+use abs_smux::conn::{TrChannelListener, TrConnection, TrDockBinding};
+use buffex::{
+    ring::{Ring, RingReader, RingWriter},
+    x_deps::abs_buff::{
+        Demand, TrBuffRead, TrBuffWrite,
+        buffer::{TrBuffSegmMut, TrBuffSegmRef},
+        io::{TrInput, TrOutput},
+    },
+};
+use buffex_tokio_adapt::x_deps::abs_buff_tokio_adapt::{ReadAsInput, WriteAsOutput};
+use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
+use smux_v1::connection::{DefaultConnCfg, Dock, MuxConnection};
+use smux_v1::handshake::{
+    agent::{AcceptAllEntries, HandshakeAgent},
+    opts::BasicOpts,
+};
+use tokio::net::UnixStream;
+
+/// 全被动环的存储类型（连接级帧暂存也用它）。
+type Buf = Owned<[MaybeUninit<u8>], CoreAlloc>;
+/// 交给 smux 当 `Tx` 的写半边。
+type Tx = RingWriter<Shared<Ring<Buf, u8>, CoreAlloc>, Buf, u8>;
+/// 交给 smux 当 `Rx` 的读半边。
+type Rx = RingReader<Shared<Ring<Buf, u8>, CoreAlloc>, Buf, u8>;
+
+/// 传输环容量：只在吞吐上有意义，取多大都不影响正确性。
+const K_RING_CAP: usize = 64usize * 1024usize;
+/// 单次从 socket 搬进环的分块上限。
+const K_PUMP_CHUNK: usize = 4096usize;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (socket_a, socket_b) = UnixStream::pair()?;
+    let scope = LocalScope::new();
+
+    // -- 传输装配：每端两个全被动环，四个半部按「谁贴 socket、谁贴 smux」分派。
+    //    两个泵与场景在同一个任务里轮询，因此不需要 `Send`／`'static`。
+    let (mut rd_a, mut wr_a) = socket_a.into_split();
+    let (mut rd_b, mut wr_b) = socket_b.into_split();
+    let (a_in_tx, a_rx) = passive_ring_();
+    let (a_tx, a_out_rx) = passive_ring_();
+    let (b_in_tx, b_rx) = passive_ring_();
+    let (b_tx, b_out_rx) = passive_ring_();
+
+    let scenario = async {
+        let (a, b) = futures::join!(active(&scope, a_rx, a_tx), passive(&scope, b_rx, b_tx));
+        // 两个连接交回这里保管：**drop 连接 = 拆连接**，四个循环会随之收尾，
+        // 因此发送方必须把连接活到「数据真的上网」为止。
+        let (conn_a, conn_b) = (a?, b?);
+        drop((conn_a, conn_b));
+        Result::<(), Box<dyn std::error::Error>>::Ok(())
+    };
+    let pumps = async {
+        futures::join!(
+            pump_input_(ReadAsInput::new(&mut rd_a), a_in_tx),
+            pump_output_(a_out_rx, WriteAsOutput::new(&mut wr_a)),
+            pump_input_(ReadAsInput::new(&mut rd_b), b_in_tx),
+            pump_output_(b_out_rx, WriteAsOutput::new(&mut wr_b)),
+        )
+    };
+
+    // 场景跑完就丢掉泵（相当于关闭传输）：两边都不再需要它。
+    futures::pin_mut!(scenario);
+    futures::pin_mut!(pumps);
+    scope
+        .run_until(async {
+            match futures::future::select(scenario, pumps).await {
+                futures::future::Either::Left((res, _pumps)) => res,
+                // 四个泵全部退出 ⇒ 场景没能跑完。
+                futures::future::Either::Right((_pump_outs, _scenario)) => {
+                    Result::Err("传输泵在场景完成之前全部退出".into())
+                }
+            }
+        })
+        .await
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 主动端 / 被动端：与 README §2 的两段代码逐行对应
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// **主动端**：连上去，开一条子流，发消息，半关闭。
+async fn active(
+    scope: &LocalScope,
+    rx: Rx,
+    tx: Tx,
+) -> Result<MuxConnection<DefaultConnCfg<Tx, Rx>, LocalScope>, Box<dyn std::error::Error>> {
+    // ① 握手
+    let delivery = HandshakeAgent::new(tx, rx)
+        .invite_async(&BasicOpts::default(), AcceptAllEntries)
+        .await?;
+
+    // ② 建连接：需要环境提供一个 LocalScope。
+    let conn = MuxConnection::from_delivery(scope, delivery)?;
+
+    let local_dock = Dock::new(0x2001);
+    let remote_dock = Dock::new(1);
+    let mut binding = conn.bind_async(local_dock).await?;
+
+    let mut invitation: &[u8] = b"Hi, SMUX!";
+    let mut ch = binding.open_channel_async(remote_dock, &mut invitation).await?;
+    let (mut tx, _rx) = ch.accept_async_default().await?;
+
+    tx.write_all(b"hello").await?;
+    drop(tx); // 半关闭：对端读到 EOF
+    println!("主动端：已发出 5 字节并半关闭");
+    Ok(conn)
+}
+
+/// **被动端**：等对端来找这个 dock，收到子流后读到 EOF。
+async fn passive(
+    scope: &LocalScope,
+    rx: Rx,
+    tx: Tx,
+) -> Result<MuxConnection<DefaultConnCfg<Tx, Rx>, LocalScope>, Box<dyn std::error::Error>> {
+    // ① 握手
+    let delivery = HandshakeAgent::new(tx, rx)
+        .listen_async(&BasicOpts::default(), AcceptAllEntries)
+        .await?;
+
+    // ② 建连接：需要环境提供一个 LocalScope。
+    let conn = MuxConnection::from_delivery(scope, delivery)?;
+
+    let local_dock = Dock::new(1);
+    let mut listener = conn
+        .bind_async(local_dock).await? // 绑定 dock
+        .listen_async().await?;        // 开始收建流请求
+
+    let mut incoming = listener.income_async().await?;
+    let (_tx, mut rx) = incoming.accept_async_default().await?;
+
+    let mut buf = [0u8; 5];
+    rx.read_exact(&mut buf).await?; // 对端 drop(tx) 之后就到这里
+    assert_eq!(&buf, b"hello");
+    println!("被动端：收到 {:?}", core::str::from_utf8(&buf)?);
+    Ok(conn)
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 后端胶水：socket ↔ 全被动环 ↔ 调用方驱动的泵
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 造一条全被动环，切成 `(写端, 读端)`。
+fn passive_ring_() -> (Tx, Rx) {
+    let buffer: Buf = Owned::new_uninit_slice(K_RING_CAP, CoreAlloc);
+    let ring = Ring::try_new(buffer).expect("容量合法");
+    let shared = Shared::new(ring, CoreAlloc);
+    // SAFETY: 这条环由刚建出的 `Shared` 独占，且不存在对应的 `Weak`，
+    // 因此两个半部各持一个强引用是安全的（与 `Ring::split_unchecked` 的要求一致）。
+    unsafe { Ring::split_unchecked(shared) }
+}
+
+/// 入向泵：socket 读设备 → 全被动环（环的读端即 smux 的 `Rx`）。
+async fn pump_input_<I, W>(mut input: I, mut ring_tx: W)
+where
+    I: TrInput<u8>,
+    W: TrBuffWrite<u8>,
+{
+    let mut chunk: Vec<MaybeUninit<u8>> =
+        (0..K_PUMP_CHUNK).map(|_| MaybeUninit::uninit()).collect();
+    loop {
+        let read = input.read_async(&mut chunk).await;
+        let n = match read.pick_left() {
+            Option::Some(n) => n,
+            // 设备侧结束（EOF 以 `ReadErrTag::Closing` 的形式上报）或出错：收工。
+            // 丢掉 `ring_tx` 之后 smux 的 `Rx` 会看到「不再有数据」。
+            Option::None => return,
+        };
+        if n == 0usize {
+            return;
+        }
+        // SAFETY: 设备只把已初始化的字节写进 `chunk[..n]`；`MaybeUninit<u8>` 与 `u8`
+        // 布局相同、对齐相同（均为 1），按已初始化前缀读取是健全的。
+        let bytes: &[u8] = unsafe { core::slice::from_raw_parts(chunk.as_ptr() as *const u8, n) };
+
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let demand = Demand::at_least(1usize);
+            let mut outcome = ring_tx.write_async(&demand).await;
+            let put = match outcome.as_mut().pick_left() {
+                Option::Some(segm) => {
+                    segm.as_segm_mut().clone_items_from_buff(&bytes[off..])
+                }
+                // 环被拆掉：收工。
+                Option::None => return,
+            };
+            if put == 0usize {
+                return;
+            }
+            off += put;
+            // `outcome` 在此 drop：提交写入 → 唤醒 smux 的读侧。
+        }
+    }
+}
+
+/// 出向泵：全被动环（环的写端即 smux 的 `Tx`）→ socket 写设备。
+async fn pump_output_<R, O>(mut ring_rx: R, mut output: O)
+where
+    R: TrBuffRead<u8>,
+    O: TrOutput<u8>,
+{
+    loop {
+        let demand = Demand::at_least(1usize);
+        let mut outcome = ring_rx.read_async(&demand).await;
+        {
+            let segm = outcome.as_mut().pick_left();
+            let Option::Some(segm) = segm else {
+                // 环被拆掉（smux 侧 `Tx` 已被 drop）：收工。
+                return;
+            };
+            let mut child = segm.as_segm_ref();
+            let n = child.least_count();
+            let mut dst: Vec<MaybeUninit<u8>> =
+                (0..n).map(|_| MaybeUninit::uninit()).collect();
+            // SAFETY: `dst` 是本函数独占的可写切片，`move_items_to_buff` 只写入其中
+            // 已初始化的前缀（返回值给出长度）。
+            let moved = unsafe { child.move_items_to_buff(&mut dst) };
+            if moved == 0usize {
+                return;
+            }
+            // 先把 `dst[..moved]` 全写给设备，再 drop 段提交消费——顺序保证了
+            // 「设备已收下」一定先于「环缓冲被释放」。
+            let mut off = 0usize;
+            while off < moved {
+                let w = output.write_async(&dst[off..moved]).await;
+                match w.pick_left() {
+                    Option::Some(0usize) | Option::None => return,
+                    Option::Some(k) => off += k,
+                }
+            }
+            drop(child);
+        }
+        // `outcome` 在此 drop：提交消费 → 唤醒 smux 的写侧。
+    }
+}

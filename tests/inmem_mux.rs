@@ -80,7 +80,7 @@ async fn mux_small_inmem_dual_() {
     // tokio 的本地队列归作用域值所有，由 `run_until` 驱动；连接在核心留了一份克隆
     // 保活，因此队列不会先于连接消失。
     let scope = LocalScope::new();
-    let scenario = common::run_small_mux_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = common::run_small_mux_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 dual_runtime_test_!(mux_small_inmem_dual_);
@@ -98,7 +98,7 @@ async fn mux_single_byte_transport_dual_() {
     let (b_tx, a_rx) = common::make_passive_ring_(1usize);
 
     let scope = LocalScope::new();
-    let scenario = common::run_small_mux_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = common::run_small_mux_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 dual_runtime_test_!(mux_single_byte_transport_dual_);
@@ -119,7 +119,7 @@ async fn mux_unsettled_handle_dual_() {
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
     let scope = LocalScope::new();
-    let scenario = common::run_unsettled_handle_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = common::run_unsettled_handle_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 dual_runtime_test_!(mux_unsettled_handle_dual_);
@@ -140,7 +140,7 @@ async fn mux_bind_is_exclusive_dual_() {
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
     let scope = LocalScope::new();
-    let scenario = common::run_bind_exclusivity_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = common::run_bind_exclusivity_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 dual_runtime_test_!(mux_bind_is_exclusive_dual_);
@@ -162,7 +162,7 @@ async fn mux_per_channel_alloc_dual_() {
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
     let scope = LocalScope::new();
-    let scenario = common::run_per_channel_alloc_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = common::run_per_channel_alloc_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 dual_runtime_test_!(mux_per_channel_alloc_dual_);
@@ -373,13 +373,13 @@ where
         let invite_opts = BasicOpts::default();
         let listen_opts = BasicOpts::default();
         let invite_fut = HandshakeAgent::new(
-            DropProbeRx_::new_(a_rx, dropped[0].clone()),
             DropProbeTx_::new_(a_tx, dropped[1].clone()),
+            DropProbeRx_::new_(a_rx, dropped[0].clone()),
         )
         .invite_async(&invite_opts, AcceptAllEntries);
         let listen_fut = HandshakeAgent::new(
-            DropProbeRx_::new_(b_rx, dropped[2].clone()),
             DropProbeTx_::new_(b_tx, dropped[3].clone()),
+            DropProbeRx_::new_(b_rx, dropped[2].clone()),
         )
         .listen_async(&listen_opts, AcceptAllEntries);
         let (invited, accepted) =
@@ -460,13 +460,13 @@ where
         let opts_a = BasicOpts::default();
         let opts_b = BasicOpts::default();
         let invite_fut = HandshakeAgent::new(
-            DropProbeRx_::new_(a_rx, dropped[0].clone()),
             DropProbeTx_::new_(a_tx, dropped[1].clone()),
+            DropProbeRx_::new_(a_rx, dropped[0].clone()),
         )
         .invite_async(&opts_a, AcceptAllEntries);
         let listen_fut = HandshakeAgent::new(
-            DropProbeRx_::new_(b_rx, dropped[2].clone()),
             DropProbeTx_::new_(b_tx, dropped[3].clone()),
+            DropProbeRx_::new_(b_rx, dropped[2].clone()),
         )
         .listen_async(&opts_b, AcceptAllEntries);
         let (invited, accepted) =
@@ -526,7 +526,7 @@ async fn mux_ring_rejected_dual_() {
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
     let scope = LocalScope::new();
-    let scenario = common::run_ring_rejected_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = common::run_ring_rejected_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 dual_runtime_test_!(mux_ring_rejected_dual_);
@@ -654,7 +654,7 @@ where
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scenario = drive_min_stage_(scope, a_rx, a_tx, b_rx, b_tx);
+    let scenario = drive_min_stage_(scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 
@@ -673,10 +673,10 @@ dual_runtime_test_!(mux_min_stage_inmem_body_tokio_);
 /// 最小帧暂存场景的执行体：建连 + 一对子流的双向收发与半关闭。
 async fn drive_min_stage_<RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + 'static,
     WA: TrBuffWrite<u8> + 'static,
@@ -692,7 +692,7 @@ async fn drive_min_stage_<RA, WA, RB, WB, S>(
         RB,
         WB,
         S,
-    >(scope, rx_a, tx_a, rx_b, tx_b)
+    >(scope, tx_a, rx_a, tx_b, rx_b)
     .await;
 
     let dock_b = Dock::new(1u32);

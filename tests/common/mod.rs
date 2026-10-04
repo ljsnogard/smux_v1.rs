@@ -467,8 +467,8 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB, S>(
     OB: TrOutput<u8>,
     S: TrSmokeScope + Clone + 'static,
 {
-    run_socket_scenario_with_(input_a, output_a, input_b, output_b, |a_rx, a_tx, b_rx, b_tx| {
-        run_smoke_scenario_::<_, _, _, _, S>(scope, a_rx, a_tx, b_rx, b_tx)
+    run_socket_scenario_with_(input_a, output_a, input_b, output_b, |a_tx, a_rx, b_tx, b_rx| {
+        run_smoke_scenario_::<_, _, _, _, S>(scope, a_tx, a_rx, b_tx, b_rx)
     })
     .await
 }
@@ -493,8 +493,8 @@ pub async fn run_small_socket_scenario_<IA, OA, IB, OB, S>(
         output_a,
         input_b,
         output_b,
-        |a_rx, a_tx, b_rx, b_tx| {
-            run_small_mux_scenario_::<_, _, _, _, S>(scope, a_rx, a_tx, b_rx, b_tx)
+        |a_tx, a_rx, b_tx, b_rx| {
+            run_small_mux_scenario_::<_, _, _, _, S>(scope, a_tx, a_rx, b_tx, b_rx)
         },
     )
     .await
@@ -516,10 +516,10 @@ async fn run_socket_scenario_with_<IA, OA, IB, OB, F, Fut>(
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
     F: FnOnce(
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
     ) -> Fut,
     Fut: core::future::Future<Output = ()>,
 {
@@ -529,7 +529,7 @@ async fn run_socket_scenario_with_<IA, OA, IB, OB, F, Fut>(
     let (b_rx_ring_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
     let (b_tx, b_tx_ring_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
 
-    let scenario_fut = scenario(a_rx, a_tx, b_rx, b_tx);
+    let scenario_fut = scenario(a_tx, a_rx, b_tx, b_rx);
     let pumps_fut = async {
         futures::join!(
             pump_input_(input_a, a_rx_ring_tx),
@@ -564,10 +564,10 @@ async fn run_socket_scenario_with_<IA, OA, IB, OB, F, Fut>(
 /// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
 pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + 'static,
     WA: TrBuffWrite<u8> + 'static,
@@ -577,10 +577,10 @@ pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S>(
 {
     run_mux_scenario_::<_, _, _, _, S>(
         scope,
-        rx_a,
         tx_a,
-        rx_b,
+        rx_a,
         tx_b,
+        rx_b,
         K_SMALL_DOCK_COUNT,
         K_SMALL_CHANNELS_PER_DOCK,
     )
@@ -594,10 +594,10 @@ pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S>(
 /// 半关闭（[`drive_side_`]）。1024 条的冒烟场景只是它的 `16 × 64` 特例。
 async fn run_mux_scenario_<RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
     dock_count: u32,
     per_dock: usize,
 ) where
@@ -616,7 +616,7 @@ async fn run_mux_scenario_<RA, WA, RB, WB, S>(
             RB,
             WB,
             S,
-        >(scope, rx_a, tx_a, rx_b, tx_b)
+        >(scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     futures::join!(
@@ -635,10 +635,10 @@ async fn run_mux_scenario_<RA, WA, RB, WB, S>(
 /// 与其余策略完全一致，避免把「容量」以外的差异带进对照。
 pub async fn connect_pair_<CA, CB, RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
 ) -> (MuxConnection<CA, S>, MuxConnection<CB, S>)
 where
     // 连接把 Rx / Tx 移交给 `'static` 的读写循环（`spawn_local` 要求 `'static`；
@@ -674,8 +674,8 @@ where
 {
     let invite_opts = BasicOpts::default();
     let listen_opts = BasicOpts::default();
-    let invite_fut = HandshakeAgent::new(rx_a, tx_a).invite_async(&invite_opts, AcceptAllEntries);
-    let listen_fut = HandshakeAgent::new(rx_b, tx_b).listen_async(&listen_opts, AcceptAllEntries);
+    let invite_fut = HandshakeAgent::new(tx_a, rx_a).invite_async(&invite_opts, AcceptAllEntries);
+    let listen_fut = HandshakeAgent::new(tx_b, rx_b).listen_async(&listen_opts, AcceptAllEntries);
     let (invited, accepted) = futures::join!(async { invite_fut.await }, async { listen_fut.await });
     let delivery_a = invited.expect("发起方握手应当成功");
     let delivery_b = accepted.expect("等待方握手应当成功");
@@ -709,10 +709,10 @@ where
 /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
 pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + 'static,
     WA: TrBuffWrite<u8> + 'static,
@@ -729,7 +729,7 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
             RB,
             WB,
             S,
-        >(scope, rx_a, tx_a, rx_b, tx_b)
+        >(scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
@@ -792,10 +792,10 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
 /// 握手/绑定/监听失败，或上述两条判断不成立，都会 panic。
 pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + 'static,
     WA: TrBuffWrite<u8> + 'static,
@@ -812,7 +812,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
             RB,
             WB,
             S,
-        >(scope, rx_a, tx_a, rx_b, tx_b)
+        >(scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
@@ -923,10 +923,10 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
 ///   随后的那条子流必须成功——若拒绝把连接或注册表弄脏了，这一段会失败。
 pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + 'static,
     WA: TrBuffWrite<u8> + 'static,
@@ -943,7 +943,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
             RB,
             WB,
             S,
-        >(scope, rx_a, tx_a, rx_b, tx_b)
+        >(scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     let local_a = Dock::new(0x3100u32);
@@ -1058,10 +1058,10 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
 /// 握手 / 绑定 / 监听 / 交互任一环节失败都会 panic。
 pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + 'static,
     WA: TrBuffWrite<u8> + 'static,
@@ -1078,7 +1078,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
             RB,
             WB,
             S,
-        >(scope, rx_a, tx_a, rx_b, tx_b)
+        >(scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     let local_a = Dock::new(0x4000u32);
@@ -1455,10 +1455,10 @@ where
 /// 前退出时 panic——本函数是测试专用，失败即测试失败。
 pub async fn run_smoke_scenario_<RA, WA, RB, WB, S>(
     scope: &S,
-    rx_a: RA,
     tx_a: WA,
-    rx_b: RB,
+    rx_a: RA,
     tx_b: WB,
+    rx_b: RB,
 ) where
     // 连接把 Rx / Tx 移交给 `'static` 的读写循环（`spawn_local` 要求 `'static`；
     // 本地投递不要求 `Send`）。
@@ -1470,10 +1470,10 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB, S>(
 {
     run_mux_scenario_::<_, _, _, _, S>(
         scope,
-        rx_a,
         tx_a,
-        rx_b,
+        rx_a,
         tx_b,
+        rx_b,
         K_DOCK_COUNT,
         K_CHANNELS_PER_DOCK,
     )
@@ -1496,10 +1496,10 @@ pub async fn run_socket_scenario_on_runtime_<F, Fut>(
     scenario: F,
 ) where
     F: FnOnce(
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
     ) -> Fut,
     Fut: core::future::Future<Output = ()>,
 {
@@ -1528,10 +1528,10 @@ pub async fn run_socket_scenario_on_runtime_<F, Fut>(
     scenario: F,
 ) where
     F: FnOnce(
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
         smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
     ) -> Fut,
     Fut: core::future::Future<Output = ()>,
 {

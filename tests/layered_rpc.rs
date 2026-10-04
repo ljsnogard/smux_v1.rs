@@ -249,7 +249,7 @@ where
 {
     let ClientWire_ { rx_, tx_ } = wire;
     let opts = BasicOpts::default();
-    let delivery = HandshakeAgent::new(rx_, tx_)
+    let delivery = HandshakeAgent::new(tx_, rx_)
         .invite_async(&opts, AcceptAllEntries)
         .await
         .expect("客户端握手应当成功");
@@ -277,7 +277,7 @@ where
 {
     let ServerWire_ { rx_, tx_ } = wire;
     let opts = BasicOpts::default();
-    let delivery = HandshakeAgent::new(rx_, tx_)
+    let delivery = HandshakeAgent::new(tx_, rx_)
         .listen_async(&opts, AcceptAllEntries)
         .await
         .expect("服务端握手应当成功");

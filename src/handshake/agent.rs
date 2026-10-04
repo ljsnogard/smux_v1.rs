@@ -167,23 +167,27 @@ pub struct HandshakeDelivery<Tx, Rx> {
 ///
 /// 由调用方构造并持有收发通道；调用 [`HandshakeAgent::invite_async`] 执行发起
 /// 方流程，或调用 [`HandshakeAgent::listen_async`] 执行等待方流程。
-pub struct HandshakeAgent<Rx, Tx> {
-    rx_: Rx,
+pub struct HandshakeAgent<Tx, Rx> {
     tx_: Tx,
+    rx_: Rx,
 }
 
-impl<Rx, Tx> HandshakeAgent<Rx, Tx>
+impl<Tx, Rx> HandshakeAgent<Tx, Rx>
 where
-    Rx: TrBuffRead<u8>,
     Tx: TrBuffWrite<u8>,
+    Rx: TrBuffRead<u8>,
 {
     /// 用收发通道构造。
     ///
     /// 不接收「单帧长度上限」参数：条目数量不设上限（协议层面），防御无界连接
     /// 由调用方的取消令牌负责，见模块文档 §3、§10。本端对**单个条目长度**的
     /// 内部上限属于实现策略，不由构造参数给出。
-    pub fn new(rx: Rx, tx: Tx) -> Self {
-        HandshakeAgent { rx_: rx, tx_: tx }
+    ///
+    /// 参数顺序与全 crate 一致：**成对的收发一律 `(tx, rx)`**——与
+    /// [`HandshakeDelivery`] 的字段顺序、`accept_async` 的返回值、
+    /// [`BufferedChannel`](crate::connection::BufferedChannel) 等同一约定。
+    pub fn new(tx: Tx, rx: Rx) -> Self {
+        HandshakeAgent { tx_: tx, rx_: rx }
     }
 
     /// 执行完整的发起方握手：发送 `INVITE`、等待并**边收边判** `ACCEPT`、
@@ -200,17 +204,17 @@ where
         self,
         entries: I,
         negotiator: D,
-    ) -> HandshakeInviteAsync<'f, 'f, Rx, Tx, I, D>
+    ) -> HandshakeInviteAsync<'f, 'f, Tx, Rx, I, D>
     where
-        Rx: 'f,
         Tx: 'f,
+        Rx: 'f,
         I: IntoIterator<Item = NegotiationEntry<'f>> + 'f,
         D: for<'x> TrNegotiator<Entry<'x> = NegotiationEntry<'x>> + 'f,
     {
         HandshakeInviteAsync::new(
             PhantomData,
-            self.rx_,
             self.tx_,
+            self.rx_,
             entries,
             negotiator,
         )
@@ -228,13 +232,13 @@ where
         self,
         local: &'f BasicOpts,
         negotiator: D,
-    ) -> ListenHandshakeAsync<'f, 'f, Rx, Tx, D>
+    ) -> ListenHandshakeAsync<'f, 'f, Tx, Rx, D>
     where
-        Rx: 'f,
         Tx: 'f,
+        Rx: 'f,
         D: for<'x> TrNegotiator<Entry<'x> = NegotiationEntry<'x>> + 'f,
     {
-        ListenHandshakeAsync::new(self.rx_, self.tx_, local, negotiator)
+        ListenHandshakeAsync::new(self.tx_, self.rx_, local, negotiator)
     }
 }
 
@@ -281,10 +285,10 @@ where
 
 /// 发起方状态机实现；对外经 [`HandshakeAgent::invite_async`] 使用。
 #[gen_may_cancel_future(HandshakeInvite, pub)]
-async fn handshake_invite_async_<'f, R, W, I, D, K>(
+async fn handshake_invite_async_<'f, W, R, I, D, K>(
     _: PhantomData<&'f ()>,
-    mut rx: R,
     mut tx: W,
+    mut rx: R,
     entries: I,
     mut negotiator: D,
     cancel: K,
@@ -388,9 +392,9 @@ where
 
 /// 等待方状态机实现；对外经 [`HandshakeAgent::listen_async`] 使用。
 #[gen_may_cancel_future(ListenHandshake, pub)]
-async fn listen_handshake_async_<'f, R, W, D, K>(
-    mut rx: R,
+async fn listen_handshake_async_<'f, W, R, D, K>(
     mut tx: W,
+    mut rx: R,
     local: &'f BasicOpts,
     mut negotiator: D,
     cancel: K,
@@ -519,14 +523,14 @@ mod tests_ {
     async fn make_pair_(
         buff_size: usize,
     ) -> (
-        HandshakeAgent<impl TrBuffRead<u8>, impl TrBuffWrite<u8>>,
-        HandshakeAgent<impl TrBuffRead<u8>, impl TrBuffWrite<u8>>,
+        HandshakeAgent<impl TrBuffWrite<u8>, impl TrBuffRead<u8>>,
+        HandshakeAgent<impl TrBuffWrite<u8>, impl TrBuffRead<u8>>,
     ) {
         let (a_tx, b_rx) = make_test_channel_(buff_size);
         let (b_tx, a_rx) = make_test_channel_(buff_size);
         (
-            HandshakeAgent::new(a_rx, a_tx),
-            HandshakeAgent::new(b_rx, b_tx),
+            HandshakeAgent::new(a_tx, a_rx),
+            HandshakeAgent::new(b_tx, b_rx),
         )
     }
 
@@ -587,7 +591,7 @@ mod tests_ {
 
         let rx: &[u8] = &buf[..len];
         let mut sink = [0u8; 64];
-        let agent = HandshakeAgent::new(rx, &mut sink[..]);
+        let agent = HandshakeAgent::new(&mut sink[..], rx);
         let local = BasicOpts::default();
         let res = agent.listen_async(&local, AcceptAllEntries).await;
         assert!(
