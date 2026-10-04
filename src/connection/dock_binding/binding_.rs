@@ -10,7 +10,6 @@ use crate::connection::{
     ChannelHandle, Dock, MuxError, MuxConnection, ReserveErr_, TrConnCfg,
     channel_half::{ChannelRx, ChannelTx},
     channel_listener::ChannelListener,
-    error_::face_error_impls,
     signal_::SessionEvent_,
     util_::read_available_into_vec_,
 };
@@ -19,47 +18,45 @@ use crate::connection::{
 ///
 /// 一个 binding 上可以做三件事——`listen_async` / `open_telegraph_async` /
 /// `open_channel_async`——它们共用这一个错误类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BindingError {
     /// 对端 dock 是协议保留值，不能当身份用（只可能来自 `open_channel`）。
+    #[error("对端 dock 是协议保留值，不能作为身份")]
     ReservedDock,
 
     /// 同一 dock 对上已有活跃子流（`open_channel`）。
+    #[error("同一 dock 对上已有活跃子流")]
     Duplicate,
 
     /// 该 dock 对刚关闭，仍在拆流宽限期内（`open_channel`）。
+    #[error("该 dock 对刚关闭，仍在拆流宽限期内")]
     WaitClose,
 
     /// 该 dock 上的活动子流数已达上限（`open_channel`）。
+    #[error("该 dock 上的活动子流数已达上限")]
     DockChanLimit,
 
     /// 连接上的活动子流数已达上限（`open_channel`）。
+    #[error("连接上的活动子流数已达上限")]
     ChanLimit,
 
     /// 该 local_dock 已被占用（listener / telegraph / channel 不得冲突）。
+    #[error("该 local_dock 已被占用")]
     DockInUse,
 
     /// 子流 / 连接已关闭（`open_channel`）。
+    #[error("子流 / 连接已关闭")]
     Closed,
 
     /// **等锁期间被取消**（cancel token 触发）。
+    #[error("本次操作被取消")]
     Cancelled,
 
-    /// 连接级失败。
-    Mux(MuxError),
+    /// 连接级失败：`Display` 用内层文案，`source` 指回内层（`?` 亦直通）。
+    #[error("{0}")]
+    Mux(#[from] MuxError),
 }
 
-face_error_impls!(
-    BindingError,
-    BindingError::ReservedDock => "对端 dock 是协议保留值，不能作为身份",
-    BindingError::Duplicate => "同一 dock 对上已有活跃子流",
-    BindingError::WaitClose => "该 dock 对刚关闭，仍在拆流宽限期内",
-    BindingError::DockChanLimit => "该 dock 上的活动子流数已达上限",
-    BindingError::ChanLimit => "连接上的活动子流数已达上限",
-    BindingError::DockInUse => "该 local_dock 已被占用",
-    BindingError::Closed => "子流 / 连接已关闭",
-    BindingError::Cancelled => "本次操作被取消",
-);
 
 /// 把注册表的预留失败映射进 binding 的错误类型。
 fn map_reserve_err_(err: ReserveErr_) -> BindingError {

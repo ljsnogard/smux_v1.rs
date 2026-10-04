@@ -21,8 +21,7 @@ use crate::{
         owner_::{ChannelOwner_, ChannelState_, EstablishOutcome_, wait_establish_},
         ring_::new_buffered_channel_,
         signal_::{ControlFrame_, ReadEvent_, SessionEvent_, TrEventSender_, WriteEvent_},
-        error_::face_error_impls,
-        util_::read_available_into_vec_,
+            util_::read_available_into_vec_,
     },
     flow_ctrl::{
         Credit, FlowCtrl, FlowCtrlError, RecvTotal, ReportThresholds_, TrFlowCtrlPolicy,
@@ -31,35 +30,32 @@ use crate::{
 
 /// [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) 的错误类型
 /// （`accept_async` / `reject_async` 共用）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HandleError {
     /// **拒绝接受**调用方给出的环内存：大小不合用。
+    #[error("调用方给出的环内存大小不合用，已拒绝接受")]
     RingRejected,
 
     /// 对端拒绝建立这条子流（`accept_async` 的发起方一侧）。
+    #[error("对端拒绝建立这条子流")]
     Refused,
 
     /// 由连接管理内存时，底层分配器分配失败。
+    #[error("由连接管理内存时，底层分配器分配失败")]
     AllocationFailed,
 
     /// 流控失败（窗口违例或计数溢出）。
+    #[error("流控失败")]
     FlowCtrl(FlowCtrlError),
 
     /// 本次操作被取消。
+    #[error("本次操作被取消")]
     Cancelled,
 
-    /// 连接级失败。
-    Mux(MuxError),
+    /// 连接级失败：`Display` 用内层文案，`source` 指回内层（`?` 亦直通）。
+    #[error("{0}")]
+    Mux(#[from] MuxError),
 }
-
-face_error_impls!(
-    HandleError,
-    HandleError::RingRejected => "调用方给出的环内存大小不合用，已拒绝接受",
-    HandleError::AllocationFailed => "由连接管理内存时，底层分配器分配失败",
-    HandleError::Refused => "对端拒绝建立这条子流",
-    HandleError::FlowCtrl(_) => "流控失败",
-    HandleError::Cancelled => "本次操作被取消",
-);
 
 /// 一个入向建流请求的待决句柄。
 ///

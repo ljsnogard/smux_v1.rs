@@ -48,16 +48,9 @@ pub(crate) struct NullHandle_<T> {
 }
 
 /// [`NullHandle_`] 的 join 错误类型（不会被构造）。
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("空作用域的句柄不会产出结果")]
 pub(crate) struct NullJoinErr_;
-
-impl core::fmt::Display for NullJoinErr_ {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("空作用域的句柄不会产出结果")
-    }
-}
-
-impl core::error::Error for NullJoinErr_ {}
 
 impl<T> Future for NullHandle_<T> {
     type Output = Result<T, NullJoinErr_>;

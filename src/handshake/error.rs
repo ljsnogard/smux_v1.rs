@@ -3,8 +3,6 @@
 //! `HandshakeError` 同时承载读、写两侧的底层错误类型参数，使上层可以用一个
 //! 错误类型覆盖整个握手流程。
 
-use core::fmt;
-
 use abs_buff::error::{ReadErrTag, TrTaggedError, WriteErrTag};
 use buffex::x_deps::abs_buff;
 
@@ -16,27 +14,34 @@ use crate::handshake::codec_::WireError;
 ///
 /// - `RE`：底层读错误的类型（`TrBuffRead::Err`）；
 /// - `WE`：底层写错误的类型（`TrBuffWrite::Err`）。
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HandshakeError<RE, WE> {
     /// 本端上层调用者拒绝了协商结果。
+    #[error("握手协商被本端上层调用者拒绝")]
     Rejected,
 
     /// 对端发送了 `REJECT`。
+    #[error("对端发送了 REJECT")]
     PeerRejected,
 
     /// 收到取消信号。
+    #[error("握手被取消")]
     Cancelled,
 
     /// 底层读错误。
+    #[error("握手读取出错")]
     RxErr(RE),
 
     /// 底层写错误。
+    #[error("握手写入出错")]
     TxErr(WE),
 
     /// 帧首 magic 不是本状态期望的值。
+    #[error("握手帧 magic 不匹配")]
     InvalidMagic,
 
     /// 校验尾 CRC 不匹配。
+    #[error("握手帧校验失败")]
     ChecksumErr,
 
     /// 单个条目超过本端内部长度上限。
@@ -45,46 +50,24 @@ pub enum HandshakeError<RE, WE> {
     /// 「整帧字节数上限」这一保护。本变体保留给「单个条目长度超过实现内部上限」
     /// 这一情形；当前基础项是定长整数（最多 8 字节），不会触发它，扩展条目
     /// 启用后会用到。防御无界连接由调用方的取消令牌负责（模块文档 §10）。
+    #[error("握手帧超过长度上限")]
     FrameTooLarge,
 
     /// 条目区结构非法（重复键、基础项取值为 0、宽度越界等）。
+    #[error("握手帧条目区结构非法")]
     MalformedBody,
 
     /// 未知/保留键，或校验尾头不是 `0x1C` / `0x2C`。
+    #[error("握手帧包含不支持的键或校验类型")]
     UnsupportedOption,
 
     /// `ACCEPT` / `CONFIRM` 与预期不一致。
+    #[error("握手协商结果与预期不一致")]
     Inconsistent,
 
     /// 对端在帧中途关闭了连接。
+    #[error("对端在握手帧中途关闭连接")]
     PeerClosed,
-}
-
-impl<RE, WE> fmt::Display for HandshakeError<RE, WE> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
-            HandshakeError::Rejected => "握手协商被本端上层调用者拒绝",
-            HandshakeError::PeerRejected => "对端发送了 REJECT",
-            HandshakeError::Cancelled => "握手被取消",
-            HandshakeError::RxErr(_) => "握手读取出错",
-            HandshakeError::TxErr(_) => "握手写入出错",
-            HandshakeError::InvalidMagic => "握手帧 magic 不匹配",
-            HandshakeError::ChecksumErr => "握手帧校验失败",
-            HandshakeError::FrameTooLarge => "握手帧超过长度上限",
-            HandshakeError::MalformedBody => "握手帧条目区结构非法",
-            HandshakeError::UnsupportedOption => "握手帧包含不支持的键或校验类型",
-            HandshakeError::Inconsistent => "握手协商结果与预期不一致",
-            HandshakeError::PeerClosed => "对端在握手帧中途关闭连接",
-        };
-        f.write_str(text)
-    }
-}
-
-impl<RE, WE> core::error::Error for HandshakeError<RE, WE>
-where
-    RE: core::error::Error,
-    WE: core::error::Error,
-{
 }
 
 /// 把**读帧**失败映射为握手错误。

@@ -39,16 +39,9 @@ pub trait TrMuxAllocConfig {
 }
 
 /// managed 路径构造环缓冲失败。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("构造 channel ring 缓冲失败")]
 pub struct BuffAllocError;
-
-impl core::fmt::Display for BuffAllocError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("构造 channel ring 缓冲失败")
-    }
-}
-
-impl core::error::Error for BuffAllocError {}
 
 /// 连接的配置类型。
 ///

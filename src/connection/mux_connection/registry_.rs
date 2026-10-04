@@ -79,22 +79,20 @@
 //! 不需要第 4 张业务表：[`channel_range_`] 给出的开区间恰好覆盖某个
 //! `local_dock` 下的全部具体子流。
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::{
     alloc::AllocatorClone,
     ops::Bound,
     task::Waker,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Instant,
-};
+use std::time::Instant;
 
-use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
-use mm_ptr::Shared;
-
-
-use buffex::x_deps::abs_cancel::TrCancellationToken;
 use flume::Sender;
+
+use abs_cancel::TrCancellationToken;
+use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
+use buffex::x_deps::abs_cancel;
+use mm_ptr::Shared;
 
 use crate::{
     connection::{

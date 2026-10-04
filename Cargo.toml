@@ -19,6 +19,7 @@ mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2
 
 crc = { version = "3.4.*" }
 flume = { version = "0.12.*" }
+thiserror = { version = "2.0.*", default-features = false }
 
 [dev-dependencies]
 # 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在

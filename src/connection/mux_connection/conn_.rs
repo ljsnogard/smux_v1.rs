@@ -9,7 +9,6 @@ use crate::{
     connection::{
         Dock, MuxError, TrConnCfg,
         dock_binding::DockBinding,
-        error_::face_error_impls,
         session_::{LoopShared_, read_loop_async_, write_loop_async_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
     },
@@ -20,27 +19,24 @@ use super::{core_::MuxCore, registry_::{ChannelRegistry_, ReserveErr_}};
 
 
 /// [`TrConnection`](abs_smux::conn::TrConnection) 的错误类型：目前只有 `bind_async`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
     /// 要绑定的 dock 是协议保留值（`unspecified` / `wildcard`），不能当身份用。
+    #[error("要绑定的 dock 是协议保留值，不能作为身份")]
     ReservedDock,
 
     /// 该 local_dock 已被占用。
+    #[error("该 local_dock 已被占用")]
     DockInUse,
 
     /// **等锁期间被取消**（cancel token 触发）。
+    #[error("本次操作被取消")]
     Cancelled,
 
-    /// 连接级失败。
-    Mux(MuxError),
+    /// 连接级失败：`Display` 用内层文案，`source` 指回内层（`?` 亦直通）。
+    #[error("{0}")]
+    Mux(#[from] MuxError),
 }
-
-face_error_impls!(
-    BindError,
-    BindError::ReservedDock => "要绑定的 dock 是协议保留值，不能作为身份",
-    BindError::DockInUse => "该 local_dock 已被占用",
-    BindError::Cancelled => "本次操作被取消",
-);
 
 /// 复用连接：**对一个 `MuxCore` 的智能指针的薄封装**，同时实现
 /// [`TrConnection`]。

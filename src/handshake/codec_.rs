@@ -536,68 +536,47 @@ where
 /// 读完」也要用 `Err` 表达。协商器只需要知道「流已经不能再继续」，不必区分两种终止；
 /// 真正的失败原因由 [`FrameReader::take_error_`] 取回，调用方据此按模块文档 §9 分类
 /// 处置——例如 `ChecksumErr` 与主动拒绝的处置完全不同（前者不得回 `REJECT`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum StreamEnd_ {
     /// 条目流已经读到底（正常结束）。
+    #[error("握手条目流已终止")]
     Ended,
 
     /// 读侧发生失败，条目流就此终止。
+    #[error("握手条目流已终止")]
     Failed,
 }
-
-impl core::fmt::Display for StreamEnd_ {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("握手条目流已终止")
-    }
-}
-
-impl core::error::Error for StreamEnd_ {}
 
 /// 握手帧编解码失败。
 ///
 /// 读写两侧的底层错误都原样携带，由
 /// [`HandshakeError`](super::error::HandshakeError) 统一呈现给调用方。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WireError<RE, WE> {
     /// 底层读错误。
+    #[error("握手帧读取失败")]
     Read(RE),
 
     /// 底层写错误。
+    #[error("握手帧写入失败")]
     Write(WE),
 
     /// 未知 / 保留键，或算法预告 / 校验头的 `val_type` 不是 16/24/32 位校验码。
+    #[error("握手帧包含不支持的键或校验类型")]
     UnsupportedOption,
 
     /// 条目区结构非法：重复键、基础项取值为 0、数值超出 `usize`、
     /// 校验头与算法预告不一致。
+    #[error("握手帧条目区结构非法")]
     MalformedBody,
 
     /// CRC 不匹配。
+    #[error("握手帧校验失败")]
     ChecksumErr,
 
     /// 帧未读完对端就已经关闭。
+    #[error("对端在握手帧中途关闭连接")]
     PeerClosed,
-}
-
-impl<RE, WE> core::fmt::Display for WireError<RE, WE> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let text = match self {
-            WireError::Read(_) => "握手帧读取失败",
-            WireError::Write(_) => "握手帧写入失败",
-            WireError::UnsupportedOption => "握手帧包含不支持的键或校验类型",
-            WireError::MalformedBody => "握手帧条目区结构非法",
-            WireError::ChecksumErr => "握手帧校验失败",
-            WireError::PeerClosed => "对端在握手帧中途关闭连接",
-        };
-        f.write_str(text)
-    }
-}
-
-impl<RE, WE> core::error::Error for WireError<RE, WE>
-where
-    RE: core::error::Error,
-    WE: core::fmt::Debug,
-{
 }
 
 /// 把共享字节游标（[`crate::wire_io_`]）的错误映射为握手帧错误。

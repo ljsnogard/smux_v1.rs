@@ -9,24 +9,20 @@ use buffex::x_deps::abs_buff;
 use crate::connection::{
     Dock, MuxConnection, MuxError, TrConnCfg,
     channel_handle::ChannelHandle,
-    error_::face_error_impls,
     signal_::SessionEvent_,
 };
 
 /// [`TrChannelListener`](abs_smux::conn::TrChannelListener) 的错误类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ListenerError {
     /// 本次等待被取消。
+    #[error("本次等待被取消")]
     Cancelled,
 
-    /// 连接级失败。
-    Mux(MuxError),
+    /// 连接级失败：`Display` 用内层文案，`source` 指回内层（`?` 亦直通）。
+    #[error("{0}")]
+    Mux(#[from] MuxError),
 }
-
-face_error_impls!(
-    ListenerError,
-    ListenerError::Cancelled => "本次等待被取消",
-);
 
 /// 某 `local_dock` 上的入向子流监听器（类 `TcpListener`）。
 ///

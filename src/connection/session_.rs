@@ -268,7 +268,7 @@ where
     while !bytes.is_empty() {
         let demand = Demand::at_least(1usize);
         let mut outcome = writer
-                        .write_async(&demand)
+            .write_async(&demand)
             .may_cancel_with(cancel.child_token())
             .await;
         let put = match outcome.as_mut().pick_left() {
