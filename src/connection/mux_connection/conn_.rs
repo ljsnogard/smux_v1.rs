@@ -3,13 +3,15 @@ use abs_art::{TrJoinHandle, TrLocalScope};
 use abs_cancel::TrCancellationToken;
 use abs_smux::{conn::TrConnection, dock::TrDock};
 use buffex::x_deps::{abs_buff, abs_cancel};
-use mm_ptr::{Owned, Shared};
+use mm_ptr::Shared;
 
 use crate::{
     connection::{
         Dock, MuxError, TrConnCfg,
         dock_binding::DockBinding,
-        session_::{LoopShared_, read_loop_async_, write_loop_async_},
+        ring_::StageRingPair_,
+        session_::{ByteLoopShared_, MuxLoopShared_, demux_loop_async_, mux_loop_async_},
+        session_pump_::{rx_pump_loop_async_, tx_pump_loop_async_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
     },
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
@@ -72,59 +74,116 @@ where
     C: TrConnCfg,
     S: TrLocalScope + Clone,
 {
-    /// 由一次成功的握手交付物、调用方的本地作用域与资源策略构造连接：接管
-    /// `C::ConnRx` / `C::ConnTx`，并**经作用域 `spawn_local`** 投递读 / 写两个循环。
+    /// 由一次成功的握手交付物、调用方的本地作用域、资源策略与**两块连接级缓冲**
+    /// 构造连接：接管 `C::ConnRx` / `C::ConnTx`，把两块缓冲建为连接级的两条帧暂存环，
+    /// 并**经作用域 `spawn_local`** 投递四个循环。
+    ///
+    /// # 四个循环
+    ///
+    /// | 令牌序号 | 循环 | 搬运方向 |
+    /// | --- | --- | --- |
+    /// | 0 | 读泵 | `C::ConnRx` → 连接读环 |
+    /// | 1 | 解复用 | 连接读环 → 各子流接收环（解析帧、拉取读事件） |
+    /// | 2 | 复用 | 各子流发送环 → 连接写环（成帧、拉取写事件） |
+    /// | 3 | 写泵 | 连接写环 → `C::ConnTx` |
+    ///
+    /// 内侧两个循环（1 / 2）从事件队列拉取 `Attach` / `TxClosed` / `Control` 等事件，
+    /// 据此决定哪些子流此刻可搬。
+    ///
+    /// # Panics
+    ///
+    /// 传入的连接级缓冲容量不在 `buffex::ring` 允许区间内时 panic。容量由
+    /// [`TrConnCfg::StageBuff`] 的提供者与调用的构造路径决定，属**配置错误**，
+    /// 与子流环走 `Err` 的处理方式不同：那一条是运行期按调用方给的 buff 建，
+    /// 这一条在建连前就定死了。
     pub fn new(
         scope: &S,
         delivery: HandshakeDelivery<C::ConnTx, C::ConnRx>,
         config: C,
+        read_stage_buff: C::StageBuff,
+        write_stage_buff: C::StageBuff,
     ) -> Self
     where
-        C: 'static,
+        C: 'static + Clone,
         C::Alloc: 'static,
+        C::StageBuff: Send + Sync,
         S: 'static,
     {
         let HandshakeDelivery { opts, tx, rx } = delivery;
-        let bundle = CoreBundle_::build_(scope, opts, config);
+        let bundle = CoreBundle_::build_(scope, opts, config.clone());
         let CoreBundle_ {
             core_,
             shared_,
+            byte_shared_,
             w_receiver_,
             r_receiver_,
-            alloc_,
         } = bundle;
-        let max_packet_size = core_.opts_().basic_opts.max_packet_size;
+
+        // 两块连接级缓冲 ⇒ 两条环的四个半部；「外侧」（贴传输）与「内侧」（贴子流）
+        // 各拿一份（见 `ring_::StageRingPair_`）。
+        let read_stage_cap = ring_capacity_(&read_stage_buff);
+        let write_stage_cap = ring_capacity_(&write_stage_buff);
+        let stage = StageRingPair_::from_buffs_(
+            read_stage_buff,
+            write_stage_buff,
+            config.allocator(),
+        )
+        .unwrap_or_else(|bad_cap| {
+            panic!(
+                "连接级帧暂存环容量非法：读环 {read_stage_cap}、写环 {write_stage_cap}，\
+                 被拒的是 {bad_cap}；容量须落在 buffex::ring 允许区间内，\
+                 该容量源自 TrConnCfg::StageBuff 的构造，属配置错误"
+            )
+        });
+        let ((rx_stage_w_, tx_stage_r_), (rx_stage_r_, tx_stage_w_)) = stage.into_halves_();
+
         // 投递也走核心里的那一份作用域：调用方给出的值只用来克隆保活。
         let scope = core_.scope_();
 
-        // 帧暂存一律走调用方注入的分配器（`mm_ptr::Owned`），不再落到全局分配器。
-        let read_fut = read_loop_async_::<C, _>(
+        let read_pump_fut = rx_pump_loop_async_::<C, _>(
             rx,
+            byte_shared_.clone(),
+            rx_stage_w_,
+            core_.loop_token_(0usize),
+        );
+        scope.spawn_local(read_pump_fut).detach();
+
+        let demux_fut = demux_loop_async_::<C, _>(
+            rx_stage_r_,
             shared_.clone(),
             r_receiver_,
             core_.w_events_().clone(),
-            Owned::new_slice(
-                max_packet_size,
-                |_idx, slot| {
-                    slot.write(0u8);
-                },
-                alloc_.clone(),
-            ),
-            core_.loop_token_(0usize),
+            core_.loop_token_(1usize),
         );
-        scope.spawn_local(read_fut).detach();
+        scope.spawn_local(demux_fut).detach();
 
-        let write_fut = write_loop_async_::<C, _>(
-            tx,
+        let mux_fut = mux_loop_async_::<C, _>(
+            tx_stage_w_,
             shared_,
             w_receiver_,
             core_.r_events_().clone(),
-            core_.loop_token_(1usize),
+            core_.loop_token_(2usize),
         );
-        scope.spawn_local(write_fut).detach();
+        scope.spawn_local(mux_fut).detach();
+
+        let write_pump_fut = tx_pump_loop_async_::<C, _>(
+            tx,
+            byte_shared_,
+            tx_stage_r_,
+            core_.loop_token_(3usize),
+        );
+        scope.spawn_local(write_pump_fut).detach();
 
         MuxConnection { core_ }
     }
+}
+
+/// 取一块连接级缓冲的容量（`MaybeUninit<u8>` 的个数）。
+fn ring_capacity_<B>(buff: &B) -> usize
+where
+    B: core::borrow::BorrowMut<[core::mem::MaybeUninit<u8>]>,
+{
+    core::borrow::Borrow::<[core::mem::MaybeUninit<u8>]>::borrow(buff).len()
 }
 
 impl<C, S> MuxConnection<C, S>
@@ -137,16 +196,16 @@ where
     }
 }
 
-/// 建连的中间产物：核心 + 两个循环共享的一份量 + 两条事件接收端 + 分配器。
+/// 建连的中间产物：核心 + 内侧 / 外侧两套循环共享量 + 两条事件接收端。
 struct CoreBundle_<C, S>
 where
     C: TrConnCfg,
 {
     core_: Shared<MuxCore<C, S>, C::Alloc>,
-    shared_: LoopShared_<C::Alloc>,
+    shared_: MuxLoopShared_<C::Alloc>,
+    byte_shared_: ByteLoopShared_<C::Alloc>,
     w_receiver_: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
     r_receiver_: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
-    alloc_: C::Alloc,
 }
 
 impl<C, S> CoreBundle_<C, S>
@@ -165,11 +224,17 @@ where
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
 
-        let shared = LoopShared_::new_(reg.clone(), max_packet_size);
+        let shared = MuxLoopShared_::new_(reg.clone(), max_packet_size);
+        let byte_shared = ByteLoopShared_::new_(reg.clone());
 
-        // 核心自持一份两个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
+        // 核心自持一份四个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
         // （那会阻塞，而 `Drop` 可能在任意线程上发生）。
-        let loops = [reg.loop_token_(0usize), reg.loop_token_(1usize)];
+        let loops = [
+            reg.loop_token_(0usize),
+            reg.loop_token_(1usize),
+            reg.loop_token_(2usize),
+            reg.loop_token_(3usize),
+        ];
 
         let core = Shared::new(
             MuxCore::new_(
@@ -187,9 +252,9 @@ where
         CoreBundle_ {
             core_: core,
             shared_: shared,
+            byte_shared_: byte_shared,
             w_receiver_: w_receiver,
             r_receiver_: r_receiver,
-            alloc_: alloc,
         }
     }
 }

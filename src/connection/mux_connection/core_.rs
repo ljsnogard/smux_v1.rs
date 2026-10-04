@@ -85,12 +85,12 @@ where
     /// 读事件发送端（接收环注册与释放）。
     r_events_: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
 
-    /// 两个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
+    /// 四个循环的取消令牌（`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵）。
     ///
     /// 核心自己持一份克隆，**而不是在 `Drop` 里去注册表取**：注册表取锁在跨线程
     /// 争用时是阻塞等待，而 `Drop` 必须不阻塞。令牌是可克隆的共享句柄，因此这里
     /// 持有的就是循环在用的那一个。
-    loops_: [CancelToken_<C::Alloc>; 2],
+    loops_: [CancelToken_<C::Alloc>; 4],
 }
 
 impl<C, S> MuxCore<C, S>
@@ -105,7 +105,7 @@ where
         reg: ChannelRegistry_<C::Alloc>,
         w_events: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
         r_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
-        loops: [CancelToken_<C::Alloc>; 2],
+        loops: [CancelToken_<C::Alloc>; 4],
     ) -> Self {
         MuxCore {
             config_: config,
@@ -297,10 +297,10 @@ impl<C, S> Drop for MuxCore<C, S>
 where
     C: TrConnCfg,
 {
-    /// 连接收尾：触发两个循环的取消令牌。
+    /// 连接收尾：触发四个循环的取消令牌。
     ///
-    /// 循环在每个 await 点检查令牌并自行退出（读循环的 park 经
-    /// `may_cancel_with`、写循环的 park 与取消 future 竞争），因此这里是「丢弃
+    /// 循环在每个 await 点检查令牌并自行退出（泵与解复用循环的 park 经
+    /// `race_cancel_`、复用循环的 park 与取消 future 竞争），因此这里是「丢弃
     /// 连接即关闭连接」的唯一入口，不依赖句柄的 `abort` / `drop` 语义。
     ///
     /// 令牌就在核心自己的字段里，因此本 `Drop` **不取注册表锁、不阻塞**——这一点

@@ -38,6 +38,91 @@ pub type BufferedRx<B, A> = RingReader<Shared<Ring<B>, A>, B, u8>;
 /// 一条子流收发环的两个半部：`(写端, 读端)`，共享同一条 [`Ring`]。
 pub type BufferedChannel<B, A> = (BufferedTx<B, A>, BufferedRx<B, A>);
 
+/// 连接级**帧暂存**环的两个半部：`(写端, 读端)`。
+///
+/// 与 [`BufferedChannel`] 是同一对类型，差别只在用途与容量来源（见
+/// [`crate::connection::TrConnCfg::StageBuff`]）。分开起名是为了让
+/// 「这条环是连接级还是子流级」在签名上一眼可辨。
+pub type StageRing<B, A> = (BufferedTx<B, A>, BufferedRx<B, A>);
+
+/// 交给**外侧**（贴传输）两个泵循环的半部：`(读环写端, 写环读端)`。
+pub(crate) type StageOuterHalves_<B, A> = (BufferedTx<B, A>, BufferedRx<B, A>);
+
+/// 交给**内侧**（贴子流）两个循环的半部：`(读环读端, 写环写端)`。
+pub(crate) type StageInnerHalves_<B, A> = (BufferedRx<B, A>, BufferedTx<B, A>);
+
+/// 连接级两条帧暂存环的四个半部：`(读环写端, 读环读端, 写环写端, 写环读端)`。
+///
+/// # 命名约定
+///
+/// 「读 / 写」一律站在**连接**视角：读环承载 `transport → 解复用`，写环承载
+/// `复用 → transport`。
+///
+/// # 谁持有什么
+///
+/// - **外侧**（贴传输的两个泵循环）拿 [`Self::into_halves_`] 的第一组：
+///   读环**写端** + 写环**读端**——它们只与传输打交道；
+/// - **内侧**（贴子流的解复用 / 复用两个循环）拿第二组：读环**读端** + 写环**写端**。
+///
+/// 一条环的同一端不得同时被两个任务持有：环的 park / 唤醒状态是按端记的，
+/// 两端各由固定的一方驱动才能保证「写入唤醒读端、读到空 park 读端」这条约定成立。
+pub(crate) struct StageRingPair_<B, A>
+where
+    B: BorrowMut<[MaybeUninit<u8>]> + 'static,
+    A: AllocatorClone + Send + Sync,
+{
+    /// 读环写端（外侧：泵循环把网络字节搬进来）。
+    read_w_: BufferedTx<B, A>,
+    /// 读环读端（内侧：解复用循环解析帧）。
+    read_r_: BufferedRx<B, A>,
+    /// 写环写端（内侧：复用循环成帧）。
+    write_w_: BufferedTx<B, A>,
+    /// 写环读端（外侧：泵循环把环上字节写上网）。
+    write_r_: BufferedRx<B, A>,
+}
+
+impl<B, A> StageRingPair_<B, A>
+where
+    B: BorrowMut<[MaybeUninit<u8>]> + 'static,
+    A: AllocatorClone + Send + Sync,
+{
+    /// 由两块连接级缓冲造出两条环的四个半部。
+    ///
+    /// # Errors
+    ///
+    /// 任一块容量不在 [`buffex::ring`] 允许区间内时返回**该块的容量**（调用方应当
+    /// 视为配置错误：容量来自 [`TrConnCfg::make_stage_buffs`]）。
+    ///
+    /// [`TrConnCfg::make_stage_buffs`]: crate::connection::TrConnCfg::make_stage_buffs
+    pub(crate) fn from_buffs_(
+        read_buff: B,
+        write_buff: B,
+        alloc: A,
+    ) -> Result<Self, usize> {
+        let (read_w_, read_r_) = new_stage_ring_(read_buff, alloc.clone())?;
+        let (write_w_, write_r_) = new_stage_ring_(write_buff, alloc)?;
+        Result::Ok(StageRingPair_ {
+            read_w_,
+            read_r_,
+            write_w_,
+            write_r_,
+        })
+    }
+
+    /// 拆成「外侧」与「内侧」两份半部，供两条 spawn 出来的循环各持一份。
+    pub(crate) fn into_halves_(
+        self,
+    ) -> (StageOuterHalves_<B, A>, StageInnerHalves_<B, A>) {
+        let StageRingPair_ {
+            read_w_,
+            read_r_,
+            write_w_,
+            write_r_,
+        } = self;
+        ((read_w_, write_r_), (read_r_, write_w_))
+    }
+}
+
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 环内存的智能指针：把分配器类型擦除成 `dyn Allocator`
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -137,6 +222,19 @@ impl Drop for MuxChanBuff {
         // 分配器以 `Arc` 形式被本类型拥有，因此释放时它仍然有效。
         unsafe { self.alloc_.deallocate(self.ptr_.cast::<u8>(), self.layout_) };
     }
+}
+
+/// 用调用方注入的存储与分配器建立**一条连接级**帧暂存环，切成 `(写端, 读端)`。
+///
+/// # Errors
+///
+/// 容量不在 [`buffex::ring`] 允许的区间内时返回该容量本身。
+fn new_stage_ring_<B, A>(buffer: B, alloc: A) -> Result<StageRing<B, A>, usize>
+where
+    B: BorrowMut<[MaybeUninit<u8>]>,
+    A: AllocatorClone,
+{
+    new_buffered_channel_(buffer, alloc)
 }
 
 /// 用调用方注入的存储与分配器建立一条环，并把它切成 `(写端, 读端)`。

@@ -26,6 +26,13 @@
 
 mod common;
 
+/// 本文件用到的连接配置别名：两侧同构的冒烟策略（传输类型由 `connect_pair_` 的
+/// 类型参数推断，这里只固定「配置」这一层，便于给泛化的 `connect_pair_` 标注）。
+type SmokeCfg_ = common::SmokeMuxConfig<
+    smux_v1::connection::BufferedTx<common::SmokeBuff, mm_ptr::x_deps::abs_mm::CoreAlloc>,
+    smux_v1::connection::BufferedRx<common::SmokeBuff, mm_ptr::x_deps::abs_mm::CoreAlloc>,
+>;
+
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -126,7 +133,9 @@ fn mux_bind_cross_thread_is_exclusive_compio_() {
     let scope = abs_art_compio::LocalScope::new();
     let rt = compio::runtime::Runtime::new().expect("compio 运行时应当创建成功");
     let (conn_a, _conn_b) =
-        rt.block_on(common::connect_pair_(&scope, a_rx, a_tx, b_rx, b_tx));
+        rt.block_on(common::connect_pair_::<SmokeCfg_, SmokeCfg_, _, _, _, _, _>(
+            &scope, a_rx, a_tx, b_rx, b_tx,
+        ));
 
     for round in 0..K_RACE_ROUNDS {
         let dock = Dock::new(K_FIRST_DOCK + round as u32);
@@ -214,7 +223,9 @@ fn mux_rebind_after_cross_thread_drop_compio_() {
     let scope = abs_art_compio::LocalScope::new();
     let rt = compio::runtime::Runtime::new().expect("compio 运行时应当创建成功");
     let (conn_a, _conn_b) =
-        rt.block_on(common::connect_pair_(&scope, a_rx, a_tx, b_rx, b_tx));
+        rt.block_on(common::connect_pair_::<SmokeCfg_, SmokeCfg_, _, _, _, _, _>(
+            &scope, a_rx, a_tx, b_rx, b_tx,
+        ));
 
     let dock = Dock::new(K_FIRST_DOCK);
     let bound = Arc::new(AtomicBool::new(false));

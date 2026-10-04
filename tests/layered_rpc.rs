@@ -252,7 +252,14 @@ where
         .invite_async(&opts, AcceptAllEntries)
         .await
         .expect("客户端握手应当成功");
-    MuxConnection::new(scope, delivery, <SmokeCfg as Default>::default())
+    let (stage_r, stage_w) = common::make_stage_buffs_();
+    MuxConnection::new(
+        scope,
+        delivery,
+        <SmokeCfg as Default>::default(),
+        stage_r,
+        stage_w,
+    )
 }
 
 /// **L5（服务端）**：等待握手，接管收发，建出连接对象。
@@ -273,7 +280,14 @@ where
         .listen_async(&opts, AcceptAllEntries)
         .await
         .expect("服务端握手应当成功");
-    MuxConnection::new(scope, delivery, <SmokeCfg as Default>::default())
+    let (stage_r, stage_w) = common::make_stage_buffs_();
+    MuxConnection::new(
+        scope,
+        delivery,
+        <SmokeCfg as Default>::default(),
+        stage_r,
+        stage_w,
+    )
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----

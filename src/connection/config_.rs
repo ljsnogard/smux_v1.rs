@@ -12,12 +12,21 @@
 //! 多少、从哪来）由使用环境在最终裁决建立 channel 时通过
 //! [`TrPrepareChannelRing`](abs_smux::chan::TrPrepareChannelRing)（`accept_async`
 //! 的 `prepare` 参数）当场交出；连接只负责校验——大小不合适就拒绝接受。
+//!
+//! # 连接级环的存储
+//!
+//! 连接级（「帧暂存」）两条环的存储类型由 [`TrConnCfg::StageBuff`] 声明，实例由
+//! [`TrConnCfg::make_stage_buffs`] 造出：它与 [`TrMuxConfig::Buff`] **解耦**，
+//! 因此帧暂存的容量不受「子流环容量」这一策略支配（连接级环至少要能驻留一个
+//! 满帧，见 `session_` 模块文档）。
 
 extern crate alloc;
 
 use core::{
     alloc::AllocatorClone,
+    borrow::BorrowMut,
     marker::PhantomData,
+    mem::MaybeUninit,
 };
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
@@ -43,6 +52,14 @@ pub trait TrMuxAllocConfig {
 #[error("构造 channel ring 缓冲失败")]
 pub struct BuffAllocError;
 
+/// **连接级**帧暂存环的容量常数（两块：读环、写环）。
+///
+/// 依据：帧暂存环必须能整块驻留一个**满帧**，否则外侧泵循环会在「环满」与
+/// 「解析器还需要更多字节才能判完这一帧」之间互等（死锁）。默认协商值是
+/// 4096 字节，实际部署建议把 `max_packet_size` 定在 **64 KiB 以下**；
+/// 超过此值时应由配置实现者按自己的 `max_packet_size` 放大本容量。
+pub const K_STAGE_RING_CAPACITY: usize = 64usize * 1024usize;
+
 /// 连接的配置类型。
 ///
 /// 它是**使用环境**与连接之间的唯一约定：数据与 dock 类型由上游
@@ -63,6 +80,17 @@ where
     type ConnTx: TrBuffWrite<u8>;
     type ConnRx: TrBuffRead<u8>;
 
+    /// **连接级**两条帧暂存环的存储类型（读环一块、写环一块）。
+    ///
+    /// 与 [`TrMuxConfig::Buff`] 解耦：子流环容量由调用方在 `accept_async` 逐条
+    /// 决定，帧暂存容量是**连接级**策略，两者不该互相绑架。容量下限由实现者保证
+    /// （至少能整块驻留一个满帧，见 `session_` 模块文档），连接不再二次校验。
+    ///
+    /// 这里刻意**不**要求 `Send + Sync`：是否需要跨线程搬运由具体装配决定
+    /// （`MuxConnection::new` 才要求 `C::StageBuff: Send + Sync`），与
+    /// [`TrMuxConfig::Buff`] 的约束保持同一层级。
+    type StageBuff: 'static + BorrowMut<[MaybeUninit<u8>]>;
+
     /// 取连接内部结构用的分配器（按值，`buffex` 的构建器按值接收）。
     fn allocator(&self) -> Self::Alloc;
 
@@ -78,6 +106,22 @@ where
         alloc: Self::Alloc,
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), BuffAllocError>;
+
+    /// 用自身分配器造出连接级两条帧暂存环的存储：`(读环, 写环)`。
+    ///
+    /// 与 [`Self::make_ring_buffs`] 的差别不只是类型：**容量在这里由配置决定**，
+    /// 调用方不需要（也不应该）知道帧暂存要多大。
+    ///
+    /// # Errors
+    ///
+    /// 分配失败时返回 [`BuffAllocError`]；调用方（[`MuxConnection::new`]）把它视为
+    /// 连接无法建立。
+    ///
+    /// [`MuxConnection::new`]: crate::connection::MuxConnection::new
+    fn make_stage_buffs(
+        &self,
+        alloc: Self::Alloc,
+    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError>;
 }
 
 /// 默认配置：`u8` 数据、[`Dock`] dock、[`CoreAlloc`] 分配、[`DefaultPolicy`]
@@ -132,6 +176,7 @@ where
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
+    type StageBuff = MuxChanBuff;
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
@@ -147,5 +192,13 @@ where
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
         MuxChanBuff::pair_from_alloc_(alloc, capacity).map_err(|_| BuffAllocError)
+    }
+
+    fn make_stage_buffs(
+        &self,
+        alloc: Self::Alloc,
+    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
+        MuxChanBuff::pair_from_alloc_(alloc, K_STAGE_RING_CAPACITY)
+            .map_err(|_| BuffAllocError)
     }
 }

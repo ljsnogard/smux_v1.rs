@@ -20,16 +20,19 @@
 mod common;
 
 use core::cell::Cell;
+use core::marker::PhantomData;
 use std::rc::Rc;
 
 use abs_art::TrLocalScope;
+use abs_smux::conf::TrMuxConfig;
+use abs_smux::conn::{TrChannelListener, TrDockBinding};
 use abs_art_tokio::LocalScope;
 use abs_smux::conn::TrConnection;
 use buffex::x_deps::abs_buff::{Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite};
 use buffex::x_deps::anylr::SomeOf;
 use buffex::x_deps::abs_cancel;
 use smux_v1::{
-    connection::{Dock, MuxConnection},
+    connection::{Dock, MuxConnection, TrConnCfg},
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
@@ -403,15 +406,21 @@ async fn dropping_connection_stops_both_loops_tokio_() {
         let (invited, accepted) =
             futures::join!(async { invite_fut.await }, async { listen_fut.await });
 
+        let (a_stage_r, a_stage_w) = common::make_stage_buffs_();
+        let (b_stage_r, b_stage_w) = common::make_stage_buffs_();
         let conn_a = MuxConnection::new(
             &scope,
             invited.expect("发起方握手应当成功"),
             common::SmokeMuxConfig::new(),
+            a_stage_r,
+            a_stage_w,
         );
         let conn_b = MuxConnection::new(
             &scope,
             accepted.expect("等待方握手应当成功"),
             common::SmokeMuxConfig::new(),
+            b_stage_r,
+            b_stage_w,
         );
         // 会话句柄也持有一份连接克隆：逐个丢弃，最后一个消失时核心才析构。
         let binding = conn_a
@@ -477,15 +486,21 @@ async fn dropping_one_side_stops_its_loops_tokio_() {
         let (invited, accepted) =
             futures::join!(async { invite_fut.await }, async { listen_fut.await });
 
+        let (a_stage_r, a_stage_w) = common::make_stage_buffs_();
+        let (b_stage_r, b_stage_w) = common::make_stage_buffs_();
         let conn_a = MuxConnection::new(
             &scope,
             invited.expect("发起方握手应当成功"),
             common::SmokeMuxConfig::new(),
+            a_stage_r,
+            a_stage_w,
         );
         let conn_b = MuxConnection::new(
             &scope,
             accepted.expect("等待方握手应当成功"),
             common::SmokeMuxConfig::new(),
+            b_stage_r,
+            b_stage_w,
         );
 
         // 只丢 A：B 仍然活着、空闲，其写循环不会关掉 A 的接收环。
@@ -537,4 +552,250 @@ async fn mux_ring_rejected_compio_() {
     let scope = abs_art_compio::LocalScope::new();
     let scenario = common::run_ring_rejected_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
     scope.run_until(scenario).await;
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 极小帧暂存容量：钉住「逐字节异步解析」这条要求
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 本用例用的连接级帧暂存容量：**`buffex::ring` 允许的最小容量**。
+///
+/// 环原语自己要求容量 ≥ 2（位置编码用「回绕位」区分空 / 满，1 格无法表达），
+/// 因此「最小」就是 2 字节——而一个满帧（头 + `max_packet_size` 载荷）远大于 2。
+/// 本用例钉住的正是「帧暂存容量与帧长无关」：**只要 ≥ 环原语的下限**即可。
+const K_MIN_STAGE_CAPACITY_: usize = 2usize;
+
+/// 与 [`common::SmokeMuxConfig`] 同构，**只把连接级帧暂存的容量换成本用例的最小值**。
+///
+/// 除 `make_stage_buffs` 之外与冒烟配置逐项一致：子流环仍然是 4096 字节的
+/// `SmokeBuff`，分配器、策略、传输类型都不变。这样对照实验里唯一的自变量就是
+/// 「连接读环 / 连接写环的容量」。
+///
+/// `Clone` / `Copy` / `Default` **手写**：结构里只有 `PhantomData`，不该给 `W` / `R`
+/// 加上这些约束（环端既不 `Clone` 也不 `Default`）。
+struct MinStageConfig_<W, R> {
+    _mark_: PhantomData<fn() -> (W, R)>,
+}
+
+impl<W, R> Clone for MinStageConfig_<W, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<W, R> Copy for MinStageConfig_<W, R> {}
+
+impl<W, R> Default for MinStageConfig_<W, R> {
+    fn default() -> Self {
+        MinStageConfig_ {
+            _mark_: PhantomData,
+        }
+    }
+}
+
+impl<W, R> TrMuxConfig for MinStageConfig_<W, R>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+{
+    type Data = u8;
+    type Dock = smux_v1::connection::Dock;
+    type Buff = common::SmokeBuff;
+}
+
+/// [`DefaultPolicy`](smux_v1::flow_ctrl::DefaultPolicy) 是 ZST；取静态引用即可。
+static TINY_POLICY_: smux_v1::flow_ctrl::DefaultPolicy =
+    smux_v1::flow_ctrl::DefaultPolicy;
+
+impl<W, R> TrConnCfg for MinStageConfig_<W, R>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+{
+    type Alloc = mm_ptr::x_deps::abs_mm::CoreAlloc;
+    type Policy = smux_v1::flow_ctrl::DefaultPolicy;
+    type ConnTx = W;
+    type ConnRx = R;
+    type StageBuff = common::SmokeBuff;
+
+    fn allocator(&self) -> Self::Alloc {
+        mm_ptr::x_deps::abs_mm::CoreAlloc
+    }
+
+    fn policy(&self) -> &Self::Policy {
+        &TINY_POLICY_
+    }
+
+    fn make_ring_buffs(
+        &self,
+        alloc: Self::Alloc,
+        capacity: usize,
+    ) -> Result<(Self::Buff, Self::Buff), smux_v1::connection::BuffAllocError> {
+        // 与冒烟配置一致：子流环仍是 `SmokeBuff`，这里**只**改帧暂存容量。
+        Ok((
+            mm_ptr::Owned::new_uninit_slice(capacity, alloc),
+            mm_ptr::Owned::new_uninit_slice(capacity, alloc),
+        ))
+    }
+
+    /// **最小容量**帧暂存：连接读环与连接写环各只有
+    /// [`K_MIN_STAGE_CAPACITY_`] 字节（`buffex::ring` 的下限）。
+    ///
+    /// 这正是「一个满帧（头 + 最大载荷）远大于环容量」的极端：任何要求「先攒齐整帧
+    /// 再解析」的实现都会在这里互等。
+    fn make_stage_buffs(
+        &self,
+        alloc: Self::Alloc,
+    ) -> Result<(Self::StageBuff, Self::StageBuff), smux_v1::connection::BuffAllocError> {
+        let (read_stage, write_stage) = common::make_stage_buffs_with_(K_MIN_STAGE_CAPACITY_);
+        // 分配器参数这里用不上（缓冲由测试直接给），显式消费掉以免告警。
+        let _ = alloc;
+        Ok((read_stage, write_stage))
+    }
+}
+
+/// 测试目标：**连接级帧暂存环取环原语允许的最小容量（2 字节）时，双向收发与半关闭
+/// 仍然全部成功**。
+///
+/// 这条用例钉住的是「线格式解析必须逐字节纯异步」这条要求，而不是某一种实现：
+/// ring 本来就该「有多少搬多少」，解析器读完当前帧声明的载荷量就转入下一帧状态，
+/// 因此帧暂存容量的下限由**环原语**决定（2 字节，见 [`K_MIN_STAGE_CAPACITY_`]），
+/// 与帧长无关，更不需要能装下整帧。
+///
+/// - 手段：两条 64 KiB 内存环直连两个端点，用 [`MinStageConfig_`] 建连
+///   （`make_stage_buffs` 返回两块 2 字节缓冲，其余与冒烟配置一致）；在同一个 dock
+///   上并发跑一对 open / accept，双向各发一段 64 字节（首 4 字节是 `(dock, index)`
+///   编码的 tag，其余按 tag 生成），逐字节比对后丢弃发送半边、在对端等 EOF。
+/// - 判断：open / accept 均成功；两端收到的载荷与对端发出的**逐字节相等**；半关闭后
+///   读到 `Closing`（EOF）。任一不满足即 panic；实现若要求「读环能装下整帧」，本用例
+///   会在等第一帧时互等（超时）而不是通过。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_min_stage_inmem_tokio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = LocalScope::new();
+    let scenario = drive_min_stage_(&scope, a_rx, a_tx, b_rx, b_tx);
+    scope.run_until(scenario).await;
+}
+
+/// 与 [`mux_min_stage_inmem_tokio_`] 相同的验收，改用 **compio 运行时**。
+///
+/// - 手段：同样的两条内存环与一字节帧暂存配置，作用域换成
+///   `abs_art_compio::LocalScope`（队列归运行时所有）。
+/// - 判断：与 tokio 版相同——载荷逐字节相等、半关闭后读到 EOF。
+#[compio::test]
+async fn mux_min_stage_inmem_compio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = abs_art_compio::LocalScope::new();
+    let scenario = drive_min_stage_(&scope, a_rx, a_tx, b_rx, b_tx);
+    scenario.await;
+}
+
+/// 最小帧暂存场景的执行体：建连 + 一对子流的双向收发与半关闭。
+async fn drive_min_stage_<RA, WA, RB, WB, S>(
+    scope: &S,
+    rx_a: RA,
+    tx_a: WA,
+    rx_b: RB,
+    tx_b: WB,
+) where
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: common::TrSmokeScope + Clone + 'static,
+{
+    let (conn_a, conn_b) = common::connect_pair_::<
+        MinStageConfig_<WA, RA>,
+        MinStageConfig_<WB, RB>,
+        RA,
+        WA,
+        RB,
+        WB,
+        S,
+    >(scope, rx_a, tx_a, rx_b, tx_b)
+    .await;
+
+    let dock_b = Dock::new(1u32);
+    let mut listener = conn_b
+        .bind_async(dock_b)
+        .await
+        .expect("B 侧绑定监听 dock 应当成功")
+        .listen_async()
+        .await
+        .expect("B 侧建立 listener 应当成功");
+
+    let dock_a = Dock::new(0x2001u32);
+    let mut message: &[u8] = &[];
+    let mut handle = conn_a
+        .bind_async(dock_a)
+        .await
+        .expect("A 侧绑定发起 dock 应当成功")
+        .open_channel_async(dock_b, &mut message)
+        .await
+        .expect("A 侧发起子流应当成功");
+
+    let payload_a = common::make_payload_(dock_a.value(), 0usize);
+    let payload_b = common::make_payload_(dock_b.value(), 0usize);
+
+    let mut welcome_a_buf: [u8; 0] = [];
+    let mut welcome_b_buf: [u8; 0] = [];
+    let (opened, incoming) = futures::join!(
+        async {
+            let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+            handle
+                .accept_async_managed(&mut welcome_a, common::K_CHANNEL_CAPACITY)
+                .await
+        },
+        async {
+            let mut incoming_handle = listener
+                .income_async()
+                .await
+                .expect("B 侧应当取到入向建流请求");
+            let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
+            incoming_handle
+                .accept_async_managed(&mut welcome_b, common::K_CHANNEL_CAPACITY)
+                .await
+        },
+    );
+    let (tx_a, mut rx_a) = opened.expect("A 侧最终裁决应当成功");
+    let (tx_b, mut rx_b) = incoming.expect("B 侧最终裁决应当成功");
+
+    // 两个方向并发：先把本端载荷全部写进发送环，再丢弃发送半边（发 FIN）。
+    // 载荷克隆一份留在断言侧比对（`write_channel_all_` 之后仍要用来核对对端收到的内容）。
+    let payload_a_sent = payload_a.clone();
+    let payload_b_sent = payload_b.clone();
+    futures::join!(
+        async move {
+            let mut tx = tx_a;
+            common::write_channel_all_(&mut tx, &payload_a_sent)
+                .await
+                .expect("A 侧写入本端载荷应当成功");
+            drop(tx);
+        },
+        async move {
+            let mut tx = tx_b;
+            common::write_channel_all_(&mut tx, &payload_b_sent)
+                .await
+                .expect("B 侧写入本端载荷应当成功");
+            drop(tx);
+        },
+    );
+
+    let mut got_a = vec![0u8; payload_b.len()];
+    common::read_channel_exact_(&mut rx_a, &mut got_a)
+        .await
+        .expect("A 侧读满对端载荷应当成功");
+    assert_eq!(got_a, payload_b, "A 侧收到的载荷应与 B 侧发出的逐字节相等");
+    common::expect_eof_(&mut rx_a).await;
+
+    let mut got_b = vec![0u8; payload_a.len()];
+    common::read_channel_exact_(&mut rx_b, &mut got_b)
+        .await
+        .expect("B 侧读满对端载荷应当成功");
+    assert_eq!(got_b, payload_a, "B 侧收到的载荷应与 A 侧发出的逐字节相等");
+    common::expect_eof_(&mut rx_b).await;
 }

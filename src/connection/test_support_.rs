@@ -27,7 +27,8 @@ use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, BuffAllocError, MuxChanBuff, MuxConnection, TrConnCfg,
+        BufferedRx, BufferedTx, BuffAllocError, K_STAGE_RING_CAPACITY, MuxChanBuff,
+        MuxConnection, TrConnCfg,
         ring_::test_support_::TestBuff,
     },
     flow_ctrl::DefaultPolicy,
@@ -114,6 +115,7 @@ impl TrConnCfg for TestMuxConfig_ {
     type Policy = DefaultPolicy;
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
+    type StageBuff = TestBuff;
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
@@ -131,6 +133,16 @@ impl TrConnCfg for TestMuxConfig_ {
         Result::Ok((
             Owned::new_uninit_slice(capacity, alloc),
             Owned::new_uninit_slice(capacity, alloc),
+        ))
+    }
+
+    fn make_stage_buffs(
+        &self,
+        alloc: Self::Alloc,
+    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
+        Result::Ok((
+            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
+            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
         ))
     }
 }
@@ -151,6 +163,7 @@ impl TrConnCfg for ErasedTestMuxConfig_ {
     type Policy = DefaultPolicy;
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
+    type StageBuff = MuxChanBuff;
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
@@ -166,6 +179,14 @@ impl TrConnCfg for ErasedTestMuxConfig_ {
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
         MuxChanBuff::pair_from_alloc_(alloc, capacity).map_err(|_| BuffAllocError)
+    }
+
+    fn make_stage_buffs(
+        &self,
+        alloc: Self::Alloc,
+    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
+        MuxChanBuff::pair_from_alloc_(alloc, K_STAGE_RING_CAPACITY)
+            .map_err(|_| BuffAllocError)
     }
 }
 

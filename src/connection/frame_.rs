@@ -73,7 +73,7 @@
 // 因此这里保留 `dead_code` 允许；**第 5 步完成后必须移除本行**。
 
 use abs_buff::{
-    TrBuffRead, TrBuffWrite,
+    TrBuffRead,
     x_deps::abs_cancel,
 };
 use abs_cancel::TrCancellationToken;
@@ -84,7 +84,7 @@ use crate::{
     connection::{Dock, MuxError},
     flow_ctrl::{Credit, RecvTotal},
     handshake::opts::NegotiationValType as FieldValType,
-    wire_io_::{CursorError, ReadCursor, write_all_async_},
+    wire_io_::{CursorError, ReadCursor},
 };
 
 /// `kind` 在帧首字节中的掩码（低 4 位）。
@@ -356,7 +356,7 @@ impl FrameHeader {
     ///
     /// `window` 只在 `OPEN` / `PULSE` / `WINDOW_UPDATE` 上给出（`(累计已收 R,
     /// 接收窗口 W)`），其余帧必须传 `None`；合法性由
-    /// [`write_header_async_`] 再次校验。
+    /// [`encode_header_into_`] 再次校验。
     pub(crate) const fn new_(
         kind: FrameKind,
         flags: u8,
@@ -449,37 +449,12 @@ fn encode_field_(id: FieldId, value: usize) -> Option<([u8; 9], usize)> {
 }
 
 /// 写一个字段，值以 `usize` 给出。
-async fn write_field_async_<W, K>(
-    tx: &mut W,
-    id: FieldId,
-    value: usize,
-    cancel: K,
-) -> Result<(), MuxError>
-where
-    W: TrBuffWrite<u8>,
-    K: TrCancellationToken,
-{
-    let (bytes, len) = encode_field_(id, value).ok_or(MuxError::UnsupportedField)?;
-    write_all_async_(tx, &bytes[..len], cancel)
-        .await
-        .map_err(map_write_cursor_err_)
-}
-
 /// 把**读侧**游标错误映射为连接错误。底层载荷不在这里保留：帧层只关心
 /// 「读方向传输失败 / 对端关闭」这类可共享语义。
 fn map_read_cursor_err_<E>(err: CursorError<E, ()>) -> MuxError {
     match err {
         CursorError::Read(_) => MuxError::Transport { write: false },
         CursorError::Write(()) => MuxError::Transport { write: true },
-        CursorError::PeerClosed => MuxError::PeerClosed,
-    }
-}
-
-/// 把**写侧**游标错误映射为连接错误；语义与 [`map_read_cursor_err_`] 对称。
-fn map_write_cursor_err_<E>(err: CursorError<(), E>) -> MuxError {
-    match err {
-        CursorError::Write(_) => MuxError::Transport { write: true },
-        CursorError::Read(()) => MuxError::Transport { write: false },
         CursorError::PeerClosed => MuxError::PeerClosed,
     }
 }
@@ -660,11 +635,13 @@ pub(crate) const fn requires_window_report_(kind: FrameKind) -> bool {
     )
 }
 
-/// 把一个帧头写成「帧首字节 + 自描述字段序列」。
+/// 把帧头编码为「帧首字节 + 自描述字段序列」，追加到 `sink` 末尾。
 ///
-/// 只写头，不写载荷；调用方随后把载荷字节直接拼上。字段按固定顺序写出
-/// （`LocalDock` → `RemoteDock` → `RecvTotal` → `RecvWindow` → `PayloadLen`），因此
-/// `PayloadLen` 天然收尾（模块文档 §帧形状）。
+/// 字段按固定顺序写出（`LocalDock` → `RemoteDock` → `RecvTotal` → `RecvWindow` →
+/// `PayloadLen`），因此 `PayloadLen` 天然收尾（模块文档 §帧形状）。
+///
+/// 本函数是帧头编码的**唯一**来源：连接级写环的「整帧一次写」与读侧测试都走它，
+/// 避免两处各写一份字段顺序。
 ///
 /// # Errors
 ///
@@ -674,17 +651,11 @@ pub(crate) const fn requires_window_report_(kind: FrameKind) -> bool {
 ///   （都属调用方构造了自相矛盾的帧头）；
 /// - dock 取了保留值（`wildcard` / `unspecified`）→ [`MuxError::ReservedDock`]；
 /// - 把 [`flags::K_TOTAL_RESET`] 用在 `PULSE` / `WINDOW_UPDATE` 之外的帧上
-///   → [`MuxError::MalformedFrame`]；
-/// - 底层写失败 → [`MuxError::Transport`]。
-pub(crate) async fn write_header_async_<W, K>(
-    tx: &mut W,
+///   → [`MuxError::MalformedFrame`]。
+pub(crate) fn encode_header_into_(
+    sink: &mut Vec<u8>,
     header: &FrameHeader,
-    cancel: K,
-) -> Result<(), MuxError>
-where
-    W: TrBuffWrite<u8>,
-    K: TrCancellationToken,
-{
+) -> Result<(), MuxError> {
     // `TOTAL_RESET` 只对窗口通告有意义，且 OPEN 时还没有 epoch。
     if header.flags_ & flags::K_TOTAL_RESET != 0
         && !matches!(header.kind_, FrameKind::Pulse | FrameKind::WindowUpdate)
@@ -692,10 +663,7 @@ where
         return Result::Err(MuxError::MalformedFrame);
     }
 
-    let head = compose_frame_head_(header.kind_, header.flags_);
-    write_all_async_(tx, &[head], cancel.child_token())
-        .await
-        .map_err(map_write_cursor_err_)?;
+    sink.push(compose_frame_head_(header.kind_, header.flags_));
 
     // channel 作用域的帧里 dock 对就是身份：两端都必须是真实 dock。
     //
@@ -707,9 +675,9 @@ where
         return Result::Err(MuxError::ReservedDock);
     }
     let local = usize::try_from(local_dock.value()).map_err(|_| MuxError::UnsupportedField)?;
-    write_field_async_(tx, FieldId::LocalDock, local, cancel.child_token()).await?;
+    encode_field_into_(sink, FieldId::LocalDock, local)?;
     let remote = usize::try_from(remote_dock.value()).map_err(|_| MuxError::UnsupportedField)?;
-    write_field_async_(tx, FieldId::RemoteDock, remote, cancel.child_token()).await?;
+    encode_field_into_(sink, FieldId::RemoteDock, remote)?;
 
     match (
         requires_window_report_(header.kind_),
@@ -719,21 +687,23 @@ where
         (true, Option::Some(window), Option::Some(total)) => {
             // 先累计字节数（`R`）后窗口值（`W`），与模块文档的字段顺序一致。
             let total = usize::try_from(total).map_err(|_| MuxError::UnsupportedField)?;
-            write_field_async_(tx, FieldId::RecvTotal, total, cancel.child_token()).await?;
-            write_field_async_(
-                tx,
-                FieldId::RecvWindow,
-                usize::try_from(window).map_err(|_| MuxError::UnsupportedField)?,
-                cancel.child_token(),
-            )
-            .await?;
+            encode_field_into_(sink, FieldId::RecvTotal, total)?;
+            let window = usize::try_from(window).map_err(|_| MuxError::UnsupportedField)?;
+            encode_field_into_(sink, FieldId::RecvWindow, window)?;
         }
         (false, Option::None, Option::None) => {}
         // 缺一个、多一个、或出现在不该出现的帧上：都是自相矛盾的帧头。
         _ => return Result::Err(MuxError::MalformedFrame),
     }
 
-    write_field_async_(tx, FieldId::PayloadLen, header.payload_len_, cancel.child_token()).await
+    encode_field_into_(sink, FieldId::PayloadLen, header.payload_len_)
+}
+
+/// 编码单个自描述字段并追加到 `sink`（宽度取能容纳 `value` 的最小合法宽度）。
+fn encode_field_into_(sink: &mut Vec<u8>, id: FieldId, value: usize) -> Result<(), MuxError> {
+    let (bytes, len) = encode_field_(id, value).ok_or(MuxError::UnsupportedField)?;
+    sink.extend_from_slice(&bytes[..len]);
+    Result::Ok(())
 }
 
 #[cfg(test)]
@@ -785,16 +755,15 @@ mod tests_ {
         }
     }
 
-    /// 把一个帧头写进 `buf`，返回写入的字节数。
-    /// - 手段：用切片实现 [`TrBuffWrite`]，写出后由切片剩余长度反推写入量。
-    /// - 判断：写入成功；返回值为实际写出的帧头长度。
-    async fn write_header_into_buf_(buf: &mut [u8], header: &FrameHeader) -> usize {
-        let capacity = buf.len();
-        let mut cursor: &mut [u8] = buf;
-        write_header_async_::<_, _>(&mut cursor, header, NonCancellableToken::new())
-            .await
-            .expect("写帧头应当成功");
-        capacity - cursor.len()
+    /// 把一个帧头编码进 `buf`，返回写出的字节数。
+    /// - 手段：调用 [`encode_header_into_`] 得到一个临时 `Vec`，再拷进 `buf`。
+    /// - 判断：编码成功；返回值为实际写出的帧头长度。
+    fn write_header_into_buf_(buf: &mut [u8], header: &FrameHeader) -> usize {
+        let mut bytes = Vec::new();
+        encode_header_into_(&mut bytes, header).expect("编码帧头应当成功");
+        assert!(bytes.len() <= buf.len(), "测试缓冲应当装得下帧头");
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        bytes.len()
     }
 
     /// 从 `bytes` 读出一个帧头，失败时返回错误的协议层种类。
@@ -815,14 +784,11 @@ mod tests_ {
     }
 
     /// 写一个自相矛盾的帧头，返回错误的协议层种类。
-    /// - 手段：在局部缓冲上调用 [`write_header_async_`]，期望它拒绝该帧头。
+    /// - 手段：调用 [`encode_header_into_`]，期望它拒绝该帧头。
     /// - 判断：返回被测代码报出的错误种类。
-    async fn write_header_err_(header: &FrameHeader) -> ErrKind {
-        let mut buf = [0u8; 64];
-        let mut cursor: &mut [u8] = &mut buf;
-        let err = write_header_async_::<_, _>(&mut cursor, header, NonCancellableToken::new())
-            .await
-            .expect_err("写帧头应当失败");
+    fn write_header_err_(header: &FrameHeader) -> ErrKind {
+        let mut bytes = Vec::new();
+        let err = encode_header_into_(&mut bytes, header).expect_err("编码帧头应当失败");
         err_kind_(err)
     }
 
@@ -855,7 +821,7 @@ mod tests_ {
         header.payload_len_ = 1024usize;
 
         let mut buf = [0u8; 64];
-        let total = write_header_into_buf_(&mut buf, &header).await;
+        let total = write_header_into_buf_(&mut buf, &header);
 
         assert_eq!(total, 9usize);
         assert_eq!(
@@ -897,7 +863,7 @@ mod tests_ {
             header.local_dock_ = Dock::new(value);
 
             let mut buf = [0u8; 64];
-            let total = write_header_into_buf_(&mut buf, &header).await;
+            let total = write_header_into_buf_(&mut buf, &header);
 
             // 第 0 字节是帧首，第 1 字节是 LocalDock 的自描述头。
             assert_eq!(buf[1], (expect as u8) | FieldId::LocalDock.as_u8());
@@ -922,7 +888,7 @@ mod tests_ {
         header.recv_total_ = Option::Some(8192u64);
 
         let mut buf = [0u8; 64];
-        let total = write_header_into_buf_(&mut buf, &header).await;
+        let total = write_header_into_buf_(&mut buf, &header);
         let parsed = read_header_from_buf_(&buf[..total])
             .await
             .expect("读回窗口更新帧应当成功");
@@ -936,7 +902,7 @@ mod tests_ {
         missing.local_dock_ = Dock::new(7u32);
         missing.remote_dock_ = Dock::new(9u32);
         assert_eq!(
-            write_header_err_(&missing).await,
+            write_header_err_(&missing),
             ErrKind::MalformedFrame
         );
 
@@ -974,7 +940,7 @@ mod tests_ {
         header.recv_total_ = Option::Some(0u64);
 
         let mut buf = [0u8; 64];
-        let total = write_header_into_buf_(&mut buf, &header).await;
+        let total = write_header_into_buf_(&mut buf, &header);
         assert_eq!(
             &buf[..total],
             &[0x08u8, 0x00, 0x01, 0x01, 0x02, 0x14, 0x00, 0x00, 0x13, 0x10, 0x00, 0x02, 0x00]
@@ -1017,7 +983,7 @@ mod tests_ {
         missing.local_dock_ = Dock::new(1u32);
         missing.remote_dock_ = Dock::new(2u32);
         assert_eq!(
-            write_header_err_(&missing).await,
+            write_header_err_(&missing),
             ErrKind::MalformedFrame
         );
     }
@@ -1038,7 +1004,7 @@ mod tests_ {
         open.payload_len_ = 4usize;
 
         let mut buf = [0u8; 64];
-        let total = write_header_into_buf_(&mut buf, &open).await;
+        let total = write_header_into_buf_(&mut buf, &open);
         let parsed = read_header_from_buf_(&buf[..total])
             .await
             .expect("读回 OPEN 帧应当成功");
@@ -1052,7 +1018,7 @@ mod tests_ {
         open_no_window.local_dock_ = Dock::new(3u32);
         open_no_window.remote_dock_ = Dock::new(7u32);
         assert_eq!(
-            write_header_err_(&open_no_window).await,
+            write_header_err_(&open_no_window),
             ErrKind::MalformedFrame
         );
 
@@ -1063,7 +1029,7 @@ mod tests_ {
         accept_with_window.recv_window_ = Option::Some(2048u32);
         accept_with_window.recv_total_ = Option::Some(0u64);
         assert_eq!(
-            write_header_err_(&accept_with_window).await,
+            write_header_err_(&accept_with_window),
             ErrKind::MalformedFrame
         );
     }
@@ -1094,11 +1060,11 @@ mod tests_ {
         let mut header = header_(FrameKind::Data, 0u8);
         header.local_dock_ = Dock::unspecified();
         header.remote_dock_ = Dock::new(2u32);
-        assert_eq!(write_header_err_(&header).await, ErrKind::ReservedDock);
+        assert_eq!(write_header_err_(&header), ErrKind::ReservedDock);
 
         header.local_dock_ = Dock::new(1u32);
         header.remote_dock_ = Dock::wildcard();
-        assert_eq!(write_header_err_(&header).await, ErrKind::ReservedDock);
+        assert_eq!(write_header_err_(&header), ErrKind::ReservedDock);
     }
 
     /// 测试 `RecvTotal` 只接受 2 / 4 / 8 字节三种规格，并按值取最小者。
@@ -1120,7 +1086,7 @@ mod tests_ {
             header.recv_total_ = Option::Some(value);
 
             let mut buf = [0u8; 64];
-            let total = write_header_into_buf_(&mut buf, &header).await;
+            let total = write_header_into_buf_(&mut buf, &header);
             // 第 0 字节是帧首，其后依次是 LocalDock / RemoteDock，然后才是 RecvTotal。
             assert_eq!(buf[5], expect_header, "RecvTotal 的宽度规格不对");
             let parsed = read_header_from_buf_(&buf[..total])
@@ -1152,7 +1118,7 @@ mod tests_ {
         header.recv_total_ = Option::Some(65_536u64);
 
         let mut buf = [0u8; 64];
-        let total = write_header_into_buf_(&mut buf, &header).await;
+        let total = write_header_into_buf_(&mut buf, &header);
         let parsed = read_header_from_buf_(&buf[..total])
             .await
             .expect("读回重置变体应当成功");
@@ -1163,7 +1129,7 @@ mod tests_ {
         let mut open = header_(FrameKind::Open, flags::K_TOTAL_RESET);
         open.recv_window_ = Option::Some(1024u32);
         open.recv_total_ = Option::Some(0u64);
-        assert_eq!(write_header_err_(&open).await, ErrKind::MalformedFrame);
+        assert_eq!(write_header_err_(&open), ErrKind::MalformedFrame);
 
         // DATA 帧本来就不带窗口通告，更不该有重置标记。
         let on_data = [

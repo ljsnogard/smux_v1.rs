@@ -87,7 +87,7 @@ use abs_smux::{
 use smux_v1::{
     connection::{
         BindError, BuffAllocError, ChannelHandle, ChannelRx, ChannelTx, Dock, HandleError,
-        MuxConnection, TrConnCfg,
+        K_STAGE_RING_CAPACITY, MuxConnection, TrConnCfg,
     },
     flow_ctrl::DefaultPolicy,
     handshake::{
@@ -184,9 +184,22 @@ pub const K_NET_BUFFER_SIZE: usize = 64usize * 1024usize;
 
 /// 测试用复用资源策略：`mm_ptr::Owned` 存储 + `CoreAlloc` 分配器 +
 /// [`DefaultPolicy`] 流控，两条传输半边由类型参数 `W` / `R` 给出。
+///
+/// `Clone` / `Copy` **手写**而不是 derive：`#[derive(Clone)]` 会给 `W` / `R` 加上
+/// `Clone` 约束，而这里只放 `PhantomData<fn() -> _>`，本来不需要——握手里两条半边被
+/// 移进 `'static` future，`W` / `R`（环端）并不 `Clone`。
+#[derive(Debug)]
 pub struct SmokeMuxConfig<W, R> {
     _use_w_: PhantomData<fn() -> W>,
     _use_r_: PhantomData<fn() -> R>,
+}
+
+impl<W, R> Copy for SmokeMuxConfig<W, R> {}
+
+impl<W, R> Clone for SmokeMuxConfig<W, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<W, R> SmokeMuxConfig<W, R> {
@@ -227,6 +240,7 @@ where
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
+    type StageBuff = SmokeBuff;
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
@@ -246,10 +260,42 @@ where
             Owned::new_uninit_slice(capacity, alloc),
         ))
     }
+
+    fn make_stage_buffs(
+        &self,
+        alloc: Self::Alloc,
+    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
+        Result::Ok((
+            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
+            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
+        ))
+    }
+}
+
+/// 造一对**连接级**帧暂存缓冲（容量 [`K_STAGE_RING_CAPACITY`]）。
+///
+/// [`MuxConnection::new`] 要求调用方给出两块连接级缓冲，连接把它们建成两条帧暂存环
+/// （见 `src/connection/session_.rs` 模块文档）。测试里直接按配置给出。
+pub fn make_stage_buffs_() -> (SmokeBuff, SmokeBuff) {
+    make_stage_buffs_with_(K_STAGE_RING_CAPACITY)
+}
+
+/// 按指定容量造一对**连接级**帧暂存缓冲。
+///
+/// 「极小容量」用例（容量 1 字节）用它，验收「逐字节异步解析 ⇒ 帧暂存不需要装下
+/// 整帧」这条要求。
+pub fn make_stage_buffs_with_(capacity: usize) -> (SmokeBuff, SmokeBuff) {
+    (
+        Owned::new_uninit_slice(capacity, CoreAlloc),
+        Owned::new_uninit_slice(capacity, CoreAlloc),
+    )
 }
 
 /// 环存储的具体类型（元素 `u8` + `CoreAlloc`），避免类型推断歧义。
-type SmokeBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
+///
+/// 对测试目标公开：`tests/thread_safety.rs` 需要给泛化的 `connect_pair_` 标注
+/// 连接配置类型，而配置类型上带着这个存储类型。
+pub type SmokeBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
 
 /// 造一块子流环存储（容量 [`K_CHANNEL_CAPACITY`]）。
 ///
@@ -562,7 +608,16 @@ async fn run_mux_scenario_<RA, WA, RB, WB, S>(
     S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
-        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+        connect_pair_::<
+            SmokeMuxConfig<WA, RA>,
+            SmokeMuxConfig<WB, RB>,
+            RA,
+            WA,
+            RB,
+            WB,
+            S,
+        >(scope, rx_a, tx_a, rx_b, tx_b)
+        .await;
 
     futures::join!(
         drive_side_(&conn_a, 0u32, dock_count, per_dock),
@@ -574,13 +629,17 @@ async fn run_mux_scenario_<RA, WA, RB, WB, S>(
 ///
 /// 抽出来给「收发场景」与「绑定独占性场景」共用，保证两者走的是**同一套**
 /// 连接建立路径；`tests/thread_safety.rs` 也直接用它装配连接。
-pub async fn connect_pair_<RA, WA, RB, WB, S>(
+///
+/// **连接配置是泛型参数** `C`：默认调用点是 [`SmokeMuxConfig`]，而「极小帧暂存」
+/// 验收用例传入一个只把 `make_stage_buffs` 换成一字节缓冲的同构配置——两条子流环
+/// 与其余策略完全一致，避免把「容量」以外的差异带进对照。
+pub async fn connect_pair_<CA, CB, RA, WA, RB, WB, S>(
     scope: &S,
     rx_a: RA,
     tx_a: WA,
     rx_b: RB,
     tx_b: WB,
-) -> (SmokeConn<RA, WA, S>, SmokeConn<RB, WB, S>)
+) -> (MuxConnection<CA, S>, MuxConnection<CB, S>)
 where
     // 连接把 Rx / Tx 移交给 `'static` 的读写循环（`spawn_local` 要求 `'static`；
     // 本地投递**不要求** `Send`，因此 `!Send` 的传输也能直接当 `Rx` / `Tx`）。
@@ -589,6 +648,29 @@ where
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    // 两端的连接配置各自泛化：默认用例两侧都是 [`SmokeMuxConfig`]，「极小帧暂存」
+    // 用例传入一对只把 `make_stage_buffs` 换成一字节缓冲的同构配置——两条子流环与
+    // 其余策略完全一致，避免把「容量」以外的差异带进对照。
+    CA: TrConnCfg<
+            ConnRx = RA,
+            ConnTx = WA,
+            Alloc = CoreAlloc,
+            Buff = SmokeBuff,
+            StageBuff = SmokeBuff,
+        > + Default
+        + Clone
+        + 'static,
+    CB: TrConnCfg<
+            ConnRx = RB,
+            ConnTx = WB,
+            Alloc = CoreAlloc,
+            Buff = SmokeBuff,
+            StageBuff = SmokeBuff,
+        > + Default
+        + Clone
+        + 'static,
+    CA::StageBuff: Send + Sync,
+    CB::StageBuff: Send + Sync,
 {
     let invite_opts = BasicOpts::default();
     let listen_opts = BasicOpts::default();
@@ -598,9 +680,19 @@ where
     let delivery_a = invited.expect("发起方握手应当成功");
     let delivery_b = accepted.expect("等待方握手应当成功");
 
+    // 两块连接级缓冲**由配置提供**（`TrConnCfg::make_stage_buffs`）：容量是连接级
+    // 策略，测试装配不该在这里另写一份固定的 64 KiB。
+    let config_a = CA::default();
+    let config_b = CB::default();
+    let (stage_ar, stage_aw) = config_a
+        .make_stage_buffs(config_a.allocator())
+        .expect("A 侧连接级帧暂存应当分配成功");
+    let (stage_br, stage_bw) = config_b
+        .make_stage_buffs(config_b.allocator())
+        .expect("B 侧连接级帧暂存应当分配成功");
     (
-        MuxConnection::new(scope, delivery_a, SmokeMuxConfig::new()),
-        MuxConnection::new(scope, delivery_b, SmokeMuxConfig::new()),
+        MuxConnection::new(scope, delivery_a, config_a, stage_ar, stage_aw),
+        MuxConnection::new(scope, delivery_b, config_b, stage_br, stage_bw),
     )
 }
 
@@ -629,7 +721,16 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
     S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
-        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+        connect_pair_::<
+            SmokeMuxConfig<WA, RA>,
+            SmokeMuxConfig<WB, RB>,
+            RA,
+            WA,
+            RB,
+            WB,
+            S,
+        >(scope, rx_a, tx_a, rx_b, tx_b)
+        .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
     let dock = Dock::new(0x2000u32);
@@ -703,7 +804,16 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
     S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
-        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+        connect_pair_::<
+            SmokeMuxConfig<WA, RA>,
+            SmokeMuxConfig<WB, RB>,
+            RA,
+            WA,
+            RB,
+            WB,
+            S,
+        >(scope, rx_a, tx_a, rx_b, tx_b)
+        .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
     let local_a = Dock::new(0x3000u32);
@@ -825,7 +935,16 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
     S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
-        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+        connect_pair_::<
+            SmokeMuxConfig<WA, RA>,
+            SmokeMuxConfig<WB, RB>,
+            RA,
+            WA,
+            RB,
+            WB,
+            S,
+        >(scope, rx_a, tx_a, rx_b, tx_b)
+        .await;
 
     let local_a = Dock::new(0x3100u32);
     let remote_b = Dock::new(0x3101u32);
@@ -951,7 +1070,16 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
     S: TrSmokeScope + Clone + 'static,
 {
     let (conn_a, conn_b) =
-        connect_pair_::<RA, WA, RB, WB, S>(scope, rx_a, tx_a, rx_b, tx_b).await;
+        connect_pair_::<
+            SmokeMuxConfig<WA, RA>,
+            SmokeMuxConfig<WB, RB>,
+            RA,
+            WA,
+            RB,
+            WB,
+            S,
+        >(scope, rx_a, tx_a, rx_b, tx_b)
+        .await;
 
     let local_a = Dock::new(0x4000u32);
     let dock_small = Dock::new(0x4001u32);

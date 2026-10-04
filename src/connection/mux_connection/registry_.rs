@@ -435,11 +435,11 @@ where
 {
     inner_: Shared<CooperativeRwLockOwned<RegistryInner_<A>>, A>,
 
-    /// 两个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
+    /// 四个循环的取消令牌：`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵。
     ///
     /// **放在锁外**：构造后不再变化，因此取用与触发都无需取锁（`Drop` 路径要的
     /// 正是这一点）。
-    loops_: [CancelToken_<A>; 2],
+    loops_: [CancelToken_<A>; 4],
 
     /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
     mailbox_: SessionMailbox_,
@@ -481,6 +481,12 @@ where
     /// `max_channel_count` 量级准备分配器。
     pub(crate) fn new_(opts: BasicOpts, alloc: A) -> Self {
         let loops = [
+            // 0：读泵（transport → 连接读环）
+            // 1：解复用（连接读环 → 各子流接收环）
+            // 2：复用（各子流发送环 → 连接写环）
+            // 3：写泵（连接写环 → transport）
+            CancelToken_::new_(alloc.clone()),
+            CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
         ];
@@ -1124,7 +1130,7 @@ where
         self.loops_[idx].clone()
     }
 
-    /// 触发两个循环的取消令牌（连接关闭或失败时调用）。
+    /// 触发四个循环的取消令牌（连接关闭或失败时调用）。
     ///
     /// 令牌在锁外，因此本方法**不取锁**。
     pub(crate) fn cancel_loops_(&self) {

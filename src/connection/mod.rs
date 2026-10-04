@@ -6,13 +6,15 @@
 //!
 //! 握手模块只产出 [`HandshakeDelivery`](crate::handshake::agent::HandshakeDelivery)
 //! ——一对 `Tx` / `Rx` 与一份 [`BasicOpts`](crate::handshake::opts::BasicOpts)。
-//! 本模块消费这份交付物：`Rx` / `Tx` 在 [`MuxConnection::new`] 里被移进两个
-//! **local spawn** 出来的读 / 写循环；`BasicOpts` 提供连接级配额（`max_packet_size`、
-//! `max_channel_count`、`max_dock_chan_count`、`max_channel_timeout`）。
+//! 本模块消费这份交付物：`Rx` / `Tx` 与调用方给出的**两块连接级帧暂存缓冲**在
+//! [`MuxConnection::new`] 里被移进四个 **local spawn** 出来的循环；`BasicOpts` 提供
+//! 连接级配额（`max_packet_size`、`max_channel_count`、`max_dock_chan_count`、
+//! `max_channel_timeout`）。
 //!
-//! 建连需要调用方给出一个**本地作用域值**（`abs_art` 的 `TrLocalScope`）：两个循环
+//! 建连需要调用方给出一个**本地作用域值**（`abs_art` 的 `TrLocalScope`）：四个循环
 //! 经它 `spawn_local` 投递，调用方负责驱动它（见 §6）。决策与落地经过见
-//! `dev-notes/connection-20261002-0548.md` §17 与 §18。
+//! `dev-notes/connection-20261002-0548.md` §17 与 §18；四循环 + 连接级环的裁决与
+//! 踩坑记录见 `dev-notes/connection-20261122-0000.md`。
 //!
 //! ## 1. 与 `abs_smux` 的对应关系
 //!
@@ -53,23 +55,34 @@
 //! 于是「绑定 → 监听 → 接流 → 业务」可以拆到不同函数、不同结构体里表达，
 //! 不再被生命周期参数绑成一串（`tests/layered_rpc.rs` 是这条结论的编译期探针）。
 //!
-//! ### 2.2 若干 `local spawn`，以及循环**不持有核心**
+//! ### 2.2 四个 `local spawn`，以及循环**不持有核心**
 //!
-//! 连接在**一个线程**（或 thread-local runtime）里跑若干个 `TrLocalScope::spawn_local`
-//! 出来的任务：
-//!
-//! - **读循环**：从 `Rx` 解复用——逐帧解析后按 dock 对找到子流，把载荷投递进对应的
-//!   接收环，并按收到的窗口通告更新对端的发送窗口；
-//! - **写循环**：复用调度——从各子流的发送环取数据、切分并编帧，按「控制帧优先、
-//!   数据帧按对端发送窗口排序」写出；
-//! - （后续）保活定时任务。
-//!
-//! 两个循环**只持有 `LoopShared_`**（注册表句柄 + 三个标量），**不持有核心强引用**。
-//! 这不是随手的选择：若循环持有核心，核心将永远无法析构，`Drop` 里的取消令牌永远
-//! 不会触发，两个任务与整个连接状态会永久泄漏。现在的收尾链条是——
+//! 连接在**一个线程**（或 thread-local runtime）里跑四个 `TrLocalScope::spawn_local`
+//! 出来的任务。[`MuxConnection::new`] 建出**两条连接级环**（帧暂存）：
 //!
 //! ```text
-//! 最后一个应用面对象被丢弃 ⇒ MuxCore 析构 ⇒ Drop 取消两个令牌
+//! 网络 Rx ──读泵──▶ 连接读环 ──解复用──▶ 各子流接收环 ──▶ 应用
+//! 应用 ──▶ 各子流发送环 ──复用──▶ 连接写环 ──写泵──▶ 网络 Tx
+//! ```
+//!
+//! - **读泵**：`C::ConnRx → 连接读环`，只搬字节，不解析帧；
+//! - **解复用**：`连接读环 → 各子流接收环`，逐帧解析后按 dock 对找子流、投递载荷，
+//!   并按收到的窗口通告更新对端发送窗口（同时消费 `Attach` / `Release` 事件）；
+//! - **复用**：`各子流发送环 → 连接写环`，按对端发送窗口调度、编帧（同时消费控制帧、
+//!   水位与拆流事件）；
+//! - **写泵**：`连接写环 → C::ConnTx`，只搬字节。
+//!
+//! 把「字节流」与「帧 / 子流」分开的直接收益：内侧两个循环**永远不会 park 在传输
+//! 上**，因此「对端不读导致写阻塞」这个必然状态被限制在写泵一个任务里，不会让事件
+//! 通道被饿死；同时网络调用次数与帧数解耦。
+//!
+//! 四个循环**只持有 `ByteLoopShared_` / `MuxLoopShared_`**（注册表句柄 + 一个标量），
+//! **不持有核心强引用**。这不是随手的选择：若循环持有核心，核心将永远无法析构，
+//! `Drop` 里的取消令牌永远不会触发，四个任务与整个连接状态会永久泄漏。现在的收尾
+//! 链条是——
+//!
+//! ```text
+//! 最后一个应用面对象被丢弃 ⇒ MuxCore 析构 ⇒ Drop 取消四个令牌
 //!                        ⇒ 循环在下一个 await 点退出 ⇒ 传输半边被 drop、连接真正关闭
 //! ```
 //!
@@ -329,7 +342,22 @@
 //!
 //! - 每条子流持有一对 `buffex` 半部（[`BufferedTx`] / [`BufferedRx`]），
 //!   因此 [`ChannelTx`] / [`ChannelRx`] 的 `try_*` 直接作用在环形缓冲上；
-//! - 中心循环持有一条「帧暂存环」，把网络字节流与帧解析 / 成帧解耦。
+//! - 连接级另有**两条帧暂存环**：连接读环（`transport → 解复用`）与连接写环
+//!   （`复用 → transport`），存储类型是 [`TrConnCfg::StageBuff`]，由
+//!   [`TrConnCfg::make_stage_buffs`] 造出**两块**缓冲、[`MuxConnection::new`]
+//!   建环并切半。
+//!
+//! **连接读环的容量下限是硬约束**：它必须能整块驻留一个满帧（帧头 +
+//! `max_packet_size` 载荷），否则外侧读泵（环满而 park）与内侧解复用（还差几字节
+//! 才判得完这一帧而 park）会互等。默认实现给出的容量与「怎么按自己的
+//! `max_packet_size` 放大」见 [`K_STAGE_RING_CAPACITY`]。
+//!
+//! 连接写环**不要求**整帧空间：入环写入按环当前能给的段**分块**推进
+//! （`session_.rs` 的 `enqueue_frame_`）。这条同样来自踩过的坑——写环与传输环容量
+//! 互相钳制时，「等环形装得下整帧」可能永远不成立。
+//!
+//! [`TrConnCfg::StageBuff`]: crate::connection::TrConnCfg::StageBuff
+//! [`TrConnCfg::make_stage_buffs`]: crate::connection::TrConnCfg::make_stage_buffs
 //!
 //! 环的物理内存由**调用方注入**的分配器 `A` 分配（缺省 `buffex::CoreAlloc`），
 //! 容量策略同样由调用方注入（见 [`crate::flow_ctrl::TrFlowCtrlPolicy`] 与
@@ -429,7 +457,8 @@
 //! | `config_` | [`TrConnCfg`] | —（本 crate 自有） |
 //! | `types_` / `util_` | 公开类型别名 / 控制面小工具 | — |
 //! | `test_support_` | 测试专用：无循环连接、空作用域、测试策略（`#[cfg(test)]`） | — |
-//! | `session_` | 读 / 写两个内部循环（本地表也是 `BTreeMap`） | —（内部） |
+//! | `session_` | 内侧两个循环（解复用 / 复用）+ 连接级环写入（本地表也是 `BTreeMap`） | —（内部） |
+//! | `session_pump_` | 外侧两个泵循环（`transport ↔ 连接级环`，只搬字节） | —（内部） |
 //! | `mux_connection::registry_` | 统一身份表（channel / telegraph / listener / 宽限态）+ 反向索引 | —（内部） |
 //! | `sync_` / `owner_` | 通用共享单元 / 每条子流的共享标量状态 | —（内部） |
 //! | `signal_` / `frame_` / `ring_` / `error_` | 控制帧队列 / 线格式 / 环别名 / 错误 | —（内部） |
@@ -451,6 +480,7 @@ mod mux_connection;
 mod owner_;
 pub(crate) mod ring_;
 mod session_;
+pub(crate) mod session_pump_;
 mod signal_;
 mod sync_;
 mod telegraph;
@@ -462,7 +492,7 @@ mod util_;
 pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
-pub use config_::{BuffAllocError, DefaultConnCfg, TrConnCfg};
+pub use config_::{BuffAllocError, DefaultConnCfg, K_STAGE_RING_CAPACITY, TrConnCfg};
 pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
