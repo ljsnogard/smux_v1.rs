@@ -1,9 +1,11 @@
-//! 握手帧的编解码：直接针对 [`TrBuffRead`] / [`TrBuffWrite`] 工作。
+//! 握手帧的编解码：`FrameReader` 驱动 sans-IO 状态机，写侧直接作用于 [`TrBuffWrite`]。
 //!
 //! 本模块把 [`crate::handshake`] 模块文档 §4、§6 的线格式实现为两组操作：
 //!
-//! - [`FrameReader`]：先读 `magic` 与**算法预告**，随后**逐条**产出协商条目，
-//!   读到校验头即读取 `crc` 并做一票否决的校验；
+//! - [`FrameReader`]：**逐字节**驱动 [`parser_`](crate::handshake::parser_) 的
+//!   sans-IO 状态机——先读到 `magic` 与**算法预告**，随后**逐条**产出协商条目，
+//!   读到校验头即完成 `crc` 一票否决的校验。解码规则一行都不在本模块里，
+//!   本模块只负责「按 1 字节去读、把结论交给调用方」；
 //! - [`write_frame_`]：逐字段把一帧写进字节流，边写边增量计算 `crc`。
 //!
 //! # 为什么可以「不保存整帧」
@@ -20,8 +22,8 @@
 //!
 //! 内存因此与**帧长、条目数量都无关**：
 //!
-//! - 基础项是定长整数，最多 8 字节，直接在栈上解码（`decode_value_`），
-//!   **不留存原始字节**；5 个基础键各有一个定长槽位；
+//! - 基础项是定长整数，最多 8 字节，直接在定长栈缓冲上解码，**不留存原始字节**；
+//!   5 个基础键各有一个定长槽位；
 //! - 扩展条目在 v1 中是保留键，读到键就拒绝，因此目前**没有任何**按声明长度
 //!   申请缓冲的路径。将来启用时会先校验「声明长度 ≤ 内部上限」再准备等长
 //!   缓冲，这一步必须在读负载**之前**发生（`dev-notes.md` D2）；
@@ -29,6 +31,13 @@
 //!   CRC 数学）。
 //!
 //! 结论：本模块不存在任何「按帧长申请缓冲」或「先收完整帧」的代码路径。
+//!
+//! # 索取粒度：恒为 1 字节
+//!
+//! [`FrameReader`] 只调 [`ReadCursor::read_byte_async_`]，因此对底层环的 `Demand`
+//! 下限恒为 1；写侧用 [`write_all_async_`]，下限同样恒为 1。**容量小到
+//! `buffex::ring` 下限（1 字节）的传输环也能跑完整个握手**——环容量是调用方注入的，
+//! 不该由握手编解码的粒度决定成败。
 //!
 //! 单个条目的 `header` 与 `value` 宽度全部取自 [`NegotiationKey`] 与
 //! [`NegotiationValType`]，本模块不重复描述任何「键 ↔ 字节数」的对应关系；
@@ -52,6 +61,7 @@ use crate::handshake::{
         BasicOpts, K_BASIC_KEY_COUNT, NegotiationBasicEntry, NegotiationEntry, NegotiationKey,
         NegotiationValType,
     },
+    parser_::{Consume_, HandshakeParser},
 };
 
 /// CRC-16/XMODEM 的规范实例。
@@ -309,24 +319,12 @@ pub(crate) struct FrameReader<'f, R: TrBuffRead<u8>, K> {
     /// 「协商时把真正的令牌借给协商器」并存而不冲突。
     cancel_: K,
 
-    crc_: CrcDigest,
-
-    /// 算法预告 / 校验头的原始字节，两处必须逐位一致。
-    alg_hdr_: u8,
-
-    /// 校验码的字节数（2/3/4），由算法预告决定；与 `alg_hdr_` 一同取代原先
-    /// 整个 `HandshakeChecksum` 值，避免在 `FrameReader` 里放一个约 1 KB 的字段。
-    checksum_len_: usize,
-
-    magic_: MagicField,
-
-    basics_: [Option<NegotiationBasicEntry>; K_BASIC_KEY_COUNT],
-
-    /// 已出现的基础键位图，用于重复键检测。
-    seen_: u8,
-
-    /// 是否已经读到校验头并完成 `crc` 比对。
-    done_: bool,
+    /// **sans-IO** 解析状态机：解码规则全在
+    /// [`parser_`](crate::handshake::parser_) 里，本类型只负责「按 1 字节喂」。
+    ///
+    /// 解码与 IO 分离之后，本类型对底层环的索取下限**恒为 1 字节**，因此容量小到
+    /// `buffex::ring` 下限（1 字节）的 `ConnRx` 也喂得动（见 [`FrameReader::begin_async_`]）。
+    parser_: HandshakeParser,
 
     /// 条目流终止时的详细失败原因，供调用方在协商结束后取回并分类处置。
     last_err_: Option<WireError<R::Err, ()>>,
@@ -340,7 +338,14 @@ where
     /// 读取 `magic` 与算法预告，建立一个帧读取状态机。
     ///
     /// `magic` 的语义（`INVITE` / `ACCEPT` / …）由调用方通过
-    /// [`FrameReader::magic_`] 判定；这里只保证读到 4 字节。
+    /// [`FrameReader::magic_`] 判定；这里只保证读到 4 + 1 字节。
+    ///
+    /// # 索取粒度：恒为 1 字节
+    ///
+    /// 本函数**逐字节**推进 sans-IO 状态机，直到帧首 5 字节（4 字节 `magic` + 1 字节
+    /// 算法预告）消费完。因此对底层环的 `Demand` 下限恒为 1，容量小到 1 字节的
+    /// `ConnRx` 也不会出现「下限大于容量」的终态 `Unsatisfiable`——而环容量是调用方
+    /// 注入的，不该由握手解析的粒度决定成败。
     ///
     /// # Errors
     ///
@@ -351,49 +356,43 @@ where
         buff: &'f mut R,
         cancel: K,
     ) -> Result<Self, WireError<R::Err, ()>> {
-        let mut cursor = ReadCursor::new_(buff);
-        let mut magic = [0u8; 4];
-        cursor.read_async_(&mut magic, cancel.child_token()).await?;
-
-        let mut alg = [0u8; 1];
-        cursor.read_async_(&mut alg, cancel.child_token()).await?;
-        let alg_hdr = alg[0];
-        let Option::Some(checksum) = HandshakeChecksum::try_header(alg_hdr) else {
-            return Result::Err(WireError::UnsupportedOption);
+        let mut reader = FrameReader {
+            cursor_: ReadCursor::new_(buff),
+            cancel_: cancel,
+            parser_: HandshakeParser::new_(),
+            last_err_: Option::None,
         };
 
-        let mut crc = CrcDigest::new_(&checksum);
-        // 校验覆盖 magic 与算法预告本身（模块文档 §4）。
-        crc.update_(&magic);
-        crc.update_(&alg);
-
-        Result::Ok(FrameReader {
-            cursor_: cursor,
-            cancel_: cancel,
-            crc_: crc,
-            alg_hdr_: alg_hdr,
-            checksum_len_: checksum.checksum_len(),
-            magic_: magic,
-            basics_: core::array::from_fn(|_| Option::None),
-            seen_: 0u8,
-            done_: false,
-            last_err_: Option::None,
-        })
+        while !reader.parser_.is_started_() {
+            let byte = reader
+                .cursor_
+                .read_byte_async_(reader.cancel_.child_token())
+                .await?;
+            match reader.parser_.consume_byte_(byte) {
+                Consume_::Pending => {}
+                Consume_::Failed(err) => return Result::Err(err.into_wire_()),
+                // 帧首 5 字节之内不可能产出条目、也不可能整帧完成。
+                Consume_::Entry(_) | Consume_::Done => {
+                    unreachable!("magic 与算法预告阶段不会产出条目或完成")
+                }
+            }
+        }
+        Result::Ok(reader)
     }
 
     /// 帧首 4 字节 `magic`。
     pub(crate) fn magic_(&self) -> MagicField {
-        self.magic_
+        self.parser_.magic_()
     }
 
     /// 已解析的基础项槽位；下标即基础键 `0x00..=0x04`。
     pub(crate) fn basics_(&self) -> &[Option<NegotiationBasicEntry>; K_BASIC_KEY_COUNT] {
-        &self.basics_
+        self.parser_.basics_()
     }
 
     /// 是否已经读到校验头并完成 `crc` 比对。
     pub(crate) fn is_finished_(&self) -> bool {
-        self.done_
+        self.parser_.is_done_()
     }
 
     /// 取回条目流终止的详细原因（若有）。
@@ -419,81 +418,28 @@ where
     pub(crate) async fn next_entry_async_(
         &mut self,
     ) -> Result<Option<NegotiationEntry<'f>>, WireError<R::Err, ()>> {
-        if self.done_ {
-            return Result::Ok(Option::None);
+        // 已出结论时**不再去读**：读会 park 在一个不会再有输入的地方。
+        // 失败原因也因此可以被重复取回，而不是第二次调用时卡住。
+        match self.parser_.finish_() {
+            Option::Some(Result::Ok(())) => return Result::Ok(Option::None),
+            Option::Some(Result::Err(err)) => return Result::Err(err.into_wire_()),
+            Option::None => {}
         }
 
-        let mut header = [0u8; 1];
-        self.cursor_
-            .read_async_(&mut header, self.cancel_.child_token())
-            .await?;
-        self.crc_.update_(&header);
-        let byte = header[0];
-
-        let Ok(key) = NegotiationKey::try_from(byte) else {
-            return Result::Err(WireError::UnsupportedOption);
-        };
-
-        match key {
-            NegotiationKey::Checksum => {
-                // 校验头：先确认取值合法，再确认与算法预告一致。
-                let Option::Some(_) = HandshakeChecksum::try_header(byte) else {
-                    return Result::Err(WireError::UnsupportedOption);
-                };
-                if byte != self.alg_hdr_ {
-                    return Result::Err(WireError::MalformedBody);
+        // 逐字节喂状态机：索取下限恒为 1，容量 1 的环也喂得动。
+        loop {
+            let byte = self
+                .cursor_
+                .read_byte_async_(self.cancel_.child_token())
+                .await?;
+            match self.parser_.consume_byte_(byte) {
+                Consume_::Pending => continue,
+                Consume_::Entry(entry) => {
+                    return Result::Ok(Option::Some(NegotiationEntry::Basic(entry)));
                 }
-                let width = self.checksum_len_;
-                let mut bytes = [0u8; 4];
-                self.cursor_
-                    .read_async_(&mut bytes[..width], self.cancel_.child_token())
-                    .await?;
-                let expect = decode_checksum_(width, &bytes[..width]);
-                // 校验一票否决：算出的值与帧尾声明的值不等即整帧失败。
-                if self.crc_.finalize_() != expect {
-                    return Result::Err(WireError::ChecksumErr);
-                }
-                self.done_ = true;
-                Result::Ok(Option::None)
-            }
-
-            // 扩展条目在 v1 中是保留键（模块文档 §6.3）；即便将来启用，也只会
-            // 使用「先校验声明长度、再准备等长内部缓冲」的路径，不会预分配整帧。
-            NegotiationKey::ExtMsg => Result::Err(WireError::UnsupportedOption),
-
-            basic => {
-                let Ok(val_type) = NegotiationValType::try_from(byte) else {
-                    return Result::Err(WireError::UnsupportedOption);
-                };
-                let Ok(idx) = basic_key_(basic) else {
-                    return Result::Err(WireError::UnsupportedOption);
-                };
-
-                // 单条目定长栈缓冲：基础项最多 8 字节（BeU64），与帧长无关。
-                let width = val_type.value_len();
-                let mut bytes = [0u8; 8];
-                self.cursor_
-                    .read_async_(&mut bytes[..width], self.cancel_.child_token())
-                    .await?;
-                self.crc_.update_(&bytes[..width]);
-
-                let value =
-                    decode_value_(width, &bytes[..width]).map_err(|_| WireError::MalformedBody)?;
-                if value == 0 {
-                    return Result::Err(WireError::MalformedBody);
-                }
-                let bit = 1u8 << idx;
-                if self.seen_ & bit != 0 {
-                    return Result::Err(WireError::MalformedBody);
-                }
-                self.seen_ |= bit;
-
-                let entry = NegotiationBasicEntry {
-                    opts_key: byte,
-                    val_data: value,
-                };
-                self.basics_[idx as usize] = Option::Some(entry.clone());
-                Result::Ok(Option::Some(NegotiationEntry::Basic(entry)))
+                // 校验头已读到且 `crc` 相符：条目区正常结束。
+                Consume_::Done => return Result::Ok(Option::None),
+                Consume_::Failed(err) => return Result::Err(err.into_wire_()),
             }
         }
     }
@@ -659,7 +605,9 @@ const fn compose_header_(key: NegotiationKey, vl_type: NegotiationValType) -> u8
 }
 
 /// 把基础键映射为下标；`Checksum` 与保留键不在这里处理。
-fn basic_key_(key: NegotiationKey) -> Result<u8, NegotiationKey> {
+///
+/// 由本模块的写侧与 [`crate::handshake::parser_`] 的 sans-IO 状态机共用。
+pub(super) fn basic_key_(key: NegotiationKey) -> Result<u8, NegotiationKey> {
     match key {
         NegotiationKey::MaxPacketSize => Result::Ok(0u8),
         NegotiationKey::MaxChannelCount => Result::Ok(1u8),
@@ -681,8 +629,9 @@ fn checksum_bytes_(checksum: &HandshakeChecksum, value: u32) -> ([u8; 4], usize)
 
 /// 把大端 `width` 字节的校验码解码为数值。
 ///
-/// CRC-24 只有 3 字节，这里统一按 `u32` 承载。
-fn decode_checksum_(width: usize, bytes: &[u8]) -> u32 {
+/// CRC-24 只有 3 字节，这里统一按 `u32` 承载。由 [`crate::handshake::parser_`] 的
+/// sans-IO 状态机调用。
+pub(super) fn decode_checksum_(width: usize, bytes: &[u8]) -> u32 {
     debug_assert_eq!(width, bytes.len());
     let mut value = 0u32;
     for &b in bytes {
@@ -692,7 +641,9 @@ fn decode_checksum_(width: usize, bytes: &[u8]) -> u32 {
 }
 
 /// 把 `width` 字节大端无符号数解码为 `usize`；超出 `usize` 表示范围返回错误。
-fn decode_value_(width: usize, bytes: &[u8]) -> Result<usize, WireError<(), ()>> {
+///
+/// 由 [`crate::handshake::parser_`] 的 sans-IO 状态机调用。
+pub(super) fn decode_value_(width: usize, bytes: &[u8]) -> Result<usize, WireError<(), ()>> {
     debug_assert_eq!(width, bytes.len());
     let mut value = 0u64;
     for &b in bytes {
@@ -1189,4 +1140,63 @@ mod tests_ {
             Result::Ok(300usize)
         );
     }
+
+    /// 测试握手帧在**容量 1 字节**的环上也能完整写出并解析。
+    ///
+    /// - 测试目标：握手解析的索取粒度**恒为 1 字节**——从帧首到 `crc` 收完都不要求
+    ///   环里同时存在超过 1 个字节；写侧同理。
+    /// - 测试手段：用 `buffex` 的环建一条容量 1 的通道（读、写各 1 字节），一端用
+    ///   `write_frame_` 写整帧、另一端用 `FrameReader` 逐条读，靠 `join!` 并发推进
+    ///   （容量 1 时写方必然被读方压着走，任何「一次要满」的粒度都会立刻拿不到空间 /
+    ///   数据而失败）。
+    /// - 判定标准：读侧拿到正确的 `magic`、读到那条基础项、且整帧校验通过
+    ///   （`is_finished_()`）；写出侧与读取侧都不得报错。
+    async fn frame_roundtrips_over_single_byte_ring() {
+        let values = [
+            Option::Some(7usize),
+            Option::None,
+            Option::None,
+            Option::None,
+            Option::None,
+        ];
+        let checksum = K_DEFAULT_CHECKSUM;
+        // 容量 1：`buffex::ring` 允许的最小容量，正好卡住「一次要满」的实现。
+        let (mut tx, mut rx) = crate::connection::ring_::test_support_::make_test_channel_(1usize);
+
+        let writer = async {
+            write_frame_(
+                &mut tx,
+                K_INVITE_MAGIC,
+                &values,
+                &checksum,
+                NonCancellableToken::new(),
+            )
+            .await
+            .expect("容量 1 的环上也应当能写出整帧");
+        };
+
+        let reader = async {
+            let mut reader = FrameReader::begin_async_(&mut rx, NonCancellableToken::new())
+                .await
+                .expect("容量 1 的环上也应当能读出 magic 与算法预告");
+            assert_eq!(reader.magic_(), K_INVITE_MAGIC);
+
+            let mut seen = Option::None;
+            while let Option::Some(entry) = reader
+                .next_entry_async_()
+                .await
+                .expect("容量 1 的环上整帧应当校验通过")
+            {
+                if let NegotiationEntry::Basic(basic) = entry {
+                    seen = Option::Some(basic.val_data);
+                }
+            }
+            assert!(reader.is_finished_(), "读完应当已确认整帧校验通过");
+            seen
+        };
+
+        let ((), seen) = futures::join!(writer, reader);
+        assert_eq!(seen, Option::Some(7usize), "应当读到写入的那条基础项");
+    }
+    dual_runtime_test_!(frame_roundtrips_over_single_byte_ring);
 }

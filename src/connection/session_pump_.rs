@@ -221,7 +221,10 @@ pub(crate) async fn tx_pump_loop_async_<C, K>(
             if wanted == 0 {
                 continue;
             }
-            let dst_demand = Demand::at_least(wanted);
+            // 传输端只要 1 字节起步：`buffex::ring` 在下限大于容量时返回**终态**的
+            // `Unsatisfiable`，而传输环容量由调用方注入（可以小到 1 字节），不该由
+            // 本次借段的粒度决定成败。段实际能装多少就搬多少，剩下的留给下一轮。
+            let dst_demand = Demand::at_least(1usize);
             let mut dst = match race_cancel_(&cancel, tx.write_async(&dst_demand)).await {
                 Option::None => return,
                 Option::Some(outcome) => match took_(outcome) {

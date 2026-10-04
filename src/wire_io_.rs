@@ -156,6 +156,14 @@ where
 /// 与读侧对称：借出的段可能比请求的更短，也可能更长；本函数只写入需要的前缀，
 /// 未用完的容量在段被回收时归还，因此可以安全地分多次写完。
 ///
+/// # 为什么索取粒度是「至少 1 字节」而不是「正好 `rest`」
+///
+/// 同 [`ReadCursor::read_async_`]：`buffex::ring` 在 `Demand` 的下限大于环容量时返回
+/// **终态**的 `Unsatisfiable`。若按剩余长度索要，「环容量 < 本次要写的长度」会直接判
+/// 连接失败——而环容量由调用方注入，不该由一次性写入的粒度决定成败。
+/// 只要 1 字节起步、按 `clone_items_from_buff` 实际写下的量推进，`min_len == 1`
+/// 不超过任何合法容量，环再小也写得完一整帧。
+///
 /// # Errors
 ///
 /// 底层写失败 → [`CursorError::Write`]；写完之前对端关闭 →
@@ -171,8 +179,9 @@ where
 {
     let mut offset = 0usize;
     while offset < bytes.len() {
-        let rest = bytes.len() - offset;
-        let demand = Demand::exactly(rest);
+        // 下限只用 1：环容量再小也满足。段可能比剩余长度更短，
+        // `clone_items_from_buff` 只写下段能容纳的前缀。
+        let demand = Demand::at_least(1usize);
         let put;
         {
             let mut write_res = buff

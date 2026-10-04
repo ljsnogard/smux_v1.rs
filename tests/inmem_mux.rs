@@ -85,6 +85,24 @@ async fn mux_small_inmem_dual_() {
 }
 dual_runtime_test_!(mux_small_inmem_dual_);
 
+/// 测试目标：**传输环取到环原语的下限（1 字节）**时，握手 + 建流 + 双向收发仍全部成功。
+///
+/// - 手段：与 [`mux_small_inmem_dual_`] **同一份场景**，只把两条传输环的容量从
+///   `K_NET_BUFFER_SIZE` 换成 1 字节——即握手帧与协议帧都必须能在「一次只放得下 1 个
+///   字节」的环上搬完。
+/// - 判断：场景自身的断言（建流成功、载荷逐字节相等、半关闭后读到 EOF）全部成立。
+///   任何一处仍按「一次要满」的粒度向环索要，都会拿到终态 `Unsatisfiable`（连接失败）
+///   或直接挂死，本用例即失败。
+async fn mux_single_byte_transport_dual_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(1usize);
+    let (b_tx, a_rx) = common::make_passive_ring_(1usize);
+
+    let scope = LocalScope::new();
+    let scenario = common::run_small_mux_scenario_(&scope, a_rx, a_tx, b_rx, b_tx);
+    scope.run_until(scenario).await;
+}
+dual_runtime_test_!(mux_single_byte_transport_dual_);
+
 /// 测试目标（**本轮验收点**）：**最终裁决**（`accept_async`）成为建流的唯一提交点
 /// ——在它之前丢弃半建立句柄，两个角色都不留垃圾、不悬着对端。
 ///
