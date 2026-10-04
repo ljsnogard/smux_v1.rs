@@ -335,35 +335,6 @@ where
 }
 
 
-/// # 测试专用同步壳
-///
-/// 生产代码一律走 `with_async_` / `with_mut_async_`（异步、可取消）；单元测试是
-/// 单线程、无争用场景，因此这里用「不可取消令牌 + `block_on`」把一次访问压成同步，
-/// 保持测试正文的旧形状。
-#[cfg(test)]
-impl<A> ChannelOwner_<A>
-where
-    A: AllocatorClone + Send + Sync,
-{
-    /// 测试用同步读。
-    pub(crate) fn with_<R>(&self, f: impl FnOnce(&ChannelState_) -> R) -> R {
-        futures::executor::block_on(self.with_async_(
-            buffex::x_deps::abs_cancel::NonCancellableToken::new(),
-            f,
-        ))
-        .expect("测试里不该被取消")
-    }
-
-    /// 测试用同步写。
-    pub(crate) fn with_mut_<R>(&self, f: impl FnOnce(&mut ChannelState_) -> R) -> R {
-        futures::executor::block_on(self.with_mut_async_(
-            buffex::x_deps::abs_cancel::NonCancellableToken::new(),
-            f,
-        ))
-        .expect("测试里不该被取消")
-    }
-}
-
 /// 等待建流完成：等对端的 `OPEN` + `ACCEPT` / `REJECT`，或被取消 / 连接失败打断。
 pub(crate) async fn wait_establish_<A, K>(
     reg: &ChannelRegistry_<A>,
@@ -411,13 +382,34 @@ where
 
 #[cfg(test)]
 mod tests_ {
+    use buffex::x_deps::abs_cancel::NonCancellableToken;
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
-    use crate::{
-        flow_ctrl::DefaultPolicy,
-    };
+    use crate::flow_ctrl::DefaultPolicy;
 
     use super::*;
+
+    /// 测试专用：以「不可取消令牌」做一次异步读访问并解包。
+    ///
+    /// **不再用 `block_on` 把异步压成同步**：用例本身是 `async fn`，直接 `.await`
+    /// 才测到真实运行时的 park / 唤醒路径。
+    async fn read_<R>(owner: &ChannelOwner_<CoreAlloc>, f: impl FnOnce(&ChannelState_) -> R) -> R {
+        owner
+            .with_async_(NonCancellableToken::new(), f)
+            .await
+            .expect("测试里不该被取消")
+    }
+
+    /// 测试专用：以「不可取消令牌」做一次异步写访问并解包。
+    async fn write_<R>(
+        owner: &ChannelOwner_<CoreAlloc>,
+        f: impl FnOnce(&mut ChannelState_) -> R,
+    ) -> R {
+        owner
+            .with_mut_async_(NonCancellableToken::new(), f)
+            .await
+            .expect("测试里不该被取消")
+    }
 
     /// 造一条测试用的共享状态（缺省策略、容量 64）。
     fn make_owner_() -> ChannelOwner_<CoreAlloc> {
@@ -446,55 +438,54 @@ mod tests_ {
 
     /// 测试建流状态初始为空、可被置位并唤醒等待者。
     /// - 手段：初始断言 `peer_opened_` 为假且 `outcome_` 为 `None`；随后模拟读循环
-    ///   置位 `peer_opened_`，并登记一个等待者。
-    /// - 判断：置位后可读到真，且等待者槽确实登记上了——这是
-    ///   `open_channel_async` 能被唤醒的前提。
-    #[test]
-    fn establish_state_starts_empty_and_accepts_updates() {
+    ///   置位 `peer_opened_` 与 `outcome_`。
+    /// - 判断：置位后可读到对应的值——这是 `open_channel_async` 能被唤醒的前提。
+    async fn establish_state_starts_empty_and_accepts_updates() {
         let owner = make_owner_();
-        assert!(!owner.with_(|s| s.establish_.peer_opened_));
-        assert!(owner.with_(|s| s.establish_.outcome_.is_none()));
+        assert!(!read_(&owner, |s| s.establish_.peer_opened_).await);
+        assert!(read_(&owner, |s| s.establish_.outcome_.is_none()).await);
 
-        owner.with_mut_(|s| {
+        write_(&owner, |s| {
             s.establish_.peer_opened_ = true;
             s.establish_.outcome_ = Option::Some(EstablishOutcome_::Accepted);
-        });
-        assert!(owner.with_(|s| s.establish_.peer_opened_));
+        })
+        .await;
+        assert!(read_(&owner, |s| s.establish_.peer_opened_).await);
         assert_eq!(
-            owner.with_(|s| s.establish_.outcome_),
+            read_(&owner, |s| s.establish_.outcome_).await,
             Option::Some(EstablishOutcome_::Accepted)
         );
     }
+    dual_runtime_test_!(establish_state_starts_empty_and_accepts_updates);
 
     /// 测试建流通知通道：`notify_establish_` 投一条，「先通知后等待」也不会丢。
     /// - 手段：先 `notify_establish_`，再从共享的通知消费端 `try_recv`。
     /// - 判断：能取到一条通知；重复通知时通道满，投递失败是无害的。
-    #[test]
-    fn establish_notification_is_persistent() {
+    async fn establish_notification_is_persistent() {
         let owner = make_owner_();
-        owner.with_mut_(|s| s.notify_establish_());
-        let rx = owner.with_(|s| s.establish_.notify_rx_());
+        write_(&owner, |s| s.notify_establish_()).await;
+        let rx = read_(&owner, |s| s.establish_.notify_rx_()).await;
         assert!(rx.try_recv().is_ok(), "先通知后等待不应当丢唤醒");
-        owner.with_mut_(|s| s.notify_establish_());
-        owner.with_mut_(|s| s.notify_establish_());
+        write_(&owner, |s| s.notify_establish_()).await;
+        write_(&owner, |s| s.notify_establish_()).await;
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_err(), "通道容量 1：重复通知不堆积");
     }
+    dual_runtime_test_!(establish_notification_is_persistent);
 
     /// 测试 `ChannelState_::touch_` 会推进活跃时间。
     /// - 手段：先读一次 `active_`，稍作忙等后调用 `touch_` 再读一次。
     /// - 判断：第二次读到的时刻不早于第一次（`Instant` 单调）。
-    #[test]
-    fn touch_advances_activity_time() {
+    async fn touch_advances_activity_time() {
         let owner = make_owner_();
-        let first = owner.with_(|s| s.active_);
+        let first = read_(&owner, |s| s.active_).await;
         let mut spin = 0u64;
         while spin < 100_000u64 {
             spin = spin.wrapping_add(1u64);
         }
-        owner.with_mut_(|s| s.touch_());
-        let second = owner.with_(|s| s.active_);
+        write_(&owner, |s| s.touch_()).await;
+        let second = read_(&owner, |s| s.active_).await;
         assert!(second >= first, "活跃时间只能前进");
     }
-
+    dual_runtime_test_!(touch_advances_activity_time);
 }

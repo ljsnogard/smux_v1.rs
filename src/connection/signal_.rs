@@ -477,7 +477,6 @@ mod tests_ {
     ///   `Pending`、唤醒计数为 0），再投递，最后再 poll。
     /// - 判断：第一次 `Pending`；投递后唤醒计数增加；再次 poll 返回
     ///   `Ready(Some(..))`。
-    #[compio::test]
     async fn event_async_take_parks_until_send() {
         let (sender, mut receiver) = event_channel_::<TestEvent>();
         let (waker, probe) = counting_waker_();
@@ -497,11 +496,11 @@ mod tests_ {
             Poll::Ready(Option::Some(7u32))
         );
     }
+    dual_runtime_test_!(event_async_take_parks_until_send);
 
     /// 测试已有积压时异步取出立刻就绪，不产生多余唤醒。
     /// - 手段：先投一条，再建 future 并 poll。
     /// - 判断：首次 poll 即 `Ready(Some(..))`，唤醒计数保持 0。
-    #[compio::test]
     async fn event_async_take_is_immediate_with_backlog() {
         let (sender, mut receiver) = event_channel_::<TestEvent>();
         assert!(sender.try_send_event_(9u32));
@@ -515,6 +514,7 @@ mod tests_ {
         );
         assert_eq!(probe.count_.load(Ordering::SeqCst), 0usize);
     }
+    dual_runtime_test_!(event_async_take_is_immediate_with_backlog);
 
     /// 测试生产端可以克隆成多个（多生产者），任一克隆投递都能被同一个消费者取到。
     /// - 手段：把 sender 克隆成两份，各投一条。
@@ -532,10 +532,10 @@ mod tests_ {
     /// 测试所有生产端消失后，异步取出返回 `None` 而不是永久 park。
     /// - 手段：建通道后立刻丢弃生产端，再 await 取出。
     /// - 判断：返回 `None`——这正是连接收尾时循环能退出的前提。
-    #[compio::test]
     async fn event_async_take_ends_when_senders_drop() {
         let (sender, mut receiver) = event_channel_::<TestEvent>();
         drop(sender);
         assert_eq!(receiver.take_event_async_().await, Option::None);
     }
+    dual_runtime_test_!(event_async_take_ends_when_senders_drop);
 }

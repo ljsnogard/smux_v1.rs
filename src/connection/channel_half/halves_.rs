@@ -489,7 +489,6 @@ mod tests_ {
     ///   取值，再用 `try_write` 写入 5 字节、用 `try_read` 读出并比对。
     /// - 判断：dock 与写入值完全一致；读回的字节与写入逐字节相等——说明包装层
     ///   没有吞掉或改写数据。
-    #[compio::test]
     async fn halves_report_docks_and_delegate_try_io() {
         let (mut tx, mut rx) = make_halves_();
 
@@ -508,6 +507,7 @@ mod tests_ {
             .expect("从内存环读出应当成功");
         assert_eq!(got, payload);
     }
+    dual_runtime_test_!(halves_report_docks_and_delegate_try_io);
 
     /// 测试四个关闭标志分别对应环的两端，且两端互相可见。
     /// - 手段：新建的环上先断言四个标志全为假；然后关闭发送端（`ChannelTx`
@@ -516,7 +516,6 @@ mod tests_ {
     /// - 判断：关闭生产端后两个半边的 `is_tx_closed` 都变为真，而 `is_rx_closed`
     ///   仍为假；关闭消费端后两个半边的 `is_rx_closed` 也变为真——证明两个方向
     ///   互不影响、且状态由环共享。
-    #[compio::test]
     async fn close_flags_track_both_ends_independently() {
         let (tx, rx) = make_halves_();
 
@@ -535,12 +534,12 @@ mod tests_ {
         assert!(rx.is_rx_closed(), "关闭消费端后接收方向应视为已关闭");
         assert!(tx.is_rx_closed(), "接收方向的关闭应对发送半边可见");
     }
+    dual_runtime_test_!(close_flags_track_both_ends_independently);
 
     /// 测试半关闭后的 EOF 语义：写端关闭不丢数据，排空后才报关闭。
     /// - 手段：写入 3 字节后关闭发送端；先把 3 字节读走，再尝试读 1 字节。
     /// - 判断：关闭后仍能读回全部残留数据；排空后再读返回
     ///   [`ConsumerError::Closing`]——即「先读完再 EOF」。
-    #[compio::test]
     async fn send_close_keeps_buffered_data_then_eof() {
         let (mut tx, mut rx) = make_halves_();
 
@@ -566,4 +565,5 @@ mod tests_ {
             "排空且写端已关闭后应报告 Closing"
         );
     }
+    dual_runtime_test_!(send_close_keeps_buffered_data_then_eof);
 }

@@ -1479,3 +1479,79 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB, S>(
     )
     .await
 }
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 同一份场景在两个运行时下各跑一遍：只把「设备类型」留在各自的测试 target 里
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// **tokio** 版：建立一条已注册进运行时的 UNIX socket 对、装配好四条调用方驱动的
+/// 泵，然后在给定作用域上跑 `scenario`。
+///
+/// 与下面的 compio 版**逐字同构**，只有「设备类型 + 适配 crate」不同；两个运行时
+/// 因此共用同一份场景（[`run_smoke_scenario_`] / [`run_small_mux_scenario_`]），
+/// 不再各写一个测试文件。
+#[cfg(feature = "test-tokio-runtime")]
+pub async fn run_socket_scenario_on_runtime_<F, Fut>(
+    scope: &abs_art_tokio::LocalScope,
+    scenario: F,
+) where
+    F: FnOnce(
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+    ) -> Fut,
+    Fut: core::future::Future<Output = ()>,
+{
+    use buffex_tokio_adapt::x_deps::abs_buff_tokio_adapt::{ReadAsInput, WriteAsOutput};
+    use tokio::net::UnixStream;
+
+    let (stream_a, stream_b) = UnixStream::pair().expect("建立 tokio UNIX socket 对应当成功");
+    let (mut a_read, mut a_write) = stream_a.into_split();
+    let (mut b_read, mut b_write) = stream_b.into_split();
+
+    let fut = run_socket_scenario_with_(
+        ReadAsInput::new(&mut a_read),
+        WriteAsOutput::new(&mut a_write),
+        ReadAsInput::new(&mut b_read),
+        WriteAsOutput::new(&mut b_write),
+        scenario,
+    );
+    scope.run_until(fut).await;
+}
+
+/// **compio** 版：0.19 的 `UnixStream` 没有 `pair()`，因此先建 `std` socket 对再
+/// 逐个 `from_std` 注册进当前运行时。其余与 tokio 版逐字同构。
+#[cfg(not(feature = "test-tokio-runtime"))]
+pub async fn run_socket_scenario_on_runtime_<F, Fut>(
+    scope: &abs_art_compio::LocalScope,
+    scenario: F,
+) where
+    F: FnOnce(
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+    ) -> Fut,
+    Fut: core::future::Future<Output = ()>,
+{
+    use buffex_compio_adapt::{ReadAsInput, WriteAsOutput};
+
+    let (std_a, std_b) =
+        std::os::unix::net::UnixStream::pair().expect("建立 std UNIX socket 对应当成功");
+    let stream_a =
+        compio::net::UnixStream::from_std(std_a).expect("a 端应能注册到 compio 运行时");
+    let stream_b =
+        compio::net::UnixStream::from_std(std_b).expect("b 端应能注册到 compio 运行时");
+    let (mut a_read, mut a_write) = stream_a.into_split();
+    let (mut b_read, mut b_write) = stream_b.into_split();
+
+    let fut = run_socket_scenario_with_(
+        ReadAsInput::new(&mut a_read),
+        WriteAsOutput::new(&mut a_write),
+        ReadAsInput::new(&mut b_read),
+        WriteAsOutput::new(&mut b_write),
+        scenario,
+    );
+    scope.run_until(fut).await;
+}

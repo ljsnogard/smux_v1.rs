@@ -813,7 +813,6 @@ mod tests_ {
     ///   并把 `CrcDigest` 的结果与 `crc::Crc::checksum` 的一次性结果对比。
     /// - 判断：`FrameReader` 读完后 `is_finished_()` 为真，且增量校验值与
     ///   `crc` crate 的结果完全一致。
-    #[compio::test]
     async fn incremental_crc_matches_one_shot() {
         let values = [
             Option::Some(7usize),
@@ -855,11 +854,11 @@ mod tests_ {
             assert_eq!(reader.basics_()[0].as_ref().unwrap().val_data, 7usize);
         }
     }
+    dual_runtime_test_!(incremental_crc_matches_one_shot);
 
     /// 测试三种校验算法都能被写侧声明、被读侧识别。
     /// - 手段：分别用 CRC-16 / CRC-24 / CRC-32 写帧，再用 `FrameReader` 读完。
     /// - 判断：三次读取都成功，且帧长符合 `4 + 1 + 2 + 1 + crc_len`。
-    #[compio::test]
     async fn roundtrip_supports_crc16_crc24_crc32() {
         let values = [
             Option::Some(7usize),
@@ -901,11 +900,11 @@ mod tests_ {
             assert_eq!(total, 4 + 1 + 2 + 1 + crc_len);
         }
     }
+    dual_runtime_test_!(roundtrip_supports_crc16_crc24_crc32);
 
     /// 测试 CRC-24 校验码被篡改时会被识别。
     /// - 手段：用 CRC-24 写帧后翻转校验码最后一个字节。
     /// - 判断：读完帧时返回 `ChecksumErr`。
-    #[compio::test]
     async fn crc24_mismatch_is_rejected() {
         let values = [
             Option::Some(7usize),
@@ -925,11 +924,11 @@ mod tests_ {
         let res = reader.drain_async_().await;
         assert!(matches!(res, Result::Err(WireError::ChecksumErr)));
     }
+    dual_runtime_test_!(crc24_mismatch_is_rejected);
 
     /// 测试 CRC-8（`BeU8`）不是合法算法预告。
     /// - 手段：手工构造 `magic + 0x0C`（`BeU8` + Checksum）。
     /// - 判断：`FrameReader::begin_async_` 返回 `UnsupportedOption`。
-    #[compio::test]
     async fn crc8_alg_hint_is_unsupported() {
         let mut buf = [0u8; 8];
         buf[..4].copy_from_slice(&K_INVITE_MAGIC);
@@ -938,11 +937,11 @@ mod tests_ {
         let res = FrameReader::begin_async_(&mut probe, NonCancellableToken::new()).await;
         assert!(matches!(res, Result::Err(WireError::UnsupportedOption)));
     }
+    dual_runtime_test_!(crc8_alg_hint_is_unsupported);
 
     /// 测试校验头与算法预告不一致会被拒绝。
     /// - 手段：算法预告用 CRC-16，帧尾校验头改成 CRC-32。
     /// - 判断：读到校验头时返回 `MalformedBody`。
-    #[compio::test]
     async fn checksum_header_mismatch_is_rejected() {
         let values = [
             Option::Some(7usize),
@@ -969,11 +968,11 @@ mod tests_ {
         let res = reader.drain_async_().await;
         assert!(matches!(res, Result::Err(WireError::MalformedBody)));
     }
+    dual_runtime_test_!(checksum_header_mismatch_is_rejected);
 
     /// 测试未知 / 保留键会被拒绝。
     /// - 手段：构造头字节键为 `0x05`（保留段）的条目。
     /// - 判断：读到该条目时返回 `UnsupportedOption`。
-    #[compio::test]
     async fn reserved_key_is_rejected() {
         let mut buf = [0u8; 16];
         buf[..4].copy_from_slice(&K_INVITE_MAGIC);
@@ -989,11 +988,11 @@ mod tests_ {
         let res = reader.drain_async_().await;
         assert!(matches!(res, Result::Err(WireError::UnsupportedOption)));
     }
+    dual_runtime_test_!(reserved_key_is_rejected);
 
     /// 测试扩展条目（`0x0E`）在 v1 中按保留键处理。
     /// - 手段：构造头字节键为 `0x0E` 的条目。
     /// - 判断：读到该条目时返回 `UnsupportedOption`。
-    #[compio::test]
     async fn ext_key_is_rejected_in_v1() {
         let mut buf = [0u8; 16];
         buf[..4].copy_from_slice(&K_INVITE_MAGIC);
@@ -1007,11 +1006,11 @@ mod tests_ {
         let res = reader.drain_async_().await;
         assert!(matches!(res, Result::Err(WireError::UnsupportedOption)));
     }
+    dual_runtime_test_!(ext_key_is_rejected_in_v1);
 
     /// 测试重复键会被拒绝。
     /// - 手段：构造同一基础键 `0x00` 出现两次的条目区，其后补合法 CRC-16 校验尾。
     /// - 判断：读到第二个条目时返回 `MalformedBody`。
-    #[compio::test]
     async fn duplicate_key_is_rejected() {
         let mut buf = [0u8; 16];
         buf[..4].copy_from_slice(&K_INVITE_MAGIC);
@@ -1030,11 +1029,11 @@ mod tests_ {
         let res = reader.drain_async_().await;
         assert!(matches!(res, Result::Err(WireError::MalformedBody)));
     }
+    dual_runtime_test_!(duplicate_key_is_rejected);
 
     /// 测试基础项取值为 0 会被拒绝。
     /// - 手段：构造 `key = 0x00, value = 0x00` 的条目。
     /// - 判断：返回 `MalformedBody`。
-    #[compio::test]
     async fn zero_value_is_rejected() {
         let mut buf = [0u8; 16];
         buf[..4].copy_from_slice(&K_INVITE_MAGIC);
@@ -1048,13 +1047,13 @@ mod tests_ {
         let res = reader.drain_async_().await;
         assert!(matches!(res, Result::Err(WireError::MalformedBody)));
     }
+    dual_runtime_test_!(zero_value_is_rejected);
 
     /// 测试条目是**逐条**产出的：解析一条只需要该条目自身的字节，不必等整帧。
     /// - 手段：写入一个完整帧，然后**截断**成只剩 `magic + 算法预告 + 第一条`；
     ///   用 `FrameReader` 读第一条，再尝试读下一条。
     /// - 判断：第一条能成功读出（证明不需要整帧）；此时 `is_finished_()` 为假；
     ///   继续读会因为缺少后续字节而失败。若读侧依赖整帧，第一步就会失败。
-    #[compio::test]
     async fn entries_are_yielded_incrementally() {
         let values = [
             Option::Some(4096usize),
@@ -1092,6 +1091,7 @@ mod tests_ {
         }
         assert_eq!(probe.len(), 0usize, "读第一条只消费它自己的字节");
     }
+    dual_runtime_test_!(entries_are_yielded_incrementally);
 
     /// 测试等待方补全规则：已提及项覆盖本地值，未提及项保留本地值。
     /// - 手段：本地五项齐全，`INVITE` 只提及 `max_packet_size = 8192`。
@@ -1128,7 +1128,6 @@ mod tests_ {
     ///   `values_to_basic_` 还原为 [`BasicOpts`]。
     /// - 判断：第 5 个槽位（下标 4）对应的键确实是 `MaxChannelWaitClose`，还原出的
     ///   `max_channel_wait_close` 恰为 7 秒，且其余基础项与原始值一致。
-    #[compio::test]
     async fn max_channel_wait_close_roundtrips_through_codec() {
         let opts = BasicOpts {
             max_channel_wait_close: Duration::from_secs(7u64),
@@ -1164,6 +1163,7 @@ mod tests_ {
         assert_eq!(restored.max_dock_chan_count, opts.max_dock_chan_count);
         assert_eq!(restored.max_channel_timeout, opts.max_channel_timeout);
     }
+    dual_runtime_test_!(max_channel_wait_close_roundtrips_through_codec);
 
     /// 测试新增基础键 `MaxChannelWaitClose`（`0x04`）的最小宽度选择。
     /// - 手段：用 `encode_entry_` 分别以 5 与 300 为取值编码该键的条目，再按

@@ -813,7 +813,6 @@ mod tests_ {
     /// - 判断：字节序列恰为 `15 00 03 11 01 02 12 04 00`（帧首 = `FIN << 4 | DATA`，
     ///   dock 各按 1 / 2 字节、载荷长度按 2 字节编码）；解析结果各字段与写入值
     ///   完全一致。
-    #[compio::test]
     async fn data_frame_roundtrip_uses_min_width() {
         let mut header = header_(FrameKind::Data, flags::K_FIN);
         header.local_dock_ = Dock::new(3u32);
@@ -841,6 +840,7 @@ mod tests_ {
         assert_eq!(parsed.payload_len(), 1024usize);
         assert_eq!(parsed.recv_window(), Option::None);
     }
+    dual_runtime_test_!(data_frame_roundtrip_uses_min_width);
 
     /// 测试 dock 的宽度边界：按数值大小在 1 / 2 / 4 字节间选宽，且能原值往返。
     /// - 手段：对 `0xFF` / `0x100` / `0xFFFF` / `0x1_0000` / `0xFFFF_FFFE` 各写一个
@@ -849,7 +849,6 @@ mod tests_ {
     ///   解析回来的 dock 数值与写入值相等。
     ///   （`u32::MAX` 是保留的 `wildcard`，故用 `u32::MAX - 1` 覆盖 4 字节宽度；
     ///   保留值的拒绝见 `reserved_docks_are_rejected_both_ways`。）
-    #[compio::test]
     async fn dock_widths_follow_value_magnitude() {
         let cases = [
             (0x00FFu32, FieldValType::BeU8),
@@ -873,13 +872,13 @@ mod tests_ {
             assert_eq!(parsed.local_dock(), Dock::new(value));
         }
     }
+    dual_runtime_test_!(dock_widths_follow_value_magnitude);
 
     /// 测试 `WINDOW_UPDATE` 帧的往返与「窗口通告两字段必需」两条约束。
     /// - 手段：带增量 4096 的 `WINDOW_UPDATE` 帧头往返；再分别用「写侧缺增量」
     ///   「读侧缺字段」「非 `WINDOW_UPDATE` 帧带增量」三种畸形输入触发校验。
     /// - 判断：正常帧的增量与 dock 对原值返回；三种畸形输入都报
     ///   [`MuxError::MalformedFrame`]。
-    #[compio::test]
     async fn window_update_frame_requires_window_report() {
         let mut header = header_(FrameKind::WindowUpdate, 0u8);
         header.local_dock_ = Dock::new(7u32);
@@ -923,6 +922,7 @@ mod tests_ {
             Option::Some(ErrKind::MalformedFrame)
         );
     }
+    dual_runtime_test_!(window_update_frame_requires_window_report);
 
     /// 测试保活帧 `PULSE` 是子流作用域，且必须携带接收窗口通告。
     /// - 手段：写一个 dock 对为 `(1, 2)`、接收窗口为 4096 的 `PULSE` 帧头并逐字节
@@ -931,7 +931,6 @@ mod tests_ {
     ///   PULSE`，随后 `LocalDock=1`、`RemoteDock=2`、`RecvWindow=4096`（`BeU16`）、
     ///   `PayloadLen=0`）；解析结果与写入一致；两种畸形输入都报
     ///   [`MuxError::MalformedFrame`]。
-    #[compio::test]
     async fn pulse_is_substream_scoped_and_carries_window() {
         let mut header = header_(FrameKind::Pulse, 0u8);
         header.local_dock_ = Dock::new(1u32);
@@ -987,6 +986,7 @@ mod tests_ {
             ErrKind::MalformedFrame
         );
     }
+    dual_runtime_test_!(pulse_is_substream_scoped_and_carries_window);
 
     /// 测试建流用的 `OPEN` 必须携带接收窗口通告，而 `ACCEPT` 不得携带。
     /// - 手段：写一个带窗口的 `OPEN` 并读回；再分别构造「无窗口的 `OPEN`」与
@@ -994,7 +994,6 @@ mod tests_ {
     /// - 判断：正常 `OPEN` 往返后 dock 对与窗口都一致；两种自相矛盾的帧头都报
     ///   [`MuxError::MalformedFrame`]（`ACCEPT` 的接收窗口已由被动方自己的
     ///   `OPEN` 通告过）。
-    #[compio::test]
     async fn open_carries_window_but_accept_does_not() {
         let mut open = header_(FrameKind::Open, 0u8);
         open.local_dock_ = Dock::new(3u32);
@@ -1033,12 +1032,12 @@ mod tests_ {
             ErrKind::MalformedFrame
         );
     }
+    dual_runtime_test_!(open_carries_window_but_accept_does_not);
 
     /// 测试 `wildcard` 与 `unspecified` 两个保留 dock 不能作为子流 dock。
     /// - 手段：在 `DATA` 帧里分别把 `LocalDock` 写成 `0`（`unspecified`）与
     ///   `u32::MAX`（`wildcard`）；再用写侧构造同样取保留值的帧头。
     /// - 判断：读侧的两种输入都报 [`MuxError::ReservedDock`]；写侧也拒绝。
-    #[compio::test]
     async fn reserved_docks_are_rejected_both_ways() {
         // unspecified = 0：0x00 是 LocalDock 的字段头，值为 1 字节 0x00。
         let unspecified = [0x05u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x00];
@@ -1066,6 +1065,7 @@ mod tests_ {
         header.remote_dock_ = Dock::wildcard();
         assert_eq!(write_header_err_(&header), ErrKind::ReservedDock);
     }
+    dual_runtime_test_!(reserved_docks_are_rejected_both_ways);
 
     /// 测试 `RecvTotal` 只接受 2 / 4 / 8 字节三种规格，并按值取最小者。
     /// - 手段：`PULSE` 帧里把 `RecvTotal` 分别写成 0（`BeU16`）、70000（`BeU32`）、
@@ -1073,7 +1073,6 @@ mod tests_ {
     ///   `BeU8` 编码 `RecvTotal` 的帧。
     /// - 判断：三种值分别编成 `0x14` / `0x34` / `0x44`；`BeU8` 编码报
     ///   [`MuxError::UnsupportedField`]。
-    #[compio::test]
     async fn recv_total_accepts_two_four_eight_byte_widths() {
         let cases = [
             (0u64, 0x14u8),
@@ -1102,6 +1101,7 @@ mod tests_ {
             Option::Some(ErrKind::UnsupportedField)
         );
     }
+    dual_runtime_test_!(recv_total_accepts_two_four_eight_byte_widths);
 
     /// 测试「累计量已重置」变体：`TOTAL_RESET` 标记往返，且只允许出现在保活 /
     /// 窗口更新帧上。
@@ -1109,7 +1109,6 @@ mod tests_ {
     ///   放到 `OPEN` 与 `DATA` 帧上。
     /// - 判断：读回的 `is_total_reset()` 为真且累计量是重置前的值；两种非法组合都报
     ///   [`MuxError::MalformedFrame`]。
-    #[compio::test]
     async fn total_reset_flag_is_a_window_report_variant() {
         let mut header = header_(FrameKind::WindowUpdate, flags::K_TOTAL_RESET);
         header.local_dock_ = Dock::new(4u32);
@@ -1141,12 +1140,12 @@ mod tests_ {
             Option::Some(ErrKind::MalformedFrame)
         );
     }
+    dual_runtime_test_!(total_reset_flag_is_a_window_report_variant);
 
     /// 测试保留的 `kind` 与保留的字段标识都被拒绝。
     /// - 手段：帧首分别取 `0x00`（保留）与 `0x0A`（保留），以及字段标识 `0x06`
     ///   （保留）。
     /// - 判断：三种输入都报 [`MuxError::UnsupportedField`]。
-    #[compio::test]
     async fn reserved_kind_and_field_id_are_rejected() {
         // 保留 kind：0x00 与 0x0A..=0x0F。
         for head in [0x00u8, 0x0A, 0x0F] {
@@ -1163,13 +1162,13 @@ mod tests_ {
             Option::Some(ErrKind::UnsupportedField)
         );
     }
+    dual_runtime_test_!(reserved_kind_and_field_id_are_rejected);
 
     /// 测试 dock 字段拒绝非 1 / 2 / 4 字节的宽度，而其它字段接受非最小宽度。
     /// - 手段：给出以 `BeU24` / `BeU64` 编码的 `LocalDock`；再给出以 `BeU24`
     ///   编码的 `PayloadLen`（数值 3，本可用 1 字节）。
     /// - 判断：dock 的两种宽度都报 [`MuxError::UnsupportedField`]；非最小的
     ///   `PayloadLen` 被接受，解析出 3。
-    #[compio::test]
     async fn dock_rejects_non_byte_aligned_width() {
         // LocalDock 用 BeU24（0x20）与 BeU64（0x40）：宽度检查在读值之前发生，
         // 因此不需要提供值字节。
@@ -1192,12 +1191,12 @@ mod tests_ {
             .expect("接收方应当接受任意足够宽的编码");
         assert_eq!(parsed.payload_len(), 3usize);
     }
+    dual_runtime_test_!(dock_rejects_non_byte_aligned_width);
 
     /// 测试字段重复与必需字段缺失都被判为结构非法。
     /// - 手段：给出「两个 `LocalDock`」与「`DATA` 帧缺 `RemoteDock`」两种字段
     ///   序列。
     /// - 判断：两种输入都报 [`MuxError::MalformedFrame`]。
-    #[compio::test]
     async fn duplicate_and_missing_fields_are_rejected() {
         let duplicate_local = [
             0x05u8, // 帧首：DATA
@@ -1221,13 +1220,13 @@ mod tests_ {
             Option::Some(ErrKind::MalformedFrame)
         );
     }
+    dual_runtime_test_!(duplicate_and_missing_fields_are_rejected);
 
     /// 测试 `ReasonCode` 只允许出现在 `REJECT` 帧上，且取值必须能装进 `u8`。
     /// - 手段：`REJECT` + `ReasonCode = 7`（合法）；`REJECT` + `ReasonCode = 0x100`
     ///   （超 `u8`）；`DATA` + `ReasonCode = 7`（种类不符）。
     /// - 判断：第一种解析成功（且不保留该字段）；后两种都报
     ///   [`MuxError::MalformedFrame`]。
-    #[compio::test]
     async fn reason_code_only_on_reject() {
         let reject_with_reason = [
             0x03u8, // 帧首：REJECT
@@ -1265,12 +1264,12 @@ mod tests_ {
             Option::Some(ErrKind::MalformedFrame)
         );
     }
+    dual_runtime_test_!(reason_code_only_on_reject);
 
     /// 测试除 `PayloadLen` 外的字段顺序不承载语义。
     /// - 手段：`WINDOW_UPDATE` 帧按「WindowUpdate → RemoteDock → LocalDock →
     ///   PayloadLen」排列。
     /// - 判断：解析成功，各字段取值与排列顺序无关地正确。
-    #[compio::test]
     async fn field_order_before_payload_len_is_free() {
         let shuffled = [
             0x07u8, // 帧首：WINDOW_UPDATE
@@ -1287,12 +1286,12 @@ mod tests_ {
         assert_eq!(parsed.local_dock(), Dock::new(1u32));
         assert_eq!(parsed.remote_dock(), Dock::new(2u32));
     }
+    dual_runtime_test_!(field_order_before_payload_len_is_free);
 
     /// 测试 `PayloadLen` 是头字段序列的定界符：它之后的字节属于载荷。
     /// - 手段：`PayloadLen = 1` 之后再放一个「看起来像字段」的字节 `0xFF`。
     /// - 判断：解析成功且 `payload_len` 为 1——说明 `0xFF` 没有被当成头字段
     ///   （否则会因保留字段标识而报 [`MuxError::UnsupportedField`]）。
-    #[compio::test]
     async fn payload_len_terminates_the_header() {
         let with_payload = [
             0x05u8, // 帧首：DATA
@@ -1306,12 +1305,12 @@ mod tests_ {
             .expect("PayloadLen 之后的字节属于载荷");
         assert_eq!(parsed.payload_len(), 1usize);
     }
+    dual_runtime_test_!(payload_len_terminates_the_header);
 
     /// 测试帧中途截断时如实上报底层读错误，而不是解析出一半成功。
     /// - 手段：给空缓冲，以及「`LocalDock` 头字节之后缺值字节」两种截断输入。
     /// - 判断：两种情况都返回错误（切片夹具把「读不够」表现为底层读错误，
     ///   因此这里断言 [`ErrKind::Rx`]）。
-    #[compio::test]
     async fn truncated_header_reports_read_error() {
         assert_eq!(
             read_err_(&[]).await,
@@ -1323,4 +1322,5 @@ mod tests_ {
             Option::Some(ErrKind::Rx)
         );
     }
+    dual_runtime_test_!(truncated_header_reports_read_error);
 }

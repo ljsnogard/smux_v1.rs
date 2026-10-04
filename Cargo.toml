@@ -21,6 +21,19 @@ crc = { version = "3.4.*" }
 flume = { version = "0.12.*" }
 thiserror = { version = "2.0.*", default-features = false }
 
+[features]
+# 测试装配用：让 `tests/common` 与 `tests/smoke_common` 知道当前测试 target 跑在
+# 哪个运行时上（tokio 与 compio 的 socket / 适配类型不同，无法用同一个函数体同时
+# 表达）。两个冒烟 target 各选中其一 —— 因此同一份场景只写一次、两个运行时各跑一遍。
+test-tokio-runtime = []
+# compio 侧：与 tokio feature 构成**互斥二选一**（共享文件按「compio feature 是否
+# 打开」分派设备类型）。**两个都默认打开**：这样 `cargo test --all-targets` 不带任何
+# 参数就能把两个冒烟 target 各按自己的运行时编译一遍，与改动前 `smoke_tokio.rs` +
+# `smoke_compio.rs` 两个文件各自运行的效果一致；单独跑某一个 target 时用
+# `--no-default-features --features <该侧>` 即可。
+test-compio-runtime = []
+default = ["test-tokio-runtime", "test-compio-runtime"]
+
 [dev-dependencies]
 # 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在
 # dev-dependencies 中出现（`buffex` 已是正式依赖，不在此重复）。
@@ -45,3 +58,14 @@ abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch =
 # `futures`，不需要为两个运行时各写一份并发代码。
 futures = "0.3.*"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+
+# 冒烟测试的两个 target：**同一份场景**（`tests/smoke_common.inc`）在两个运行时下各
+# 跑一遍，`required-features` 决定每个 target 用哪一套 socket / 适配类型。
+[[test]]
+name = "smoke_tokio"
+path = "tests/smoke_tokio.rs"
+required-features = ["test-tokio-runtime"]
+
+[[test]]
+name = "smoke_compio"
+path = "tests/smoke_compio.rs"

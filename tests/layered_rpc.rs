@@ -136,6 +136,7 @@ use common::AcceptAsyncClosureExt;
 use core::mem::MaybeUninit;
 
 use abs_art::TrLocalScope;
+use smux_v1::dual_runtime_test_;
 use abs_smux::{
     chan::TrChannelHalf,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
@@ -710,30 +711,27 @@ struct HalfHolder_<S> {
 // 用例
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-/// 测试目标：在 **tokio** 上按 L4→L5→L6→L7 分层跑通一次「客户端 4 次并发 RPC」。
+/// 测试目标：按 L4→L5→L6→L7 分层跑通一次「客户端 4 次并发 RPC」，**两个运行时各跑
+/// 一遍**（tokio 与 compio 由 [`dual_runtime_test_!`] 生成）。
 ///
 /// - 手段：用 [`layered_rpc_scenario_`] 串起各层——内存环建链、两端并发握手、
 ///   服务端「建 listener」与「accept 循环」分两个函数、客户端为每次调用绑定不同的
-///   临时 dock 并建流、两侧按长度前缀成帧交换一次请求/响应。缺省配置下连接的两个
-///   循环经作用域 `spawn_local` 投递，因此整个场景由 `scope.run_until(..)` 驱动。
+///   临时 dock 并建流、两侧按长度前缀成帧交换一次请求/响应。连接内部的四个循环经
+///   作用域 `spawn_local` 投递，因此整个场景由 `scope.run_until(..)` 驱动。
 /// - 判断：4 次 RPC 的响应字节与业务层预期**逐字节相等**；任一步骤的 API 接线失败
 ///   （绑定、建流、接受、读写、半关闭）都会 panic。本条**不**判定协议行为，只判定
 ///   「当前 API 允许这样分层地用」。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn layered_rpc_tokio_() {
-    let scope = abs_art_tokio::LocalScope::new();
-    let scenario = layered_rpc_scenario_(&scope);
+async fn layered_rpc_dual_<S>(scope: &S)
+where
+    S: TrLocalScope + Clone + 'static,
+{
+    let scenario = layered_rpc_scenario_(scope);
     scope.run_until(scenario).await;
 }
 
-/// 测试目标：与 tokio 版逐字相同的分层场景，改用 **compio** 运行时。
-///
-/// - 手段：同一份 [`layered_rpc_scenario_`]，只把作用域换成
-///   `abs_art_compio::LocalScope`（零大小，队列由运行时自己驱动）。
-/// - 判断：与 tokio 版相同——4 次 RPC 的响应逐字节相等，且全部分层接线可用。
-#[compio::test]
-async fn layered_rpc_compio_() {
-    let scope = abs_art_compio::LocalScope::new();
-    let scenario = layered_rpc_scenario_(&scope);
-    scope.run_until(scenario).await;
+/// 见 [`layered_rpc_dual_`] 说明：本函数只是给 tokio 作用域类型做一次实例化。
+async fn layered_rpc_body_tokio_() {
+    let scope = abs_art_tokio::LocalScope::new();
+    layered_rpc_dual_(&scope).await;
 }
+dual_runtime_test_!(layered_rpc_body_tokio_);

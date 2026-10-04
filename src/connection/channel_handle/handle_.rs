@@ -603,8 +603,6 @@ where
 mod tests_ {
     use std::time::Instant;
 
-    use futures::executor::block_on;
-
     use crate::{
         connection::test_support_::{
             ErasedTestMuxConfig_, NullScope_, TestMuxConfig_,
@@ -641,13 +639,16 @@ mod tests_ {
         let mut welcome: [u8; 0] = [];
         let mut welcome_slice: &mut [u8] = &mut welcome[..];
 
-        futures::executor::block_on(conn.core_().reg_().reserve_inbound_(
-            local,
-            remote,
-            WindowReport::new(0u64, 64u32),
-            buffex::x_deps::abs_cancel::NonCancellableToken::new(),
-        ))
-        .expect("登记入向请求应当成功");
+        conn.core_()
+            .reg_()
+            .reserve_inbound_(
+                local,
+                remote,
+                WindowReport::new(0u64, 64u32),
+                buffex::x_deps::abs_cancel::NonCancellableToken::new(),
+            )
+            .await
+            .expect("登记入向请求应当成功");
         let mut handle = ChannelHandle::new_(conn.clone(), local, remote);
 
         let t0 = Instant::now();
@@ -689,20 +690,17 @@ mod tests_ {
     /// cargo test --release --lib -- \
     ///   --ignored --nocapture managed_owned_vs_erased_accept_bench_
     /// ```
-    #[test]
-    #[ignore = "benchmark; run with --release --ignored --nocapture"]
-    fn managed_owned_vs_erased_accept_bench_() {
-        block_on(async {
-            // 先跑一次短预热，避免首次分配 / 缺页被算进正式数据。
-            let conn = make_conn_(TestMuxConfig_);
-            for i in 0..BENCH_WARMUP {
-                let _ = accept_once_(&conn, Dock::new(0x8000u32 + i as u32)).await;
-            }
-        });
+    async fn managed_owned_vs_erased_accept_bench_() {
+        // 先跑一次短预热，避免首次分配 / 缺页被算进正式数据。
+        let conn = make_conn_(TestMuxConfig_);
+        for i in 0..BENCH_WARMUP {
+            let _ = accept_once_(&conn, Dock::new(0x8000u32 + i as u32)).await;
+        }
 
-        let (owned, erased) = block_on(bench_both_managed_buffers_());
+        let (owned, erased) = bench_both_managed_buffers_().await;
         eprintln!("owned managed accept:  {owned:8.1} ns/channel");
         eprintln!("erased managed accept: {erased:8.1} ns/channel");
         eprintln!("delta: {:+.1} ns/channel", erased - owned);
     }
+    dual_runtime_test_!(managed_owned_vs_erased_accept_bench_);
 }

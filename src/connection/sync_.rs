@@ -260,24 +260,21 @@ mod tests_ {
     use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
-
     use super::*;
 
     /// 形态探针：守卫必须能**逃逸出** `acquire_*`（它借用调用方的会话），
     /// 这样调用点才能「自建会话 → 取守卫 → 在守卫上直接操作」。
     /// - 手段：建一把 `u32` 协作式锁，自建会话后用 `acquire_read_` 取读守卫。
     /// - 判断：守卫可读回锁内的初值（编译通过本身就是本探针的主要目的）。
-    #[test]
-    fn acquire_guard_escapes_session() {
+    async fn acquire_guard_escapes_session() {
         let lock = CooperativeRwLockOwned::<u32>::new_owned(7u32);
         let mut session = lock.acquire_session();
-        let guard = futures::executor::block_on(acquire_read_(
-            &mut session,
-            abs_cancel::NonCancellableToken::new(),
-        ))
-        .expect("非取消路径不应失败");
+        let guard = acquire_read_(&mut session, abs_cancel::NonCancellableToken::new())
+            .await
+            .expect("非取消路径不应失败");
         assert_eq!(*guard, 7u32);
     }
+    dual_runtime_test_!(acquire_guard_escapes_session);
 
     /// 计数唤醒器：统计 `wake` 被调用次数，用来断言唤醒确实发生。
     struct CountingWake_ {
@@ -309,9 +306,9 @@ mod tests_ {
     /// - 手段：先 poll 一次 `cancellation()`（此时应 `Pending` 并登记 waker），
     ///   再触发 `cancel_()`，最后再 poll 一次。
     /// - 判断：第一次返回 `Pending` 且尚未唤醒；触发取消后计数加一（说明登记的
-    ///   waker 被唤醒）；再次 poll 返回 `Ready`。
-    #[test]
-    fn cancel_token_wakes_parked_waiter() {
+    ///   waker 被唤醒）；再次 poll 返回 `Ready`。这里的「手工 poll」是**故意**的：
+    ///   本用例验的正是 waker 记账本身，而不是某个运行时的调度行为。
+    async fn cancel_token_wakes_parked_waiter() {
         let token = CancelToken_::new_(CoreAlloc);
         let (waker, probe) = counting_waker_();
         let mut context = Context::from_waker(&waker);
@@ -332,12 +329,13 @@ mod tests_ {
         token.cancel_();
         assert_eq!(probe.count_.load(Ordering::SeqCst), 1usize);
     }
+    dual_runtime_test_!(cancel_token_wakes_parked_waiter);
+
     /// 测试「先取消、后等待」时 future 立刻就绪。
     /// - 手段：先 `cancel_()`，再 poll 一个新建的 `cancellation()`。
     /// - 判断：`TrCancellationToken::is_cancelled` 为真，且首次 poll 即返回 `Ready`（`can_be_cancelled`
     ///   也为真，说明它不是常量令牌）。
-    #[test]
-    fn cancel_token_already_cancelled_is_ready_at_once() {
+    async fn cancel_token_already_cancelled_is_ready_at_once() {
         let token = CancelToken_::new_(CoreAlloc);
         assert!(!TrCancellationToken::is_cancelled(&token));
         assert!(TrCancellationToken::can_be_cancelled(&token));
@@ -349,6 +347,11 @@ mod tests_ {
         let mut context = Context::from_waker(&waker);
         let mut wait = core::pin::pin!(token.cancellation());
         assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
-        assert_eq!(probe.count_.load(Ordering::SeqCst), 0usize, "已取消无需唤醒");
+        assert_eq!(
+            probe.count_.load(Ordering::SeqCst),
+            0usize,
+            "已取消无需唤醒"
+        );
     }
+    dual_runtime_test_!(cancel_token_already_cancelled_is_ready_at_once);
 }

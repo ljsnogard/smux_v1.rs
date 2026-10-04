@@ -9,6 +9,22 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+/// 测试共用的双运行时支撑：`dual_runtime_test_!`。
+///
+/// 与上游 `buffex` 的同名模块同形：**同一个用例逻辑在 tokio 与 compio 下各跑一遍**。
+///
+/// 本模块**不在 `cfg(test)` 下编译**：宏需要能被 `tests/` 下的集成测试取到，而集成
+/// 测试链接的是「正常编译的库」（不置 `cfg(test)`）。内容只有宏与文档，因此常驻编译
+/// 没有运行期代价。
+#[macro_use]
+mod test_support_;
+
+/// 把 `dual_runtime_test_!` 放到 crate 根，供集成测试 `use smux_v1::dual_runtime_test_;`
+/// （`#[macro_export]` 只把它放在 crate 根的宏命名空间里，不产生可 `use` 的项）。
+#[doc(hidden)]
+#[allow(unused_imports)]
+pub use dual_runtime_test_ as _;
+
 pub mod connection;
 pub mod flow_ctrl;
 pub mod handshake;

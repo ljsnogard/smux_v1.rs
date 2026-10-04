@@ -456,7 +456,6 @@ where
 
 #[cfg(test)]
 mod tests_ {
-    use abs_art_bridge::Runtime;
     use abs_cancel::NonCancellableToken;
 
     use crate::connection::ring_::test_support_::make_test_channel_;
@@ -532,27 +531,20 @@ mod tests_ {
     }
 
     /// 测试握手能在一对环形缓冲上完整走通，且协商结果等于双方声明的缺省值。
-    /// - 手段：把等待方与发起方分别投递到 compio 运行时并发执行；发起方声明
+    /// - 手段：在同一任务里用 `futures::join!` 并发推进等待方与发起方；发起方声明
     ///   [`BasicOpts::DEFAULT`]，等待方本地值同样是缺省值，协商器接受一切。
     /// - 判断：两侧 future 都返回 `Ok`，且各自拿到的 `max_packet_size` 都是
     ///   4096（`BasicOpts::DEFAULT`）。
-    #[compio::test]
     async fn handshake_through_ring_test_() {
         let (a, b) = make_pair_(16usize).await;
 
-        let a_accept = Runtime::spawn_local(async move {
-            let local_opts = BasicOpts::default();
-            a.listen_async(&local_opts, AcceptAllEntries)
-                .await
-        });
-        let b_invite = Runtime::spawn_local(async move {
-            let proposed = BasicOpts::default();
-            b.invite_async(&proposed, AcceptAllEntries)
-                .await
-        });
+        let local_opts = BasicOpts::default();
+        let proposed = BasicOpts::default();
+        let (accepted, invited) = futures::join!(
+            async move { a.listen_async(&local_opts, AcceptAllEntries).await },
+            async move { b.invite_async(&proposed, AcceptAllEntries).await },
+        );
 
-        let accepted = a_accept.await.expect("等待方任务不应 panic");
-        let invited = b_invite.await.expect("发起方任务不应 panic");
         assert!(accepted.is_ok(), "等待方握手应当成功");
         assert!(invited.is_ok(), "发起方握手应当成功");
         let accepted = accepted.unwrap();
@@ -560,13 +552,13 @@ mod tests_ {
         assert_eq!(accepted.opts.basic_opts.max_packet_size, 4096usize);
         assert_eq!(invited.opts.basic_opts.max_packet_size, 4096usize);
     }
+    dual_runtime_test_!(handshake_through_ring_test_);
 
     /// 测试读侧校验失败不会被误报成「本端主动拒绝」。
     /// - 手段：手工构造一个 CRC 被翻转的 `INVITE` 字节流交给等待方读取；协商器
     ///   在条目流上只能看到「终止」，详细原因由读状态机记录。
     /// - 判断：等待方返回 `ChecksumErr` 而不是 `Rejected`——按模块文档 §9，
     ///   校验失败不得回 `REJECT`。
-    #[compio::test]
     async fn checksum_failure_is_not_reported_as_rejected() {
         let values = [
             Option::Some(4096usize),
@@ -603,6 +595,7 @@ mod tests_ {
             "校验失败必须按其本身分类，而不是 Rejected"
         );
     }
+    dual_runtime_test_!(checksum_failure_is_not_reported_as_rejected);
 
     /// 测试协商器拒绝时握手立即失败（发起方收到 `PeerRejected`）。
     /// - 手段：等待方的协商器把 `max_packet_size` 上限压到 1，而发起方声明
@@ -614,29 +607,27 @@ mod tests_ {
     /// `MaxPacketSize` 后就不再读取，而发起方仍会把剩余条目与校验尾写完；环放不下
     /// 就会让发起方阻塞在写上、双方互等。基础协商项每多一项，这个下界就抬高一截，
     /// 因此这里留出足够余量（64 字节）而不是贴着算。
-    #[compio::test]
     async fn negotiator_rejects_immediately() {
         let (a, b) = make_pair_(64usize).await;
 
-        let a_accept = Runtime::spawn_local(async move {
-            let local_opts = BasicOpts::default();
-            a.listen_async(
-                &local_opts,
-                CapPacketSize {
-                    cap_: 1usize,
-                    seen_: 0usize,
-                },
-            )
-            .await
-        });
-        let b_invite = Runtime::spawn_local(async move {
-            let proposed = BasicOpts::default();
-            b.invite_async(&proposed, AcceptAllEntries).await
-        });
+        let local_opts = BasicOpts::default();
+        let proposed = BasicOpts::default();
+        let (accepted, invited) = futures::join!(
+            async move {
+                a.listen_async(
+                    &local_opts,
+                    CapPacketSize {
+                        cap_: 1usize,
+                        seen_: 0usize,
+                    },
+                )
+                .await
+            },
+            async move { b.invite_async(&proposed, AcceptAllEntries).await },
+        );
 
-        let accepted = a_accept.await.expect("等待方任务不应 panic");
-        let invited = b_invite.await.expect("发起方任务不应 panic");
         assert!(matches!(accepted, Result::Err(HandshakeError::Rejected)));
         assert!(matches!(invited, Result::Err(HandshakeError::PeerRejected)));
     }
+    dual_runtime_test_!(negotiator_rejects_immediately);
 }
