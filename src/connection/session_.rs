@@ -104,7 +104,7 @@ use core::{
     ops::Bound,
     task::Poll,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use abs_buff::{
     Demand, TrBuffWrite,
@@ -112,7 +112,7 @@ use abs_buff::{
     x_deps::{abs_cancel, anylr::SomeOf},
 };
 use abs_cancel::{TrCancellationToken, TrMayCancel};
-use buffex::x_deps::abs_buff;
+use buffex::{ring::ConsumerError, x_deps::abs_buff};
 use mm_ptr::Owned;
 
 use crate::{
@@ -254,6 +254,119 @@ type ReadTable_<B, A> = BTreeMap<(Dock, Dock), ReadEntry_<B, A>, A>;
 
 /// 复用循环的本地表：dock 对 → 该子流的发送环读端与共享状态。
 type WriteTable_<B, A> = BTreeMap<(Dock, Dock), WriteEntry_<B, A>, A>;
+
+/// 「发送方向已收尾、但**数据还没排空**（或额度还没回来），因此还没发 `FIN`」的
+/// 子流集合（复用循环本地持有）。
+///
+/// 存在的唯一理由是**半关闭的协议义务**：`drop(tx)` 只表示「不再写」，应用此前
+/// 写进发送环的字节**仍然是承诺要送达的**，`FIN` 必须等它们全部上线之后才能发。
+/// 而发送额度可能在中途用尽（`SendWindow::available() == 0`），此时循环不能 park
+/// 在这一条子流上（那会挡住别的子流的事件），只能把它记在这里、等额度回补充或
+/// 环被读空时再继续。见 [`finalize_entry_`]。
+type PendingFin_ = BTreeSet<(Dock, Dock)>;
+
+/// 尝试把一条「已丢弃发送半边」的子流真正收尾：排空发送环 → 发 `CLOSE(FIN)` →
+/// 设置 `local_fin_sent_` → 从本地表移除。
+///
+/// 返回 `true` 表示**本轮有进展**（循环值得再调一次），`false` 表示遇到下面两种
+/// 合法阻塞之一、已把它留在 [`PendingFin_`] 里等条件变化：
+///
+/// - **发送环里还有数据但额度为 0**：等对端的窗口通告；
+/// - **段一时借不出来**（环被写者占住）：等下一次 `TxReady` / 环提交。
+///
+/// 收尾成功后调用方仍需走 [`maybe_release_`]——真正释放注册表条目还要看接收方向
+/// 是否也已收尾。
+#[allow(clippy::too_many_arguments)]
+async fn finalize_entry_<C, K>(
+    tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
+    shared: &MuxLoopShared_<C::Alloc>,
+    table: &mut WriteTable_<C::Buff, C::Alloc>,
+    scratch: &mut Owned<[u8], C::Alloc>,
+    pending_fin: &mut PendingFin_,
+    read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
+    pair: (Dock, Dock),
+    cancel: &K,
+) -> Result<bool, MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    // 1. 先尽力把环里剩下的字节送出去（额度用尽时 `drain_one_` 静默返回 `false`）。
+    flush_entry_::<C, _>(tx_stage, shared, table, scratch, pair, cancel).await?;
+
+    // 2. 环里还有没有数据？`None` = 不可判定（写者正占着环），下轮再来。
+    match has_writable_::<C>(table, pair) {
+        Option::None => return Result::Ok(false),
+        // 还有数据没发出去：留在待收尾集合里等额度 / 环推进。
+        Option::Some(true) => {
+            pending_fin.insert(pair);
+            return Result::Ok(false);
+        }
+        Option::Some(false) => {}
+    }
+
+    // 3. 环已排空：此刻才可以发 `CLOSE(FIN)`。
+    control_close_via_::<C, _>(
+        tx_stage,
+        shared.max_packet_size_,
+        pair.0,
+        pair.1,
+        false,
+        cancel.child_token(),
+    )
+    .await?;
+    if let Option::Some(entry) = table.get_mut(&pair) {
+        lock_or_fail_!(entry
+            .owner_
+            .with_mut_async_(cancel.child_token(), |state| {
+                state.set_local_fin_sent_();
+            }));
+    }
+    table.remove(&pair);
+    pending_fin.remove(&pair);
+    maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
+    Result::Ok(true)
+}
+
+/// 非阻塞地问一句：这条子流的发送环里**还有数据没发出去**吗？
+///
+/// - `Some(true)`：还有（`drain_one_` 此刻取不出来，多半是额度不够或环被写者占住）；
+/// - `Some(false)`：已排空，可以发 `FIN`；
+/// - `None`：**不可判定**（环给不出段也给不出「空」的错误，例如写者正持有段）。
+///
+/// 与 [`drain_one_`] 同一条纪律：这里**只能用 `try_read`**——`read_async` 会在空环上
+/// park，而一 park 就再也看不到事件通道里的事件（多子流下直接死锁）。
+fn has_writable_<C>(
+    table: &mut WriteTable_<C::Buff, C::Alloc>,
+    pair: (Dock, Dock),
+) -> Option<bool>
+where
+    C: TrConnCfg,
+{
+    let entry = table.get_mut(&pair)?;
+    let demand = Demand::at_least(1usize);
+    let mut outcome = entry.reader_.try_read(&demand);
+    match outcome.as_mut().pick_left() {
+        // 借到了段：里面确实还有数据。段在这里被丢弃（**不消费**）——`drain_one_`
+        // 才是唯一有权搬出字节的地方。
+        Option::Some(_segm) => Option::Some(true),
+        Option::None => match outcome.pick_right() {
+            // 环空（`Drained`）或已被写者关闭（`Closing`）：都不会再有新数据。
+            Option::Some(err) => {
+                if matches!(
+                    err,
+                    ConsumerError::Drained(_) | ConsumerError::Closing
+                ) {
+                    Option::Some(false)
+                } else {
+                    // `Stuffed` / `Unsatisfiable` / `Cancelled` 都不足以断言「已排空」。
+                    Option::None
+                }
+            }
+            Option::None => Option::None,
+        },
+    }
+}
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 小工具
@@ -628,6 +741,44 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     fail_mux_loop_(&shared, &cancel, &MuxError::FlowCtrl(err)).await;
                     return;
                 }
+                // 「额度归零」必须**当场**通告，不能只等写循环那条 `RxConsumed`。
+                //
+                // 原因是时序：应用完全可以在这个循环反应过来之前就把刚到的字节读走。
+                // 那时窗口已经不是 0 了，`should_report` 里的归零判据再也不会成立——
+                // 而**已通告快照仍是旧值**（本函数的 `on_data` 不推进它），对端于是
+                // 一直按「还有一整个窗口」行动，最后停在一个我们永远不会再纠正的额度
+                // 上。这里补一次判定机会，判据全在 `RecvWindow::should_report_with_`
+                // 里（窗口归零落在**临界区**，临界区每变必报）。
+                let imminent = lock_or_exit_!(entry
+                    .owner_
+                    .with_mut_async_(cancel.child_token(), |state| {
+                        let thresholds = state.thresholds_();
+                        let recv = state.flow_mut_().recv_window_mut();
+                        if recv.should_report_with_(&thresholds) {
+                            // 分区必须在 `report()` **之前**取：`report()` 会把
+                            // `reported_` 推进到当前值，之后就判不出旧分区了。
+                            let zone = recv.zone_with_(&thresholds);
+                            Option::Some(recv.report_in_zone_(zone))
+                        } else {
+                            Option::None
+                        }
+                    }));
+                if let Option::Some(report) = imminent {
+                    let _ = events_tx.try_send_event_(WriteEvent_::Control {
+                        frame_: ControlFrame_::with_window_(
+                            FrameKind::WindowUpdate,
+                            if report.is_reset() {
+                                flags::K_TOTAL_RESET
+                            } else {
+                                0u8
+                            },
+                            local,
+                            remote,
+                            Option::Some((report.recv_total(), report.window())),
+                            Vec::new(),
+                        ),
+                    });
+                }
                 let wrote = race_cancel_(
                     &cancel,
                     write_into_ring_(&mut entry.writer_, bytes, cancel.child_token()),
@@ -743,12 +894,24 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 if let Option::Some(entry) = table.get_mut(&pair)
                     && let Option::Some(report) = window_report_of_(&header)
                 {
-                    lock_or_exit_!(entry
-                        .owner_
-                        .with_mut_async_(cancel.child_token(), |state| {
-                            let _ = state.flow_mut_().send_window_mut().on_report(report);
-                            state.touch_();
-                        }));
+                    let owner = entry.owner_.clone();
+                    lock_or_exit_!(owner.with_mut_async_(cancel.child_token(), |state| {
+                        let _ = state.flow_mut_().send_window_mut().on_report(report);
+                        state.touch_();
+                    }));
+                    // **必须叫醒复用循环**：这条子流的额度刚刚（可能）变大，而写循环
+                    // 完全可能正 park 在事件通道上——它上一次尝试发送时额度为 0，
+                    // 于是「环里有数据但发不出去」，此后应用不再写入（环是满的），
+                    // 也就不会再产生 `TxReady`。少了这次唤醒，`WINDOW_UPDATE` 会被
+                    // 白收：发送方永远停在 0，接收方空着额度（本仓库流控验收用例撞到
+                    // 的第三个死锁）。
+                    //
+                    // 这里**不能用「已入队」去重位**：它可能正被应用上一次写入置着
+                    // （额度为 0 时写循环根本没机会清它），于是这次唤醒会被静默丢掉。
+                    let _ = events_tx.try_send_event_(WriteEvent_::TxReady {
+                        local_dock: local,
+                        remote_dock: remote,
+                    });
                 }
             }
             FrameKind::Datagram => {
@@ -862,6 +1025,9 @@ pub(crate) async fn mux_loop_async_<C, K>(
     let mut table: WriteTable_<C::Buff, C::Alloc> =
         BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())));
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
+    // 「发送方向已丢弃、但发送环还没排空（或额度没回来）」的子流：它们还欠对端一条
+    // `CLOSE(FIN)`，由下面第 2.5 步在有进展时继续收尾（见 `finalize_entry_`）。
+    let mut pending_fin: PendingFin_ = BTreeSet::new();
     // 环段字节的搬出暂存：`clone_items_from_buff` / `move_items_to_buff` 需要一个
     // 连续切片作为中间落点（段本身不能作为 `write_all_async_` 的源）。走调用方注入
     // 的分配器（`mm_ptr::Owned`），整条连接只分配一次。
@@ -882,13 +1048,24 @@ pub(crate) async fn mux_loop_async_<C, K>(
         // 件事，是为了让释放不必等某次 API 操作：两个内侧循环任一被调度即可推进。
         lock_or_exit_!(shared.reg_.drain_session_events_(cancel.child_token()));
 
-        // 1. 先把**已经到达**的事件处理掉（非阻塞）。
+        // 1. 先把**已经到达**的事件成批处理掉（非阻塞），**但批有上限**。
         //
         // 这一步的顺序很关键：下面第 2 步会 park 在「最近通知过的那条发送环」上；
         // 若不在 park 之前排空事件队列，其它子流的 `Attach` / `Control`（例如它们
         // 的 `OPEN`）就会排在一条正在 park 的循环后面，形成死锁。单线程运行时下
         // 「检查队列」与「登记 park」之间没有 `await`，因此不存在竞态。
-        if let Option::Some(event) = events.try_take_event_() {
+        //
+        // **上限不可省。** 事件是持续到来的（每条子流每次写入都会投 `TxReady`），
+        // 若「每处理一条事件就 `continue` 回顶部」，那么只要事件队列始终非空，第 2 步
+        // 的排空**永远轮不到**——发送方一帧也发不出去。这不是理论风险：真实 socket 的
+        // 流控验收用例正是卡在这里（对端已经把窗口抬到 384，事件也不断到达，而本循环
+        // 一直在顶部打转、从没进过排空段）。因此每轮只处理有上限的一批，然后必定走一次
+        // 排空。
+        const K_EVENT_BATCH: usize = 32usize;
+        for _ in 0..K_EVENT_BATCH {
+            let Option::Some(event) = events.try_take_event_() else {
+                break;
+            };
             match race_cancel_(
                 &cancel,
                 handle_write_event_::<C, _>(
@@ -896,6 +1073,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &mut tx_stage,
                     &mut table,
                     &mut scratch,
+                    &mut pending_fin,
                     &shared,
                     &read_events,
                     &cancel,
@@ -911,7 +1089,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     return;
                 }
             }
-            continue;
         }
 
         // 2. 尽量把各子流的数据发出去（一次一段），直到没有可发的。
@@ -923,6 +1100,38 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &shared,
                     &mut table,
                     &mut scratch,
+                    &cancel,
+                ),
+            )
+            .await
+            {
+                Option::None => return,
+                Option::Some(Result::Ok(true)) => continue,
+                Option::Some(Result::Ok(false)) => break,
+                Option::Some(Result::Err(err)) => {
+                    fail_mux_loop_(&shared, &cancel, &err).await;
+                    return;
+                }
+            }
+        }
+
+        // 2.5. 额度回补或环被读空之后，把「欠着 FIN」的子流继续收尾。
+        //
+        //    收尾要等两个条件同时成立：发送环已排空、且能写出 `CLOSE` 帧。`drain_once_`
+        //    刚刚尽力把数据发出去了，因此这里每次只取一条试收尾、且**不跨 `await`
+        //    持有对集合的借用**（收尾本身会改写集合）；「本轮有进展」就继续轮，每一轮
+        //    要么写出一段数据、要么真正收尾掉一条，必然收敛。
+        while let Some(pair) = pending_fin.iter().next().copied() {
+            match race_cancel_(
+                &cancel,
+                finalize_entry_::<C, _>(
+                    &mut tx_stage,
+                    &shared,
+                    &mut table,
+                    &mut scratch,
+                    &mut pending_fin,
+                    &read_events,
+                    pair,
                     &cancel,
                 ),
             )
@@ -974,8 +1183,23 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 // 这条 park 是**可选**的（「最近通知」那条环可能已经不存在），因此
                 // 就地建出 future、就地 poll：`Demand` 与借出的段都只活在这个分支里，
                 // 不会把 `table` 的借用带出闭包。
+                //
+                // **但「环可读」不等于「有进展可能」**：额度为 0 时 `drain_one_`
+                // 一条也发不出去，若这里照样因「环可读」返回就绪，整圈会在
+                // 「回到顶部 → drain 失败 → 立刻又就绪」之间**纯空转**：CPU 打满，
+                // 同运行时上的其它任务被饿死，连超时看门狗都来不及触发。因此就绪
+                // 条件必须同时要求「这条子流确实还有发送额度」；额度归零之后，唤醒
+                // 一律来自读循环收到窗口通告时投的那条事件（见 `write_into_ring` 的
+                // 对端通告分支）。`try_with_` 同步取读状态：拿不到锁就按「没额度」
+                // 处理，不唤醒——那同样是安全方向。
                 if let Option::Some(pair) = last_ready
                     && let Option::Some(entry) = table.get_mut(&pair)
+                    && matches!(
+                        entry
+                            .owner_
+                            .try_with_(|state| state.flow_().send_window().available() > 0u32),
+                        Result::Ok(true)
+                    )
                 {
                     let ring_fut = core::pin::pin!(core::future::IntoFuture::into_future(
                         entry.reader_.read_async(&ring_demand),
@@ -1000,6 +1224,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &mut tx_stage,
                     &mut table,
                     &mut scratch,
+                    &mut pending_fin,
                     &shared,
                     &read_events,
                     &cancel,
@@ -1033,6 +1258,7 @@ async fn handle_write_event_<C, K>(
     tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
+    pending_fin: &mut PendingFin_,
     shared: &MuxLoopShared_<C::Alloc>,
     read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: &K,
@@ -1088,12 +1314,11 @@ where
                 state.flow_mut_().recv_window_mut().on_consumed(amount_);
                 state.touch_();
                 let thresholds = state.thresholds_();
-                if state
-                    .flow_mut_()
-                    .recv_window()
-                    .should_report_with_(&thresholds)
-                {
-                    Option::Some(state.flow_mut_().recv_window_mut().report())
+                let recv = state.flow_mut_().recv_window_mut();
+                if recv.should_report_with_(&thresholds) {
+                    // 分区必须在 `report()` 之前取（见读循环同款注释）。
+                    let zone = recv.zone_with_(&thresholds);
+                    Option::Some(recv.report_in_zone_(zone))
                 } else {
                     Option::None
                 }
@@ -1114,40 +1339,32 @@ where
             remote_dock,
         } => {
             let pair = (local_dock, remote_dock);
-            // 把已缓存数据全部发完，再发 FIN。
-            flush_entry_::<C, _>(
-                tx_stage,
-                shared,
-                table,
-                scratch,
-                pair,
-                cancel,
-            )
-            .await?;
-            control_close_via_::<C, _>(
-                tx_stage,
-                shared.max_packet_size_,
-                local_dock,
-                remote_dock,
-                false,
-                cancel.child_token(),
-            )
-            .await?;
+            // 应用已不再写：记下这件事，然后**尝试**收尾。
+            //
+            // 收尾不一定一次成功：应用此前写进发送环的字节是「承诺要送达」的，`FIN`
+            // 必须等它们全部上线（`drop(tx)` 本身不等待送达，见 README §5）；而发送
+            // 额度可能中途用尽。因此这里不再「无条件发 FIN」，而是交给
+            // [`finalize_entry_`]——它在「环已排空」时才发 FIN，否则把这条子流记进
+            // `pending_fin`，等窗口通告 / 环推进之后由主循环第 2.5 步继续。
             if let Option::Some(entry) = table.get_mut(&pair) {
                 lock_or_fail_!(entry
                     .owner_
                     .with_mut_async_(cancel.child_token(), |state| {
                         state.set_app_tx_closed_();
-                        state.set_local_fin_sent_();
                     }));
             }
-            table.remove(&pair);
-            maybe_release_::<C, _>(
+            // 返回值只表示「本轮有进展」；成功收尾与暂时受阻两种结果都已经由
+            // [`finalize_entry_`] 自己落实（受阻时它已登记进 `pending_fin`），
+            // 主循环第 2.5 步会在有进展时再试。
+            let _ = finalize_entry_::<C, _>(
+                tx_stage,
                 shared,
-                read_events,
                 table,
+                scratch,
+                pending_fin,
+                read_events,
                 pair,
-                cancel.child_token(),
+                cancel,
             )
             .await?;
         }

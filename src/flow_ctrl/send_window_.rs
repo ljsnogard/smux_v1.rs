@@ -68,8 +68,24 @@ impl SendWindow {
     ///
     /// 重置变体（[`WindowReport::is_reset`]）会先把对端的 epoch 起点推进到它携带的
     /// 「重置前累计量」，因此两种变体都能折算成同一个**绝对**累计已收量再比较。
-    /// 过期或重复的通告（折算后的 `R` 不比已记录的更大）被忽略，因此**幂等**：保活
-    /// `PULSE` 可以放心地重复携带同一份快照。
+    ///
+    /// # 接受与忽略的判据（**不是**「`R` 必须变大」）
+    ///
+    /// 新快照严格优于旧快照的判据是
+    ///
+    /// ```text
+    /// absolute > r0  ||  (absolute == r0 && window > w0)
+    /// ```
+    ///
+    /// 后半条不可省。接收方**消费**数据会让窗口回补，而它此时可能还没有再收到新数据
+    /// ——于是通告是「`R` 不变、`W` 变大」。窗口跌到 0 之后的第一条回补通告恰好总是
+    /// 这种形状，因此这不是边角情形。若把它当重复通告丢掉，发送方会永远停在
+    /// `available() == 0`，而接收方明明空着额度：**这条子流就此死锁**（本仓库
+    /// `send_window_` 的 `report_with_same_recv_total_but_larger_window_is_accepted_`
+    /// 钉住了这一点）。
+    ///
+    /// 反过来，`absolute < r0`、或「`R` 与 `W` 都没变」的快照确实是过期 / 重复的，
+    /// 忽略它们让本方法保持**幂等**：保活 `PULSE` 可以放心地重复携带同一份快照。
     ///
     /// # Errors
     ///
@@ -84,10 +100,10 @@ impl SendWindow {
             self.peer_epoch_base_.saturating_add(report.recv_total())
         };
 
-        if let Option::Some((r0, _)) = self.reported_
-            && absolute <= r0
+        if let Option::Some((r0, w0)) = self.reported_
+            && (absolute < r0 || (absolute == r0 && report.window() <= w0))
         {
-            // 旧快照：不覆盖、不推进 epoch 起点，也不报错。
+            // 过期或重复的快照：不覆盖、不推进 epoch 起点，也不报错。
             return Result::Ok(());
         }
         if report.window() > self.max_ {

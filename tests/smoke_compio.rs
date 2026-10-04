@@ -33,3 +33,22 @@ async fn small_socket_compio_() {
     let scope = abs_art_compio::LocalScope::new();
     smoke_common::small_socket_body_(&scope).await;
 }
+
+/// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_socket_body_`]。
+///
+/// **当前 `#[ignore]`**：与 tokio 侧同名用例同因——它专为「窗口反复归零再回补」而设，
+/// 因此会稳定卡在两个已知未修的流控死锁上，见
+/// `dev-notes/flow-ctrl-20261004-1241.md` §2。修好后必须去掉。
+#[ignore = "阻塞于已知的两个流控死锁，见 dev-notes/flow-ctrl-20261004-1241.md §2"]
+#[compio::test]
+async fn flow_ctrl_socket_compio_() {
+    let scope = abs_art_compio::LocalScope::new();
+    smoke_common::flow_ctrl_socket_body_(&scope).await;
+}
+
+/// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_isolation_socket_body_`]。
+#[compio::test]
+async fn flow_ctrl_isolation_socket_compio_() {
+    let scope = abs_art_compio::LocalScope::new();
+    smoke_common::flow_ctrl_isolation_socket_body_(&scope).await;
+}

@@ -332,6 +332,32 @@ where
         let mut guard = acquire_write_(&mut session, cancel).await?;
         Result::Ok(f(&mut guard))
     }
+
+    /// **同步、非阻塞**地取读状态：只在锁**当场可用**时返回 `Some`，否则返回
+    /// `None`（`WouldBlock`）。
+    ///
+    /// 供 `poll` 闭包这类**没有 `await` 可用**的地方使用：那里既不能等锁，也不该
+    /// 因为「读不到状态」就唤醒自己（那会变成忙等）。当前唯一的使用点是复用循环的
+    /// park 条件——它要问「这条子流的发送额度是不是 > 0」，从而避免在「环里有数据、
+    /// 但额度为 0」时把「环可读」当成唤醒理由（那会纯空转，见
+    /// [`crate::connection::session_`] 的 mux 循环文档）。
+    ///
+    /// **失败即不唤醒**是安全的方向：唯一的额度来源是读循环收到窗口通告，而那条
+    /// 路径一定会投一条事件上来，把 park 打断。
+    ///
+    /// # Errors
+    ///
+    /// 锁当场不可用时返回 [`LockCancelled_`]（与异步版本的失败类型一致）。
+    pub(crate) fn try_with_<R>(
+        &self,
+        f: impl FnOnce(&ChannelState_) -> R,
+    ) -> Result<R, LockCancelled_> {
+        let mut session = self.inner_.acquire_session();
+        match session.try_read() {
+            Result::Ok(guard) => Result::Ok(f(&guard)),
+            Result::Err(_) => Result::Err(LockCancelled_),
+        }
+    }
 }
 
 

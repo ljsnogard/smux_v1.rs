@@ -31,8 +31,12 @@
 //!    会把在途量重复计入（推导见 [`WindowReport`]）。
 //! 4. 通告**什么时候发**由阈值 + 频率限制决定（[`RecvWindow::should_report`]）：
 //!    建流时一次（通告最大窗口），此后**收缩**跌破 `1/2` / `1/4` / `0`、**扩张**升过
-//!    `1/2` / `3/4` / 满时各发一次；两次通告之间至少隔若干个数据帧，避免窗口在阈值
-//!    附近抖动时反复发同一条事件。因为通告是快照，**延迟通告不会导致越权**。
+//!    `1/2` / `3/4` / 满时各发一次；两次通告之间一般至少隔若干个数据帧，避免窗口在
+//!    阈值附近抖动时反复发同一条事件。因为通告是快照，**延迟通告不会导致越权**。
+//!
+//!    但「**窗口从 0 抬起**」这一次**不受**帧数门限约束：门限靠收到数据帧推进，而
+//!    发送方一旦没额度就一条帧也发不出来，两者互为前提会把双方锁死（本仓库的流控
+//!    验收用例撞到过）。详见 [`RecvWindow::should_report`] 的方法文档。
 //! 5. 绝对上限由 [`TrFlowCtrlPolicy::max_window`] 钳制，防止两端来回加码导致窗口
 //!    无限增长。
 //!
@@ -63,7 +67,7 @@ mod tests_;
 pub use error_::FlowCtrlError;
 pub use flow_::FlowCtrl;
 pub use policy_::{DefaultPolicy, TrFlowCtrlPolicy};
-pub use recv_window_::{K_REPORT_LEVEL_COUNT, RecvWindow};
+pub use recv_window_::RecvWindow;
 pub(crate) use recv_window_::ReportThresholds_;
 pub use report_::WindowReport;
 pub use send_window_::SendWindow;

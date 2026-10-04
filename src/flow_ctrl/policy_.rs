@@ -1,4 +1,4 @@
-use crate::flow_ctrl::{Credit, K_REPORT_LEVEL_COUNT, RecvTotal};
+use crate::flow_ctrl::{Credit, RecvTotal};
 
 /// 流控策略：把「缓冲能力」翻译成窗口参数与通告时机。
 ///
@@ -12,24 +12,36 @@ pub trait TrFlowCtrlPolicy {
     /// 因为它同时决定后续通告的上界。
     fn initial_window(&self, ring_capacity: usize) -> Credit;
 
-    /// **收缩方向**的通告水位（相对初始窗口而言的绝对值），按任意顺序返回。
+    /// **临界区**的容量分母：剩余容量不足 `容量 / N` 时进入「临界区」。
     ///
-    /// 本端接收窗口 `W` 跌破其中任一水位（含恰好落在水位上）、且该水位严格低于
-    /// 「上次通告值」时发一次通告。水位列里带 `0` 是为了表达「窗口降到 0」这个
-    /// 触发点。缺省为 `[1/2, 1/4, 0]`。
-    fn shrink_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT];
+    /// 临界区里**任何变化都提醒**——越接近瘫痪的子流，越要给它改变状态的机会。
+    /// 缺省 `N = 4`（即剩余不足 1/4）。
+    ///
+    /// 与之对称的另一端是「**3/4 以上不提醒**」：剩余容量超过 `容量 × 3/4` 时离瘫痪
+    /// 还远，没有必要为它产生任何控制帧。这个上界由本值直接推出
+    /// （`1 − 1/N`），不再单列一个方法，避免两个旋钮互相矛盾。
+    fn critical_denominator(&self) -> Credit;
 
-    /// **扩张方向**的通告水位，语义与 [`TrFlowCtrlPolicy::shrink_levels`] 对称。
+    /// **中间区**（临界区之外、充裕区之下）两次提醒之间，至少要积累多少字节的
+    /// **变动量**；`0` 表示不做频率限制。
     ///
-    /// 缺省为 `[1/2, 3/4, 初始值]`。
-    fn expand_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT];
-
-    /// 两次通告之间**至少**要经过多少个数据帧；`0` 表示不做频率限制。
+    /// 中间区离瘫痪还远，提醒的价值低，这里用一个变动量下限把频率压住——这正是
+    /// 「防抖」该待的地方。临界区不受它约束（那里每变必报）。
     ///
-    /// 目的是避免窗口在阈值附近来回抖动时反复发同一条事件。因为通告携带的是
-    /// 「截至某累计已收字节数的窗口」快照，**延迟通告不会导致越权**（发送方按上一次
-    /// 通告算出的额度本身就受限于那次的真实窗口），所以这里可以放心限制频率。
-    fn min_frames_between_reports(&self) -> usize;
+    /// # 为什么量的是**字节**而不是**帧数**
+    ///
+    /// 曾经量的是「自上次提醒以来收到多少个数据帧」。那个口径有个致命偏斜：**它只能
+    /// 靠收到数据帧推进**，因此窗口一旦归零（发送方停摆、一帧也发不出来），或者应用
+    /// 只消费而发送方还没跟上时，「变动量」明明在涨、帧计数却纹丝不动，提醒被永久
+    /// 压住——双方互等。字节口径对「哪一侧在动」不敏感，任何真实进展都能推进它。
+    ///
+    /// 缺省实现取「临界区上界的大小」与一个下限中的较大者（见 [`DefaultPolicy`]）；
+    /// 这样中间区每积累大约一档临界容量的变动才提醒一次，与分区粒度同量级。
+    ///
+    /// 因为提醒携带的是「截至某累计已收字节数的窗口」快照，**延迟提醒不会导致越权**
+    /// （发送方按上一次通告算出的额度本身就受限于那次的真实窗口），所以这里可以放心
+    /// 限制频率。
+    fn min_advance_between_reports(&self, initial: Credit) -> Credit;
 
     /// 窗口的**绝对上限**。
     ///
@@ -70,8 +82,8 @@ impl DefaultPolicy {
         DefaultPolicy
     }
 
-    /// 缺省的最小通告间隔（数据帧数）。
-    pub const K_MIN_FRAMES_BETWEEN_REPORTS: usize = 4;
+    /// 缺省的最小通告间隔的**绝对下限**（字节）。
+    pub const K_MIN_ADVANCE_FLOOR: Credit = 16u32;
 }
 
 
@@ -82,16 +94,15 @@ impl TrFlowCtrlPolicy for DefaultPolicy {
         ring_capacity.min(Credit::MAX as usize) as Credit
     }
 
-    fn shrink_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT] {
-        [initial / 2u32, initial / 4u32, 0u32]
+    fn critical_denominator(&self) -> Credit {
+        4u32
     }
 
-    fn expand_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT] {
-        [initial / 2u32, initial / 4u32 * 3u32, initial]
-    }
-
-    fn min_frames_between_reports(&self) -> usize {
-        Self::K_MIN_FRAMES_BETWEEN_REPORTS
+    fn min_advance_between_reports(&self, initial: Credit) -> Credit {
+        // 与临界区同粒度：中间区每积累「一档临界容量」的变动就值得提醒一次。
+        // 再压一个绝对下限，避免极小窗口下门限退化成 0（= 不限频）。
+        let critical = initial / self.critical_denominator().max(1u32);
+        critical.max(Self::K_MIN_ADVANCE_FLOOR)
     }
 
     fn max_window(&self) -> Credit {

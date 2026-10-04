@@ -67,6 +67,92 @@ pub async fn small_socket_body_(scope: &abs_art_compio::LocalScope) {
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 流控验收：真实 socket 上的「窗口用尽 → 回补 → 收尾」
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 测试目标：**真实 UNIX socket** 上，接收窗口被反复用尽并回补之后，大载荷仍然
+/// 逐字节完好、且 `FIN` 排在全部数据之后。
+///
+/// - 手段：同一条 socket 装配，只是把场景换成与运行时无关的
+///   [`common::run_flow_ctrl_socket_scenario_`]（子流环上钳到 512 字节、载荷 64 KiB、
+///   接收侧每次只读 64 字节），并把整段场景包在 [`K_FLOW_CTRL_WATCHDOG_`] 之内。
+/// - 判断：字节逐字节相等、收尾读到 `Closing`；**超时即 panic**——窗口回补通告若被
+///   误判为过期（本仓库修掉的那个缺陷），这条用例会死锁而不是失败，超时是它唯一的
+///   可观测征兆。
+#[cfg(feature = "test-tokio-runtime")]
+pub async fn flow_ctrl_socket_body_(scope: &abs_art_tokio::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        let scenario =
+            common::run_flow_ctrl_socket_scenario_(scope, a_tx, a_rx, b_tx, b_rx);
+        match tokio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
+            Result::Ok(()) => {}
+            Result::Err(_) => panic!(
+                "流控场景超时（{:?}）：疑似窗口回补之后发送方永久拿不到额度而卡死",
+                common::K_FLOW_CTRL_WATCHDOG_
+            ),
+        }
+    })
+    .await;
+}
+
+/// 见 tokio 版说明。
+#[cfg(not(feature = "test-tokio-runtime"))]
+pub async fn flow_ctrl_socket_body_(scope: &abs_art_compio::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        let scenario =
+            common::run_flow_ctrl_socket_scenario_(scope, a_tx, a_rx, b_tx, b_rx);
+        match compio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
+            Result::Ok(()) => {}
+            Result::Err(_) => panic!(
+                "流控场景超时（{:?}）：疑似窗口回补之后发送方永久拿不到额度而卡死",
+                common::K_FLOW_CTRL_WATCHDOG_
+            ),
+        }
+    })
+    .await;
+}
+
+/// 测试目标：**真实 UNIX socket** 上，一条子流的发送额度被用尽，不影响同连接上
+/// 其它子流的收发。
+///
+/// - 手段：同一条 socket 装配，场景换成与运行时无关的
+///   [`common::run_flow_ctrl_isolation_scenario_`]（子流 1 写满窗口而接收侧故意不读、
+///   子流 2 正常双向收发），同样包在 [`common::K_FLOW_CTRL_WATCHDOG_`] 之内。
+/// - 判断：子流 2 逐字节相等且收到 `Closing`；子流 1 的 `Tx` 仍可用；超时即 panic。
+#[cfg(feature = "test-tokio-runtime")]
+pub async fn flow_ctrl_isolation_socket_body_(scope: &abs_art_tokio::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        let scenario =
+            common::run_flow_ctrl_isolation_scenario_(scope, a_tx, a_rx, b_tx, b_rx);
+        match tokio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
+            Result::Ok(()) => {}
+            Result::Err(_) => panic!(
+                "流控隔离场景超时（{:?}）：一条子流的额度耗尽拖死了其它子流",
+                common::K_FLOW_CTRL_WATCHDOG_
+            ),
+        }
+    })
+    .await;
+}
+
+/// 见 tokio 版说明。
+#[cfg(not(feature = "test-tokio-runtime"))]
+pub async fn flow_ctrl_isolation_socket_body_(scope: &abs_art_compio::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        let scenario =
+            common::run_flow_ctrl_isolation_scenario_(scope, a_tx, a_rx, b_tx, b_rx);
+        match compio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
+            Result::Ok(()) => {}
+            Result::Err(_) => panic!(
+                "流控隔离场景超时（{:?}）：一条子流的额度耗尽拖死了其它子流",
+                common::K_FLOW_CTRL_WATCHDOG_
+            ),
+        }
+    })
+    .await;
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 编译期探针：设备级适配必须满足 common 对输入 / 输出设备的契约
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 

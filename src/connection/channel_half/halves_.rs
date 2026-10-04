@@ -88,6 +88,21 @@ where
 
     /// 对端 dock。
     remote_dock_: Dock,
+
+    /// **发送环的临界水位**：环内积压超过它（即剩余空间不足
+    /// `容量 × 1/N`）就算进入「临界区」。
+    ///
+    /// 与接收侧的临界区同源——都取自
+    /// [`TrFlowCtrlPolicy::critical_denominator`]，只是这里量的是「待发积压」而
+    /// 不是「剩余接收容量」。两侧对称的含义是一致的：**剩余不足 1/N 就每变必报**。
+    backlog_: Credit,
+
+    /// 最近一次通知写循环时，发送环是否已经处于临界区。
+    ///
+    /// 通知（`TxReady`）只在**临界区里**频繁发：越接近「发不出去」，越要保证写循环
+    /// 拿得到取数机会；积压不严重时不必每次写入都喊一遍（那会把事件通道灌满，反过来
+    /// 挤占写循环的排空段——本仓库真实 socket 用例撞到过）。
+    backlogged_: bool,
 }
 
 impl<C, S> ChannelTx<C, S>
@@ -95,6 +110,8 @@ where
     C: TrConnCfg<Data = u8>,
 {
     /// 由环生产端、共享状态、连接与 dock 对构造。
+    ///
+    /// `backlog` 是**发送环的临界水位**（见 [`ChannelTx`] 的同名字段文档）。
     ///
     /// 只供连接内部（建流路径）与单元测试使用：对外部使用者而言，这两个半边只应由
     /// `abs_smux` 的 trait 产出。
@@ -104,30 +121,48 @@ where
         conn: MuxConnection<C, S>,
         local_dock: Dock,
         remote_dock: Dock,
+        backlog: Credit,
     ) -> Self {
         ChannelTx {
             ring_: ring,
             owner_: owner,
             conn_: conn,
             local_dock_: local_dock,
-            remote_dock_: remote_dock}
+            remote_dock_: remote_dock,
+            backlog_: backlog,
+            backlogged_: false}
     }
 
     /// 通知写循环「这条子流的发送环可能有数据」。
     ///
-    /// 每条子流至多一条待处理事件：只有 `tx_queued_` 由假变真时才真正投递
-    /// （顺序与去重协议见 `dev-notes` §11.4）。
-    fn notify_tx_ready_(&self) {
-        // 去重位在锁外（原子）：同步路径没有 `await` 可用，因此这里不取锁。
-        let fresh = self.owner_.mark_tx_queued_();
-        if fresh {
-            let _ = self
-                .conn_
-                .core_()
-                .w_events_()
-                .try_send_event_(WriteEvent_::TxReady {
-                    local_dock: self.local_dock_,
-                    remote_dock: self.remote_dock_});
+    /// # 只在**临界区**里频繁通知
+    ///
+    /// 通知是**提醒**而不是数据：写循环真正要的是「环里有积压、快来取」。积压不严重
+    /// 时每次写入都喊一遍没有信息量，反而会把事件通道灌满——而写循环每轮要**在排空
+    /// 与处理事件之间分时**，事件灌满会挤占排空段（本仓库真实 socket 用例撞到过）。
+    ///
+    /// 因此规则与接收侧对称：**待发积压超过 `容量 × 3/4`（即剩余不足 `容量 × 1/4`）
+    /// 时任何变化都通知**；积压不严重时只在「刚从积压状态回落」的边沿补一次，保证写
+    /// 循环不会因为漏掉一次通知而永久睡下去。
+    ///
+    /// 「已入队」去重位仍然保留：它保证同一条子流至多一条待处理事件。
+    fn notify_tx_ready_(&mut self) {
+        let queued = self.ring_.ring_state().data_size() as u64;
+        let congested = queued > self.backlog_ as u64;
+        // 边沿也要通知一次（进临界区 / 出临界区），避免写循环漏掉状态切换。
+        let edge = congested != self.backlogged_;
+        if congested || edge {
+            self.backlogged_ = congested;
+            let fresh = self.owner_.mark_tx_queued_();
+            if fresh {
+                let _ = self
+                    .conn_
+                    .core_()
+                    .w_events_()
+                    .try_send_event_(WriteEvent_::TxReady {
+                        local_dock: self.local_dock_,
+                        remote_dock: self.remote_dock_});
+            }
         }
     }
 
@@ -515,6 +550,8 @@ mod tests_ {
                 conn.clone(),
                 local,
                 remote,
+                // 测试环容量 64 ⇒ 临界水位 64/4 = 16。
+                16u32,
             ),
             ChannelRx::new_(half_rx, conn, local, remote),
         )

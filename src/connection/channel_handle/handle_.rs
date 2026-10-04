@@ -500,6 +500,9 @@ where
     // 本端接收窗口由**接收环容量**决定；发送窗口先按同一初值起算，随后被对端 `OPEN`
     // 的通告覆盖。
     let initial = policy.initial_window(rx_cap);
+    // 发送环的临界水位：与接收侧同源（`容量 × 1/N`）。发送环容量与接收环同批给出，
+    // 用同一个 `initial` 即可。
+    let backlog = initial / policy.critical_denominator().max(1u32);
     let thresholds = ReportThresholds_::new_(policy, initial);
     let mut flow = FlowCtrl::new(policy, rx_cap);
     flow.recv_window_mut().report();
@@ -543,7 +546,7 @@ where
 
     Result::Ok((
         owner.clone(),
-        ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote),
+        ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote, backlog),
         ChannelRx::new_(rx_r, conn.clone(), local, remote),
         initial,
     ))

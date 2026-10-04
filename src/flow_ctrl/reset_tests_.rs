@@ -8,16 +8,12 @@ impl TrFlowCtrlPolicy for TinyEpochPolicy {
         ring_capacity.min(Credit::MAX as usize) as Credit
     }
 
-    fn shrink_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT] {
-        [initial / 2u32, initial / 4u32, 0u32]
+    fn critical_denominator(&self) -> Credit {
+        4u32
     }
 
-    fn expand_levels(&self, initial: Credit) -> [Credit; K_REPORT_LEVEL_COUNT] {
-        [initial / 2u32, initial / 4u32 * 3u32, initial]
-    }
-
-    fn min_frames_between_reports(&self) -> usize {
-        4usize
+    fn min_advance_between_reports(&self, initial: Credit) -> Credit {
+        (initial / 4u32).max(1u32)
     }
 
     fn max_window(&self) -> Credit {
@@ -68,7 +64,7 @@ fn recv_window_reset_carries_pre_reset_total() {
 
 /// 测试重置不受频率限制影响（频率限制只约束阈值通告）。
 /// - 手段：2 字节 epoch 策略下通告一次，收 1 个数据帧就把累计量推过规格。
-/// - 判断：帧数远小于 `min_frames_between_reports` 时 `should_report` 仍为真，
+/// - 判断：变动量远小于中间区门限时 `should_report` 仍为真（重置是编码前提），
 ///   且 `report()` 产出重置变体。
 #[test]
 fn reset_bypasses_report_rate_limit() {
