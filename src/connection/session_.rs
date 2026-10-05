@@ -117,7 +117,7 @@ use mm_ptr::Owned;
 use crate::{
     connection::{
         Dock, FrameHeader, FrameKind, MuxError, TrConnCfg, flags,
-        frame_::encode_header_into_,
+        frame_::{K_MAX_FRAME_HEADER, encode_header_},
         frame_parser_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
         owner_::ChannelOwner_,
@@ -137,11 +137,9 @@ use crate::{
 /// 段而让其他子流等太久（公平性，见 `connection-20260919-1631.md` §5.2）。
 const K_MAX_DATA_CHUNK: usize = 16usize * 1024usize;
 
-/// 帧暂存环容量的**理论下限**：一帧 = 头（自描述字段序列）+ 载荷。
-///
-/// 字段最坏情况是三字节宽（每种字段各一个、加上帧首字节），这里给一个宽松的上限
-/// 就够——真正的容量由配置给出（见模块文档「连接级环的硬约束」）。
-const K_MAX_FRAME_HEADER: usize = 64usize;
+// 帧暂存环容量与**帧头上界**无关：帧头逐字节解析 / 编码（`frame_::encode_header_`
+// 用栈上定长缓冲，长度上界 [`K_MAX_FRAME_HEADER`]），载荷按底层段长分块搬入 / 写出，
+// 因此帧暂存容量取到环原语的下限也能跑通（见模块文档「连接级环的硬约束」）。
 
 /// 两个**内侧**循环共享的、与调用方配置无关的量。
 ///
@@ -563,22 +561,33 @@ where
     Result::Ok(())
 }
 
-/// 把「帧头 + 载荷」编码成一个连续帧。
+/// 把**帧头 + 载荷**分两段写进连接写环（数据面与控制面共用的入环入口）。
 ///
-/// 返回 `Ok(None)` 表示**帧总长超限**（头 + 载荷 > `max_packet_size`）——由调用方
-/// 决定这是「连接级失败」还是「调用方构造了过大的帧」。
-fn encode_whole_frame_(
-    header: &FrameHeader,
+/// # 为什么可以分两段
+///
+/// 连接写环是**单生产者**（只有复用循环写它），因此先写头、再写载荷不会被别的帧
+/// 插进来；两段各自都是「按环当前能给的段分块推进、环满即 park」，与单段写入的语义
+/// 完全一致。
+///
+/// 这样每帧不必先拼出一个连续 `Vec`：帧头来自栈上定长缓冲（[`frame_::encode_header_`]），
+/// 载荷来自 `scratch`（注入分配器）或控制帧自己的载荷。**每帧少一次全局分配，数据面
+/// 少一跳拷贝**（见 `dev-notes/audit-heap-alloc-20261004-1122.md` §3.1 #1 与 §5.1）。
+///
+/// # Errors
+///
+/// 与 [`enqueue_frame_`] 相同。
+async fn enqueue_frame_parts_<C, K>(
+    tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
+    head: &[u8],
     payload: &[u8],
-    max_packet_size: usize,
-) -> Result<Option<Vec<u8>>, MuxError> {
-    let mut frame = Vec::with_capacity(K_MAX_FRAME_HEADER + payload.len());
-    encode_header_into_(&mut frame, header)?;
-    if frame.len() + payload.len() > max_packet_size {
-        return Result::Ok(Option::None);
-    }
-    frame.extend_from_slice(payload);
-    Result::Ok(Option::Some(frame))
+    cancel: K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    enqueue_frame_::<C, _>(tx_stage, head, cancel.child_token()).await?;
+    enqueue_frame_::<C, _>(tx_stage, payload, cancel.child_token()).await
 }
 
 /// 把**读侧**游标错误映射为连接错误。
@@ -1652,10 +1661,13 @@ where
         frame.payload_().len(),
         frame.window_(),
     );
-    let Some(bytes) = encode_whole_frame_(&header, frame.payload_(), max_packet_size)? else {
+    // 帧头进栈上定长缓冲；帧总长上限的判定与「拼成整帧」时同义。
+    let (head, head_len) = encode_header_(&header)?;
+    let payload = frame.payload_();
+    if head_len + payload.len() > max_packet_size {
         return Result::Err(MuxError::FrameTooLarge);
-    };
-    enqueue_frame_::<C, _>(tx_stage, &bytes, cancel.child_token()).await
+    }
+    enqueue_frame_parts_::<C, _>(tx_stage, &head[..head_len], payload, cancel.child_token()).await
 }
 
 /// 把某条子流发送环里已提交的数据全部写出（直到取空）。
@@ -1831,12 +1843,11 @@ where
         return Result::Err(MuxError::MalformedFrame);
     }
 
-    // 整帧写进连接写环。空间在上面已经判过（保守预判保证够），因此这里**不会再**
-    // 出现「字节已离开子流环、帧却没写出去」的状态。
-    let Some(frame) = encode_whole_frame_(&header, &scratch[..moved], shared.max_packet_size_)?
-    else {
+    // 帧头进**栈上定长缓冲**（零分配），并用它的**实际长度**做帧总长判定。
+    let (head, head_len) = encode_header_(&header)?;
+    if head_len + moved > shared.max_packet_size_ {
         return Result::Err(MuxError::FrameTooLarge);
-    };
+    }
 
     // 预扣窗口（`take <= available`，因此必定足额）。
     let granted = owner.send_reserve_(take as Credit);
@@ -1845,8 +1856,16 @@ where
         return Result::Ok(false);
     }
 
-    if let Result::Err(err) =
-        enqueue_frame_::<C, _>(tx_stage, &frame, token.child_token()).await
+    // **两段**写进连接写环：先帧头（栈上缓冲）、再载荷（`scratch`）。写环是单生产者，
+    // 因此两段之间不会被别的帧插进来。空间在上面已经判过（保守预判 + 实际头长），
+    // 因此这里**不会再**出现「字节已离开子流环、帧却没写出去」的状态。
+    if let Result::Err(err) = enqueue_frame_parts_::<C, _>(
+        tx_stage,
+        &head[..head_len],
+        &scratch[..moved],
+        token.child_token(),
+    )
+    .await
     {
         // 写环已结束：把预扣的窗口退回去，再按连接级失败处理。
         owner.send_refund_(take as Credit);

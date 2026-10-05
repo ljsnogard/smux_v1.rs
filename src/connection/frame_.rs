@@ -74,8 +74,9 @@
 //! 帧头**解析**已迁到 [`crate::connection::frame_parser_`] 的 sans-IO 逐字节状态机
 //! （原因：旧入口按字段索要 `width`
 //! 字节，环容量小于 `width` 时会拿到终态的 `Unsatisfiable` 而整条连接失败）。
-//! 本模块保留 `encode_header_into_`、`FieldId` / `FrameKind` / `flags` 等公共件，以及
-//! 两个状态机共用的 `decode_dock_field_`。
+//! 本模块保留 `encode_header_`（栈上定长缓冲，写路径的唯一入口）、`FieldId` /
+//! `FrameKind` / `flags` 等公共件，以及两个状态机共用的 `decode_dock_field_`；`Vec`
+//! 版本的 `encode_header_into_` 只留给测试。
 
 use abs_smux::dock::TrDock;
 // 测试夹具用 `abs_buff` 的 `NonCancellableToken` 驱动解析器；非测试构建用不到。
@@ -357,7 +358,7 @@ impl FrameHeader {
     ///
     /// `window` 只在 `OPEN` / `PULSE` / `WINDOW_UPDATE` 上给出（`(累计已收 R,
     /// 接收窗口 W)`），其余帧必须传 `None`；合法性由
-    /// [`encode_header_into_`] 再次校验。
+    /// [`encode_header_`] 再次校验。
     pub(crate) const fn new_(
         kind: FrameKind,
         flags: u8,
@@ -493,25 +494,58 @@ pub(crate) const fn requires_window_report_(kind: FrameKind) -> bool {
 
 /// 把帧头编码为「帧首字节 + 自描述字段序列」，追加到 `sink` 末尾。
 ///
-/// 字段按固定顺序写出（`LocalDock` → `RemoteDock` → `RecvTotal` → `RecvWindow` →
-/// `PayloadLen`），因此 `PayloadLen` 天然收尾（模块文档 §帧形状）。
+/// 把帧头编码并追加到 `sink`（**仅测试使用**）。
 ///
-/// 本函数是帧头编码的**唯一**来源：连接级写环的「整帧一次写」与读侧测试都走它，
-/// 避免两处各写一份字段顺序。
-///
-/// # Errors
-///
-/// - 字段宽度越界（例如 dock 超过 `u32::MAX`）→ [`MuxError::UnsupportedField`]；
-/// - `OPEN` / `PULSE` / `WINDOW_UPDATE` 缺少窗口通告的任一半（`RecvTotal` /
-///   `RecvWindow`），或其余帧带上了窗口通告 → [`MuxError::MalformedFrame`]
-///   （都属调用方构造了自相矛盾的帧头）；
-/// - dock 取了保留值（`wildcard` / `unspecified`）→ [`MuxError::ReservedDock`]；
-/// - 把 [`flags::K_TOTAL_RESET`] 用在 `PULSE` / `WINDOW_UPDATE` 之外的帧上
-///   → [`MuxError::MalformedFrame`]。
+/// 生产路径一律用 [`encode_header_`]（栈上定长缓冲、零分配）；这里保留 `Vec` 版本是
+/// 因为测试更愿意比对一串字节，而测试不受分配纪律约束。
+#[cfg(test)]
 pub(crate) fn encode_header_into_(
     sink: &mut Vec<u8>,
     header: &FrameHeader,
 ) -> Result<(), MuxError> {
+    let (buf, len) = encode_header_(header)?;
+    sink.extend_from_slice(&buf[..len]);
+    Result::Ok(())
+}
+
+/// 帧头的**最坏编码长度**（字节）。
+///
+/// 每个自描述字段占「1 字节头 + 大端值」，宽度取能容纳该值的最小合法者
+/// （见 `encode_field_`）。本版本的帧头字段与最坏宽度：
+///
+/// | 字段 | 允许宽度 | 最坏字节 |
+/// | --- | --- | --- |
+/// | 帧首字节 | — | 1 |
+/// | `LocalDock` | 1 / 2 / 4 字节 | 5 |
+/// | `RemoteDock` | 1 / 2 / 4 字节 | 5 |
+/// | `RecvTotal` | 2 / 4 / 8 字节 | 9 |
+/// | `RecvWindow` | 任意宽度 | 9 |
+/// | `PayloadLen` | 任意宽度 | 9 |
+///
+/// **真实**最坏组合（窗口两项只出现在 `OPEN` / `PULSE` / `WINDOW_UPDATE` 上，且与
+/// `REJECT` 的 `ReasonCode` 互斥；`ReasonCode` 目前走**载荷**而不是头字段）是
+/// `1 + 5 + 5 + 9 + 9 + 9 = 38` 字节；把不存在的字段组合也算上也只有 47 字节。
+/// 取 64 是为了给后续加字段留余量，而不是「刚好够用」。
+pub(crate) const K_MAX_FRAME_HEADER: usize = 64usize;
+
+/// 把帧头编码进一块**栈上定长缓冲**，返回 `(缓冲, 实际长度)`。
+///
+/// 这是数据面唯一需要「一段连续帧头字节」的地方；用定长数组把它从堆上拿下来之后，
+/// 每 DATA 帧少一次全局分配，载荷也不必再整体拷进临时 `Vec`
+/// （见 `dev-notes/audit-heap-alloc-20261004-1122.md` §3.1 #1 与 §5.1）。
+///
+/// # Errors
+///
+/// 与测试用的 `encode_header_into_` 完全一致（两者共用本实现）：`TOTAL_RESET` 用在
+/// `PULSE` / `WINDOW_UPDATE` 之外 → [`MuxError::MalformedFrame`]；dock 取保留值 →
+/// [`MuxError::ReservedDock`]；窗口通告缺一半或多一半 → [`MuxError::MalformedFrame`]；
+/// 字段宽度无法容纳 → [`MuxError::UnsupportedField`]。
+pub(crate) fn encode_header_(
+    header: &FrameHeader,
+) -> Result<([u8; K_MAX_FRAME_HEADER], usize), MuxError> {
+    let mut buf = [0u8; K_MAX_FRAME_HEADER];
+    let mut cursor = 0usize;
+
     // `TOTAL_RESET` 只对窗口通告有意义，且 OPEN 时还没有 epoch。
     if header.flags_ & flags::K_TOTAL_RESET != 0
         && !matches!(header.kind_, FrameKind::Pulse | FrameKind::WindowUpdate)
@@ -519,7 +553,7 @@ pub(crate) fn encode_header_into_(
         return Result::Err(MuxError::MalformedFrame);
     }
 
-    sink.push(compose_frame_head_(header.kind_, header.flags_));
+    write_byte_(&mut buf, &mut cursor, compose_frame_head_(header.kind_, header.flags_))?;
 
     // channel 作用域的帧里 dock 对就是身份：两端都必须是真实 dock。
     //
@@ -531,9 +565,9 @@ pub(crate) fn encode_header_into_(
         return Result::Err(MuxError::ReservedDock);
     }
     let local = usize::try_from(local_dock.value()).map_err(|_| MuxError::UnsupportedField)?;
-    encode_field_into_(sink, FieldId::LocalDock, local)?;
+    write_field_(&mut buf, &mut cursor, FieldId::LocalDock, local)?;
     let remote = usize::try_from(remote_dock.value()).map_err(|_| MuxError::UnsupportedField)?;
-    encode_field_into_(sink, FieldId::RemoteDock, remote)?;
+    write_field_(&mut buf, &mut cursor, FieldId::RemoteDock, remote)?;
 
     match (
         requires_window_report_(header.kind_),
@@ -543,22 +577,44 @@ pub(crate) fn encode_header_into_(
         (true, Option::Some(window), Option::Some(total)) => {
             // 先累计字节数（`R`）后窗口值（`W`），与模块文档的字段顺序一致。
             let total = usize::try_from(total).map_err(|_| MuxError::UnsupportedField)?;
-            encode_field_into_(sink, FieldId::RecvTotal, total)?;
+            write_field_(&mut buf, &mut cursor, FieldId::RecvTotal, total)?;
             let window = usize::try_from(window).map_err(|_| MuxError::UnsupportedField)?;
-            encode_field_into_(sink, FieldId::RecvWindow, window)?;
+            write_field_(&mut buf, &mut cursor, FieldId::RecvWindow, window)?;
         }
         (false, Option::None, Option::None) => {}
         // 缺一个、多一个、或出现在不该出现的帧上：都是自相矛盾的帧头。
         _ => return Result::Err(MuxError::MalformedFrame),
     }
 
-    encode_field_into_(sink, FieldId::PayloadLen, header.payload_len_)
+    write_field_(&mut buf, &mut cursor, FieldId::PayloadLen, header.payload_len_)?;
+    Result::Ok((buf, cursor))
 }
 
-/// 编码单个自描述字段并追加到 `sink`（宽度取能容纳 `value` 的最小合法宽度）。
-fn encode_field_into_(sink: &mut Vec<u8>, id: FieldId, value: usize) -> Result<(), MuxError> {
+/// 往定长缓冲里写一个字节。
+fn write_byte_(buf: &mut [u8], cursor: &mut usize, byte: u8) -> Result<(), MuxError> {
+    let Some(slot) = buf.get_mut(*cursor) else {
+        // 缓冲按最坏字段组合取值；越界只可能是「字段上界被改小」这类内部错误。
+        return Result::Err(MuxError::FrameTooLarge);
+    };
+    *slot = byte;
+    *cursor += 1usize;
+    Result::Ok(())
+}
+
+/// 编码单个自描述字段并写进定长缓冲（宽度取能容纳 `value` 的最小合法宽度）。
+fn write_field_(
+    buf: &mut [u8],
+    cursor: &mut usize,
+    id: FieldId,
+    value: usize,
+) -> Result<(), MuxError> {
     let (bytes, len) = encode_field_(id, value).ok_or(MuxError::UnsupportedField)?;
-    sink.extend_from_slice(&bytes[..len]);
+    let end = *cursor + len;
+    let Some(dst) = buf.get_mut(*cursor..end) else {
+        return Result::Err(MuxError::FrameTooLarge);
+    };
+    dst.copy_from_slice(&bytes[..len]);
+    *cursor = end;
     Result::Ok(())
 }
 
