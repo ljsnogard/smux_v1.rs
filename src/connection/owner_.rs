@@ -32,20 +32,20 @@ use core::{
     alloc::AllocatorClone,
     future::poll_fn,
     sync::atomic::{AtomicU64, Ordering},
-    task::Poll,
+    task::{Context, Poll},
 };
 use std::time::Instant;
 
 use atomic_sync::x_deps::atomex;
 use atomex::AtomicFlags;
 use buffex::x_deps::abs_cancel::TrCancellationToken;
-use flume::{Receiver, Sender};
 use mm_ptr::Shared;
 
 use crate::{
     connection::{
         error_::MuxError,
         mux_connection::ChannelRegistry_,
+        sync_::NotifySlot_,
     },
     flow_ctrl::{Credit, FlowCtrl, FlowCtrlError, WindowReport},
 };
@@ -110,50 +110,20 @@ fn rx_done_of_(value: usize) -> bool {
 // 建流
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-/// 建流三步的进展（标志位在状态字里，这里只承载等待所需的持久通知通道）。
+/// 建流三步的进展（标志位在状态字里；[`ChannelState_`] 另持一个**零分配**的通知槽）。
 ///
 /// 两侧状态机同形（见 `crate::connection` 模块文档 §4.2）：主动方要等对端的
 /// `OPEN`（拿到对端接收窗口）与 `ACCEPT` / `REJECT`；对应的两位在 [`ChannelState_`]
-/// 的状态字里，收到相应帧时置位并[`Establish_::notify_`]。
+/// 的状态字里，收到相应帧时置位并 [`ChannelState_::notify_establish_`]。
 ///
-/// # 通知用通道而不是 waker 槽
+/// # 通知用**内联槽**而不是通道
 ///
-/// 等待方是 async 上下文（[`wait_establish_`]），它自己拿不到 `cx` 去登记 waker；
-/// 而通道是**持久**的：「先通知、后等待」不会丢（消息留在队列里），因此等待方
-/// 只要先查状态、再 `recv_async().await` 即可，不需要手写 `poll`。
-#[derive(Debug)]
-pub(crate) struct Establish_ {
-    /// 通知生产端。
-    notify_tx_: Sender<()>,
-
-    /// 通知消费端（等待方克隆一份去 await）。
-    notify_rx_: Receiver<()>,
-}
-
-impl Default for Establish_ {
-    fn default() -> Self {
-        // 容量 1：通知是「状态可能变了」的幂等提示。
-        let (notify_tx_, notify_rx_) = flume::bounded(1usize);
-        Establish_ {
-            notify_tx_,
-            notify_rx_,
-        }
-    }
-}
-
-impl Establish_ {
-    /// 提示等待方「建流状态可能变了」（幂等；队列满时投递失败是无害的）。
-    pub(crate) fn notify_(&self) {
-        let _ = self.notify_tx_.try_send(());
-    }
-
-    /// 取一份通知消费端（等待方持有它去 `recv_async`）。
-    pub(crate) fn notify_rx_(&self) -> Receiver<()> {
-        self.notify_rx_.clone()
-    }
-}
-
-/// 建流的最终结果。
+/// 等待方是 async 上下文（[`wait_establish_`]），因此需要一个能被唤醒的落点。
+/// 早先用 `flume` 容量 1 通道（持久、无需 `cx`），但它**每条子流一次全局分配**
+/// （`dev-notes/audit-heap-alloc-20261004-1122.md` §3.1 #7）。现在改用
+/// [`NotifySlot_`]：一个原子位 + 一个 waker 槽，零堆分配；代价是等待方要手写
+/// `poll`，因此「登记 → 复检」的协议写在 [`NotifySlot_`] 的类型文档里，并有用例钉住
+/// （`sync_::tests_` 的三条 + 本文的 `establish_notification_is_persistent`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EstablishOutcome_ {
     /// 对端回复 `ACCEPT`。
@@ -177,8 +147,8 @@ pub(crate) struct ChannelState_ {
     /// 收发双向流控状态（内部字段也是原子）。
     flow_: FlowCtrl,
 
-    /// 建流等待者的持久通知通道。
-    establish_: Establish_,
+    /// 建流等待者的**零分配**内联通知槽（协议见 [`NotifySlot_`]）。
+    establish_: NotifySlot_,
 
     /// 节点建立时刻：`active_millis_` 的计时基准。
     base_: Instant,
@@ -194,7 +164,7 @@ impl ChannelState_ {
         ChannelState_ {
             flags_: AtomicFlags::new(core::sync::atomic::AtomicUsize::new(0usize)),
             flow_: FlowCtrl::new_empty_(),
-            establish_: Establish_::default(),
+            establish_: NotifySlot_::new_(),
             base_: Instant::now(),
             active_millis_: AtomicU64::new(0u64),
         }
@@ -242,14 +212,18 @@ impl ChannelState_ {
     //-- ---- 建流位 ----
 
     /// 提示建流等待方「状态可能变了」；读循环在收到 `OPEN` / `ACCEPT` / `REJECT`
-    /// 后调用（幂等、不阻塞）。
+    /// 后调用（幂等、不阻塞、零分配）。
     pub(crate) fn notify_establish_(&self) {
         self.establish_.notify_();
     }
 
-    /// 取一份建流通知消费端（等待方持有它去 await）。
-    pub(crate) fn establish_notify_rx_(&self) -> Receiver<()> {
-        self.establish_.notify_rx_()
+    /// 等建流状态变化：消费已到达的通知，或在槽里登记 waker 后返回
+    /// [`Poll::Pending`]（等待方持有 `cx` 直接 poll）。
+    ///
+    /// 「登记 → 复检」由 [`NotifySlot_::poll_wait_`] 保证，因此调用方只要
+    /// 「先查状态、再 poll」即可，不会丢唤醒。
+    pub(crate) fn establish_poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.establish_.poll_wait_(cx)
     }
 
     /// 记录「已收到对端 `OPEN`」。
@@ -522,19 +496,19 @@ where
         if let Result::Ok(Option::Some(err)) = reg.failure_(cancel.child_token()).await {
             return Result::Err(err);
         }
-        // 2. 拿到结果了吗？没有就取一份通知端再等。
-        //    通道是**持久**的：第 2 步与第 3 步之间的通知不会丢。
+        // 2. 拿到结果了吗？没有就登记等待。
+        //    通知槽是**持久**的：第 2 步与第 3 步之间的通知不会丢（协议见
+        //    [`NotifySlot_::poll_wait_`]）。
         if let Option::Some(outcome) = owner.establish_outcome_() {
             return Result::Ok(outcome);
         }
-        let notify_rx = owner.establish_notify_rx_();
-        let mut notified = core::pin::pin!(notify_rx.recv_async());
+        let mut notified = core::pin::pin!(poll_fn(|cx| owner.establish_poll_wait_(cx)));
         let mut cancelled = core::pin::pin!(cancel.child_token().cancellation());
         let notified = poll_fn(|cx| {
             if core::future::Future::poll(cancelled.as_mut(), cx).is_ready() {
                 return Poll::Ready(false);
             }
-            core::future::Future::poll(notified.as_mut(), cx).map(|_| true)
+            core::future::Future::poll(notified.as_mut(), cx).map(|()| true)
         })
         .await;
         if !notified {
@@ -556,6 +530,34 @@ mod tests_ {
         let owner = new_owner_(CoreAlloc);
         owner.install_(&DefaultPolicy, 64usize);
         owner
+    }
+
+    /// 计数唤醒器：统计 `wake` 被调用次数，用来断言唤醒确实发生。
+    struct CountingWake_ {
+        count_: core::sync::atomic::AtomicUsize,
+    }
+
+    impl std::task::Wake for CountingWake_ {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.count_
+                .fetch_add(1usize, core::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.count_
+                .fetch_add(1usize, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 造一个带计数的 `Waker`（断言「唤醒登记在槽里的等待者」用）。
+    /// - 手段：把 [`CountingWake_`] 包进 `Arc` 再转成 `Waker`。
+    /// - 判断：返回的 `Waker` 每次被 `wake` 都会让计数加一。
+    fn counting_waker_() -> (core::task::Waker, std::sync::Arc<CountingWake_>) {
+        let probe = std::sync::Arc::new(CountingWake_ {
+            count_: core::sync::atomic::AtomicUsize::new(0usize),
+        });
+        let waker = core::task::Waker::from(probe.clone());
+        (waker, probe)
     }
 
     /// 测试状态节点在建立时尚未安装窗口参数，安装后可见。
@@ -634,18 +636,44 @@ mod tests_ {
     }
     dual_runtime_test_!(establish_state_starts_empty_and_accepts_updates);
 
-    /// 测试建流通知通道：`notify_establish_` 投一条，「先通知后等待」也不会丢。
-    /// - 手段：先 `notify_establish_`，再从共享的通知消费端 `try_recv`。
-    /// - 判断：能取到一条通知；重复通知时通道满，投递失败是无害的。
+    /// 测试建流通知槽是**持久**的：先通知后等待也不丢、重复通知不堆积、登记后被唤醒。
+    /// - 手段：先 `notify_establish_`，用计数 waker 手工 poll 一次通知槽；连续
+    ///   `notify_establish_` 两次后再 poll；随后 poll 一次（登记）→ 通知 → 断言唤醒。
+    /// - 判断：第一次 poll 立刻就绪（先通知后等待不丢）；重复通知合并成一次且随后
+    ///   一次 poll 挂起（不堆积、此前的就绪与唤醒无关）；登记后被通知恰好唤醒一次。
     async fn establish_notification_is_persistent() {
         let owner = make_owner_();
         owner.notify_establish_();
-        let rx = owner.establish_notify_rx_();
-        assert!(rx.try_recv().is_ok(), "先通知后等待不应当丢唤醒");
+
+        let (waker, probe) = counting_waker_();
+        let mut context = Context::from_waker(&waker);
+        assert!(
+            owner.establish_poll_wait_(&mut context).is_ready(),
+            "先通知后等待不应当丢唤醒"
+        );
         owner.notify_establish_();
         owner.notify_establish_();
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_err(), "通道容量 1：重复通知不堆积");
+        assert!(
+            owner.establish_poll_wait_(&mut context).is_ready(),
+            "重复通知合并成一次，仍然就绪"
+        );
+        assert!(
+            owner.establish_poll_wait_(&mut context).is_pending(),
+            "通知已被消费：不应再就绪"
+        );
+        assert_eq!(
+            probe.count_.load(Ordering::SeqCst),
+            0usize,
+            "没有等待者登记时不应当发生唤醒"
+        );
+
+        owner.notify_establish_();
+        assert_eq!(
+            probe.count_.load(Ordering::SeqCst),
+            1usize,
+            "登记中的等待者应当被唤醒"
+        );
+        assert!(owner.establish_poll_wait_(&mut context).is_ready());
     }
     dual_runtime_test_!(establish_notification_is_persistent);
 

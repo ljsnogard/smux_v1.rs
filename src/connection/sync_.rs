@@ -1,8 +1,9 @@
 //! 连接的共享状态层：读写循环与 API 面之间的唯一共享点。
 //!
-//! 本模块承载两样东西：
+//! 本模块承载三样东西：
 //!
 //! - [`CancelToken_`]：**可主动触发**的取消令牌（无锁）；
+//! - [`NotifySlot_`]：**零分配**的单等待者持久通知槽（建流等待者用）；
 //! - [`acquire_read_`] / [`acquire_write_`]：协作式锁的**可取消异步获取**。
 //!
 //! 注册表（dock / 子流索引与配额）已移到 `mux_connection::registry_`。
@@ -36,12 +37,23 @@
 //! `cancellation()` 的等待在 `poll` 中登记），套锁解决不了等待问题：它用
 //! `AtomicBool` + **持久通知通道**实现，取消状态是原子读，唤醒是 `recv_async`。
 //!
-//! # 唤醒
+//! # 唤醒：按**实例数**选落点
 //!
-//! 「某件事发生了」一律走**持久通知通道**（`flume` 容量 1）：取消令牌、建流等待者
-//! 与 listener 的入向等待都是它。通道持久意味着「先通知、后等待」不会丢唤醒，
-//! 而且等待方在 async 上下文里只要「先查状态、再 `recv_async().await`」即可——
-//! 不需要 `cx`、因此不再有手写的 `poll` 与 waker 槽（旧 `WakerSlot_` 已删除）。
+//! 「某件事发生了」有两种落点，选择依据是这条通知**每多少实例一个**：
+//!
+//! - **持久通知通道**（`flume` 容量 1）用于 [`CancelToken_`] 与 listener 的入向等待：
+//!   它们每**连接**（或每 dock）一个，通道那一次全局分配可以接受；通道持久意味着
+//!   「先通知、后等待」不会丢唤醒，而且等待方在 async 上下文里只要「先查状态、再
+//!   `recv_async().await`」即可——不需要 `cx`，没有手写的 `poll`；
+//! - [`NotifySlot_`]（一个原子位 + 一个 waker 槽，**零堆分配**）用于**建流等待者**：
+//!   它是**每条子流**一个的，通道那一次全局分配正是待整改项
+//!   （`dev-notes/audit-heap-alloc-20261004-1122.md` §3.1 #7）。它要手写 `poll`，因此
+//!   「登记 → 复检」的协议与「至多一个等待者」的前提都写在 [`NotifySlot_`] 的文档里，
+//!   并有用例钉住。
+//!
+//! 早先这里删过一版 waker 槽（`WakerSlot_`），理由是「改用通道就不必手写 `poll`」；
+//! 本轮因为**每条子流一次的全局分配**把它按上述协议重新引入——推翻的是当时那个
+//! 选择，不是当时对丢唤醒的警惕。
 //!
 //! # 分配
 //!
@@ -55,6 +67,7 @@ use core::{
     alloc::AllocatorClone,
     future::Future,
     sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll, Waker},
 };
 
 use abs_cancel::{TrCancellationToken, TrMayCancel};
@@ -70,9 +83,11 @@ use mm_ptr::Shared;
 // 便于在调用点直接声明 `let mut session = reg.lock_session_();`）。
 use core::sync::atomic::AtomicUsize;
 use atomic_sync::{
+    mutex::preemptive::SpinningMutexOwned,
     rwlock::cooperative::{CooperativeAcqSession, ReaderGuard, WriterGuard},
-    x_deps::atomex::StrictOrderings,
+    x_deps::{abs_sync, atomex::StrictOrderings},
 };
+use abs_sync::may_break::TrMayBreak;
 
 /// 协作式锁的取锁会话（`CooperativeRwLockOwned<T>` 的默认参数展开）。
 pub(crate) type CoopSession_<'a, T> =
@@ -249,9 +264,126 @@ where
     }
 }
 
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 零分配的单等待者通知槽
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// **零分配**的单等待者持久通知槽。
+///
+/// # 为什么不直接用 `flume` 通道
+///
+/// 通道的「先通知、后等待不丢」由队列的**持久性**提供，代价是每条实例一次**全局**
+/// 堆分配（见 `dev-notes/audit-heap-alloc-20261004-1122.md` §3.1 #7）。建流等待者是
+/// **每条子流**一个、且**至多一个**，因此这里用「一个原子位 + 一个 waker 槽」表达
+/// 同一语义：零堆分配；唯一一把自旋锁只保护那一个 `Option<Waker>`，且只在
+/// 登记 / 取走这两处同步短临界区里被持有。
+///
+/// # 协议：登记 → 复检（两端都不可省）
+///
+/// - **通知方**（[`NotifySlot_::notify_`]）：先置位 `pending_`，再取走 waker；取锁
+///   释放**之后**才 `wake()`——`wake` 可能同步重入 `poll` 并再次抢这把锁，持锁调用
+///   在单线程执行器上就是自死锁；
+/// - **等待方**（[`NotifySlot_::poll_wait_`]）：先消费 `pending_`（有则立即就绪）；
+///   没有则登记 waker；**登记之后再复检一次** `pending_`。少了这次复检，
+///   「先查后登记」之间发生的通知会永久丢失；
+/// - `pending_` 是**持久**的：只有等待方消费它，因此「先通知、后登记」也不会丢
+///   （这正是容量 1 通道在同一场景下的行为）。
+///
+/// # 至多一个等待者
+///
+/// 槽只保存**一个** waker：第二个等待者登记会覆盖第一个，第一个此后不再被唤醒。
+/// 这是调用方必须保证的前提，与 [`CancelToken_`] 的「单等待者」是同一条契约。
+/// 当前唯一的用法是建流等待（每条子流至多一个等待者：`ChannelHandle` 是 `!Clone`，
+/// `accept_async` 取 `&mut self`）。
+pub(crate) struct NotifySlot_ {
+    /// 「状态可能变了」的持久位；只有等待方消费它。
+    pending_: AtomicBool,
+
+    /// 等待者槽：`Option<Waker>`，用零分配自旋锁保护。
+    waker_: SpinningMutexOwned<Option<Waker>>,
+}
+
+impl core::fmt::Debug for NotifySlot_ {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NotifySlot_")
+            .field("pending", &self.pending_.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl Default for NotifySlot_ {
+    fn default() -> Self {
+        Self::new_()
+    }
+}
+
+impl NotifySlot_ {
+    /// 空槽（未通知、无等待者）。
+    pub(crate) fn new_() -> Self {
+        NotifySlot_ {
+            pending_: AtomicBool::new(false),
+            waker_: SpinningMutexOwned::new_owned(Option::None),
+        }
+    }
+
+    /// 在槽锁下访问 waker（不可取消的自旋等待）。
+    ///
+    /// `wait_or` 的失败分支只可能来自**可取消**的等待；这里用的是不可取消令牌，
+    /// 因此该分支不可达（与 `flow_ctrl::SendWindow::with_inner_` 同款）。
+    fn with_waker_<R>(&self, f: impl FnOnce(&mut Option<Waker>) -> R) -> R {
+        let mut session = self.waker_.lock_session();
+        let mut guard = session
+            .lock()
+            .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
+        f(&mut guard)
+    }
+
+    /// 报告「状态可能变了」：置位并唤醒等待者（若有）。幂等、不阻塞。
+    pub(crate) fn notify_(&self) {
+        self.pending_.store(true, Ordering::Release);
+        // 取 waker 与 `wake` 分开：不得在持锁时 `wake`（理由见类型文档）。
+        let waker = self.with_waker_(|slot| slot.take());
+        if let Option::Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// 等下一次通知：消费持久位，或在槽里登记 waker 之后返回 [`Poll::Pending`]。
+    pub(crate) fn poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.take_pending_() {
+            return Poll::Ready(());
+        }
+        // 登记（同一个 waker 重复登记不 clone）。
+        self.with_waker_(|slot| {
+            let stale = match slot.as_ref() {
+                Option::Some(old) => !old.will_wake(cx.waker()),
+                Option::None => true,
+            };
+            if stale {
+                *slot = Option::Some(cx.waker().clone());
+            }
+        });
+        // 复检：登记与上一次检查之间发生的通知不能丢。
+        if self.take_pending_() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+
+    /// 消费「状态可能变了」那一位；返回它此前是否为真。
+    fn take_pending_(&self) -> bool {
+        self.pending_.swap(false, Ordering::AcqRel)
+    }
+
+    /// 当前是否有等待者登记（诊断 / 测试用）。
+    #[cfg(test)]
+    pub(crate) fn is_registered_(&self) -> bool {
+        self.with_waker_(|slot| slot.is_some())
+    }
+}
+
 #[cfg(test)]
 mod tests_ {
-    use core::task::{Context, Poll, Waker};
     use std::{
         sync::{
             Arc,
@@ -357,4 +489,105 @@ mod tests_ {
         );
     }
     dual_runtime_test_!(cancel_token_already_cancelled_is_ready_at_once);
+
+    /// 测试通知槽在**没有等待者**时也持久保存通知（等价于容量 1 通道的行为）。
+    /// - 手段：先 `notify_`，再用计数 waker poll 一次；随后连续 `notify_` 两次，再 poll。
+    /// - 判断：两次 poll 都立刻 `Ready`（重复通知合并成一次、不堆积）；因为期间从未
+    ///   有等待者登记，计数 waker 一次也没有被唤醒。
+    async fn notify_slot_is_persistent_without_waiter() {
+        let slot = NotifySlot_::new_();
+        let (waker, probe) = counting_waker_();
+        let mut context = Context::from_waker(&waker);
+
+        slot.notify_();
+        assert_eq!(
+            slot.poll_wait_(&mut context),
+            Poll::Ready(()),
+            "先通知后等待不应当丢"
+        );
+        slot.notify_();
+        slot.notify_();
+        assert_eq!(
+            slot.poll_wait_(&mut context),
+            Poll::Ready(()),
+            "重复通知合并成一次，仍然就绪"
+        );
+        assert_eq!(
+            slot.poll_wait_(&mut context),
+            Poll::Pending,
+            "通知已被消费，不应再就绪"
+        );
+        assert_eq!(
+            probe.count_.load(Ordering::SeqCst),
+            0usize,
+            "没有等待者登记时不应当发生唤醒"
+        );
+    }
+    dual_runtime_test_!(notify_slot_is_persistent_without_waiter);
+
+    /// 测试通知槽唤醒**已经登记**的等待者，且取走 waker 后不再重复唤醒。
+    /// - 手段：poll 一次（应当 `Pending` 并登记）→ `notify_` → 再 `notify_` → poll。
+    /// - 判断：第一次通知恰好唤醒一次；第二次通知没有等待者可唤醒（唤醒计数仍为 1）；
+    ///   随后 poll 返回 `Ready`。
+    async fn notify_slot_wakes_registered_waiter_once() {
+        let slot = NotifySlot_::new_();
+        let (waker, probe) = counting_waker_();
+        let mut context = Context::from_waker(&waker);
+
+        assert_eq!(slot.poll_wait_(&mut context), Poll::Pending);
+        assert!(slot.is_registered_(), "挂起之后应当留下等待者");
+
+        slot.notify_();
+        assert_eq!(
+            probe.count_.load(Ordering::SeqCst),
+            1usize,
+            "通知应当唤醒登记中的等待者"
+        );
+        slot.notify_();
+        assert_eq!(
+            probe.count_.load(Ordering::SeqCst),
+            1usize,
+            "waker 已被取走，重复通知不再唤醒"
+        );
+        assert_eq!(slot.poll_wait_(&mut context), Poll::Ready(()));
+    }
+    dual_runtime_test_!(notify_slot_wakes_registered_waiter_once);
+
+    /// 测试通知槽在**高频置位 + 等待者反复进出**下不丢唤醒（audit §5.6 要求的压测）。
+    /// - 手段：单线程循环 4096 轮，每轮「poll（应当 `Pending`，登记 waker）→ `notify_`
+    ///   → poll（应当 `Ready`）」；结束后在无通知时再 poll 一次。
+    /// - 判断：每一轮都必须以 `Ready` 收尾（任何一轮丢唤醒都会失败）；每轮通知都应当
+    ///   唤醒登记的等待者（计数恰为轮数）；末尾无通知时必须挂起而不是忙就绪。
+    async fn notify_slot_survives_high_frequency_races() {
+        const K_ROUNDS: usize = 4096usize;
+
+        let slot = NotifySlot_::new_();
+        let (waker, probe) = counting_waker_();
+        let mut context = Context::from_waker(&waker);
+
+        for round in 0..K_ROUNDS {
+            assert_eq!(
+                slot.poll_wait_(&mut context),
+                Poll::Pending,
+                "第 {round} 轮应当先挂起"
+            );
+            slot.notify_();
+            assert_eq!(
+                slot.poll_wait_(&mut context),
+                Poll::Ready(()),
+                "第 {round} 轮的通知不得丢"
+            );
+        }
+        assert_eq!(
+            probe.count_.load(Ordering::SeqCst),
+            K_ROUNDS,
+            "每一轮通知都应当唤醒恰好一次"
+        );
+        assert_eq!(
+            slot.poll_wait_(&mut context),
+            Poll::Pending,
+            "没有新通知时应当挂起"
+        );
+    }
+    dual_runtime_test_!(notify_slot_survives_high_frequency_races);
 }
