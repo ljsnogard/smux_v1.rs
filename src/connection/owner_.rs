@@ -423,7 +423,7 @@ impl ChannelState_ {
         );
     }
 
-    //-- ---- 流控便捷入口（一次原子访问，不取锁） ----
+    //-- ---- 流控便捷入口（窗口内部各自一把自旋锁，见 `flow_ctrl`） ----
 
     /// 对端又发来 `amount` 字节：记入接收窗口并做越权判定。
     pub(crate) fn recv_on_data_(&self, amount: Credit) -> Result<(), FlowCtrlError> {
@@ -431,13 +431,12 @@ impl ChannelState_ {
     }
 
     /// 收到数据之后当场判定「是否该通告」；是则产出一份快照。
+    ///
+    /// 判定与产出快照在**窗口内部的同一个临界区**里完成（见
+    /// [`RecvWindow::take_report_`](crate::flow_ctrl::RecvWindow)），因此这里不做
+    /// 「先 `should_report` 再 `report`」的两步调用。
     pub(crate) fn recv_take_report_(&self) -> Option<WindowReport> {
-        let recv = self.flow_.recv_window();
-        if recv.should_report_() {
-            Option::Some(recv.report())
-        } else {
-            Option::None
-        }
+        self.flow_.recv_window().take_report_()
     }
 
     /// 应用消费之后由**持有接收环写端**的解复用循环核对水位并择机补发通告。
@@ -445,21 +444,14 @@ impl ChannelState_ {
     /// `buffered` 是环内**实际积压**（已提交、应用还没取走）。本循环是接收环唯一的
     /// 写入方，因此「已记账的累计已收 − 环内积压」就是**精确**的累计已消费量；应用侧
     /// 采样差值会被并发写入掩盖（因果见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
+    ///
+    /// 记账与判定在同一段窗口临界区里完成；只有真的推进了消费记账才刷新活跃时间。
     pub(crate) fn recv_recheck_(&self, buffered: Credit) -> Option<WindowReport> {
-        let recv = self.flow_.recv_window();
-        // `R` 可能已经把「尚未写进环」的字节记在账上（`on_data` 先于入环），因此这里
-        // 用饱和减法兜住那个瞬间。
-        let consumed = recv.recv_total().saturating_sub(buffered as u64);
-        let delta = consumed.saturating_sub(recv.consumed_total());
-        if delta > 0u64 {
-            recv.on_consumed(Credit::try_from(delta).unwrap_or(Credit::MAX));
+        let (advanced, report) = self.flow_.recv_window().recheck_(buffered);
+        if advanced {
             self.touch_();
         }
-        if recv.should_report_() {
-            Option::Some(recv.report())
-        } else {
-            Option::None
-        }
+        report
     }
 
     /// 收到对端的窗口通告。
@@ -470,6 +462,14 @@ impl ChannelState_ {
     /// 发送窗口剩余额度。
     pub(crate) fn send_available_(&self) -> Credit {
         self.flow_.send_window().available()
+    }
+
+    /// 发送窗口剩余额度的**非阻塞**查询：窗口锁当场不可用时返回 `None`。
+    ///
+    /// 供复用循环 park 的 `poll` 用（那里不能等锁）：`None` 按「没额度」处理，
+    /// 额度真正回来时会由窗口通告事件把 park 打断。
+    pub(crate) fn send_available_try_(&self) -> Option<Credit> {
+        self.flow_.send_window().available_try_()
     }
 
     /// 预扣发送额度。

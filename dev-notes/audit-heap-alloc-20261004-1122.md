@@ -4,10 +4,12 @@
 范围：`smux_v1/src/**`，**不含** `#[cfg(test)] mod` 内的代码
 性质：跨模块调研 + 改造意见（含「没有好办法」的条目）
 
-> **修订：2026-10-05**——「子流状态原子化」一轮（`substream-atomic-20261005-0419.md`）
-> 落地后，本文有两条现状变化：**§3.1 #4 的 `wakers` 死代码已删除**；
-> **每条子流的 owner 从 3 次 `Shared::new` 降到 1 次**（`Shared<ChannelState_>`，
-> 随注册表身份记录建立）。§3.1 #7 的 `flume::bounded(1)` 与 §3.5 的依赖链分配**未动**。
+> **修订：2026-10-05**——「子流状态节点化 + 窗口带锁」一轮
+> （`substream-state-20261005-0419.md`）落地后，本文有两条现状变化：
+> **§3.1 #4 的 `wakers` 死代码已删除**；**每条子流的 owner 从 3 次 `Shared::new`
+> 降到 1 次**（`Shared<ChannelState_>`，随注册表身份记录建立），两个窗口各持一把
+> `SpinningMutexOwned`（零内部堆分配，不引入新的全局分配）。§3.1 #7 的
+> `flume::bounded(1)` 与 §3.5 的依赖链分配**未动**。
 
 ## 1. 为什么查
 
@@ -43,7 +45,7 @@
 | --- | --- | --- | --- |
 | 1 | `src/connection/session_.rs:466` `encode_whole_frame_` | `Vec::with_capacity(64 + payload.len())` | **每一条 DATA 帧**（经 `drain_one_`，:1501）、每条控制帧（:1277 / :1324） |
 | 2 | `src/connection/util_.rs:23` `read_available_into_vec_` | `Vec<u8>`（`resize` 增长） | 建流时的开场消息（`dock_binding/binding_.rs:280`）、拒绝理由（`channel_handle/handle_.rs:593`） |
-| 3 | `src/connection/mux_connection/registry_.rs:1074` `mark_failed_` | `Vec<ChannelOwner_<A>>` | 连接级失败一次（**2026-10-05 已随状态原子化删除**：通知建流等待者不再需要离开注册表锁） |
+| 3 | `src/connection/mux_connection/registry_.rs:1074` `mark_failed_` | `Vec<ChannelOwner_<A>>` | 连接级失败一次（**2026-10-05 已删除**：通知建流等待者不再需要离开注册表锁） |
 | 4 | `src/connection/mux_connection/registry_.rs:1073` 同函数 | `Vec<Waker>` | **从不**（声明后未 `push`）——**2026-10-05 已删除**，见 §5.4 |
 | 5 | `src/connection/ring_.rs:174` `MuxChanBuff::pair_from_alloc_` | `Arc<dyn Allocator + Send + Sync>` | 每次 `make_ring_buffs`（每条子流一次） |
 | 6 | `dock_binding/binding_.rs:202` | `flume::bounded(1)` | 每个被监听的 dock 一次 |
@@ -174,9 +176,9 @@
 的注释不符。唤醒职责实际由 `ctx.notify_tx_.try_send(())`（监听者）与
 `state.notify_establish_()`（子流建流等待者）承担，覆盖是完整的。
 
-**落地**：「子流状态原子化」一轮把 `mark_failed_` 改为在注册表锁内直接
+**落地**：「子流状态节点化」一轮把 `mark_failed_` 改为在注册表锁内直接
 `notify_establish_`（状态无锁），`wakers` 与那个循环、以及收集 owner 的 `Vec` 一起删除。
-见 `substream-atomic-20261005-0419.md` §4.3。
+见 `substream-state-20261005-0419.md` §4.3。
 
 ### 5.5 #5 `Arc<dyn Allocator>` —— **能减量，但做不到零分配**
 
@@ -220,7 +222,7 @@
 | 4 | #5-A `Arc` 降到每连接一份 | 计数分配器：每条子流不再新增一次全局分配 |
 | 5 | #2 开场消息 / 拒绝理由 | 先定长度语义；再按 §5.2 A/B 落地 |
 | 6 | #6 三个提示通道 → `NotifySlot_` | 丢唤醒压力用例（单轮内高频置位 + 等待者反复进出） |
-| — | 每条子流的 owner 合并 | **已完成（2026-10-05）**：3 次 `Shared::new` → 1 次 `Shared<ChannelState_>`，见 `substream-atomic-20261005-0419.md` |
+| — | 每条子流的 owner 合并 | **已完成（2026-10-05）**：3 次 `Shared::new` → 1 次 `Shared<ChannelState_>`，见 `substream-state-20261005-0419.md` |
 | — | #6 两个无界事件通道 | **不推进**，作为已承认的例外记在此处 |
 
 ## 7. 遗留

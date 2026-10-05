@@ -1360,11 +1360,11 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 // 同运行时上的其它任务被饿死，连超时看门狗都来不及触发。因此就绪
                 // 条件必须同时要求「这条子流确实还有发送额度」；额度归零之后，唤醒
                 // 一律来自读循环收到窗口通告时投的那条事件（见 `write_into_ring` 的
-                // 对端通告分支）。`try_with_` 同步取读状态：拿不到锁就按「没额度」
-                // 处理，不唤醒——那同样是安全方向。
+                // 对端通告分支）。这里用**非阻塞**的 `send_available_try_`：窗口锁当场
+                // 取不到就按「没额度」处理，不唤醒——那同样是安全方向。
                 if let Option::Some(pair) = last_ready
                     && let Option::Some(entry) = table.get_mut(&pair)
-                    && entry.owner_.send_available_() > 0u32
+                    && matches!(entry.owner_.send_available_try_(), Option::Some(credit) if credit > 0u32)
                 {
                     let ring_fut = core::pin::pin!(core::future::IntoFuture::into_future(
                         entry.reader_.read_async(&ring_demand),

@@ -10,10 +10,14 @@ use crate::flow_ctrl::{RecvWindow, SendWindow, TrFlowCtrlPolicy};
 /// 子流的**身份记录**先于「环容量」出现：读循环在收到对端 `OPEN` 时就要登记身份，
 /// 而接收窗口由调用方在最终裁决（`accept_async`）给出的接收缓冲容量决定。因此共享
 /// 状态节点建立时 [`FlowCtrl`] 是**空**的（`new_empty_`），等拿到容量再 `install_`。
-/// 两个入口都是 `&self`：字段本身是原子，安装只是一次存储。
+/// 两个入口都是 `&self`。
 ///
-/// 这也解释了本类型为什么不再有 `send_window_mut` / `recv_window_mut`：可变借出与
-/// 「状态被多个任务经共享句柄持有」不相容，而原子访问不需要可变借用。
+/// # 为什么全是 `&self`
+///
+/// 本类型被多个任务经 `Shared` 句柄以 `&self` 持有，因此不能提供
+/// `send_window_mut` / `recv_window_mut` 这类可变借出。并发**不在这一层**：每个窗口
+/// 内部各自持一把零分配的 `SpinningMutexOwned`，把整块窗口状态放进临界区
+/// （见 [`SendWindow`] / [`RecvWindow`] 的文档）。于是这里只是两个字段的透传。
 pub struct FlowCtrl {
     send_: SendWindow,
     recv_: RecvWindow,
@@ -34,7 +38,7 @@ impl FlowCtrl {
     }
 
     /// 建一条**尚未安装**的双向窗口（容量/阈值待 `install_`）。
-    pub(crate) const fn new_empty_() -> Self {
+    pub(crate) fn new_empty_() -> Self {
         FlowCtrl {
             send_: SendWindow::new_empty_(),
             recv_: RecvWindow::new_empty_(),
