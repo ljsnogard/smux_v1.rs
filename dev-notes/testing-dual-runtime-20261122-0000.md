@@ -117,19 +117,70 @@ just test
 cd smux_v1
 cargo clippy --all-targets       # 零告警
 cargo test --all-targets         # 133 lib + 14(2 ignored) inmem + 2 layered
-                                 # + 2 smoke + 2 thread
+                                 # + 2 smoke + 2 thread   ← 本轮快照
 cargo test --test smoke_compio --no-default-features --features test-compio-runtime
 cargo test --doc                 # 4 passed
 ```
+
+> 上面这段是**本轮快照**；用例数已随后续几轮上涨，最新的验收数字见 §9。
 
 对比改造前：lib 侧 77 → 133 个测试（异步用例各多一份运行时实例），
 集成侧用例数不变（重复的运行时副本被合并）。
 
 ## 8. 遗留
 
-1. `tests/inmem_mux.rs` 的**最小帧暂存**用例（2 字节容量）当前标 `#[ignore]`：现有
-   实现要求「帧暂存环能装下整帧」，逐字节流式解析落地后去掉 ignore 即可（用例本身
-   不需要改）。
+1. ~~`tests/inmem_mux.rs` 的**最小帧暂存**用例（2 字节容量）当前标 `#[ignore]`~~
+   **已解决**（2026-10-05 更新）：逐字节流式解析落地后该用例已去掉 `#[ignore]` 并通过
+   （见用例自身的文档说明）。
 2. compio 侧冒烟必须显式 `--no-default-features` 才能跑（见 §3）：这是「同一份共享
    文件按 feature 分派 + `--all-targets` 用默认 feature」的必然结果。若将来希望一条
    命令跑全，需要把共享文件拆成两个 feature 各自独立的模块、或引入自定义测试框架。
+
+## 9. 2026-10-05 追加：`tests/common/` 的模块拆分
+
+**问题**：`tests/common/mod.rs` 涨到 **1978 行**，把「连接配置 / 缓冲构造 / 传输泵 /
+socket 装配 / 子流读写 / 载荷生成 / 建连 / 五组场景」全塞在一个文件里，与纪律 5
+（`mod.rs` 只负责导出层级控制、不得用 `*`）相悖，也不便于审计。
+
+**落点**：`mod.rs` 现在只有 **89 行**——`//!` 文档（分工表 + 四条跨文件约定）+ 子模块
+声明 + **逐项** `pub use`（无 `*`、无逻辑）。逻辑按「一件事一个文件」拆成 14 个：
+
+| 文件 | 职责 |
+| --- | --- |
+| `config_.rs` | 两套连接配置与全部容量常量 |
+| `buff_.rs` | 帧暂存 / 子流环缓冲构造 |
+| `pump_.rs` | 调用方驱动的两条泵 + 全被动环 |
+| `socket_.rs` | socket 装配与两个运行时的驱动入口 |
+| `closure_.rs` | `TrPrepareChannelRing` 的测试侧适配 |
+| `channel_io_.rs` | 子流半边整段读写与 EOF 等待 |
+| `payload_.rs` | 确定性载荷生成 |
+| `scenarios_/` | 场景主体：`connect_` / `kit_` / `smoke_` / `small_` / `bind_` / `buffers_` / `flow_ctrl_` |
+
+**机械拆分暴露出的两处真实耦合**（不是拆分引入的，是原来被同一个文件掩盖的）：
+
+1. **跨文件复用的私有件**：`pump_input_` / `pump_output_`（socket 装配用）与
+   `run_mux_scenario_` / `drive_side_` / `exchange_and_half_close_`（`smoke_` 与
+   `small_` / `buffers_` 互用）。兄弟模块看不见彼此的私有项，因此前者放宽为
+   `pub(super)`（仍不出 `common`），后三者收进 `scenarios_/kit_.rs` 并 `pub(super)`
+   ——按「共用件」而不是「放宽一堆可见性」处理。
+2. **只在方法语法里用到的 trait 必须显式 `use`**：拆分后每个文件自带 `use`，而
+   `segm.least_count()` / `err.err_tag()` / `handle.accept_async()` 这类调用不会在代码里
+   出现 trait 名，漏了就报 `E0599`（`TrBuffSegmView` / `TrTaggedError` /
+   `TrBuffSegmMut` / `TrBuffSegmRef` / `TrChannelHandle` / `TrChannelListener` /
+   `TrConnection` / `TrDockBinding` / `TrChannelHalf` 都踩到了）。这是拆测试辅助模块时
+   最容易漏的一类，**靠编译器提示逐个补齐**比肉眼找可靠。
+
+**验收**（2026-10-05）：
+
+- 拆分前后**顶层项名集合逐项相同**（`fn` / `struct` / `trait` / `enum` / `type` / `const`
+  的名称与出现次数做 `diff`，为空）——没有任何东西被漏掉或重复；
+- `cargo check --all-targets` 与 `cargo clippy --all-targets -- -D warnings`（缺省与
+  compio 两侧）**零告警**；
+- 可运行目标全绿：167 lib + 18 inmem + 4 smoke_tokio + 4 smoke_compio（`--no-default-features`）
+  + 2 thread_safety + 4 doc；
+- `layered_rpc`（2 条）在本环境**挂死**，与拆分无关：`git stash` 到 HEAD 原状同样挂死
+  （见 `outlook-…` §12-T5 的排查项）。
+
+**生成方式**：拆分由一次性脚本完成（`mod.rs` 只导出、子文件逐个搬运），脚本留在
+`target/split3.py`（未跟踪，`cargo clean` 会清掉）；它在同样输入下**逐字节可复现**。
+若希望把「怎么拆的」也纳入审计，可以把它移进仓库并跟踪。
