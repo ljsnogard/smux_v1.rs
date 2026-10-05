@@ -103,6 +103,29 @@ async fn mux_single_byte_transport_dual_() {
 }
 dual_runtime_test_!(mux_single_byte_transport_dual_);
 
+/// 测试目标（**丢唤醒回归**）：安静的连接上，某条子流**第一次**写入低于临界水位也必须
+/// 被搬运到对端。
+///
+/// - 背景：`ChannelTx::notify_tx_ready_` 原来只在「积压超过临界水位（`容量 / 4`）」或该
+///   状态的边沿上发 `TxReady`。于是安静连接上的第一次小写入一条事件都不发，而写循环
+///   `last_ready` 为空、没有可 park 的子流环——数据无人搬运（**挂死**）。该路径由
+///   `tests/alloc_count.rs` 的基线用例稳定复现；本用例把它钉成行为回归。
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_idle_small_write_scenario_`]：一条 dock 对上的单条子流，A 写
+///   `512 B`（< `4096 / 4 = 1024`），读之前让出一次执行权，读取本身包在「让出 4096 轮
+///   仍无进展即 panic」的看门狗里；随后双向半关闭等 EOF。场景由 `scope.run_until` 驱动。
+/// - 判断：B 读到完整且逐字节相等的载荷，半关闭后双方读到 EOF。丢唤醒时看门狗先
+///   panic（可读的失败），而不是让用例挂死。
+async fn mux_idle_small_write_inmem_dual_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = LocalScope::new();
+    let scenario = common::run_idle_small_write_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+dual_runtime_test_!(mux_idle_small_write_inmem_dual_);
+
 /// 测试目标（**本轮验收点**）：**最终裁决**（`accept_async`）成为建流的唯一提交点
 /// ——在它之前丢弃半建立句柄，两个角色都不留垃圾、不悬着对端。
 ///

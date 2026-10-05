@@ -8,6 +8,7 @@ mod bind_;
 mod buffers_;
 mod connect_;
 mod flow_ctrl_;
+mod idle_write_;
 mod kit_;
 mod small_;
 mod smoke_;
@@ -19,5 +20,6 @@ pub use flow_ctrl_::{
     run_flow_ctrl_isolation_scenario_, run_flow_ctrl_socket_scenario_,
     run_recv_dropped_scenario_,
 };
+pub use idle_write_::run_idle_small_write_scenario_;
 pub use small_::run_small_mux_scenario_;
 pub use smoke_::run_smoke_scenario_;

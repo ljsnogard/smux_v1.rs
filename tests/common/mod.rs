@@ -81,6 +81,7 @@ pub use scenarios_::{
     run_bind_exclusivity_scenario_,
     run_flow_ctrl_isolation_scenario_,
     run_flow_ctrl_socket_scenario_,
+    run_idle_small_write_scenario_,
     run_per_channel_alloc_scenario_,
     run_recv_dropped_scenario_,
     run_ring_rejected_scenario_,
