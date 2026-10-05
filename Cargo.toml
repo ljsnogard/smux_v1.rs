@@ -8,8 +8,8 @@ description = "流复用协议第一版"
 [dependencies]
 abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
-# abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
-abs_smux = { path = "../abs_smux" }
+abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
+# abs_smux = { path = "../abs_smux" }
 atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch = "dev/0.3.0" }
 
 # 复用子流与协议帧的缓冲区一律使用 `buffex::circular_buff`，因此它是正式依赖
@@ -43,8 +43,8 @@ abs_art-bridge = { version = "0.2.2", default-features = false, features = ["bac
 # - 两个运行时都用「调用方驱动的泵 + 全被动 buffex 环」搬运 socket 数据；
 # - tokio 侧用 `abs_buff_tokio_adapt` 的设备适配，compio 侧用
 #   `abs_buff_compio_adapt` 的设备适配（原因与三处阻塞点见 dev-notes §9）。
-buffex_tokio_adapt = { path = "../buffex_tokio_adapt" }
-buffex_compio_adapt = { path = "../buffex_compio_adapt" }
+buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt.git" }
+buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_compio_adapt.git" }
 
 # 连接层经 `abs_art` 的**值化本地作用域**（`TrLocalScope`）投递读 / 写循环，
 # 因此冒烟测试要给出具体的后端作用域值：tokio 版用 `abs_art_tokio::LocalScope`，

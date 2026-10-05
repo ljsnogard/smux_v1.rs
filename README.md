@@ -14,14 +14,12 @@ cargo run --example active_passive
 
 ## 1. 为什么值得用
 
-- **一条连接，上万条子流**：TCP / UNIX socket / QUIC stream 进来，出去是互不干扰的
+- **一条连接复用成多条并行子流**：可以基于 TCP / UNIX socket / QUIC stream 等连接复用成互不干扰的
   channel。
+- **不绑定运行时**，且 `no_std` 友好
 - **两端对称**：没有 client / server 之分——各自在 dock 上绑定，一侧 `open`、
   一侧 `listen`。
-- **半关闭是真语义**：丢掉发送半边就是对端的 EOF，协议保证**先排空再发 FIN**。
 - **零拷贝**：子流两端直接就是 `abs_buff` 的段接口，没有中间缓冲，也不按帧长分配。
-- **极小内存也能跑**：帧头与握手都是 sans-IO 逐字节状态机，环容量 1 字节也够。
-- **不绑定运行时**，`no_std` 友好，每一处堆分配都走调用方注入的分配器。
 
 ## 2. 怎么用起来
 
