@@ -254,9 +254,10 @@ impl ChannelState_ {
 /// - 热状态（窗口、建流状态机、关闭位）经**协作式读写锁**：只在 async 上下文访问，
 ///   因此争用时可以 `read_async` / `write_async().may_cancel_with(cancel).await`
 ///   ——异步等待、可被外部 cancel token 取消（[`ChannelOwner_::with_async_`]）。
-/// - `tx_queued_` 去重位在**锁外**的原子里：它是唯一会被**同步**路径访问的状态
-///   （`ChannelTx::try_write` / `write_async` 的入口，见
-///   [`ChannelOwner_::mark_tx_queued_`]），同步路径没有 `await` 可用，因此这里用
+/// - 两个**去重位**在**锁外**的原子里：它们都被**同步**路径访问
+///   （`ChannelTx::try_write` / `write_async`、`ChannelRx::try_read` /
+///   `read_async` 的入口，见 [`ChannelOwner_::mark_tx_queued_`] /
+///   [`ChannelOwner_::mark_rx_consumed_`]），同步路径没有 `await` 可用，因此这里用
 ///   一次 `swap` 表达「我是不是第一个置位者」，完全不取锁。
 pub(crate) struct ChannelOwner_<A>
 where
@@ -267,6 +268,9 @@ where
 
     /// 「发送环有数据」去重位；**锁外**，供同步路径无锁使用。
     tx_queued_: Shared<AtomicBool, A>,
+
+    /// 「应用消费了接收数据」去重位；**锁外**，理由同上。
+    rx_consumed_: Shared<AtomicBool, A>,
 }
 
 impl<A> Clone for ChannelOwner_<A>
@@ -277,6 +281,7 @@ where
         ChannelOwner_ {
             inner_: self.inner_.clone(),
             tx_queued_: self.tx_queued_.clone(),
+            rx_consumed_: self.rx_consumed_.clone(),
         }
     }
 }
@@ -289,7 +294,8 @@ where
     pub(crate) fn new_(state: ChannelState_, alloc: A) -> Self {
         ChannelOwner_ {
             inner_: Shared::new(CooperativeRwLockOwned::new_owned(state), alloc.clone()),
-            tx_queued_: Shared::new(AtomicBool::new(false), alloc),
+            tx_queued_: Shared::new(AtomicBool::new(false), alloc.clone()),
+            rx_consumed_: Shared::new(AtomicBool::new(false), alloc),
         }
     }
 
@@ -303,6 +309,24 @@ where
     /// 写循环排空后清去重位（同步路径，不取锁）。
     pub(crate) fn clear_tx_queued_(&self) {
         self.tx_queued_.store(false, Ordering::Release);
+    }
+
+    /// 「应用可能消费了接收数据」去重位：**第一个**置位者返回 `true`。
+    ///
+    /// 同步路径（`try_read` / `read_async` 的入口）专用：不取锁、不等待。
+    pub(crate) fn mark_rx_consumed_(&self) -> bool {
+        !self.rx_consumed_.swap(true, Ordering::AcqRel)
+    }
+
+    /// 读循环核对接收水位**之前**清去重位（同步路径，不取锁）。
+    ///
+    /// # 顺序不可反
+    ///
+    /// 必须**先清位、再读环内积压**：这样「清位之后发生的消费」会重新置位并投递一条
+    /// 新通知，而「清位之前的消费」已经体现在随后读到的积压量里。反过来（先读积压、
+    /// 后清位）会丢掉清位与读之间那一次消费的唤醒。
+    pub(crate) fn clear_rx_consumed_(&self) {
+        self.rx_consumed_.store(false, Ordering::Release);
     }
 
     /// **异步**取读状态：`try_read` 快路径；失败则等，等待可被 `cancel` 取消。
@@ -460,6 +484,36 @@ mod tests_ {
         );
         a.clear_tx_queued_();
         assert!(b.mark_tx_queued_(), "清位在共享句柄上也可见");
+    }
+
+    /// 测试「应用消费了」去重位与「发送环有数据」去重位**互相独立**，且同样跨 clone
+    /// 共享、可清位后重新置位。
+    ///
+    /// 两条方向的通知共用一个 `ChannelOwner_`，若两个位串在一起，接收方向的一次消费
+    /// 就会把发送方向的通知吞掉（或反之）——那是本轮修掉的「唤醒被静默丢掉」的翻版。
+    ///
+    /// - 手段：在同一个句柄上先置 `tx_queued_`，再置 `rx_consumed_`；随后清 `rx` 位。
+    /// - 判断：两个位互不影响（各自能独立置 true），clone 句柄看到同一状态，清位可
+    ///   重新置 true。
+    #[test]
+    fn owner_tx_and_rx_dedup_bits_are_independent() {
+        let a = make_owner_();
+        let b = a.clone();
+        assert!(a.mark_tx_queued_(), "发送方向首次置位应当是 fresh");
+        assert!(
+            b.mark_rx_consumed_(),
+            "接收方向首次置位应当是 fresh，且不受发送方向的位影响"
+        );
+        assert!(
+            !a.mark_tx_queued_(),
+            "接收方向置位不应清掉发送方向的位"
+        );
+        assert!(
+            !a.mark_rx_consumed_(),
+            "clone 句柄应看到同一份接收方向去重位"
+        );
+        b.clear_rx_consumed_();
+        assert!(a.mark_rx_consumed_(), "清位后可重新置位");
     }
 
     /// 测试建流状态初始为空、可被置位并唤醒等待者。

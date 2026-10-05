@@ -62,9 +62,9 @@ fn recv_window_reset_carries_pre_reset_total() {
     assert_eq!(next.recv_total(), 4u64, "epoch 内累计量");
 }
 
-/// 测试重置不受频率限制影响（频率限制只约束阈值通告）。
+/// 测试重置不受频率限制影响（频率限制只约束按分区的阈值通告）。
 /// - 手段：2 字节 epoch 策略下通告一次，收 1 个数据帧就把累计量推过规格。
-/// - 判断：变动量远小于中间区门限时 `should_report` 仍为真（重置是编码前提），
+/// - 判断：变动量远小于非临界区门限时 `should_report` 仍为真（重置是编码前提），
 ///   且 `report()` 产出重置变体。
 #[test]
 fn reset_bypasses_report_rate_limit() {

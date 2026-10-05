@@ -3,8 +3,7 @@
 //! 本模块是经 `abs_art` 的本地作用域 spawn 出来的**内侧**两个 `'static` 任务的全部
 //! 实现（**外侧**两个贴传输的泵循环见 [`session_pump_`](super::session_pump_)）。
 //! 结构见 [`crate::connection`] 模块文档 §2、§5，落地裁决见
-//! `dev-notes/connection-20261002-0548.md` §5，连接级环的形状见
-//! `dev-notes/connection-20261122-0000.md`。
+//! `dev-notes/connection-20261002-0548.md` §5。
 //!
 //! # 数据流
 //!
@@ -630,30 +629,48 @@ pub(crate) async fn demux_loop_async_<C, K>(
         // 子流」之前必须先让「刚被丢弃的句柄」的释放生效——否则在途帧会被误判成
         // 协议违例，而不是宽限期（`WAIT_CLOSE`）内的静默丢弃。
         lock_or_exit_!(shared.reg_.drain_session_events_(cancel.child_token()));
-        // 1. 先把挂起的 Attach / Release 排空。
-        drain_read_events_::<C>(&mut events, &mut table);
+        // 1. 先把挂起的 `Attach` / `Release` / `RxConsumed` 成批排空。
+        if let Result::Err(err) =
+            drain_read_events_::<C, _>(&mut events, &mut table, &events_tx, &cancel).await
+        {
+            fail_mux_loop_(&shared, &cancel, &err).await;
+            return;
+        }
 
         // 2. 读一个帧头。字节由外侧读泵填进连接读环；这里只在环上等待
-        //    （park 在环读端，并与取消令牌竞争）。
+        //    （park 在环读端，**同时与读事件通道、取消令牌竞争**）。
         let readable = match ring_readable_(&rx_stage) {
             Option::Some(count) => count,
             // 读泵结束且环已排空：字节流到此为止，本循环退出（写泵会随之收尾）。
             Option::None => return,
         };
         if readable == 0 {
-            // 环空：park 到「可读」或「取消」。
-            match race_cancel_(
-                &cancel,
-                rx_stage.read_async(&Demand::at_least(1usize)),
-            )
-            .await
-            {
-                Option::None => return,
-                // 借出的段立即丢弃（不消费）：只是为了拿到「有字节了」这个事实。
-                Option::Some(outcome) => match took_(outcome) {
-                    Took_::Segm(segm) => drop(segm),
-                    Took_::Failed(_) | Took_::Nothing => return,
-                },
+            // 环空：park 到「环里来了字节」/「有读事件」/「取消」三者之一。
+            //
+            // **必须同时等读事件通道**：`RxConsumed` 是「应用刚消费、去核对水位」的
+            // 唯一触发点，而它到来时连接读环完全可能长期为空（对端正等额度、没有新帧）。
+            // 只 park 在环上会让这条通知一直排在一条睡着的循环后面——应用读空了环却
+            // 没人补发额度，两端互等（本仓库流控验收用例的死锁形态）。
+            match park_read_wake_::<C, _>(&cancel, &mut rx_stage, &mut events).await {
+                // 环里有字节：回顶部交给正式的帧头解析。
+                ReadWake_::Bytes => {}
+                // 事件已由 park **取出**（`flume` 的 `recv_async` 是消费语义，丢掉它就
+                // 等于把这条 `Attach` / `Release` / `RxConsumed` 静默吞掉），因此必须
+                // 在这里就地处理，不能只回顶部等 `drain_read_events_` 再取一次。
+                ReadWake_::Event(event) => {
+                    if let Result::Err(err) = handle_read_event_::<C, _>(
+                        event,
+                        &mut table,
+                        &events_tx,
+                        &cancel,
+                    )
+                    .await
+                    {
+                        fail_mux_loop_(&shared, &cancel, &err).await;
+                        return;
+                    }
+                }
+                ReadWake_::Cancelled => return,
             }
             continue;
         }
@@ -741,42 +758,30 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     fail_mux_loop_(&shared, &cancel, &MuxError::FlowCtrl(err)).await;
                     return;
                 }
-                // 「额度归零」必须**当场**通告，不能只等写循环那条 `RxConsumed`。
+                // **数据到达本身就是一次水位变化**（尤其是「刚好归零」），必须在这次
+                // 派发里当场判定并通告。
                 //
-                // 原因是时序：应用完全可以在这个循环反应过来之前就把刚到的字节读走。
-                // 那时窗口已经不是 0 了，`should_report` 里的归零判据再也不会成立——
-                // 而**已通告快照仍是旧值**（本函数的 `on_data` 不推进它），对端于是
-                // 一直按「还有一整个窗口」行动，最后停在一个我们永远不会再纠正的额度
-                // 上。这里补一次判定机会，判据全在 `RecvWindow::should_report_with_`
-                // 里（窗口归零落在**临界区**，临界区每变必报）。
+                // 不能只靠应用消费触发的核对（`ReadEvent_::RxConsumed`）：那条路径要等
+                // 应用真的读一次才走，而「只收不消费」的那一段正是对端最需要知道水位已经
+                // 变小的时刻。更要紧的是时序——应用完全可能在本循环反应过来之前就把刚到的
+                // 字节读走，那时窗口已经不是 0 了，归零判据再也不会成立，而**已通告快照
+                // 仍是旧值**（上面的 `on_data` 不推进它），对端会一直按「还有一整个窗口」
+                // 行动。判据全在 `RecvWindow::should_report_with_` 里（窗口归零落在
+                // **临界区**，临界区每变必报）。
                 let imminent = lock_or_exit_!(entry
                     .owner_
                     .with_mut_async_(cancel.child_token(), |state| {
                         let thresholds = state.thresholds_();
                         let recv = state.flow_mut_().recv_window_mut();
                         if recv.should_report_with_(&thresholds) {
-                            // 分区必须在 `report()` **之前**取：`report()` 会把
-                            // `reported_` 推进到当前值，之后就判不出旧分区了。
-                            let zone = recv.zone_with_(&thresholds);
-                            Option::Some(recv.report_in_zone_(zone))
+                            Option::Some(recv.report())
                         } else {
                             Option::None
                         }
                     }));
                 if let Option::Some(report) = imminent {
                     let _ = events_tx.try_send_event_(WriteEvent_::Control {
-                        frame_: ControlFrame_::with_window_(
-                            FrameKind::WindowUpdate,
-                            if report.is_reset() {
-                                flags::K_TOTAL_RESET
-                            } else {
-                                0u8
-                            },
-                            local,
-                            remote,
-                            Option::Some((report.recv_total(), report.window())),
-                            Vec::new(),
-                        ),
+                        frame_: window_update_frame_(pair, report),
                     });
                 }
                 let wrote = race_cancel_(
@@ -932,38 +937,247 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
     }
 }
 
-/// 非阻塞排空读事件（`Attach` / `Release`）。
-fn drain_read_events_<C>(
+/// 非阻塞排空读事件（`Attach` / `Release` / `RxConsumed`），返回连接级错误。
+///
+/// 与本模块的复用循环同理：**每轮的批有上限**。事件是持续到来的（应用每读一次就会
+/// 投一条 `RxConsumed`），若「处理完为止」而不设上限，事件队列始终非空时本循环就
+/// 永远走不到「读一个帧头」那一步。
+///
+/// `RxConsumed` 的处理要取子流热状态锁，因此本函数是 `async`。
+async fn drain_read_events_<C, K>(
     events: &mut EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
     table: &mut ReadTable_<C::Buff, C::Alloc>,
-) where
+    events_tx: &EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
     C: TrConnCfg,
+    K: TrCancellationToken,
 {
-    while let Option::Some(event) = events.try_take_event_() {
-        match event {
-            ReadEvent_::Attach {
-                local_dock,
-                remote_dock,
-                owner,
-                writer_,
-            } => {
-                // 节点分配由表自己的分配器承担（`new_in` 时已注入），这里不再需要
-                // 手工构造 `Owned`。重复 `Attach` 直接覆盖，不会留下陈旧条目。
-                table.insert(
-                    (local_dock, remote_dock),
-                    ReadEntry_ {
-                        owner_: owner,
-                        writer_,
-                    },
-                );
-            }
-            ReadEvent_::Release {
-                local_dock,
-                remote_dock,
-            } => {
-                table.remove(&(local_dock, remote_dock));
+    const K_EVENT_BATCH: usize = 32usize;
+    for _ in 0..K_EVENT_BATCH {
+        let Option::Some(event) = events.try_take_event_() else {
+            break;
+        };
+        handle_read_event_::<C, _>(event, table, events_tx, cancel).await?;
+    }
+    Result::Ok(())
+}
+
+/// 处理**单条**读事件。
+///
+/// 单独成函数是因为同一种事件有**两个**来源：`drain_read_events_` 从队列成批取出的，
+/// 以及循环 park 时从队列里**取出**的那一条。后者不可省——`flume` 的异步接收是
+/// **消费**语义，park 拿到手又丢掉就等于把这条 `Attach` 静默吞掉（本仓库的
+/// `mux_min_stage_inmem` 用例正是这么挂死的：附加事件被 park 吃掉，随后到达的数据帧
+/// 在本地表里找不到表项，读循环掉进「未知子流」分支并卡在注册表锁上）。
+async fn handle_read_event_<C, K>(
+    event: ReadEvent_<C::Buff, C::Alloc>,
+    table: &mut ReadTable_<C::Buff, C::Alloc>,
+    events_tx: &EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    match event {
+        ReadEvent_::Attach {
+            local_dock,
+            remote_dock,
+            owner,
+            writer_,
+        } => {
+            // 节点分配由表自己的分配器承担（`new_in` 时已注入），这里不再需要
+            // 手工构造 `Owned`。重复 `Attach` 直接覆盖，不会留下陈旧条目。
+            table.insert(
+                (local_dock, remote_dock),
+                ReadEntry_ {
+                    owner_: owner,
+                    writer_,
+                },
+            );
+        }
+        ReadEvent_::Release {
+            local_dock,
+            remote_dock,
+        } => {
+            table.remove(&(local_dock, remote_dock));
+        }
+        ReadEvent_::RxConsumed {
+            local_dock,
+            remote_dock,
+        } => {
+            let pair = (local_dock, remote_dock);
+            let Some(entry) = table.get_mut(&pair) else {
+                // 表里没有这条子流：附加事件还没到（或已被 Release 摘掉），
+                // 本次通知已无对象，直接丢弃。
+                return Result::Ok(());
+            };
+            // **先清位、再读环内积压**：顺序不可反，否则「清位与读积压之间」发生的
+            // 那次消费会既没有置位、也没有被这次核对看到（见
+            // `ChannelOwner_::clear_rx_consumed_`）。
+            entry.owner_.clear_rx_consumed_();
+            let owner = entry.owner_.clone();
+            // 环内**实际积压**（已提交、应用还没取走）。本循环是接收环唯一的写入
+            // 方，因此这次采样与上面的 `received_` 是同一时刻的一致快照。
+            let buffered = entry.writer_.ring_state().data_size();
+            recheck_recv_level_::<C, _>(&owner, buffered, events_tx, pair, cancel).await?;
+        }
+    }
+    Result::Ok(())
+}
+
+/// 应用消费之后，由**持有接收环写端**的本循环核对水位并择机补发通告。
+///
+/// # 为什么判定权在这里
+///
+/// 「累计已消费量」= `RecvWindow` 记账的累计已收 `R` − 环内实际积压 `buffered`。
+/// 本循环是接收环**唯一的写入方**，两个量都在同一个任务里读，因此这个差值是**精确**
+/// 的；而应用侧只能采样 `data_size` 求差，一次并发写入就会把同一区间的读出掩盖
+/// （因果与实测终局见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
+///
+/// 通告仍走 [`WriteEvent_::Control`] 这条车道交给复用循环写出——本循环不持有连接
+/// 写环。
+async fn recheck_recv_level_<C, K>(
+    owner: &ChannelOwner_<C::Alloc>,
+    buffered: usize,
+    events_tx: &EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
+    pair: (Dock, Dock),
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let buffered = Credit::try_from(buffered).unwrap_or(Credit::MAX);
+    let report = lock_or_fail_!(owner.with_mut_async_(cancel.child_token(), |state| {
+        let recv = state.flow_mut_().recv_window_mut();
+        // 权威的累计已消费量。`R` 可能已经把「尚未写进环」的字节记在账上（`on_data`
+        // 先于入环），因此这里用饱和减法兜住那个瞬间。
+        let consumed = recv.recv_total().saturating_sub(buffered as u64);
+        let delta = consumed.saturating_sub(recv.consumed_total());
+        if delta > 0 {
+            recv.on_consumed(Credit::try_from(delta).unwrap_or(Credit::MAX));
+            state.touch_();
+        }
+        let thresholds = state.thresholds_();
+        let recv = state.flow_mut_().recv_window_mut();
+        if recv.should_report_with_(&thresholds) {
+            Option::Some(recv.report())
+        } else {
+            Option::None
+        }
+    }));
+    if let Option::Some(report) = report {
+        let _ = events_tx.try_send_event_(WriteEvent_::Control {
+            frame_: window_update_frame_(pair, report),
+        });
+    }
+    Result::Ok(())
+}
+
+/// 造一条携带窗口通告的 `WINDOW_UPDATE` 控制帧（读循环的两条通告路径共用）。
+fn window_update_frame_(pair: (Dock, Dock), report: WindowReport) -> ControlFrame_ {
+    ControlFrame_::with_window_(
+        FrameKind::WindowUpdate,
+        if report.is_reset() {
+            flags::K_TOTAL_RESET
+        } else {
+            0u8
+        },
+        pair.0,
+        pair.1,
+        Option::Some((report.recv_total(), report.window())),
+        Vec::new(),
+    )
+}
+
+/// 解复用循环在「连接读环为空」时的等待结果。
+enum ReadWake_<B, A>
+where
+    B: BorrowMut<[MaybeUninit<u8>]>,
+    A: AllocatorClone + Send + Sync,
+{
+    /// 连接读环里来了字节（也可能是读端收尾：回顶部由 `ring_readable_` 判定）。
+    Bytes,
+
+    /// 从读事件通道里**取出**了一条事件（`Attach` / `Release` / `RxConsumed`）。
+    ///
+    /// 必须由调用方处理：`flume` 的异步接收是**消费**语义，丢掉它就等于静默吞掉
+    /// 这条事件。
+    Event(ReadEvent_<B, A>),
+
+    /// 取消令牌触发：连接正在收尾，本循环退出。
+    Cancelled,
+}
+
+/// 解复用循环空环时的 park：**同时**等「连接读环有字节」与「读事件通道有事件」，
+/// 并与取消令牌竞争。
+///
+/// # 三个 future 必须在闭包外 `pin` 好
+///
+/// 环的 park future 在 drop 时**撤回**自己的唤醒登记（`buffex::ring` 的等待槽是
+/// **单槽信箱**），因此「就地建 future、poll 一次、丢掉」等于只问一句「此刻可读吗」，
+/// 留不下任何唤醒——复用循环那条「park 在环上等提交」的兜底正是这么失效的（见
+/// `dev-notes/flow-ctrl-20261005-0115.md` §5）。这里把三个 future 都跨 poll 持有。
+async fn park_read_wake_<C, K>(
+    cancel: &K,
+    rx_stage: &mut BufferedRx<C::StageBuff, C::Alloc>,
+    events: &mut EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
+) -> ReadWake_<C::Buff, C::Alloc>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let demand = Demand::at_least(1usize);
+    let cancel_fut = cancel.child_token().cancellation();
+    let mut cancel_fut = core::pin::pin!(cancel_fut);
+    let mut event_fut = core::pin::pin!(events.take_event_async_());
+    let mut ring_fut = core::pin::pin!(core::future::IntoFuture::into_future(
+        rx_stage.read_async(&demand),
+    ));
+    // 读事件的生产端全部消失 = 连接核心已析构，取消令牌随即触发。此后不再 poll 事件
+    // 通道（它已 `Ready(None)` 且会立刻再次就绪），只等环与取消令牌。
+    let mut events_closed = false;
+    let mut cancelled = false;
+    // 从通道里**取出**的事件：必须原样带回调用方，不能在此丢掉。
+    let mut taken: Option<ReadEvent_<C::Buff, C::Alloc>> = Option::None;
+    let mut ring_ready = false;
+    poll_fn(|cx| {
+        // 取消令牌优先：连接已收尾，直接退出。
+        if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
+            cancelled = true;
+            return Poll::Ready(());
+        }
+        if !events_closed {
+            match core::future::Future::poll(event_fut.as_mut(), cx) {
+                Poll::Ready(Option::Some(event)) => {
+                    taken = Option::Some(event);
+                    return Poll::Ready(());
+                }
+                Poll::Ready(Option::None) => events_closed = true,
+                Poll::Pending => {}
             }
         }
+        // 连接读环来了字节：回顶部交给正式的帧头解析。借出的段在此 drop（**不消费**，
+        // 已消费量为 0）。
+        if core::future::Future::poll(ring_fut.as_mut(), cx).is_ready() {
+            ring_ready = true;
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    })
+    .await;
+    if cancelled {
+        ReadWake_::Cancelled
+    } else if let Option::Some(event) = taken {
+        ReadWake_::Event(event)
+    } else if ring_ready {
+        ReadWake_::Bytes
+    } else {
+        // 事件通道关闭（连接核心已析构）且环与取消都没就绪：按收尾处理。
+        ReadWake_::Cancelled
     }
 }
 
@@ -1300,40 +1514,6 @@ where
         } => {
             *last_ready = Option::Some((local_dock, remote_dock));
         }
-        WriteEvent_::RxConsumed {
-            local_dock,
-            remote_dock,
-            amount_,
-        } => {
-            let pair = (local_dock, remote_dock);
-            let Some(entry) = table.get_mut(&pair) else {
-                return Result::Ok(());
-            };
-            let owner = entry.owner_.clone();
-            let report = lock_or_fail_!(owner.with_mut_async_(cancel.child_token(), |state| {
-                state.flow_mut_().recv_window_mut().on_consumed(amount_);
-                state.touch_();
-                let thresholds = state.thresholds_();
-                let recv = state.flow_mut_().recv_window_mut();
-                if recv.should_report_with_(&thresholds) {
-                    // 分区必须在 `report()` 之前取（见读循环同款注释）。
-                    let zone = recv.zone_with_(&thresholds);
-                    Option::Some(recv.report_in_zone_(zone))
-                } else {
-                    Option::None
-                }
-            }));
-            if let Option::Some(report) = report {
-                send_window_update_::<C, _>(
-                        tx_stage,
-                    shared.max_packet_size_,
-                    pair,
-                    report,
-                    cancel.child_token(),
-                )
-                .await?;
-            }
-        }
         WriteEvent_::TxClosed {
             local_dock,
             remote_dock,
@@ -1465,36 +1645,6 @@ where
         });
     }
     Result::Ok(())
-}
-
-/// 发送一条窗口更新（`WINDOW_UPDATE`）。
-async fn send_window_update_<C, K>(
-    tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
-    max_packet_size: usize,
-    pair: (Dock, Dock),
-    report: WindowReport,
-    cancel: K,
-) -> Result<(), MuxError>
-where
-    C: TrConnCfg,
-    K: TrCancellationToken,
-{
-    let header = FrameHeader::new_(
-        FrameKind::WindowUpdate,
-        if report.is_reset() {
-            flags::K_TOTAL_RESET
-        } else {
-            0u8
-        },
-        pair.0,
-        pair.1,
-        0usize,
-        Option::Some((report.recv_total(), report.window())),
-    );
-    let Some(bytes) = encode_whole_frame_(&header, &[], max_packet_size)? else {
-        return Result::Err(MuxError::FrameTooLarge);
-    };
-    enqueue_frame_::<C, _>(tx_stage, &bytes, cancel).await
 }
 
 /// 发一条 `CLOSE`。用独立的 helper 以便在事件处理里直接 await。
@@ -1694,8 +1844,15 @@ where
     // 把段的字节**搬出**到循环暂存里：`move_items_to_buff` 会推进段的已消费量，
     // 段的 drop 才会把消费提交回环。**不能用 `iter_slices()` 只读不消费**——那样
     // 环的读指针不前进，同一段数据会被反复取出、反复上线。
+    //
+    // **必须搬整个逻辑读段，不能先 `as_segm_ref()` 再搬一个子段。**
+    // `take`（= `least_count()`）是**逻辑**长度：读指针靠近环末端时，这一段在物理上
+    // 是**两段**（环尾 + 环首）。`as_segm_ref()` 只给出「当前物理段」，于是只搬一次
+    // 会少搬 `take − 首段长` 个字节，下面的一致性检查便会把一条**正常**的数据帧判成
+    // `MalformedFrame`，进而 `fail_mux_loop_` 终止整条连接——发送方此后一帧也不再
+    // 搬出（本仓库流控验收用例的「第二轮窗口归零后停摆」正是死在这里）。
+    // `ReclSliceRef::move_items_to_buff` 会自己按物理段循环，直到搬够 `take`。
     let moved = {
-        let mut child = segm.as_segm_ref();
         let dst = &mut scratch[..take];
         // SAFETY: `MaybeUninit<u8>` 与 `u8` 布局相同（同尺寸、同对齐、无 niche）；
         // `dst` 是本循环独占的可写区间，`move_items_to_buff` 只写入其中已初始化的
@@ -1706,7 +1863,7 @@ where
                 dst.len(),
             )
         };
-        unsafe { child.move_items_to_buff(uninit) }
+        unsafe { segm.move_items_to_buff(uninit) }
     };
     if moved != take {
         // 段长度与搬出量应当一致；不一致说明上游语义变了。

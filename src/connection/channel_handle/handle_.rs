@@ -547,7 +547,7 @@ where
     Result::Ok((
         owner.clone(),
         ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote, backlog),
-        ChannelRx::new_(rx_r, conn.clone(), local, remote),
+        ChannelRx::new_(rx_r, owner.clone(), conn.clone(), local, remote),
         initial,
     ))
 }

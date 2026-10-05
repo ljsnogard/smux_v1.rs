@@ -1750,7 +1750,7 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S>(
             .expect("A 侧发起子流应当成功");
         let mut welcome_buf: [u8; 0] = [];
         let mut welcome: &mut [u8] = &mut welcome_buf[..];
-        let (mut tx, _rx) = handle
+        let (mut tx, rx) = handle
             .accept_async_closure(&mut welcome, || {
                 (
                     make_channel_buff_with_(K_FLOW_CTRL_RING_CAPACITY),
@@ -1765,6 +1765,15 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S>(
             .expect("写入本端子流发送环应当成功（连接必须持续给窗口）");
         // 半关闭：`FIN` 必须等这批字节全部上线之后才发。
         drop(tx);
+        // **接收半边必须活到场景结束**——本场景只声明「丢发送半边」。若在这里顺带把它
+        // 丢掉，本端会立刻向对端发 `CLOSE(RESET)`，而对端收到 `RESET` 会连自己的**接收
+        // 环写端**一并关掉，于是本端仍在途的最后一个窗口（512 字节）被丢弃，接收侧读到的
+        // 载荷会短一截（实测 65024/65536）。因此把它交还给调用方持有：`join!` 结束时才
+        // 随结果一起丢弃。
+        //
+        // 「`RESET` 该不该动对端的接收方向」本轮裁决**先不动**，半 RESET 记为后续项，
+        // 见 `dev-notes/flow-ctrl-20261005-0115.md` §3.3。
+        rx
     };
 
     let b_side = async {

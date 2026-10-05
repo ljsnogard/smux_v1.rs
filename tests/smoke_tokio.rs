@@ -35,15 +35,13 @@ async fn small_socket_tokio_() {
 /// 不得死锁。`multi_thread` 与真实 socket 一起构成「有真实 IO 参与时流控仍然成立」
 /// 的验收（内存环直连的版本见 `tests/inmem_mux.rs`）。
 ///
-/// **当前 `#[ignore]`**：本条用例正是为「窗口反复归零再回补」设计的，因此它会稳定
-/// 卡在**已知未修的两个死锁**上——「窗口归零 / 解封两次通告被帧数门限压住」与「收到
-/// `WINDOW_UPDATE` 不叫醒复用循环」。诊断记录与建议修法见
-/// `dev-notes/flow-ctrl-20261004-1241.md` §2。修好之后**必须去掉 `#[ignore]`**：
-/// 它是本轮「流控真的有效」的主证据。
+/// **本条曾经 `#[ignore]`，本轮已转绿（`#[ignore]` 已去掉）**：它专为「窗口反复归零
+/// 再回补」而设，因此曾稳定卡死。两个真因都已修：发送方复用循环把跨环末端的逻辑读段
+/// 误判成 `MalformedFrame` 而终止；接收侧「已消费量」按 `data_size` 采样记账、被并发
+/// 写入掩盖。因果链与实测记录见 `dev-notes/flow-ctrl-20261005-0115.md` §2、§3。
 ///
-/// （同目录的 `flow_ctrl_isolation_socket_tokio_` 是绿的，它只把一条子流写到恰好
-/// 一个窗口，不触发归零后的回补。）
-#[ignore = "阻塞于已知的两个流控死锁，见 dev-notes/flow-ctrl-20261004-1241.md §2"]
+/// （同目录的 `flow_ctrl_isolation_socket_tokio_` 只把一条子流写到恰好一个窗口，
+/// 不触发归零后的回补，是本条之外的独立对照。）
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flow_ctrl_socket_tokio_() {
     let scope = abs_art_tokio::LocalScope::new();

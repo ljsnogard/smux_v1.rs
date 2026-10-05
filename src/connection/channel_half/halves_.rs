@@ -47,7 +47,7 @@ use crate::{
         BufferedRx, BufferedTx, Dock, MuxConnection, TrConnCfg,
         // config_::TrMuxAllocConfig,
         owner_::ChannelOwner_,
-        signal_::{TrEventSender_, WriteEvent_},
+        signal_::{ReadEvent_, TrEventSender_, WriteEvent_},
     },
     flow_ctrl::Credit,
 };
@@ -300,9 +300,9 @@ impl<C, S> TrChannelTx<C> for ChannelTx<C, S> where C: TrConnCfg {}
 /// 实现 `TrBuffTryRead<u8>`；环空即返回 `ReadErrTag::Drained`。数据由
 /// 内部读循环从网络解复用后写入。
 ///
-/// 每次应用发起读之前，先按环的 `data_size` 变化算出**已提交消费量**并通知写循环
-/// 回补窗口。用增量而不是「本次借出的段长」是为了不超前通告：段在被 drop 之前
-/// 仍占用环空间。
+/// 每次应用发起读之前，先**通知解复用循环**「水位可能变了」——注意是**裸通知**，
+/// 不带消费增量：增量由持有接收环**写端**的解复用循环按「自己记账的累计已收 − 环内
+/// 实际积压」重算，原因见 `notify_consumed_` 的文档。
 ///
 /// # 关闭语义（半关闭）
 ///
@@ -315,6 +315,10 @@ where
     /// `buffex` 消费端半部（[`BufferedRx`] 的实例）。
     ring_: BufferedRx<C::Buff, C::Alloc>,
 
+    /// 该子流的共享状态（「已消费」去重位在锁外，见
+    /// [`ChannelOwner_::mark_rx_consumed_`]）。
+    owner_: ChannelOwner_<C::Alloc>,
+
     /// 连接智能指针：通知写循环 + 保活。
     conn_: MuxConnection<C, S>,
 
@@ -323,45 +327,58 @@ where
 
     /// 对端 dock。
     remote_dock_: Dock,
-
-    /// 上一次观察到的环内数据量（用于算已提交消费的增量）。
-    last_data_: usize}
+}
 
 impl<C, S> ChannelRx<C, S>
 where
     C: TrConnCfg,
 {
-    /// 由环消费端、连接与 dock 对构造；可见性同 [`ChannelTx::new_`]。
+    /// 由环消费端、共享状态、连接与 dock 对构造；可见性同 [`ChannelTx::new_`]。
     pub(crate) fn new_(
         ring: BufferedRx<C::Buff, C::Alloc>,
+        owner: ChannelOwner_<C::Alloc>,
         conn: MuxConnection<C, S>,
         local_dock: Dock,
         remote_dock: Dock,
     ) -> Self {
         ChannelRx {
             ring_: ring,
+            owner_: owner,
             conn_: conn,
             local_dock_: local_dock,
-            remote_dock_: remote_dock,
-            last_data_: 0usize}
+            remote_dock_: remote_dock}
     }
 
-    /// 观察 `data_size` 的下降量（= 上次调用之后已提交的消费量）并上报。
-    fn note_consumed_(&mut self) {
-        let now = self.ring_.ring_state().data_size();
-        let delta = self.last_data_.saturating_sub(now);
-        self.last_data_ = now;
-        if delta > 0 {
-            let amount = Credit::try_from(delta).unwrap_or(Credit::MAX);
-            let _ = self
-                .conn_
-                .core_()
-                .w_events_()
-                .try_send_event_(WriteEvent_::RxConsumed {
-                    local_dock: self.local_dock_,
-                    remote_dock: self.remote_dock_,
-                    amount_: amount});
+    /// 通知**解复用循环**「应用刚取走了数据，接收窗口的账面水位可能变了」。
+    ///
+    /// # 为什么是裸通知，而不是「本次消费了多少字节」
+    ///
+    /// 应用侧只能**采样**环的 `data_size` 再求差，而 `data_size` 是**净**水位：只要
+    /// 两次采样之间既有读出又有写入，差值就退化成 0，那一次消费被永久漏记。稳态恰好
+    /// 是这个形状——对端每拿到一份额度就写回等量字节，正好把应用刚读掉的顶回去。
+    /// 漏记累积到一个整窗口之后，接收环已经读空、通告窗口却仍是 0，两端互等
+    /// （实测终局与因果链见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
+    ///
+    /// 解复用循环持有接收环**写端**，它在自己的任务里读到的「环内积压」与它自己记账的
+    /// 「累计已收」是同一时刻的一致快照，二者之差即**精确**的累计已消费量，因此判定
+    /// 权归它。
+    ///
+    /// # 去重
+    ///
+    /// 与发送侧的「已入队」位同构：每条子流至多一条待处理通知。消费方必须**先清位、
+    /// 再读环内积压**（见 [`ChannelOwner_::clear_rx_consumed_`]），这样清位之后发生的
+    /// 消费会重新置位并投递，不会丢。
+    fn notify_consumed_(&mut self) {
+        if !self.owner_.mark_rx_consumed_() {
+            return;
         }
+        let _ = self
+            .conn_
+            .core_()
+            .r_events_()
+            .try_send_event_(ReadEvent_::RxConsumed {
+                local_dock: self.local_dock_,
+                remote_dock: self.remote_dock_});
     }
 
     /// 从接收环读满 `out`。
@@ -451,7 +468,7 @@ where
         &'f mut self,
         demand: &'f Demand<usize>,
     ) -> SomeOf<Self::SegmRef<'f>, Self::Err> {
-        self.note_consumed_();
+        self.notify_consumed_();
         self.ring_.try_read(demand)
     }
 }
@@ -466,7 +483,7 @@ where
         Self: 'f;
 
     fn read_async<'f>(&'f mut self, demand: &'f Demand<usize>) -> Self::ReadAsync<'f> {
-        self.note_consumed_();
+        self.notify_consumed_();
         self.ring_.read_async(demand)
     }
 }
@@ -546,14 +563,14 @@ mod tests_ {
         (
             ChannelTx::new_(
                 half_tx,
-                owner,
+                owner.clone(),
                 conn.clone(),
                 local,
                 remote,
                 // 测试环容量 64 ⇒ 临界水位 64/4 = 16。
                 16u32,
             ),
-            ChannelRx::new_(half_rx, conn, local, remote),
+            ChannelRx::new_(half_rx, owner, conn, local, remote),
         )
     }
 

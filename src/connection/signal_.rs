@@ -10,10 +10,18 @@
 //!
 //! - [`WriteEvent_`] → **写循环**：会话侧发送环读端上线（
 //!   [`WriteEvent_::Attach`]）、待写出的控制帧（[`WriteEvent_::Control`]）、
-//!   「某条子流发送环有数据」（[`WriteEvent_::TxReady`]）、应用消费了接收数据
-//!   （[`WriteEvent_::RxConsumed`]）、拆流（[`WriteEvent_::Release`]）；
+//!   「某条子流发送环有数据」（[`WriteEvent_::TxReady`]）、拆流（`TxClosed` /
+//!   `RxClosed` / `PeerClosed`）；
 //! - [`ReadEvent_`] → **读循环**：会话侧接收环写端上线（[`ReadEvent_::Attach`]）、
-//!   拆流（[`ReadEvent_::Release`]）。
+//!   拆流（[`ReadEvent_::Release`]）、「应用取走了数据，去看看接收水位」
+//!   （[`ReadEvent_::RxConsumed`]）。
+//!
+//! # 两条水位通知的方向**刻意不同**
+//!
+//! - 「发送环有数据」投给**写循环**：只有它持有发送环读端，能立刻去搬。
+//! - 「应用消费了」投给**读循环**：只有它持有接收环**写端**，能在同一任务里读到
+//!   「环内实际积压」，从而算出**精确**的累计已消费量。应用侧采样差值会被并发写入
+//!   掩盖，因此那条路早已废弃（见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
 //!
 //! # 为什么是**无界**的（本轮裁决 Q6）
 //!
@@ -23,7 +31,10 @@
 //! 让队列长度天然有界：
 //!
 //! 1. 每条子流的「有数据」事件至多一条在队列里（由
-//!    [`ChannelState_::tx_queued_`](super::owner_::ChannelState_::tx_queued_) 去重）；
+//!    [`ChannelOwner_::mark_tx_queued_`](super::owner_::ChannelOwner_::mark_tx_queued_)
+//!    去重）、「消费了」事件同样至多一条（由
+//!    [`ChannelOwner_::mark_rx_consumed_`](super::owner_::ChannelOwner_::mark_rx_consumed_)
+//!    去重）；
 //! 2. 控制帧与拆流事件的产生频率由协议状态机约束（每条子流建流 / 拆流各一次）。
 //!
 //! 于是 `try_send` 不会失败，「全扫标志」整个机制不再需要。这与 §11.4 的「定容」
@@ -182,16 +193,6 @@ where
         remote_dock: Dock,
     },
 
-    /// 应用从接收环取走了 `amount_` 字节，接收窗口可回补。
-    RxConsumed {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-        /// 本次消费的字节数（应用侧报出，允许略微超前于段的提交）。
-        amount_: Credit,
-    },
-
     /// 应用丢弃了发送半边：写循环排空剩余数据后发 `CLOSE(FIN)`。
     TxClosed {
         /// 本端 dock。
@@ -239,6 +240,23 @@ where
 
     /// 释放一条子流：读循环丢弃本地表项。
     Release {
+        /// 本端 dock。
+        local_dock: Dock,
+        /// 对端 dock。
+        remote_dock: Dock,
+    },
+
+    /// 应用从接收环取走了数据：**接收窗口的账面水位可能变了**。
+    ///
+    /// 这是**裸通知**，刻意不带增量。增量必须由**持有接收环写端**的解复用循环按
+    /// 「自己记账的累计已收 − 环内实际积压」重算：应用侧只能采样 `data_size` 的差值，
+    /// 而一次并发写入就会把同一区间里的读出完全掩盖，额度被永久漏记、两端互等
+    /// （因果链见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
+    ///
+    /// 投递按子流去重（见
+    /// [`ChannelOwner_::mark_rx_consumed_`](super::owner_::ChannelOwner_::mark_rx_consumed_)）：
+    /// 每条子流至多一条待处理通知。
+    RxConsumed {
         /// 本端 dock。
         local_dock: Dock,
         /// 对端 dock。
