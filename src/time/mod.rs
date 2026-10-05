@@ -1,70 +1,47 @@
-//! # 时间：**每连接一个**的轮盘式计时器
+//! # 时间：**绝对期限的算术层**
 //!
-//! 本模块提供「等到某个时刻 / 某个期限」的那一层原语，供连接自身的保活（PULSE）、
-//! 空闲超时与其它定时特性使用。它**仿照 compio 的 `runtime::time`** 设计，公开面
-//! 与那边基本一一对应：[`Elapsed`]、[`Interval`]，以及 `sleep` / `sleep_until` /
-//! `timeout` / `timeout_at` / `interval` / `interval_at`。
+//! 本模块只做一件事：把**绝对期限**（`C::Instant`）折算成 [`TrTime`] 能接受的
+//! **相对时长**（`Duration`），以及把 `abs_art` 的计时能力与错误类型转出来给连接层用。
 //!
-//! ## 与 compio 的**唯一必要偏离**：没有全局运行时
+//! # 为什么这里这么薄
 //!
-//! compio 的 `sleep_until` 之类的自由函数只收一个 `Instant`，是因为它背后有个
-//! **全局** `Runtime`：`TimerFuture::try_new` 靠 `Runtime::with_current` 摸到运行
-//! 时的 `TimerRuntime`。本仓的连接**可能跑在 tokio 或 compio 上**，不存在这样一个
-//! 全局对象，因此把「compio 里由运行时隐式持有的那个轮盘」提成**显式参数**：
-//! [`Timer`]。每个连接一个，由调用方构造并持有。
+//! 保活（T6）施工单里原先设想「在 `smux_v1` 自建一个轮盘式计时器」，那是
+//! **`abs_art` 还没有计时能力时的补救**：轮盘（`Rc<RefCell<BTreeMap>>` + waker 槽 +
+//! 每条等待者一个节点）存在的唯一理由，是当时拿不到一个可等待的「睡到某时刻」。
 //!
-//! | compio | 本模块 |
-//! | --- | --- |
-//! | `sleep_until(deadline)` | `sleep_until(&timer, deadline)` |
-//! | `interval(period)` | `interval(&timer, period)` |
-//! | 运行时事件循环驱动轮盘 | 连接的 tick 循环驱动轮盘（[`Timer::min_timeout`] + [`Timer::wake`]） |
+//! 现在能力已经在 `abs_art` 家族里（trait 在 `abs_art::time`，实现在三个后端），
+//! 于是轮盘整个删除，本模块只剩下**算术**：
 //!
-//! ## 时刻的来源：`embedded_timers`
+//! ```text
+//! D::sleep_until(&clock, t)   =  D::delay(t − clock.now())
+//! D::timeout_at(&clock, t, f) =  D::timeout(t − clock.now(), f)
+//! ```
 //!
-//! 时刻类型**不写死**为 `std::time::Instant`，而由
-//! [`Clock`](embedded_timers::clock::Clock) 的关联类型给出（`embedded_timers` 的
-//! [`Clock`](embedded_timers::clock::Clock) /
-//! [`Instant`](embedded_timers::instant::Instant) trait）。收益有两个：
+//! 两个都是**运行时类型的关联函数**（`D` 是最终二进制选中的后端），与 `abs_art`
+//! 家族既有的 `Runtime::block_on(..)` / `Runtime::delay(..)` 同形——见 [`TrDeadline`]。
 //!
-//! 1. `src` 里除测试外**不再出现 `std::time::Instant`**（现在只剩
-//!    `connection::owner_` 与 `connection::mux_connection::registry_` 两处等待迁移）；
-//! 2. 超时与宽限期可以用**假时钟**确定性地验收，而不是靠看门狗掐时间。
+//! # 分层：等待层归后端，算术与判定层留本地
 //!
-//! 具体取哪个类型由调用方实现 [`Clock`](embedded_timers::clock::Clock) 时给出；
-//! `embedded_timers` 自带的
-//! `Instant32` / `Instant64` / `TimespecInstant` 都是现成的时刻实现，本模块的用例
-//! 就用 `Instant64<1_000_000>` 配合假时钟。
+//! | 层 | 归谁 | 为什么 |
+//! | --- | --- | --- |
+//! | 「睡一段 / 每周期醒」 | 后端（[`TrTime`]） | 只有运行时知道怎么等；三个后端各自的实现由 `abs_art-smoke` 的契约矩阵钉住 |
+//! | 「什么时候该醒」 | 本地（本模块 + 注入的 [`Clock`](embedded_timers::clock::Clock)） | 连接级 epoch、每子流空闲毫秒、宽限期判定都是**协议语义**；而注入式时钟让它们可以**用假时钟确定性验收** |
 //!
-//! ## 语义约定
+//! 这条缝就是本轮把「绝对时刻」留在消费方的收益：`TrTime` 是 `Duration`-only 的
+//! （见 `abs_art::time` 模块文档），因此后端的真实时钟**不**会挤进本模块的判定，
+//! 而 [`TrDeadline::sleep_until`] / [`TrDeadline::timeout_at`] 这两个绝对形式在这里
+//! 由本地时钟补上。
 //!
-//! - **取消就是丢弃**：所有等待者（`sleep` 返回的 future、[`Interval::tick`]）
-//!   一旦被丢弃就撤销登记，轮盘上不留悬空 waker 槽。
-//! - **到期判据是 `deadline <= now`**（含相等），与 `std::time` 一致。
-//! - **本模块的等待者是叶子 future**，因此**不**套 `gen_may_cancel_future`
-//!   （AGENTS §4 的「优先考虑」）：连接层每个 park 点一律用既有的
-//!   `race_cancel_` / `may_cancel_with` 与取消令牌竞争，套在外层的取消包装反而
-//!   会把「可竞争」变成「不可竞争」。
-//! - **登记不会唤醒驱动方**：见 [`Timer`] 的文档——新登记一个更早的期限时，
-//!   驱动方可能正等在一个更晚的期限上，这个通知落点尚待裁决。
+//! # 与 `abs_art` 的关系
 //!
-//! ## 本模块**不做**的事
-//!
-//! - **不提供异步等待源**：轮盘只记录「谁想在什么时候被唤醒」，真正「睡到那时候」
-//!   的定时源由调用方（连接的 tick 循环）提供。`embedded_timers` 给不了这一项
-//!   （它只有阻塞式 `Delay`，在异步循环里禁用），因此这正是连接层尚待裁决的一项
-//!   （见 `dev-notes/keepalive-20261005-0901.md` §2.2 与 §5.2）。
-//! - **不做连接级策略**：保活 PULSE 的阈值与限频、空闲超时的宽限期、超时后是拆
-//!   子流还是终连接，都是连接层的语义，不属于本模块。
+//! 计时能力**不**在这里定义实现，也不在这里重新导出成新名字：需要相对形式
+//! （`D::delay(Duration)` / `D::interval(period)` / `D::timeout(Duration, f)`）的
+//! 调用方直接用 `abs_art` 的 [`TrTime`]。本模块只补绝对形式。
 
-mod interval_;
-mod sleep_;
-mod timeout_;
-mod wheel_;
+mod deadline_;
 
-pub use interval_::{Interval, interval, interval_at};
-pub use sleep_::{sleep, sleep_until};
-pub use timeout_::{Elapsed, timeout, timeout_at};
-pub use wheel_::Timer;
+pub use abs_art::{Elapsed, TrInterval, TrTime};
+pub use deadline_::TrDeadline;
 
 #[cfg(test)]
 mod tests_;

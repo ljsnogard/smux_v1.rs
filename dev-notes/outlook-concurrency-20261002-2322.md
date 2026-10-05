@@ -491,21 +491,28 @@ enum EstablishReply_ { Accepted, Refused, Failed(MuxError<(), ()>) }
 
 ### T6 保活与空闲超时（写法 B：每连接一个 tick 循环）
 
-- **状态**：**第 1 步已落地**（2026-10-05 11:30）：公开模块 `src/time` 已实现
-  `Elapsed` / `Interval` / `Timer` 与 `sleep`/`sleep_until`/`timeout`/`timeout_at`/
-  `interval`/`interval_at`，含 13 个假时钟确定性用例——见 `time-mod-20261005-1130.md`。
-  **tick 循环、PULSE、超时落地仍未开工**（即 `keepalive…` §4 的第 3～7 步）。
-  `embedded-timers v0.4.0` 已由人类加入 `Cargo.toml`（commit `aa2be18`）。
-- **做什么**：一个连接**一个**计数器（本仓自建轮盘 `time::Timer`），写成**第 5 个本地
-  循环**；它在完全静默时仍会醒来，并**激活其它可能已经静默的循环**（投 PULSE / 超时事件），
-  从而补齐 `PULSE` 的发送点与 `MuxError::IdleTimeout` 的产生点。
-- **施工单与前置**：见 `keepalive-20261005-0901.md`（含 6 项待裁决——其中只有
-  「`Clock` 由调用方给值、模块泛型化」被第 1 步部分落地；`embedded-timers` 的真实能力
-  边界；时间表示统一为「连接级 epoch + 毫秒」）；原记的**只读 `CARGO_HOME` 构建前置已
-  消解**（见该文 §6.1 后记）。第 1 步另新增两条待裁决：轮盘的 `BTreeMap` 是否改走注入
-  分配器、是否把 `embedded_timers` 导出到 `x_deps`（见新文 §6）。
-- **关联**：T6 同时把「时间能力怎么注入」一并裁决（`TrDelay` 不在 `S: TrLocalScope` 上，
-  见施工单 §2.2/§5.2）；事件通道的定额化（本列表最后一条）与 T6 的限频要求相互牵制。
+- **状态**：**时间能力已就位，tick 循环仍未开工**。
+  - 2026-10-05 11:30：在 `smux_v1` 自建了轮盘式 `src/time`（13 个确定性用例）——
+    **已被取代**，见下一条。
+  - 2026-10-05 12:30：计时能力上移到 `abs_art` 家族（trait 在 `abs_art::time`、
+    实现在 tokio/compio/smol 三个后端，另有 15 格跨后端契约矩阵），
+    `smux_v1::time` 因此收缩成**纯算术层**（`sleep_until` / `timeout_at` + 转出
+    `TrTime`/`Elapsed`），**轮盘整个删除**、`RefCell`/`Rc`/每次登记的分配与
+    「登记时唤醒驱动方」这个未决项随之消失。见
+    `time-capability-20261005-1230.md`。
+  - **仍未开工**：tick 循环、PULSE、超时落地（`keepalive…` §4 的第 3～7 步）。
+  - `embedded-timers v0.4.0` 已加入 `Cargo.toml`（commit `aa2be18`），现在只用于
+    `Clock`/`Instant` 的**算术层**。
+- **做什么**：一个连接**一个**计数器，写成**第 5 个本地循环**；它在完全静默时仍会醒来，
+  并**激活其它可能已经静默的循环**（投 PULSE / 超时事件），从而补齐 `PULSE` 的发送点与
+  `MuxError::IdleTimeout` 的产生点。等待用后端的 `TrTime`（不再有轮盘），
+  「什么时候该醒」用注入式 `Clock` 在本地算。
+- **施工单与前置**：见 `keepalive-20261005-0901.md`——其中 §5.2「异步等待源」**已消解**、
+  §6.1 的构建前置**已消解**；其余待裁决（超时语义、PULSE 规则、`Clock` 注入形状、
+  tick 唤醒落点、tick 频率）仍然有效。另新增一条：`D: TrTime` 怎么进 `MuxConnection`
+  （第三个类型参数，还是把 `TrTime` 加到作用域值的约束上）。
+- **关联**：「时间能力怎么注入」本轮已由 `abs_art` 侧的 `TrTime` 回答；事件通道的定额化
+  （本列表最后一条）与 T6 的限频要求仍然相互牵制。
 
 ### 已并入其他文档的待办（此处不重复）
 
