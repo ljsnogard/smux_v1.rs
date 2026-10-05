@@ -72,7 +72,7 @@
 //! # 本模块现在只管**编码**与字段级公共件
 //!
 //! 帧头**解析**已迁到 [`crate::connection::frame_parser_`] 的 sans-IO 逐字节状态机
-//! （原因见 `dev-notes/frame-parser-20261004-0600.md` §1：旧入口按字段索要 `width`
+//! （原因：旧入口按字段索要 `width`
 //! 字节，环容量小于 `width` 时会拿到终态的 `Unsatisfiable` 而整条连接失败）。
 //! 本模块保留 `encode_header_into_`、`FieldId` / `FrameKind` / `flags` 等公共件，以及
 //! 两个状态机共用的 `decode_dock_field_`。

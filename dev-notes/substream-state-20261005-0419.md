@@ -159,8 +159,8 @@ pub struct RecvWindow { inner_: SpinningMutexOwned<RecvInner> }
 
 锁的选型：`atomic_sync::mutex::preemptive::SpinningMutexOwned`（`AtomicUsize` +
 `UnsafeCell<T>`，**零内部堆分配**）。`cooperative` 版本每条实例持一个 `Arc<RwCore>`，
-等于给每条子流添一次**全局**分配，与本仓分配纪律冲突（来历见
-`connection-20261002-0548.md` §14/§17）。
+等于给每条子流添一次**全局**分配，与本仓分配纪律冲突（选型对照见 §3.3 与
+§4.2）。
 
 三条实现纪律：
 

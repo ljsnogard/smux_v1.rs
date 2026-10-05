@@ -9,8 +9,7 @@
 //!   也在这里。
 //!
 //! 连接的读写循环在 `session_`，各会话对象（binding / listener / handle / 半部）
-//! 在各自子模块。设计见 [`crate::connection`] 模块文档 §2 与
-//! `dev-notes/connection-20261002-0548.md` §17。
+//! 在各自子模块。设计见 [`crate::connection`] 模块文档 §2。
 
 mod conn_;
 mod core_;

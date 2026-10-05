@@ -2,8 +2,7 @@
 //!
 //! 本模块是经 `abs_art` 的本地作用域 spawn 出来的**内侧**两个 `'static` 任务的全部
 //! 实现（**外侧**两个贴传输的泵循环见 [`session_pump_`](super::session_pump_)）。
-//! 结构见 [`crate::connection`] 模块文档 §2、§5，落地裁决见
-//! `dev-notes/connection-20261002-0548.md` §5。
+//! 结构见 [`crate::connection`] 模块文档 §2、§5。
 //!
 //! # 数据流
 //!
