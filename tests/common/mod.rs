@@ -67,7 +67,9 @@ pub use config_::{
     K_TOTAL_CHANNELS,
     SmokeConn,
     SmokeMuxConfig,
+    TrLocalScope,
     TrSmokeScope,
+    TrTime,
 };
 pub use payload_::{make_flow_payload_, make_payload_};
 pub use pump_::make_passive_ring_;

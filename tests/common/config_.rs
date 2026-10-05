@@ -11,17 +11,28 @@ use abs_smux::conf::TrMuxConfig;
 use smux_v1::{
     connection::{BuffAllocError, Dock, K_STAGE_RING_CAPACITY, MuxConnection, TrConnCfg},
     flow_ctrl::DefaultPolicy,
+    time::SystemClock,
 };
 
 use crate::common::{SmokeBuff, make_stage_buffs_with_};
 
-/// 连接层要求的 bound：**值化的本地作用域**（`abs_art::TrLocalScope`）。
+/// 连接层要求的 bound：**值化的本地作用域**（`abs_art::TrLocalScope`）**再加后端的
+/// 计时能力**（`abs_art::TrTime`，第五个循环要等「下一个期限」）。
+///
+/// 它是一个**空标记 trait**（对所有 `TrLocalScope + TrTime` 的类型 blanket 实现）：
+/// Rust 还没有稳定的 trait alias，而场景函数里满是 `S: TrSmokeScope` 这样的约束，
+/// 逐处加一条 `+ TrTime` 只会把同一件事抄很多遍。真实约束仍然只有
+/// `TrLocalScope + TrTime` 两条。
 ///
 /// 场景函数一律把作用域值作为第一个参数（`scope: &S`）并原样转发给
 /// [`MuxConnection::new`]；两个测试目标各自给出具体后端的作用域值
 /// （tokio / compio 各自的 `LocalScope`）。契约是「谁取得作用域，谁负责驱动」：
 /// tokio 用 `scope.run_until(..)` 包住整段使用期，compio 由运行时自己驱动。
-pub use abs_art::TrLocalScope as TrSmokeScope;
+pub use abs_art::{TrLocalScope, TrTime};
+
+pub trait TrSmokeScope: abs_art::TrLocalScope + abs_art::TrTime {}
+
+impl<S> TrSmokeScope for S where S: abs_art::TrLocalScope + abs_art::TrTime {}
 
 
 /// 一端连接对象的类型：策略固定为 [`SmokeMuxConfig`]，传输类型由策略的类型参数
@@ -104,6 +115,7 @@ where
     R: TrBuffRead<u8> + 'static,
 {
     type Alloc = CoreAlloc;
+    type Clock = SystemClock;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -111,6 +123,10 @@ where
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
+    }
+
+    fn clock(&self) -> Self::Clock {
+        SystemClock
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -203,6 +219,7 @@ where
     R: TrBuffRead<u8> + 'static,
 {
     type Alloc = CoreAlloc;
+    type Clock = SystemClock;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -210,6 +227,10 @@ where
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
+    }
+
+    fn clock(&self) -> Self::Clock {
+        SystemClock
     }
 
     fn policy(&self) -> &Self::Policy {

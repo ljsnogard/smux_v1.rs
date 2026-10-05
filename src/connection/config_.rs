@@ -37,6 +37,7 @@ use crate::{
     connection::{Dock, MuxChanBuff},
     flow_ctrl::{DefaultPolicy, TrFlowCtrlPolicy},
     handshake::agent::HandshakeDelivery,
+    time::{Clock, SystemClock},
 };
 
 #[allow(unused)]
@@ -78,6 +79,25 @@ where
     /// 连接内部结构（帧暂存、注册表等）的分配器。
     type Alloc: AllocatorClone + Send + Sync;
 
+    /// **时刻来源**：保活（`PULSE`）、空闲超时与拆流宽限期都以它为准。
+    ///
+    /// # 为什么是配置的一部分
+    ///
+    /// 与 [`Self::Alloc`] / [`Self::Policy`] 同一条理由：它是「使用环境注入的策略」，
+    /// 不是连接自己能决定的东西。连接内部的协议时间一律记成**自建连时刻（epoch）起
+    /// 算的毫秒数**，因此换一个时钟就能把「空闲超时到点」这类判定从「掐真实时间」
+    /// 变成**确定性验收**。
+    ///
+    /// # 约束
+    ///
+    /// - [`Clock`]：时刻类型与 `now()`；
+    /// - `Clone`：同一个时钟值要被核心与五个循环共享（各持一份克隆）；
+    /// - `'static`：五个循环都是 `spawn_local` 出来的 `'static` 任务。
+    ///
+    /// 缺省实现见 [`DefaultConnCfg`]（用 [`SystemClock`]）；测试用假时钟只需给出一个
+    /// 零大小、由外部原子量驱动的实现。
+    type Clock: Clock + Clone + 'static;
+
     /// 流控策略。
     type Policy: TrFlowCtrlPolicy;
 
@@ -98,6 +118,9 @@ where
 
     /// 取连接内部结构用的分配器（按值，`buffex` 的构建器按值接收）。
     fn allocator(&self) -> Self::Alloc;
+
+    /// 取时刻来源（按值；连接内部各持有者各拿一份克隆）。
+    fn clock(&self) -> Self::Clock;
 
     /// 取流控策略。
     fn policy(&self) -> &Self::Policy;
@@ -224,6 +247,7 @@ where
     P: TrFlowCtrlPolicy + 'static,
 {
     type Alloc = CoreAlloc;
+    type Clock = SystemClock;
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
@@ -231,6 +255,10 @@ where
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
+    }
+
+    fn clock(&self) -> Self::Clock {
+        SystemClock
     }
 
     fn policy(&self) -> &Self::Policy {

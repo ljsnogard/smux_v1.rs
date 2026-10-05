@@ -70,7 +70,7 @@ where
     }
 }
 
-/// 丢弃端点即**解除 telegraph 身份**（投递 [`SessionEvent_::ReleaseTelegraph`]，
+/// 丢弃端点即**解除 telegraph 身份**（投递 `SessionEvent_::ReleaseTelegraph`，
 /// 由核心落实），使同一个 `local_dock` 之后可以再作 channel 或 listener 使用
 /// （见 `ChannelRegistry_::release_telegraph_`）。
 ///

@@ -128,6 +128,7 @@ use crate::{
         },
     },
     flow_ctrl::{Credit, WindowReport},
+    time::{Clock, ConnClock_},
     wire_io_::{CursorError, ReadCursor},
 };
 
@@ -143,36 +144,85 @@ const K_MAX_DATA_CHUNK: usize = 16usize * 1024usize;
 
 /// 两个**内侧**循环共享的、与调用方配置无关的量。
 ///
-/// 它由建连路径从核心展开而来：注册表句柄 + 单帧上限。注意它**不含核心引用**
-/// （模块文档「循环不持有连接核心」），因此核心可以在最后一个应用面对象被丢弃时
-/// 正常析构并触发收尾。
+/// 它由建连路径从核心展开而来：注册表句柄 + 单帧上限 + **连接级时钟** + 空闲超时。
+/// 注意它**不含核心引用**（模块文档「循环不持有连接核心」），因此核心可以在最后一个
+/// 应用面对象被丢弃时正常析构并触发收尾。
 ///
 /// 「初始接收窗口」与「通告阈值」**不在这里**：`abs_smux` 更新后，子流缓冲由调用方
 /// 在最终裁决（`accept_async`）时给出，容量逐条子流不同，因此这两个量在**建流时**
 /// 按该子流的接收缓冲容量算出，存进该子流的 [`ChannelState_`]（见
 /// [`crate::connection::owner_`]）。循环侧不再需要任何连接级窗口快照。
+///
+/// # 时钟参数 `K`
+///
+/// 注册表里与时间有关的操作（拆流宽限期回收、进入宽限态、判宽限态）都要「现在」，
+/// 而两个内侧循环恰好都要调它们（解复用循环判宽限态、复用循环进宽限态）。把
+/// [`ConnClock_`] 放在共享量里，五个循环因此都拿得到**同一个 epoch** 下的毫秒。
 #[derive(Clone)]
-pub(crate) struct MuxLoopShared_<A>
+pub(crate) struct MuxLoopShared_<A, K>
 where
     A: AllocatorClone + Send + Sync,
+    K: Clock,
 {
-    /// 注册表（dock / 子流索引与配额、失败标志、取消令牌）。
+    /// 注册表（dock / 子流索引与配额、失败标志、取消令牌、计时唤醒槽）。
     reg_: ChannelRegistry_<A>,
 
     /// 协商出的单帧总长上限。
     max_packet_size_: usize,
+
+    /// 连接级时钟（注入的时钟 + 建连 epoch）。
+    conn_clock_: ConnClock_<K>,
+
+    /// 协商出的**活跃子流空闲超时**（毫秒）；计时循环的判据。
+    channel_timeout_millis_: u64,
 }
 
-impl<A> MuxLoopShared_<A>
+/// [`MuxLoopShared_`] 在具体连接策略上的简写：`C` 同时给出分配器与时钟类型。
+///
+/// 循环与事件处理的签名里满是这个类型，用别名把两个关联类型摊平，读起来只剩
+/// 「哪个连接策略」一个变化维度。
+pub(crate) type MuxShared_<C> =
+    MuxLoopShared_<<C as TrConnCfg>::Alloc, <C as TrConnCfg>::Clock>;
+
+impl<A, K> MuxLoopShared_<A, K>
 where
     A: AllocatorClone + Send + Sync,
+    K: Clock,
 {
     /// 由建连路径展开后的量构造（成员私有，构造只能走这里）。
-    pub(crate) fn new_(reg: ChannelRegistry_<A>, max_packet_size: usize) -> Self {
+    pub(crate) fn new_(
+        reg: ChannelRegistry_<A>,
+        max_packet_size: usize,
+        conn_clock: ConnClock_<K>,
+        channel_timeout_millis: u64,
+    ) -> Self {
         MuxLoopShared_ {
             reg_: reg,
             max_packet_size_: max_packet_size,
+            conn_clock_: conn_clock,
+            channel_timeout_millis_: channel_timeout_millis,
         }
+    }
+}
+
+impl<A, K> MuxLoopShared_<A, K>
+where
+    A: AllocatorClone + Send + Sync,
+    K: Clock,
+{
+    /// 注册表句柄。
+    pub(crate) fn reg_(&self) -> &ChannelRegistry_<A> {
+        &self.reg_
+    }
+
+    /// 连接级时钟。
+    pub(crate) fn conn_clock_(&self) -> &ConnClock_<K> {
+        &self.conn_clock_
+    }
+
+    /// 协商出的活跃子流空闲超时（毫秒）。
+    pub(crate) fn channel_timeout_millis_(&self) -> u64 {
+        self.channel_timeout_millis_
     }
 }
 
@@ -279,7 +329,7 @@ type PendingFin_<A> = BTreeSet<(Dock, Dock), A>;
 #[allow(clippy::too_many_arguments)]
 async fn finalize_entry_<C, K>(
     tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
-    shared: &MuxLoopShared_<C::Alloc>,
+    shared: &MuxShared_<C>,
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
     pending_fin: &mut PendingFin_<C::Alloc>,
@@ -385,12 +435,13 @@ where
 /// 连接被丢弃时 [`MuxCore::drop`](super::mux_connection::core_::MuxCore) 触发取消
 /// 令牌，循环在 await 点上以「取消错误」的形式收到通知并退出——那是正常关闭，
 /// 不应在注册表上留下失败标志（否则收尾路径会伪造出一个假的连接级失败）。
-pub(crate) async fn fail_mux_loop_<A, K>(
-    shared: &MuxLoopShared_<A>,
+pub(crate) async fn fail_mux_loop_<A, KC, K>(
+    shared: &MuxLoopShared_<A, KC>,
     cancel: &K,
     err: &MuxError,
 ) where
     A: AllocatorClone + Send + Sync,
+    KC: Clock,
     K: TrCancellationToken,
 {
     if !cancel.is_cancelled() {
@@ -606,7 +657,7 @@ fn map_read_cursor_err_<E>(err: CursorError<E, ()>) -> MuxError {
 /// 解复用循环：从连接读环解析帧、投递载荷、推进建流状态机。
 pub(crate) async fn demux_loop_async_<C, K>(
     mut rx_stage: BufferedRx<C::StageBuff, C::Alloc>,
-    shared: MuxLoopShared_<C::Alloc>,
+    shared: MuxShared_<C>,
     mut events: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
     events_tx: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
     cancel: K,
@@ -634,10 +685,19 @@ pub(crate) async fn demux_loop_async_<C, K>(
         // 0. 先落实**会话释放**消息：`Drop` 只投消息、不碰身份表，因此处理「未知
         // 子流」之前必须先让「刚被丢弃的句柄」的释放生效——否则在途帧会被误判成
         // 协议违例，而不是宽限期（`WAIT_CLOSE`）内的静默丢弃。
-        lock_or_exit_!(shared.reg_.drain_session_events_(cancel.child_token()));
+        lock_or_exit_!(shared
+            .reg_
+            .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token()));
         // 1. 先把挂起的 `Attach` / `Release` / `RxConsumed` 成批排空。
         if let Result::Err(err) =
-            drain_read_events_::<C, _>(&mut events, &mut table, &events_tx, &cancel).await
+            drain_read_events_::<C, _>(
+                &mut events,
+                &mut table,
+                shared.conn_clock_().now_millis_(),
+                &events_tx,
+                &cancel,
+            )
+            .await
         {
             fail_mux_loop_(&shared, &cancel, &err).await;
             return;
@@ -667,6 +727,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     if let Result::Err(err) = handle_read_event_::<C, _>(
                         event,
                         &mut table,
+                        shared.conn_clock_().now_millis_(),
                         &events_tx,
                         &cancel,
                     )
@@ -731,6 +792,9 @@ pub(crate) async fn demux_loop_async_<C, K>(
         let remote = header.local_dock();
         let pair = (local, remote);
 
+        // 每次活动就地读一次连接级时钟（vDSO 读，相对本帧的解析 / 环操作可忽略）：
+        // 两个时钟必须记下**活动发生的时刻**，而不是计时循环扫描的时刻。
+        let now_millis = shared.conn_clock_().now_millis_();
         match header.kind() {
             FrameKind::Data => {
                 let amount = Credit::try_from(len).unwrap_or(Credit::MAX);
@@ -744,6 +808,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     if lock_or_exit_!(shared.reg_.is_wait_close_(
                         local,
                         remote,
+                        shared.conn_clock_().now_millis_(),
                         cancel.child_token()
                     )) {
                         continue;
@@ -758,7 +823,14 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     // 错误（旧实现的实测形态）；因此这里**静默丢弃**。
                     continue;
                 }
-                entry.owner_.touch_();
+                if entry.owner_.is_aborted_() {
+                    // 计时循环已判定空闲超时并认领了中止：身份正在（或已经）转入宽限态。
+                    // 这条判定不能省——从「认领中止」到「登记处落成宽限态」之间有一段
+                    // 会被本循环插进来的窗口，此间到达的在途数据必须静默丢弃，而不是掉进
+                    // 「未知子流」分支把整条连接判成协议违例。
+                    continue;
+                }
+                entry.owner_.mark_data_(now_millis);
                 let counted = entry.owner_.recv_on_data_(amount);
                 if let Result::Err(err) = counted {
                     fail_mux_loop_(&shared, &cancel, &MuxError::FlowCtrl(err)).await;
@@ -809,7 +881,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     let owner = entry.owner_.clone();
                     let _ = owner.send_on_report_(report);
                     owner.set_peer_opened_();
-                    owner.touch_();
+                    owner.mark_data_(now_millis);
                     wake_establish_(&owner);
                 } else {
                     // 入向请求：**只登记，不回帧**。
@@ -820,7 +892,13 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     // `accept_async` 发出（见 `channel_handle` 模块文档）。
                     let reserved = shared
                         .reg_
-                        .reserve_inbound_(local, remote, report, cancel.child_token())
+                        .reserve_inbound_(
+                            local,
+                            remote,
+                            report,
+                            shared.conn_clock_().now_millis_(),
+                            cancel.child_token(),
+                        )
                         .await;
                     match reserved {
                         Result::Ok(_) => {}
@@ -851,7 +929,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         crate::connection::owner_::EstablishOutcome_::Refused
                     };
                     owner.set_establish_outcome_(outcome);
-                    owner.touch_();
+                    owner.mark_data_(now_millis);
                     wake_establish_(&owner);
                 }
             }
@@ -870,7 +948,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         entry.writer_.close();
                         entry.owner_.set_peer_fin_();
                     }
-                    entry.owner_.touch_();
+                    entry.owner_.mark_data_(now_millis);
                     // 拆流记账（移除写侧表项、释放身份）交给复用循环的统一入口。
                     let _ = events_tx.try_send_event_(WriteEvent_::PeerClosed {
                         local_dock: local,
@@ -885,7 +963,14 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 {
                     let owner = entry.owner_.clone();
                     let _ = owner.send_on_report_(report);
-                    owner.touch_();
+                    // `WINDOW_UPDATE` 是**数据路径**上的活动（对端应用消费了数据），
+                    // 因此也刷新保活职责时钟；`PULSE` 只是保活本身，**只**刷新存活
+                    // 时钟——这正是两端都不会被对方的保活「劝退」的原因。
+                    if header.kind() == FrameKind::Pulse {
+                        owner.touch_(now_millis);
+                    } else {
+                        owner.mark_data_(now_millis);
+                    }
                     // **必须叫醒复用循环**：这条子流的额度刚刚（可能）变大，而写循环
                     // 完全可能正 park 在事件通道上——它上一次尝试发送时额度为 0，
                     // 于是「环里有数据但发不出去」，此后应用不再写入（环是满的），
@@ -930,6 +1015,7 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
 async fn drain_read_events_<C, K>(
     events: &mut EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
     table: &mut ReadTable_<C::Buff, C::Alloc>,
+    now_millis: u64,
     events_tx: &EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
     cancel: &K,
 ) -> Result<(), MuxError>
@@ -942,7 +1028,7 @@ where
         let Option::Some(event) = events.try_take_event_() else {
             break;
         };
-        handle_read_event_::<C, _>(event, table, events_tx, cancel).await?;
+        handle_read_event_::<C, _>(event, table, now_millis, events_tx, cancel).await?;
     }
     Result::Ok(())
 }
@@ -957,6 +1043,7 @@ where
 async fn handle_read_event_<C, K>(
     event: ReadEvent_<C::Buff, C::Alloc>,
     table: &mut ReadTable_<C::Buff, C::Alloc>,
+    now_millis: u64,
     events_tx: &EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
     cancel: &K,
 ) -> Result<(), MuxError>
@@ -985,7 +1072,13 @@ where
             local_dock,
             remote_dock,
         } => {
-            table.remove(&(local_dock, remote_dock));
+            // 身份已被释放：本循环不再向这条接收环投递任何字节。**必须显式关闭
+            // 生产端**——`buffex` 的环半部被 drop **不会**置位关闭标记，少了这一步
+            // 应用侧永远读不到 EOF（计时循环的超时拆流走的正是这条事件；对端 `FIN`
+            // 那条路径由 `Close` 分支自己 `close()`）。
+            if let Option::Some(mut entry) = table.remove(&(local_dock, remote_dock)) {
+                entry.writer_.close();
+            }
         }
         ReadEvent_::RxConsumed {
             local_dock,
@@ -1005,7 +1098,8 @@ where
             // 环内**实际积压**（已提交、应用还没取走）。本循环是接收环唯一的写入
             // 方，因此这次采样与上面的 `received_` 是同一时刻的一致快照。
             let buffered = entry.writer_.ring_state().data_size();
-            recheck_recv_level_::<C, _>(&owner, buffered, events_tx, pair, cancel).await?;
+            recheck_recv_level_::<C, _>(&owner, buffered, now_millis, events_tx, pair, cancel)
+                .await?;
         }
     }
     Result::Ok(())
@@ -1025,6 +1119,7 @@ where
 async fn recheck_recv_level_<C, K>(
     owner: &ChannelOwner_<C::Alloc>,
     buffered: usize,
+    now_millis: u64,
     events_tx: &EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
     pair: (Dock, Dock),
     cancel: &K,
@@ -1035,7 +1130,7 @@ where
 {
     let _ = cancel;
     let buffered = Credit::try_from(buffered).unwrap_or(Credit::MAX);
-    let report = owner.recv_recheck_(buffered);
+    let report = owner.recv_recheck_(buffered, now_millis);
     if let Option::Some(report) = report {
         let _ = events_tx.try_send_event_(WriteEvent_::Control {
             frame_: window_update_frame_(pair, report),
@@ -1195,7 +1290,7 @@ where
 /// 字节到网络的搬运由外侧写泵负责（见 `session_pump_`）。
 pub(crate) async fn mux_loop_async_<C, K>(
     mut tx_stage: BufferedTx<C::StageBuff, C::Alloc>,
-    shared: MuxLoopShared_<C::Alloc>,
+    shared: MuxShared_<C>,
     mut events: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
     read_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: K,
@@ -1228,7 +1323,9 @@ pub(crate) async fn mux_loop_async_<C, K>(
 
         // 0. 先落实**会话释放**消息（`Drop` 只投消息、不碰身份表）。写循环也做这
         // 件事，是为了让释放不必等某次 API 操作：两个内侧循环任一被调度即可推进。
-        lock_or_exit_!(shared.reg_.drain_session_events_(cancel.child_token()));
+        lock_or_exit_!(shared
+            .reg_
+            .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token()));
 
         // 1. 先把**已经到达**的事件成批处理掉（非阻塞），**但批有上限**。
         //
@@ -1436,7 +1533,7 @@ async fn handle_write_event_<C, K>(
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
     pending_fin: &mut PendingFin_<C::Alloc>,
-    shared: &MuxLoopShared_<C::Alloc>,
+    shared: &MuxShared_<C>,
     read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: &K,
     last_ready: &mut Option<(Dock, Dock)>,
@@ -1555,6 +1652,21 @@ where
             )
             .await?;
         }
+        WriteEvent_::LocalAbort {
+            local_dock,
+            remote_dock,
+        } => {
+            let pair = (local_dock, remote_dock);
+            // 本端主动拆流（空闲超时）：显式关闭发送环的消费端——没有别的执行者会替
+            // 这条路径关它，而应用必须立刻看到发送方向已关闭。理由见事件类型文档。
+            if let Option::Some(entry) = table.get_mut(&pair) {
+                entry.reader_.close();
+            }
+            table.remove(&pair);
+            pending_fin.remove(&pair);
+            maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token())
+                .await?;
+        }
         WriteEvent_::PeerClosed {
             local_dock,
             remote_dock,
@@ -1587,7 +1699,7 @@ where
 /// （即发送环已排空），接收方向要等应用丢半边或对端 `FIN`。**应用丢弃发送半边不算
 /// 完成**——那只是「不再写」的意图。
 async fn maybe_release_<C, K>(
-    shared: &MuxLoopShared_<C::Alloc>,
+    shared: &MuxShared_<C>,
     read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     table: &WriteTable_<C::Buff, C::Alloc>,
     pair: (Dock, Dock),
@@ -1610,7 +1722,12 @@ where
     if owner.claim_release_() {
         let _ = shared
             .reg_
-            .release_channel_(pair.0, pair.1, cancel.child_token())
+            .release_channel_(
+                pair.0,
+                pair.1,
+                shared.conn_clock_().now_millis_(),
+                cancel.child_token(),
+            )
             .await;
         let _ = read_events.try_send_event_(ReadEvent_::Release {
             local_dock: pair.0,
@@ -1673,7 +1790,7 @@ where
 /// 把某条子流发送环里已提交的数据全部写出（直到取空）。
 async fn flush_entry_<C, K>(
     tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
-    shared: &MuxLoopShared_<C::Alloc>,
+    shared: &MuxShared_<C>,
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
     pair: (Dock, Dock),
@@ -1704,7 +1821,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn drain_once_<C, K>(
     tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
-    shared: &MuxLoopShared_<C::Alloc>,
+    shared: &MuxShared_<C>,
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
     cancel: &K,
@@ -1749,7 +1866,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn drain_one_<C, K>(
     tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
-    shared: &MuxLoopShared_<C::Alloc>,
+    shared: &MuxShared_<C>,
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
     pair: (Dock, Dock),
@@ -1871,6 +1988,6 @@ where
         owner.send_refund_(take as Credit);
         return Result::Err(err);
     }
-    owner.touch_();
+    owner.mark_data_(shared.conn_clock_().now_millis_());
     Result::Ok(true)
 }

@@ -19,7 +19,10 @@ atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch 
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
 
-embedded-timers = { git = "https://gitee.com/lino_snsalias/embedded-timers.git", tag = "v0.4.0" }
+# `std` feature：让 `std::time::Instant` 实现 `embedded_timers::instant::Instant`，
+# 从而缺省时钟 `time::SystemClock` 能把它当作 `Clock::Instant`。没有它就只能用
+# `Instant32` / `Instant64` 这类 tick 计数器，而本 crate 没有产出真实 tick 的时钟源。
+embedded-timers = { git = "https://gitee.com/lino_snsalias/embedded-timers.git", tag = "v0.4.0", features = ["std"] }
 
 crc = { version = "3.4.*" }
 flume = { version = "0.12.*" }
@@ -75,3 +78,17 @@ required-features = ["test-tokio-runtime"]
 [[test]]
 name = "smoke_compio"
 path = "tests/smoke_compio.rs"
+required-features = ["test-compio-runtime"]
+
+# 保活 / 空闲超时的端到端验收：两个薄壳共用 `tests/keepalive_common.inc`。
+# 与冒烟 target 分开的同一条理由：这两个场景要真实时间，而计时循环必须跑在**真正支持
+# 计时**的后端上（tokio 与 compio 的作用域是两个不同类型，无法在同一测试进程里互换）。
+[[test]]
+name = "keepalive"
+path = "tests/keepalive.rs"
+required-features = ["test-tokio-runtime"]
+
+[[test]]
+name = "keepalive_compio"
+path = "tests/keepalive_compio.rs"
+required-features = ["test-compio-runtime"]

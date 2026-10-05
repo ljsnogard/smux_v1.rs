@@ -9,6 +9,7 @@ use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use crate::common::{
     K_NET_BUFFER_SIZE,
     SmokeBuff,
+    TrLocalScope,
     TrSmokeScope,
     make_passive_ring_,
     run_small_mux_scenario_,

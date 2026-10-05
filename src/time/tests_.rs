@@ -310,6 +310,55 @@ fn keepalive_style_loop_sleeps_until_each_deadline() {
     }
 }
 
+// ── 连接级时钟（`ConnClock_`）────────────────────────────────────────────
+
+/// 验证 `ConnClock_` 以**建立时刻**为 epoch，把时刻折算成单调毫秒。
+/// - 手段：虚拟时钟 0 处建连接级时钟，分别推进到 1500 µs 与再 2498.5 ms 后读回。
+/// - 判断：`now_millis_` 依次是 0 / 1 / 2500——即自 epoch 起算、向下取整到毫秒。
+#[test]
+fn conn_clock_reports_millis_since_its_epoch() {
+    virtual_reset_();
+    let conn_clock = super::clock_::ConnClock_::new_(FakeClock_);
+    assert_eq!(conn_clock.now_millis_(), 0u64, "刚建立时应当是 0");
+
+    virtual_advance_(Duration::from_micros(1500u64));
+    assert_eq!(conn_clock.now_millis_(), 1u64, "向下取整到毫秒");
+
+    virtual_advance_(Duration::from_millis(2498u64) + Duration::from_micros(500u64));
+    assert_eq!(conn_clock.now_millis_(), 2500u64);
+}
+
+/// 验证 `ConnClock_::deadline_` 是「epoch + 毫秒」的绝对期限。
+/// - 手段：虚拟时钟停在 5 ms 处建时钟，取 `deadline_(7500)`；再把虚拟时钟推到
+///   105 ms，与 `clock_().now()` 相减。
+/// - 判断：期限距「现在」正好 7400 ms（= 7500 − 100）——折算基准是**建时钟那一刻**
+///   的 epoch，而不是某次调用时刻。
+#[test]
+fn conn_clock_deadline_is_epoch_plus_millis() {
+    virtual_reset_();
+    virtual_advance_(Duration::from_millis(5u64));
+    let conn_clock = super::clock_::ConnClock_::new_(FakeClock_);
+    let deadline = conn_clock.deadline_(7500u64);
+
+    virtual_advance_(Duration::from_millis(100u64));
+    let now = conn_clock.clock_().now();
+    assert_eq!(deadline - now, Duration::from_millis(7400u64));
+    assert_eq!(
+        conn_clock.now_millis_(),
+        100u64,
+        "`now_millis_` 是自 epoch（建时钟那一刻）起算的量"
+    );
+}
+
+/// 验证 `millis_of_` 对超出 `u64` 的时长**饱和**而不是截断。
+/// - 手段：折算 `Duration::MAX` 与一个普通时长。
+/// - 判断：前者为 `u64::MAX`（截断会给出一个小数字、让超时提前触发），后者原样。
+#[test]
+fn millis_of_saturates_instead_of_wrapping() {
+    assert_eq!(super::millis_of_(Duration::MAX), u64::MAX);
+    assert_eq!(super::millis_of_(Duration::from_millis(7u64)), 7u64);
+}
+
 // ── 真实后端用例（两个运行时各一格，缺省 feature 下都跑）──────────────────
 
 /// 以构造时刻为 epoch 的**真实**时钟（纳秒刻度）。

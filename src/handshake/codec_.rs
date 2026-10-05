@@ -511,8 +511,8 @@ pub enum WireError<RE, WE> {
     #[error("握手帧包含不支持的键或校验类型")]
     UnsupportedOption,
 
-    /// 条目区结构非法：重复键、基础项取值为 0、数值超出 `usize`、
-    /// 校验头与算法预告不一致。
+    /// 条目区结构非法：重复键、基础项取值为 0（读侧的解析器与写侧的
+    /// [`write_frame_`] 都判）、数值超出 `usize`、校验头与算法预告不一致。
     #[error("握手帧条目区结构非法")]
     MalformedBody,
 
@@ -583,6 +583,12 @@ where
         let Ok(key) = NegotiationKey::try_from(key as u8) else {
             return Result::Err(WireError::UnsupportedOption);
         };
+        // 基础项取值为 0 在 v1 里非法（`0` 表示「未提供」，应当省略该键）。这是
+        // **编码咽喉**上的最后一道：调用点各自的早判（发起方入参 / 等待方本端项）
+        // 负责「在写出任何字节之前失败」，这一道负责「任何调用者都写不出 0」。
+        if *value == 0 {
+            return Result::Err(WireError::MalformedBody);
+        }
         let (vl_type, entry) = encode_entry_(key, *value);
         let width = 1usize + vl_type.value_len();
         write_all_async_(buff, &entry[..width], cancel.child_token()).await?;
@@ -689,6 +695,29 @@ pub(super) fn basic_to_values_(opts: &BasicOpts) -> [Option<usize>; K_BASIC_KEY_
     ]
 }
 
+/// 本端基础项取值是否合法：v1 里每一项都必须 **`>= 1`**。
+///
+/// # 为什么 `>= 1` 而不是「任意 `usize`」
+///
+/// `0` 在 v1 里表示**「本项未提供」**——那就应当直接**省略该键**，而不是写一个 0。
+/// 秒为单位的两项（`MaxChannelTimeout` / `MaxChannelWaitClose`）因此最小是 1 秒：
+/// `Duration::from_millis(500u64).as_secs() == 0`，这样的本地配置若被写上线，对端的
+/// 解析器会把它判成条目区结构非法——调用方从一个「结构非法」里看不出是自己的配置
+/// 问题。
+///
+/// 这条规则在**三处**落地，缺一不可：
+///
+/// 1. 发起方 [`HandshakeAgent::invite_async`](crate::handshake::agent::HandshakeAgent::invite_async)
+///    对入参逐条判（在写出任何字节之前）；
+/// 2. 等待方 `listen` 对本端 `local` 展开后的 5 项判（同样在读写任何字节之前）；
+/// 3. 编码咽喉 [`write_frame_`] 对**每一帧的每一个条目**再判一次——它是唯一的
+///    出口，因此「v1 不会写出取值为 0 的基础项」是本地可保证的，而不依赖调用点。
+pub(super) fn basic_values_are_valid_(values: &[Option<usize>; K_BASIC_KEY_COUNT]) -> bool {
+    values
+        .iter()
+        .all(|value| matches!(value, Option::None | Option::Some(1usize..)))
+}
+
 /// 判断 5 个基础键是否全部出现。
 pub(super) fn is_complete_(values: &[Option<usize>; K_BASIC_KEY_COUNT]) -> bool {
     values.iter().all(Option::is_some)
@@ -741,6 +770,26 @@ mod tests_ {
     use buffex::x_deps::abs_cancel::NonCancellableToken;
 
     use super::*;
+    /// 目的：验证写侧基础项校验只接受 `>= 1`，`0` 与「缺省」分别被拒 / 放行。
+    ///
+    /// 手段：从全 1 的合法数组出发，逐项改成 `0`（必须非法）再改回 `1`；最后把一项
+    /// 置成 `None`（「未提供」必须合法）。
+    ///
+    /// 判断：每一步的 `basic_values_are_valid_` 结论与上述一致——这条规则是
+    /// 「秒为单位的两项最小 1 秒」在写侧的唯一出处。
+    #[test]
+    fn basic_values_reject_zero_and_accept_one() {
+        let mut values = [Option::Some(1usize); K_BASIC_KEY_COUNT];
+        assert!(basic_values_are_valid_(&values), "全 1 必须合法");
+        for idx in 0..K_BASIC_KEY_COUNT {
+            values[idx] = Option::Some(0usize);
+            assert!(!basic_values_are_valid_(&values), "第 {idx} 项取 0 必须非法");
+            values[idx] = Option::Some(1usize);
+        }
+        values[2] = Option::None;
+        assert!(basic_values_are_valid_(&values), "缺省（未提供）必须合法");
+    }
+
     use crate::handshake::{K_ACCEPT_MAGIC, K_INVITE_MAGIC};
 
     /// 把一帧写进 `buf`，返回写入的字节数。

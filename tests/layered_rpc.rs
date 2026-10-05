@@ -136,7 +136,7 @@ use common::AcceptAsyncClosureExt;
 use core::mem::MaybeUninit;
 
 use abs_art::TrLocalScope;
-use smux_v1::dual_runtime_test_;
+use smux_v1::single_runtime_test_;
 use abs_smux::{
     chan::TrChannelHalf,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
@@ -712,7 +712,7 @@ struct HalfHolder_<S> {
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 /// 测试目标：按 L4→L5→L6→L7 分层跑通一次「客户端 4 次并发 RPC」，**两个运行时各跑
-/// 一遍**（tokio 与 compio 由 [`dual_runtime_test_!`] 生成）。
+/// 一遍**（tokio 与 compio 由 [`single_runtime_test_!`] 生成）。
 ///
 /// - 手段：用 [`layered_rpc_scenario_`] 串起各层——内存环建链、两端并发握手、
 ///   服务端「建 listener」与「accept 循环」分两个函数、客户端为每次调用绑定不同的
@@ -723,7 +723,7 @@ struct HalfHolder_<S> {
 ///   「当前 API 允许这样分层地用」。
 async fn layered_rpc_dual_<S>(scope: &S)
 where
-    S: TrLocalScope + Clone + 'static,
+    S: TrLocalScope + abs_art::TrTime + Clone + 'static,
 {
     let scenario = layered_rpc_scenario_(scope);
     scope.run_until(scenario).await;
@@ -731,7 +731,10 @@ where
 
 /// 见 [`layered_rpc_dual_`] 说明：本函数只是给 tokio 作用域类型做一次实例化。
 async fn layered_rpc_body_tokio_() {
+    #[cfg(feature = "test-tokio-runtime")]
     let scope = abs_art_tokio::LocalScope::new();
+    #[cfg(not(feature = "test-tokio-runtime"))]
+    let scope = abs_art_compio::LocalScope::new();
     layered_rpc_dual_(&scope).await;
 }
-dual_runtime_test_!(layered_rpc_body_tokio_);
+single_runtime_test_!(layered_rpc_body_tokio_);

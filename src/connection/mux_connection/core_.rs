@@ -48,6 +48,7 @@ use crate::{
     },
     flow_ctrl::WindowReport,
     handshake::opts::HandshakeOpts,
+    time::ConnClock_,
 };
 
 /// 复用连接的**演员核心**：连接的全部共享状态与全部资源句柄。
@@ -61,7 +62,7 @@ use crate::{
 ///
 /// # 生命周期
 ///
-/// 最后一个应用面强引用消失时本类型析构，`Drop` 触发两个循环的取消令牌
+/// 最后一个应用面强引用消失时本类型析构，`Drop` 触发五个循环的取消令牌
 /// （`ChannelRegistry_::cancel_loops_`），循环随即在下一个 await 点自行退出。
 pub(crate) struct MuxCore<C, S>
 where
@@ -76,6 +77,11 @@ where
     /// 本地作用域：既用于建连时 `spawn_local`，也作为队列的保活槽。
     scope_: S,
 
+    /// 连接级时钟（注入的时钟 + 建连 epoch）：API 路径要用它取「现在」。
+    ///
+    /// 五个循环各持一份克隆，与这里共享**同一个** epoch，因此各处算出的毫秒可比。
+    conn_clock_: ConnClock_<C::Clock>,
+
     /// dock / 子流身份索引、失败标志与两个循环的取消令牌。
     reg_: ChannelRegistry_<C::Alloc>,
 
@@ -85,12 +91,13 @@ where
     /// 读事件发送端（接收环注册与释放）。
     r_events_: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
 
-    /// 四个循环的取消令牌（`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵）。
+    /// 五个循环的取消令牌（`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵、
+    /// `4` = 计时）。
     ///
     /// 核心自己持一份克隆，**而不是在 `Drop` 里去注册表取**：注册表取锁在跨线程
     /// 争用时是阻塞等待，而 `Drop` 必须不阻塞。令牌是可克隆的共享句柄，因此这里
     /// 持有的就是循环在用的那一个。
-    loops_: [CancelToken_<C::Alloc>; 4],
+    loops_: [CancelToken_<C::Alloc>; 5],
 }
 
 impl<C, S> MuxCore<C, S>
@@ -98,19 +105,25 @@ where
     C: TrConnCfg,
 {
     /// 由建连路径展开后的全部量构造（成员私有，构造只能走这里）。
+    ///
+    /// 参数确实多（策略 / 协商结果 / 作用域 / 注册表 / 时钟 / 两条通道 / 五个令牌）：
+    /// 它们全部来自同一个建连路径，打成一个中间结构只会多一层壳而没有别的收益。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_(
         config: C,
         opts: HandshakeOpts,
         scope: S,
         reg: ChannelRegistry_<C::Alloc>,
+        conn_clock: ConnClock_<C::Clock>,
         w_events: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
         r_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
-        loops: [CancelToken_<C::Alloc>; 4],
+        loops: [CancelToken_<C::Alloc>; 5],
     ) -> Self {
         MuxCore {
             config_: config,
             opts_: opts,
             scope_: scope,
+            conn_clock_: conn_clock,
             reg_: reg,
             w_events_: w_events,
             r_events_: r_events,
@@ -132,6 +145,11 @@ where
         &self.scope_
     }
 
+    /// 「现在」的连接内毫秒（等价于 `conn_clock_().now_millis_()` 的便捷入口）。
+    pub(crate) fn now_millis_(&self) -> u64 {
+        self.conn_clock_.now_millis_()
+    }
+
     /// dock / 子流身份索引与失败标志。
     pub(crate) fn reg_(&self) -> &ChannelRegistry_<C::Alloc> {
         &self.reg_
@@ -147,7 +165,8 @@ where
         &self.r_events_
     }
 
-    /// 第 `idx` 个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
+    /// 第 `idx` 个循环的取消令牌（`0` = 读泵、`1` = 解复用、`2` = 复用、
+    /// `3` = 写泵、`4` = 计时）。
     pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<C::Alloc> {
         self.loops_[idx].clone()
     }
@@ -179,7 +198,9 @@ where
         &self,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
-        self.reg_.drain_session_events_(cancel).await
+        self.reg_
+            .drain_session_events_(self.now_millis_(), cancel)
+            .await
     }
 
     /// 独占绑定一个 `local_dock`（[`TrConnection::bind_async`] 的登记点）。
@@ -221,7 +242,7 @@ where
         cancel: K,
     ) -> Result<ChannelOwner_<C::Alloc>, ReserveErr_> {
         self.reg_
-            .reserve_channel_(local_dock, remote_dock, cancel)
+            .reserve_channel_(local_dock, remote_dock, self.now_millis_(), cancel)
             .await
     }
 
@@ -245,7 +266,7 @@ where
         cancel: K,
     ) -> Result<(), ReserveErr_> {
         self.reg_
-            .release_channel_(local_dock, remote_dock, cancel)
+            .release_channel_(local_dock, remote_dock, self.now_millis_(), cancel)
             .await
     }
 
@@ -283,14 +304,15 @@ impl<C, S> Drop for MuxCore<C, S>
 where
     C: TrConnCfg,
 {
-    /// 连接收尾：触发四个循环的取消令牌。
+    /// 连接收尾：触发五个循环的取消令牌。
     ///
     /// 循环在每个 await 点检查令牌并自行退出（泵与解复用循环的 park 经
     /// `race_cancel_`、复用循环的 park 与取消 future 竞争），因此这里是「丢弃
     /// 连接即关闭连接」的唯一入口，不依赖句柄的 `abort` / `drop` 语义。
     ///
     /// 令牌就在核心自己的字段里，因此本 `Drop` **不取注册表锁、不阻塞**——这一点
-    /// 是跨线程收尾的前提：最后一个句柄可能在任意线程上被丢弃。
+    /// 是跨线程收尾的前提：最后一个句柄可能在任意线程上被丢弃。计时循环也在这份
+    /// 令牌上竞争，因此它不会在连接析构后继续持有状态。
     fn drop(&mut self) {
         for token in &self.loops_ {
             token.cancel_();

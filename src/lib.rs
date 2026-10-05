@@ -25,6 +25,12 @@ mod test_support_;
 #[allow(unused_imports)]
 pub use dual_runtime_test_ as _;
 
+/// 同上：把 `single_runtime_test_!` 放到 crate 根，供集成测试
+/// `use smux_v1::single_runtime_test_;`。
+#[doc(hidden)]
+#[allow(unused_imports)]
+pub use single_runtime_test_ as _;
+
 pub mod connection;
 pub mod flow_ctrl;
 pub mod handshake;

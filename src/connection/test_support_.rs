@@ -33,6 +33,7 @@ use crate::{
     },
     flow_ctrl::DefaultPolicy,
     handshake::opts::{BasicOpts, HandshakeOpts},
+    time::SystemClock,
 };
 
 /// 测试用的本地作用域：**不驱动也不保存**任何任务。
@@ -112,6 +113,7 @@ impl TrMuxConfig for TestMuxConfig_ {
 
 impl TrConnCfg for TestMuxConfig_ {
     type Alloc = CoreAlloc;
+    type Clock = SystemClock;
     type Policy = DefaultPolicy;
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
@@ -119,6 +121,10 @@ impl TrConnCfg for TestMuxConfig_ {
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
+    }
+
+    fn clock(&self) -> Self::Clock {
+        SystemClock
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -160,6 +166,7 @@ impl TrMuxConfig for ErasedTestMuxConfig_ {
 
 impl TrConnCfg for ErasedTestMuxConfig_ {
     type Alloc = CoreAlloc;
+    type Clock = SystemClock;
     type Policy = DefaultPolicy;
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
@@ -167,6 +174,10 @@ impl TrConnCfg for ErasedTestMuxConfig_ {
 
     fn allocator(&self) -> Self::Alloc {
         CoreAlloc
+    }
+
+    fn clock(&self) -> Self::Clock {
+        SystemClock
     }
 
     fn policy(&self) -> &Self::Policy {

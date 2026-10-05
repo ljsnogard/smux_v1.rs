@@ -13,9 +13,18 @@
 //!
 //! # 运行方式：作用域由调用方取得并驱动
 //!
-//! 连接的两个循环经 `abs_art` 的 [`TrLocalScope`] **值**投递（不再有运行时类型
+//! 连接的五个循环经 `abs_art` 的 [`TrLocalScope`] **值**投递（不再有运行时类型
 //! 参数），因此每个用例自己做两件事：取得作用域、驱动它。tokio 用
 //! `scope.run_until(..)`，compio 的运行时自己驱动线程本地队列。
+//!
+//! # 为什么用 `single_runtime_test_!` 而不是 `dual_runtime_test_!`
+//!
+//! 第五个循环（保活 / 空闲超时）要**真正等一段时间**，而等待能力挂在后端类型上：
+//! tokio 与 compio 的 `LocalScope` 是两个类型。本文件因此按当前 feature 选作用域
+//! （见下面的 `LocalScope` 选择），并让每个用例只生成**一个**变体——两个 feature
+//! 组合各跑一遍，覆盖面与「两个变体」相同，但不会在一个运行时里拿到另一个后端的
+//! 作用域（那样第五个循环会 panic「no reactor running」）。理由详见
+//! `single_runtime_test_!` 的文档。
 
 mod common;
 
@@ -48,12 +57,18 @@ macro_rules! yield_once_ {
 use abs_art::TrLocalScope;
 use abs_smux::conf::TrMuxConfig;
 use abs_smux::conn::{TrChannelListener, TrDockBinding};
+// 作用域类型随 feature 选：这两个后端的 `LocalScope` 各自提供计时能力，而第五个
+// 循环（保活 / 空闲超时）**必须**跑在真正支持计时的后端上。详见
+// `single_runtime_test_!` 的文档。
+#[cfg(feature = "test-tokio-runtime")]
 use abs_art_tokio::LocalScope;
+#[cfg(not(feature = "test-tokio-runtime"))]
+use abs_art_compio::LocalScope;
 use abs_smux::conn::TrConnection;
 use buffex::x_deps::abs_buff::{Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite};
 use buffex::x_deps::anylr::SomeOf;
 use buffex::x_deps::abs_cancel;
-use smux_v1::dual_runtime_test_;
+use smux_v1::single_runtime_test_;
 use smux_v1::{
     connection::{Dock, MuxConnection, TrConnCfg},
     handshake::{
@@ -83,7 +98,7 @@ async fn mux_small_inmem_dual_() {
     let scenario = common::run_small_mux_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
-dual_runtime_test_!(mux_small_inmem_dual_);
+single_runtime_test_!(mux_small_inmem_dual_);
 
 /// 测试目标：**传输环取到环原语的下限（1 字节）**时，握手 + 建流 + 双向收发仍全部成功。
 ///
@@ -101,7 +116,7 @@ async fn mux_single_byte_transport_dual_() {
     let scenario = common::run_small_mux_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
-dual_runtime_test_!(mux_single_byte_transport_dual_);
+single_runtime_test_!(mux_single_byte_transport_dual_);
 
 /// 测试目标（**丢唤醒回归**）：安静的连接上，某条子流**第一次**写入低于临界水位也必须
 /// 被搬运到对端。
@@ -124,7 +139,7 @@ async fn mux_idle_small_write_inmem_dual_() {
     let scenario = common::run_idle_small_write_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
-dual_runtime_test_!(mux_idle_small_write_inmem_dual_);
+single_runtime_test_!(mux_idle_small_write_inmem_dual_);
 
 /// 测试目标（**本轮验收点**）：**最终裁决**（`accept_async`）成为建流的唯一提交点
 /// ——在它之前丢弃半建立句柄，两个角色都不留垃圾、不悬着对端。
@@ -145,7 +160,7 @@ async fn mux_unsettled_handle_dual_() {
     let scenario = common::run_unsettled_handle_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
-dual_runtime_test_!(mux_unsettled_handle_dual_);
+single_runtime_test_!(mux_unsettled_handle_dual_);
 
 /// 测试目标：tokio 下 `bind_async` 对同一个 `local_dock` 是**独占**的——首次绑定
 /// 成功，第二次绑定报 `BindError::DockInUse`，丢弃 binding 后可重绑。
@@ -166,7 +181,7 @@ async fn mux_bind_is_exclusive_dual_() {
     let scenario = common::run_bind_exclusivity_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
-dual_runtime_test_!(mux_bind_is_exclusive_dual_);
+single_runtime_test_!(mux_bind_is_exclusive_dual_);
 
 /// 测试目标（**本轮验收点**）：环存储的**类型**由使用环境声明、**分配**由 accept 端
 /// 当场决定——同一条连接上两条子流可以切不同容量、来自不同段内存，全程零装箱。
@@ -188,7 +203,7 @@ async fn mux_per_channel_alloc_dual_() {
     let scenario = common::run_per_channel_alloc_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
-dual_runtime_test_!(mux_per_channel_alloc_dual_);
+single_runtime_test_!(mux_per_channel_alloc_dual_);
 
 /// 测试目标（**T1 验收点**）：应用丢掉接收半边之后到达的数据被**静默丢弃**，连接
 /// 继续服务同一条连接上的其它子流。
@@ -209,7 +224,7 @@ async fn mux_recv_dropped_dual_() {
     let scenario = common::run_recv_dropped_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
-dual_runtime_test_!(mux_recv_dropped_dual_);
+single_runtime_test_!(mux_recv_dropped_dual_);
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 收尾：丢弃连接 ⇒ 两个循环退出并把传输交还
@@ -475,7 +490,7 @@ async fn dropping_connection_stops_both_loops_body_tokio_() {
     let scope = LocalScope::new();
     dropping_connection_stops_both_loops_dual_(&scope).await;
 }
-dual_runtime_test_!(dropping_connection_stops_both_loops_body_tokio_);
+single_runtime_test_!(dropping_connection_stops_both_loops_body_tokio_);
 
 /// 测试目标：**只丢弃一侧连接时，该侧的两个循环也必须退出**——即使对端仍然活着且
 /// 完全空闲（既不发送、也不关闭自己的方向）。
@@ -554,7 +569,7 @@ async fn dropping_one_side_stops_its_loops_body_tokio_() {
     let scope = LocalScope::new();
     dropping_one_side_stops_its_loops_dual_(&scope).await;
 }
-dual_runtime_test_!(dropping_one_side_stops_its_loops_body_tokio_);
+single_runtime_test_!(dropping_one_side_stops_its_loops_body_tokio_);
 
 /// 测试目标（**本轮验收点**）：连接**拒绝接受**不合约的环内存，且因此不弄脏连接。
 ///
@@ -573,7 +588,7 @@ async fn mux_ring_rejected_dual_() {
     let scenario = common::run_ring_rejected_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
-dual_runtime_test_!(mux_ring_rejected_dual_);
+single_runtime_test_!(mux_ring_rejected_dual_);
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 极小帧暂存容量：钉住「逐字节异步解析」这条要求
@@ -636,6 +651,7 @@ where
     R: TrBuffRead<u8> + 'static,
 {
     type Alloc = mm_ptr::x_deps::abs_mm::CoreAlloc;
+    type Clock = smux_v1::time::SystemClock;
     type Policy = smux_v1::flow_ctrl::DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -643,6 +659,10 @@ where
 
     fn allocator(&self) -> Self::Alloc {
         mm_ptr::x_deps::abs_mm::CoreAlloc
+    }
+
+    fn clock(&self) -> Self::Clock {
+        smux_v1::time::SystemClock
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -712,7 +732,7 @@ async fn mux_min_stage_inmem_body_tokio_() {
     let scope = LocalScope::new();
     mux_min_stage_inmem_dual_(&scope).await;
 }
-dual_runtime_test_!(mux_min_stage_inmem_body_tokio_);
+single_runtime_test_!(mux_min_stage_inmem_body_tokio_);
 
 /// 最小帧暂存场景的执行体：建连 + 一对子流的双向收发与半关闭。
 async fn drive_min_stage_<RA, WA, RB, WB, S>(

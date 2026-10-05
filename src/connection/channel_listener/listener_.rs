@@ -69,7 +69,7 @@ where
     }
 }
 
-/// 丢弃监听器即**解除 listener 身份**（投递 [`SessionEvent_::ReleaseListener`]，
+/// 丢弃监听器即**解除 listener 身份**（投递 `SessionEvent_::ReleaseListener`，
 /// 由核心落实），使同一个 `local_dock` 之后可以再作 telegraph 使用
 /// （见 `ChannelRegistry_::release_listener_`）。
 ///

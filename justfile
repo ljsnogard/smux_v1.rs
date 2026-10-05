@@ -52,6 +52,10 @@ test-compio: test-tokio
     @echo "注：必须 --no-default-features，否则 test-tokio-runtime 仍会被默认打开、"
     @echo "    共享场景会走 tokio 分支；本 target 在 --all-targets 下被 cfg 掉。"
     cargo test --manifest-path {{manifest}} --test smoke_compio --no-default-features --features test-compio-runtime
+    cargo test --manifest-path {{manifest}} --test keepalive_compio --no-default-features --features test-compio-runtime
+    @echo "注：inmem_mux / layered_rpc 的用例体按 feature 选作用域（第五个循环必须跑在"
+    @echo "    真正支持计时的后端上），因此它们也要在 compio 侧单独跑一遍。"
+    cargo test --manifest-path {{manifest}} --test inmem_mux --test layered_rpc --no-default-features --features test-compio-runtime
 
 # tokio 侧全部集成用例（缺省 feature 下的 `--all-targets`）
 test-tokio: check-all-features

@@ -44,7 +44,7 @@ use buffex::{
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, Dock, MuxConnection, TrConnCfg,
+        BufferedRx, BufferedTx, Dock, MuxConnection, MuxError, TrConnCfg,
         // config_::TrMuxAllocConfig,
         owner_::ChannelOwner_,
         signal_::{ReadEvent_, TrEventSender_, WriteEvent_},
@@ -222,6 +222,31 @@ where
             offset += put;
         }
         Result::Ok(())
+    }
+
+    /// 本条子流被**连接内部主动中止**的原因（若发生过）。
+    ///
+    /// # 什么时候会有值
+    ///
+    /// 目前只有一种：`max_channel_timeout` 内既无数据、也无任何方向的保活往来，
+    /// 计时循环判**空闲超时**（[`MuxError::IdleTimeout`]）并拆掉这条子流。此时：
+    ///
+    /// - 本半部与对侧半部的环都进入关闭态（`is_tx_closed` / `is_rx_closed` 为真，
+    ///   读写返回 `Closing`），与「对端正常半关闭」在**环**这一层不可区分；
+    /// - 本方法是两者**唯一**的区别：它给出「是保活判定拆的，而不是对端关的」。
+    ///
+    /// 返回值只增不减：一旦置上就不会被后来的正常关闭覆盖。
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // 应用侧轮询到环关闭之后，用它区分「对端关的」与「空闲超时拆的」。
+    /// if tx.is_tx_closed() && tx.abort_reason() == Some(MuxError::IdleTimeout) {
+    ///     // 保活判定拆流：可以按自己的策略重连。
+    /// }
+    /// ```
+    pub fn abort_reason(&self) -> Option<MuxError> {
+        self.owner_.abort_reason_()
     }
 }
 
@@ -445,6 +470,14 @@ where
             offset += got;
         }
         Result::Ok(())
+    }
+
+    /// 本条子流被**连接内部主动中止**的原因（若发生过）。
+    ///
+    /// 与 [`ChannelTx::abort_reason`] 同源、同语义：一条子流的两个半部读到**同一个**
+    /// 原因（它在共享状态里，不在任一半部里）。见该方法的说明。
+    pub fn abort_reason(&self) -> Option<MuxError> {
+        self.owner_.abort_reason_()
     }
 }
 

@@ -41,8 +41,8 @@ use buffex::x_deps::{abs_buff, abs_cancel};
 use crate::handshake::{
     K_ACCEPT_MAGIC, K_CONFRM_MAGIC, K_INVITE_MAGIC, K_REJECT_MAGIC,
     codec_::{
-        FrameReader, K_DEFAULT_CHECKSUM, complete_invite_, complete_values_, confirm_matches_,
-        values_to_basic_, write_frame_,
+        FrameReader, K_DEFAULT_CHECKSUM, basic_to_values_, basic_values_are_valid_,
+        complete_invite_, complete_values_, confirm_matches_, values_to_basic_, write_frame_,
     },
     error::{HandshakeError, from_read_frame_err_, from_write_frame_err_},
     opts::{BasicOpts, HandshakeOpts, K_BASIC_KEY_COUNT, NegotiationEntry, NegotiationKey},
@@ -407,6 +407,17 @@ where
 {
     let empty: [Option<usize>; K_BASIC_KEY_COUNT] = [Option::None; K_BASIC_KEY_COUNT];
 
+    // 0. 本端基础项先过一遍：补全 `INVITE` 未提及的项时会把它们写进 `ACCEPT`
+    //    （`complete_invite_`），而 `0` 在 v1 里非法（`0` 表示「未提供」：秒为单位
+    //    的项因此最小是 1 秒，`Duration::from_millis(500).as_secs() == 0`）。
+    //
+    //    在这里判、而不是等编码咽喉 `write_frame_` 判：本检查发生在**读写任何
+    //    字节之前**，失败时线上没有半条帧——与发起方 `invite_async` 对入参的早判
+    //    对称（那一条见 `handshake_invite_async_` 的入参循环）。
+    if !basic_values_are_valid_(&basic_to_values_(local)) {
+        return Result::Err(HandshakeError::MalformedBody);
+    }
+
     // 1. 等待 INVITE，并**边收边判**。
     let mut reader = FrameReader::begin_async_(&mut rx, cancel.child_token())
         .await
@@ -557,6 +568,55 @@ mod tests_ {
         assert_eq!(invited.opts.basic_opts.max_packet_size, 4096usize);
     }
     dual_runtime_test_!(handshake_through_ring_test_);
+
+    /// 目的：验证发起方对本端声明的入参做**同一条** `>= 1` 早判（与等待方对称）。
+    ///
+    /// 手段：把截断为 0 的 `max_channel_timeout` 所在的 [`BasicOpts`] 当入参
+    /// （`&BasicOpts` 实现了 `IntoIterator<Item = NegotiationEntry>`），接收侧给一段
+    /// **空**字节流，直接调用 `invite_async`。
+    ///
+    /// 判断：返回 `MalformedBody`——校验发生在写 `INVITE` 与读 `ACCEPT` 之前，空接收侧
+    /// 因此绝不会被读到（读到会先得到读错误）。这条早判原先就存在，这里把它钉住，
+    /// 免得将来只剩编码咽喉那一处兜底。
+    async fn invite_rejects_zero_valued_entry() {
+        let proposed = BasicOpts {
+            max_channel_timeout: core::time::Duration::from_millis(500u64),
+            ..BasicOpts::default()
+        };
+        let rx: &[u8] = &[];
+        let mut sink = [0u8; 64];
+        let agent = HandshakeAgent::new(&mut sink[..], rx);
+        let res = agent.invite_async(&proposed, AcceptAllEntries).await;
+        assert!(
+            matches!(res, Result::Err(HandshakeError::MalformedBody)),
+            "本端入参里截断为 0 的秒级项必须在写 INVITE 之前被拒"
+        );
+    }
+    dual_runtime_test_!(invite_rejects_zero_valued_entry);
+
+    /// 目的：验证等待方的**本端**基础项取 0 时，在读写任何字节之前就失败。
+    ///
+    /// 手段：`max_channel_timeout` 取 500 ms（`as_secs()` 截断为 0）作为 `local`，
+    /// 接收侧给一段**空**字节流，直接调用 `listen_async`。
+    ///
+    /// 判断：返回 `MalformedBody`——接收侧是空的，若校验发生在读之后，这里会先得到
+    /// 读错误；返回它即证明该检查在这些读写之前。这条与发起方对入参的早判对称，
+    /// 补上的是等待方原先唯一的缺口（`local` 经 `complete_invite_` 补进 `ACCEPT`）。
+    async fn listen_rejects_sub_second_local_timeout() {
+        let local = BasicOpts {
+            max_channel_timeout: core::time::Duration::from_millis(500u64),
+            ..BasicOpts::default()
+        };
+        let rx: &[u8] = &[];
+        let mut sink = [0u8; 64];
+        let agent = HandshakeAgent::new(&mut sink[..], rx);
+        let res = agent.listen_async(&local, AcceptAllEntries).await;
+        assert!(
+            matches!(res, Result::Err(HandshakeError::MalformedBody)),
+            "本端秒级项截断为 0 必须在写 ACCEPT 之前被拒"
+        );
+    }
+    dual_runtime_test_!(listen_rejects_sub_second_local_timeout);
 
     /// 测试读侧校验失败不会被误报成「本端主动拒绝」。
     /// - 手段：手工构造一个 CRC 被翻转的 `INVITE` 字节流交给等待方读取；协商器

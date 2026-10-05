@@ -35,6 +35,24 @@
 //! 3. 去重位仍是**锁外**：同步路径（`try_write` / `try_read`）没有 `await` 可用，
 //!    CAS 是唯一不需要等待的表达。
 //!
+//! # 保活记账（活跃脏位 + 中止代码）
+//!
+//! 除状态字外，每条子流还有三个与保活有关的独立原子量，它们**不进**状态字，因为
+//! 写入者不同、且都不参与「两个方向是否收尾」的 CAS 判据：
+//!
+//! | 字段 | 谁写 | 语义 |
+//! | --- | --- | --- |
+//! | `active_millis_` | 任何 `touch_` / `mark_data_` 调用点（热路径，每帧一次） | 最近一次活动（存活时钟） |
+//! | `data_millis_` | 任何 `mark_data_` 调用点 + 计时循环发 `PULSE` 时 | 最近一次非保活活动（保活职责时钟） |
+//! | `abort_` | **只有计时循环**（一次 CAS 认领） | 中止代码，见 [`AbortCode_`] |
+//!
+//! 两个时钟分开是**保活能否收敛**的前提：收到对端 `PULSE` 只刷新存活时钟，
+//! 因此两端都会按自己的职责时钟继续发 `PULSE`（若合一，两端会互相把对方的保活
+//! 「劝退」，先停手的那一侧必定被判空闲超时）。
+//!
+//! 这样切分的收益是热路径**不读时钟**：活动点只做一次原子置位，而「现在几点」由
+//! 唯一持有时间语义的计时循环在扫描时打点（见 [`ChannelState_::touch_`]）。
+//!
 //! # 流控也是原子的
 //!
 //! [`FlowCtrl`]（收发双向窗口）的方法全部取 `&self`、字段全部是原子，因此对窗口的
@@ -44,10 +62,9 @@
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicU8, Ordering},
     task::{Context, Poll},
 };
-use std::time::Instant;
 
 use atomic_sync::x_deps::atomex;
 use atomex::AtomicFlags;
@@ -150,6 +167,51 @@ pub(crate) enum EstablishOutcome_ {
 // 共享状态节点
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
+/// 一条子流的中止原因（保活判定用）。
+///
+/// 目前只有一种：空闲超时。它由**计时循环**认领（[`ChannelState_::claim_abort_`]）
+/// 并通过 [`ChannelState_::abort_reason_`] 回传给应用侧的两个半部
+/// （[`ChannelTx::abort_reason`](super::ChannelTx::abort_reason)）。
+///
+/// 存成 `AtomicU8` 而不是把 `MuxError` 塞进原子：`MuxError` 是普通的 `Copy` 枚举，
+/// 没有稳定的整数表示，直接把它的位模式存下来会随编译选项变化。这里只存一个
+/// **代码**，读出来时再映射成 [`MuxError`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbortCode_ {
+    /// 空闲超时：`max_channel_timeout` 内既无数据、也无保活往来。
+    IdleTimeout,
+}
+
+impl AbortCode_ {
+    /// 「没有中止」的哨兵值。
+    const NONE: u8 = 0u8;
+
+    /// 空闲超时的代码值。
+    const IDLE_TIMEOUT: u8 = 1u8;
+
+    /// 编码成原子字。
+    fn as_u8_(self) -> u8 {
+        match self {
+            AbortCode_::IdleTimeout => AbortCode_::IDLE_TIMEOUT,
+        }
+    }
+
+    /// 从原子字解码；`NONE` 与未知值都解码成 `None`。
+    fn from_u8_(value: u8) -> Option<Self> {
+        match value {
+            AbortCode_::IDLE_TIMEOUT => Option::Some(AbortCode_::IdleTimeout),
+            _ => Option::None,
+        }
+    }
+
+    /// 投影成连接级错误（应用侧看到的那一个）。
+    fn as_error_(self) -> MuxError {
+        match self {
+            AbortCode_::IdleTimeout => MuxError::IdleTimeout,
+        }
+    }
+}
+
 /// 一条子流的共享状态。
 ///
 /// 成员一律私有：读写循环在 `session_` 模块，只能经本模块的关联函数访问。
@@ -163,23 +225,39 @@ pub(crate) struct ChannelState_ {
     /// 建流等待者的**零分配**内联通知槽（协议见 [`NotifySlot_`]）。
     establish_: NotifySlot_,
 
-    /// 节点建立时刻：`active_millis_` 的计时基准。
-    base_: Instant,
-
-    /// 最近一次与本子流相关的收发活动时间（自 `base_` 起的毫秒；保活只记录，本轮
-    /// 不判定超时）。
+    /// **存活时钟**：最近一次收到任何一帧（**含**对端 `PULSE`）或本端写出一段
+    /// 数据的连接内毫秒。`max_channel_timeout` 的判据是它。
     active_millis_: AtomicU64,
+
+    /// **保活职责时钟**：最近一次**非保活**活动（数据 / 建流帧 / 窗口通告）的连接内
+    /// 毫秒，也包含本端自己上一次发出 `PULSE` 的时刻。`PULSE` 的职责以它为准。
+    ///
+    /// 与 [`ChannelState_::active_millis_`] 分开是**保活能否收敛**的前提：
+    /// **收到对端的 `PULSE` 只刷新存活时钟、不刷新本端的保活职责时钟**。若两者合一，
+    /// 两端会在同一时刻互相把对方的空闲清零、于是**都不发** `PULSE`，而各自的存活
+    /// 时钟又从「最后一次真实活动」起算——先停手的那一侧必定先到
+    /// `max_channel_timeout` 并被拆掉（`tests/keepalive.rs` 的第一版正是这么失败的：
+    /// 被判 `IdleTimeout` 的恰好是先发出 `PULSE` 的那一侧）。
+    data_millis_: AtomicU64,
+
+    /// 中止代码：[`AbortCode_::NONE`] 表示未中止（见 [`AbortCode_`]）。
+    abort_: AtomicU8,
 }
 
 impl ChannelState_ {
     /// 建一个**尚未安装窗口**的共享状态（登记身份时调用）。
+    ///
+    /// 两个时钟都从 `0` 起，**必须**由登记路径立刻用「现在」打点一次
+    /// （[`ChannelState_::mark_data_`]）：否则连接建立了很久之后才出现的子流会被算成
+    /// 「自连接建立起就没动过」，第一条扫描就判它空闲超时。
     pub(crate) fn new_empty_() -> Self {
         ChannelState_ {
             flags_: AtomicFlags::new(core::sync::atomic::AtomicUsize::new(0usize)),
             flow_: FlowCtrl::new_empty_(),
             establish_: NotifySlot_::new_(),
-            base_: Instant::now(),
             active_millis_: AtomicU64::new(0u64),
+            data_millis_: AtomicU64::new(0u64),
+            abort_: AtomicU8::new(AbortCode_::NONE),
         }
     }
 
@@ -209,17 +287,82 @@ impl ChannelState_ {
         &self.flow_
     }
 
-    /// 刷新活跃时间。
-    pub(crate) fn touch_(&self) {
-        let elapsed = self.base_.elapsed().as_millis();
-        self.active_millis_
-            .store(u64::try_from(elapsed).unwrap_or(u64::MAX), Ordering::Release);
+    /// 记下「本子流**还活着**」：刷新**存活时钟**（`max_channel_timeout` 的判据）。
+    ///
+    /// 调用点是**收到的任何一帧**——包括对端的 `PULSE`：收到保活应答正是「对端还
+    /// 活着」的直接证据。
+    ///
+    /// **本端发出的 `PULSE` 不算**：它是探测本身，若能刷新自己的存活时钟，对端已死
+    /// 时本端也会一直给自己续命，空闲超时永远不会触发。
+    ///
+    /// # 为什么时刻由调用方传进来
+    ///
+    /// 活动发生在没有时钟的地方不合适——**但时刻必须就地记下**，不能像早先那样只
+    /// 置一个脏位、等计时循环扫描时才打点：扫描是有周期的，一条在扫描间隙里到达的
+    /// 建流帧会被记成「扫描那一刻才活动」，于是本端的 `PULSE` 职责被无谓地推迟一整个
+    /// 保活周期，对端可能先一步判超时（`tests/keepalive.rs` 撞到的正是这个）。
+    ///
+    /// 调用方（解复用 / 复用循环）手上都有连接级时钟，每次活动读一次 `Instant::now()`
+    /// 就够——它是一次 vDSO 读，与本循环每帧的解析 / 环操作相比可以忽略。
+    pub(crate) fn touch_(&self, now_millis: u64) {
+        self.active_millis_.store(now_millis, Ordering::Release);
     }
 
-    /// 活跃时间（自节点建立起的毫秒）。
-    #[cfg(test)]
+    /// 记下「本子流有过**非保活**活动」：同时刷新存活时钟与**保活职责时钟**。
+    ///
+    /// 调用点覆盖收发两个方向的真实流量：收到的数据 / `OPEN` / `ACCEPT` / `CLOSE` /
+    /// 窗口通告，以及**本端成功写出的一段数据**。
+    ///
+    /// 为什么本端发送也算：纯下载方向的接收方可能长时间一个字节都不发（应用消费得
+    /// 慢、窗口通告迟迟不触发），若只认「收到」，发送方会把一条**完全健康**的连接
+    /// 判成空闲超时。两个方向对称之后，只要还有数据在动，两端都看得见活动。
+    ///
+    /// 与 [`ChannelState_::touch_`] 的差别只有一处，但那一处决定保活能否收敛：
+    /// 收到对端的 `PULSE` 只走 `touch_`，**不**重置本端的保活职责时钟——否则两端会
+    /// 互相把对方的保活「劝退」，谁都等不到对方的 `PULSE`。
+    pub(crate) fn mark_data_(&self, now_millis: u64) {
+        self.active_millis_.store(now_millis, Ordering::Release);
+        self.data_millis_.store(now_millis, Ordering::Release);
+    }
+
+    /// 最近一次活动的连接内毫秒（存活时钟）。
     pub(crate) fn active_millis_(&self) -> u64 {
         self.active_millis_.load(Ordering::Acquire)
+    }
+
+    /// 最近一次非保活活动的连接内毫秒（保活职责时钟）。
+    pub(crate) fn data_millis_(&self) -> u64 {
+        self.data_millis_.load(Ordering::Acquire)
+    }
+
+    /// 写入「上一次发出 `PULSE`」的时刻（**只有计时循环调用**）。
+    ///
+    /// 发出保活探测**不**刷新存活时钟（否则对端已死也永远不超时），但它必须推进
+    /// **保活职责时钟**，否则下一轮扫描会立刻再发一条。
+    pub(crate) fn set_data_millis_(&self, millis: u64) {
+        self.data_millis_.store(millis, Ordering::Release);
+    }
+
+    /// 认领「中止这条子流」：第一次调用返回 `true`（此后 `is_aborted_` 恒为真）。
+    pub(crate) fn claim_abort_(&self, code: AbortCode_) -> bool {
+        self.abort_
+            .compare_exchange(
+                AbortCode_::NONE,
+                code.as_u8_(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// 本子流是否已被中止（计时循环判定空闲超时后为真）。
+    pub(crate) fn is_aborted_(&self) -> bool {
+        self.abort_.load(Ordering::Acquire) != AbortCode_::NONE
+    }
+
+    /// 中止原因（若有）；应用侧的两个半部经它区分「空闲超时」与「对端正常关闭」。
+    pub(crate) fn abort_reason_(&self) -> Option<MuxError> {
+        AbortCode_::from_u8_(self.abort_.load(Ordering::Acquire)).map(AbortCode_::as_error_)
     }
 
     //-- ---- 建流位 ----
@@ -432,11 +575,13 @@ impl ChannelState_ {
     /// 写入方，因此「已记账的累计已收 − 环内积压」就是**精确**的累计已消费量；应用侧
     /// 采样差值会被并发写入掩盖（因果见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
     ///
-    /// 记账与判定在同一段窗口临界区里完成；只有真的推进了消费记账才刷新活跃时间。
-    pub(crate) fn recv_recheck_(&self, buffered: Credit) -> Option<WindowReport> {
+    /// 记账与判定在同一段窗口临界区里完成；只有真的推进了消费记账才刷新**存活时钟**
+    /// （这是本端应用在消费，不构成「对端还在」以外的任何保活义务，因此不推进保活
+    /// 职责时钟）。
+    pub(crate) fn recv_recheck_(&self, buffered: Credit, now_millis: u64) -> Option<WindowReport> {
         let (advanced, report) = self.flow_.recv_window().recheck_(buffered);
         if advanced {
-            self.touch_();
+            self.touch_(now_millis);
         }
         report
     }
@@ -900,21 +1045,47 @@ mod tests_ {
     }
     dual_runtime_test_!(establish_notification_is_persistent);
 
-    /// 测试 `touch_` 会推进活跃时间。
-    /// - 手段：先读一次活跃毫秒，稍作忙等后调用 `touch_` 再读一次。
-    /// - 判断：第二次读到的值不小于第一次（时间单调）。
-    async fn touch_advances_activity_time() {
+    /// 测试两个时钟各自独立地记账。
+    /// - 手段：新节点上读两个时钟（都应为 0）→ `touch_(1234)` → 再读；随后
+    ///   `mark_data_(4321)` → 再读；最后 `set_data_millis_(99)` 模拟「刚发过 PULSE」。
+    /// - 判断：`touch_` 只推进存活时钟、保活职责时钟不动；`mark_data_` 两个都推进；
+    ///   `set_data_millis_` 只动保活职责时钟（发 PULSE 不给自己续命）。
+    #[test]
+    fn touch_and_mark_data_stamp_independent_clocks() {
         let owner = make_owner_();
-        let first = owner.active_millis_();
-        let mut spin = 0u64;
-        while spin < 100_000u64 {
-            spin = spin.wrapping_add(1u64);
-        }
-        owner.touch_();
-        let second = owner.active_millis_();
-        assert!(second >= first, "活跃时间只能前进");
+        assert_eq!(owner.active_millis_(), 0u64);
+        assert_eq!(owner.data_millis_(), 0u64);
+
+        owner.touch_(1234u64);
+        assert_eq!(owner.active_millis_(), 1234u64, "存活时钟应当被推进");
+        assert_eq!(owner.data_millis_(), 0u64, "保活职责时钟不该被 touch_ 推进");
+
+        owner.mark_data_(4321u64);
+        assert_eq!(owner.active_millis_(), 4321u64);
+        assert_eq!(owner.data_millis_(), 4321u64, "mark_data_ 两个时钟都推进");
+
+        owner.set_data_millis_(99u64);
+        assert_eq!(owner.active_millis_(), 4321u64, "发 PULSE 不该刷新存活时钟");
+        assert_eq!(owner.data_millis_(), 99u64);
     }
-    dual_runtime_test_!(touch_advances_activity_time);
+
+
+
+    /// 测试中止认领只成功一次，且原因可回传给应用侧。
+    /// - 手段：未中止时读一次 `abort_reason_`；`claim_abort_(IdleTimeout)` 两次。
+    /// - 判断：未中止时为 `None`；第一次认领为真、第二次为假；`is_aborted_` 为真且
+    ///   `abort_reason_` 投影为 `MuxError::IdleTimeout`。
+    #[test]
+    fn abort_is_claimed_once_and_reports_idle_timeout() {
+        let owner = make_owner_();
+        assert_eq!(owner.abort_reason_(), Option::None);
+        assert!(!owner.is_aborted_(), "新身份不应处于中止态");
+
+        assert!(owner.claim_abort_(AbortCode_::IdleTimeout), "首次认领应当成功");
+        assert!(!owner.claim_abort_(AbortCode_::IdleTimeout), "只允许认领一次");
+        assert!(owner.is_aborted_());
+        assert_eq!(owner.abort_reason_(), Option::Some(MuxError::IdleTimeout));
+    }
 
     /// 测试「两个方向都在协议层收尾」才认领释放，且只认领一次。
     ///

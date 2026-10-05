@@ -491,7 +491,9 @@ enum EstablishReply_ { Accepted, Refused, Failed(MuxError<(), ()>) }
 
 ### T6 保活与空闲超时（写法 B：每连接一个 tick 循环）
 
-- **状态**：**时间能力已就位，tick 循环仍未开工**。
+- **状态**：**已落地（2026-10-05 14:20）**——见
+  `keepalive-timer-loop-20261005-1420.md`（含三处与本文预设不同的关键修正：
+  两条时钟、活动时刻就地写下、拆流用专用事件）。以下原记录保留为决策史。
   - 2026-10-05 11:30：在 `smux_v1` 自建了轮盘式 `src/time`（13 个确定性用例）——
     **已被取代**，见下一条。
   - 2026-10-05 12:30：计时能力上移到 `abs_art` 家族（trait 在 `abs_art::time`、
@@ -503,7 +505,7 @@ enum EstablishReply_ { Accepted, Refused, Failed(MuxError<(), ()>) }
   - **仍未开工**：tick 循环、PULSE、超时落地（`keepalive…` §4 的第 3～7 步）。
   - `embedded-timers v0.4.0` 已加入 `Cargo.toml`（commit `aa2be18`），现在只用于
     `Clock`/`Instant` 的**算术层**。
-- **做什么**：一个连接**一个**计数器，写成**第 5 个本地循环**；它在完全静默时仍会醒来，
+- **做什么（已实现）**：一个连接**一个**计数器，写成**第 5 个本地循环**；它在完全静默时仍会醒来，
   并**激活其它可能已经静默的循环**（投 PULSE / 超时事件），从而补齐 `PULSE` 的发送点与
   `MuxError::IdleTimeout` 的产生点。等待用后端的 `TrTime`（不再有轮盘），
   「什么时候该醒」用注入式 `Clock` 在本地算。

@@ -70,6 +70,7 @@ use smux_v1::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
     },
+    time::SystemClock,
 };
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -214,6 +215,7 @@ where
     R: TrBuffRead<u8> + 'static,
 {
     type Alloc = CountingAlloc;
+    type Clock = SystemClock;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -221,6 +223,10 @@ where
 
     fn allocator(&self) -> Self::Alloc {
         CountingAlloc
+    }
+
+    fn clock(&self) -> Self::Clock {
+        SystemClock
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -300,6 +306,7 @@ where
     R: TrBuffRead<u8> + 'static,
 {
     type Alloc = CountingAlloc;
+    type Clock = SystemClock;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -309,6 +316,10 @@ where
 
     fn allocator(&self) -> Self::Alloc {
         CountingAlloc
+    }
+
+    fn clock(&self) -> Self::Clock {
+        SystemClock
     }
 
     fn policy(&self) -> &Self::Policy {

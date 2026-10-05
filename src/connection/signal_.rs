@@ -207,6 +207,21 @@ where
         remote_dock: Dock,
     },
 
+    /// **本端计时循环**判定空闲超时：放弃该子流的发送方向、摘掉本地表项。
+    ///
+    /// 与 [`WriteEvent_::PeerClosed`]（对端发来 `CLOSE`）的区别是**谁有权关闭发送环的
+    /// 消费端**：本端主动拆流时没有别的执行者会去关它，因此写循环在这里显式
+    /// `close()`，应用侧才会立刻看到发送方向已关闭（`is_rx_closed()` 为真、写入返回
+    /// `Closing`）。对端 `RESET` 那条路径**不**关——协议只要求「允许放弃已提交字节」，
+    /// 而既有验收（`mux_recv_dropped_dual_`）钉住了「对端丢弃接收半边之前写入的字节
+    /// 仍然写得完」。
+    LocalAbort {
+        /// 本端 dock。
+        local_dock: Dock,
+        /// 对端 dock。
+        remote_dock: Dock,
+    },
+
     /// 对端发来 `CLOSE`：读循环已处理完帧面状态，通知写循环推进拆流记账。
     PeerClosed {
         /// 本端 dock。

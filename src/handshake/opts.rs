@@ -70,10 +70,16 @@ pub struct BasicOpts {
     /// 单个 dock 能容纳的最大同时活动的 channel 数量
     pub max_dock_chan_count: usize,
 
-    /// 一个 Channel 在无任何数据交流后的最长存活时间。
+    /// 一个 Channel 在无任何数据交流后的最长存活时间。**单位是秒。**
     ///
     /// # Discussion
     /// 不断地发送心跳报文（ACK）可以无限地延长 channel 存活时间，直到有一端主动关闭。
+    ///
+    /// 合法范围 `>= 1` **秒**；取值为 `0` 与非整数秒的**截断到 0**（例如
+    /// `Duration::from_millis(500)`，`as_secs()` 得 0）都会被拒绝：`0` 在 v1 的线格式里
+    /// 表示「本项未提供」，应当直接省略该键。发起方在写出任何字节之前判、等待方对本端
+    /// 补全项在读写任何字节之前判、编码咽喉再兜一次——三处都返回
+    /// [`HandshakeError::MalformedBody`](crate::handshake::error::HandshakeError::MalformedBody)。
     pub max_channel_timeout: Duration,
 
     /// **一条 channel 关闭后**，其 `(local_dock, remote_dock)` 身份在本地保留的
@@ -92,7 +98,8 @@ pub struct BasicOpts {
     ///   channel 关闭那一刻起算，与之后是否有数据往来无关，只用来吸收「双方对
     ///   关闭时刻的认知差」造成的在途帧。
     ///
-    /// 合法范围 `>= 1` 秒；取值为 `0` 由编解码层按 `MalformedBody` 拒绝。
+    /// 合法范围 `>= 1` **秒**；取值为 `0` 与非整数秒的**截断到 0** 都会被拒绝
+    /// （三处校验见 [`BasicOpts::max_channel_timeout`]）。
     pub max_channel_wait_close: Duration,
 }
 

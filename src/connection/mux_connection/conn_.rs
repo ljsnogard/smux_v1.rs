@@ -1,4 +1,4 @@
-use abs_art::{TrJoinHandle, TrLocalScope};
+use abs_art::{TrJoinHandle, TrLocalScope, TrTime};
 use abs_buff::gen_may_cancel_future;
 use abs_cancel::TrCancellationToken;
 use abs_smux::{conn::TrConnection, dock::TrDock};
@@ -10,11 +10,13 @@ use crate::{
         Dock, MuxError, TrConnCfg,
         dock_binding::DockBinding,
         ring_::StageRingPair_,
-        session_::{ByteLoopShared_, MuxLoopShared_, demux_loop_async_, mux_loop_async_},
+        session_::{ByteLoopShared_, MuxShared_, demux_loop_async_, mux_loop_async_},
         session_pump_::{rx_pump_loop_async_, tx_pump_loop_async_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
+        timer_::timer_loop_async_,
     },
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
+    time::{ConnClock_, millis_of_},
 };
 
 use super::{core_::MuxCore, registry_::{ChannelRegistry_, ReserveErr_}};
@@ -72,13 +74,13 @@ where
 impl<C, S> MuxConnection<C, S>
 where
     C: TrConnCfg,
-    S: TrLocalScope + Clone,
+    S: TrLocalScope + TrTime + Clone,
 {
     /// 由一次成功的握手交付物、调用方的本地作用域、资源策略与**两块连接级缓冲**
     /// 构造连接：接管 `C::ConnRx` / `C::ConnTx`，把两块缓冲建为连接级的两条帧暂存环，
-    /// 并**经作用域 `spawn_local`** 投递四个循环。
+    /// 并**经作用域 `spawn_local`** 投递五个循环。
     ///
-    /// # 四个循环
+    /// # 五个循环
     ///
     /// | 令牌序号 | 循环 | 搬运方向 |
     /// | --- | --- | --- |
@@ -86,9 +88,18 @@ where
     /// | 1 | 解复用 | 连接读环 → 各子流接收环（解析帧、拉取读事件） |
     /// | 2 | 复用 | 各子流发送环 → 连接写环（成帧、拉取写事件） |
     /// | 3 | 写泵 | 连接写环 → `C::ConnTx` |
+    /// | 4 | 计时 | 不搬字节：保活 `PULSE` 与空闲超时拆流（见私有模块 `timer_`） |
     ///
     /// 内侧两个循环（1 / 2）从事件队列拉取 `Attach` / `TxClosed` / `Control` 等事件，
-    /// 据此决定哪些子流此刻可搬。
+    /// 据此决定哪些子流此刻可搬；计时循环（4）在前两者都静默时仍然会醒来，把
+    /// 保活与拆流的需求投进同两条事件队列。
+    ///
+    /// # 为什么 `S` 还要 `TrTime`
+    ///
+    /// 计时循环要等「下一个期限」。等待能力（`abs_art::TrTime`）挂在**后端类型**上，
+    /// 而调用方手上只有作用域值，因此上游让三个后端的 `LocalScope` **也**实现了
+    /// `TrTime`——这里因此只需要在作用域值上多一个约束，不必给
+    /// [`MuxConnection`] 加第三个类型参数。
     ///
     /// # Panics
     ///
@@ -159,7 +170,7 @@ where
 
         let mux_fut = mux_loop_async_::<C, _>(
             tx_stage_w_,
-            shared_,
+            shared_.clone(),
             w_receiver_,
             core_.r_events_().clone(),
             core_.loop_token_(2usize),
@@ -173,6 +184,16 @@ where
             core_.loop_token_(3usize),
         );
         scope.spawn_local(write_pump_fut).detach();
+
+        // 第五个循环：保活（PULSE）与空闲超时拆流。它不搬字节，只按连接级时钟算
+        // 期限、把保活动作投进上面两条事件通道（见 `timer_` 模块文档）。
+        let timer_fut = timer_loop_async_::<C, S, _>(
+            shared_,
+            core_.w_events_().clone(),
+            core_.r_events_().clone(),
+            core_.loop_token_(4usize),
+        );
+        scope.spawn_local(timer_fut).detach();
 
         MuxConnection { core_ }
     }
@@ -202,7 +223,7 @@ where
     C: TrConnCfg,
 {
     core_: Shared<MuxCore<C, S>, C::Alloc>,
-    shared_: MuxLoopShared_<C::Alloc>,
+    shared_: MuxShared_<C>,
     byte_shared_: ByteLoopShared_<C::Alloc>,
     w_receiver_: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
     r_receiver_: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
@@ -218,22 +239,31 @@ where
         S: Clone,
     {
         let max_packet_size = opts.basic_opts.max_packet_size;
+        let channel_timeout_millis = millis_of_(opts.basic_opts.max_channel_timeout);
         let alloc = config.allocator();
+        // 建连这一刻就是连接的 epoch；此后协议里的时间量一律是「自它起算的毫秒」。
+        let conn_clock = ConnClock_::new_(config.clock());
 
         let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), alloc.clone());
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
 
-        let shared = MuxLoopShared_::new_(reg.clone(), max_packet_size);
+        let shared = MuxShared_::<C>::new_(
+            reg.clone(),
+            max_packet_size,
+            conn_clock.clone(),
+            channel_timeout_millis,
+        );
         let byte_shared = ByteLoopShared_::new_(reg.clone());
 
-        // 核心自持一份四个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
+        // 核心自持一份五个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
         // （那会阻塞，而 `Drop` 可能在任意线程上发生）。
         let loops = [
             reg.loop_token_(0usize),
             reg.loop_token_(1usize),
             reg.loop_token_(2usize),
             reg.loop_token_(3usize),
+            reg.loop_token_(4usize),
         ];
 
         let core = Shared::new(
@@ -242,6 +272,7 @@ where
                 opts,
                 scope.clone(),
                 reg,
+                conn_clock,
                 w_events,
                 r_events,
                 loops,

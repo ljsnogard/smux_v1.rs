@@ -83,8 +83,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use core::{
     alloc::AllocatorClone,
     ops::Bound,
+    task::{Context, Poll},
 };
-use std::time::Instant;
 
 use abs_cancel::TrCancellationToken;
 use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
@@ -95,14 +95,16 @@ use crate::{
     connection::{
         Dock, MuxError,
         owner_::{
-            ChannelOwner_, LsnOwner_, TgOwner_, new_listener_owner_, new_owner_,
+            AbortCode_, ChannelOwner_, LsnOwner_, TgOwner_, new_listener_owner_, new_owner_,
             new_telegraph_owner_,
         },
         signal_::{SessionEvent_, SessionMailbox_},
-        sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
+        sync_::{CancelToken_, LockCancelled_, NotifySlot_, acquire_read_, acquire_write_},
+        timer_::TimerAction_,
     },
     flow_ctrl::WindowReport,
     handshake::opts::BasicOpts,
+    time::millis_of_,
 };
 
 /// 注册表在「预留 / 绑定一个身份」时能给出的失败。
@@ -340,7 +342,10 @@ where
     ///
     /// 有了它，回收是「从最早到期的开始拿，直到没到期」的 O(k log n)，而不是全表
     /// O(n) 扫描；宽限态在高 churn 下数量可以很大。
-    wait_close_expiry_: BTreeSet<(Instant, Dock, Dock), A>,
+    ///
+    /// 时刻是**连接内毫秒**（自连接 epoch 起算，见 [`crate::time`]），因此这套索引
+    /// 与「子流最后活动」用的是同一把尺子，也不需要任何 `Instant` 类型。
+    wait_close_expiry_: BTreeSet<(u64, Dock, Dock), A>,
 
     /// 整条连接上当前在册的**活跃子流**数（受 `max_channel_count` 约束）。
     total_: usize,
@@ -361,11 +366,11 @@ where
     /// 释放键时再确认它此刻**仍是** `WaitClose`：极端情况下该键可能已在同一
     /// 宽限期窗口内被别的路径改写（例如测试直接构造的配置），确认一次即可避免
     /// 误删活跃身份。
-    fn reap_wait_close_(&mut self, now: Instant) {
+    fn reap_wait_close_(&mut self, now_millis: u64) {
         while let Option::Some((until, local_dock, remote_dock)) =
             self.wait_close_expiry_.first().copied()
         {
-            if until > now {
+            if until > now_millis {
                 break;
             }
             self.wait_close_expiry_
@@ -399,6 +404,37 @@ where
     }
 }
 
+/// 计时循环一次扫描的结果。
+///
+/// 字段私有、只经关联函数读出——与本模块其余类型同一条纪律。
+pub(crate) struct TimerScan_ {
+    /// 本轮认领到的动作条数（`actions` 切片的前缀）。
+    actions_: usize,
+
+    /// 是否因为动作批次已满而提前停下：调用方应当**立刻**再扫一轮，不要睡。
+    full_: bool,
+
+    /// 下一次必须醒来的连接内毫秒（`u64::MAX` = 当前没有需要等待的期限）。
+    next_millis_: u64,
+}
+
+impl TimerScan_ {
+    /// 本轮认领到的动作条数。
+    pub(crate) fn actions_(&self) -> usize {
+        self.actions_
+    }
+
+    /// 是否因为批次满而提前停下。
+    pub(crate) fn is_full_(&self) -> bool {
+        self.full_
+    }
+
+    /// 下一次必须醒来的连接内毫秒。
+    pub(crate) fn next_millis_(&self) -> u64 {
+        self.next_millis_
+    }
+}
+
 /// 读写循环与 API 面共享的 dock / 子流身份索引。
 ///
 /// 所有方法都取 `&self`：内部可变性由 `atomic_sync` 的**协作式读写锁**
@@ -428,14 +464,25 @@ where
 {
     inner_: Shared<CooperativeRwLockOwned<RegistryInner_<A>>, A>,
 
-    /// 四个循环的取消令牌：`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵。
+    /// 五个循环的取消令牌：`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵、
+    /// `4` = 计时（保活 / 空闲超时）。
     ///
     /// **放在锁外**：构造后不再变化，因此取用与触发都无需取锁（`Drop` 路径要的
     /// 正是这一点）。
-    loops_: [CancelToken_<A>; 4],
+    loops_: [CancelToken_<A>; 5],
 
     /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
     mailbox_: SessionMailbox_,
+
+    /// **计时循环的唤醒槽**：「身份表变了，期限可能要重算」的持久提示。
+    ///
+    /// 它让计时循环可以**动态**睡到「最早的期限」而不是固定 tick：一条新子流的
+    /// 登记、或一次身份释放，都会在锁外 `notify_` 一次，把睡着的计时循环叫醒重算。
+    ///
+    /// 用 `Shared` 包一层是为了让它的各个注册表克隆（核心、五个循环各持一份）指向
+    /// **同一个**槽；`NotifySlot_` 本身只有一个 waker 位与一个原子位，零堆分配，
+    /// `Shared` 这一次分配是**每连接一次**。
+    timer_wake_: Shared<NotifySlot_, A>,
 }
 
 impl<A> Clone for ChannelRegistry_<A>
@@ -448,6 +495,7 @@ where
             loops_: self.loops_.clone(),
             // 邮箱按值克隆：生产端共享同一条队列，消费端因此有**多个** drain 者。
             mailbox_: self.mailbox_.clone(),
+            timer_wake_: self.timer_wake_.clone(),
         }
     }
 }
@@ -478,12 +526,16 @@ where
             // 1：解复用（连接读环 → 各子流接收环）
             // 2：复用（各子流发送环 → 连接写环）
             // 3：写泵（连接写环 → transport）
+            // 4：计时（保活 PULSE 与空闲超时拆流）
+            CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
         ];
         let docks_ = BTreeMap::new_in(alloc.clone());
+        // 计时唤醒槽的节点：与注册表根部同源分配器，**每连接一次**。
+        let timer_wake_ = Shared::new(NotifySlot_::new_(), alloc.clone());
         let bindings_ = BTreeMap::new_in(alloc.clone());
         let remote_index_ = BTreeSet::new_in(alloc.clone());
         let wait_close_expiry_ = BTreeSet::new_in(alloc.clone());
@@ -503,7 +555,24 @@ where
             ),
             loops_: loops,
             mailbox_: SessionMailbox_::new_(),
+            timer_wake_,
         }
+    }
+
+    /// 提示**计时循环**「期限表可能变了」，请醒来重算。
+    ///
+    /// # 调用纪律（与 [`NotifySlot_`] 的唤醒纪律同源）
+    ///
+    /// **不得在持有注册表守卫时调用**：`notify_` 会 `wake` 计时循环的 waker，而在
+    /// 单线程执行器上 `wake` 可能同步重入 `poll`，后者又要取注册表锁
+    /// （见 `keepalive…` §6.3）。因此登记路径一律「先出作用域、再 call」。
+    pub(crate) fn notify_timer_(&self) {
+        self.timer_wake_.notify_();
+    }
+
+    /// 计时循环的等待点：有唤醒提示时立刻就绪，否则登记 waker 后 `Pending`。
+    pub(crate) fn poll_timer_wake_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.timer_wake_.poll_wait_(cx)
     }
 
     /// 投递一条**会话释放消息**（会话句柄的 `Drop` 调用）。
@@ -524,12 +593,16 @@ where
     /// # Panics
     ///
     /// **调用方不得正持有本注册表的锁**：落实每条消息都要再取一次锁。
+    ///
+    /// `now_millis` 是连接内毫秒，供落实 `ReleaseChannel`（进入拆流宽限期）时打点。
     pub(crate) async fn drain_session_events_<K: TrCancellationToken>(
         &self,
+        now_millis: u64,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
         while let Option::Some(event) = self.mailbox_.try_take_() {
-            self.apply_session_event_(event, cancel.child_token()).await?;
+            self.apply_session_event_(event, now_millis, cancel.child_token())
+                .await?;
         }
         Result::Ok(())
     }
@@ -538,6 +611,7 @@ where
     async fn apply_session_event_<K: TrCancellationToken>(
         &self,
         event: SessionEvent_,
+        now_millis: u64,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
         match event {
@@ -557,7 +631,10 @@ where
             SessionEvent_::ReleaseChannel {
                 local_dock,
                 remote_dock,
-            } => self.release_channel_(local_dock, remote_dock, cancel).await,
+            } => {
+                self.release_channel_(local_dock, remote_dock, now_millis, cancel)
+                    .await
+            }
         }
     }
 
@@ -609,55 +686,66 @@ where
     /// - 同一 dock 对处于拆流宽限期 → [`ReserveErr_::WaitClose`]；
     /// - 该 dock 上的在册子流数已达 `max_dock_chan_count` → [`ReserveErr_::DockChanLimit`]；
     /// - 连接上的在册子流数已达 `max_channel_count` → [`ReserveErr_::ChanLimit`]。
+    ///
+    /// `now_millis` 是连接内毫秒（见 [`crate::time`]），用于顺带回收已到期的宽限态。
     pub(crate) async fn reserve_channel_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
+        now_millis: u64,
         cancel: K,
     ) -> Result<ChannelOwner_<A>, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
-        let mut guard = acquire_write_(&mut session, cancel).await?;
-        let inner = &mut *guard;
-        let now = Instant::now();
-        inner.reap_wait_close_(now);
-        if inner.total_ >= inner.opts_.max_channel_count {
-            return Result::Err(ReserveErr_::ChanLimit);
-        }
-        // 先把限额取出来：下面要可变借用 `docks_`。
-        let max_dock = inner.opts_.max_dock_chan_count;
-
-        // 检查顺序与旧链表实现一致：用途 → 重复 → dock 限额。
-        if matches!(
-            inner.bindings_.get(&telegraph_key_(local_dock)),
-            Option::Some(BindingSlot_::Telegraph(_))
-        ) {
-            return Result::Err(ReserveErr_::DockInUse);
-        }
-        match inner.bindings_.get(&(local_dock, remote_dock)) {
-            Option::Some(BindingSlot_::WaitClose(_)) => {
-                return Result::Err(ReserveErr_::WaitClose);
+        let state = {
+            let mut session = self.inner_.acquire_session();
+            let mut guard = acquire_write_(&mut session, cancel).await?;
+            let inner = &mut *guard;
+            inner.reap_wait_close_(now_millis);
+            if inner.total_ >= inner.opts_.max_channel_count {
+                return Result::Err(ReserveErr_::ChanLimit);
             }
-            Option::Some(_) => return Result::Err(ReserveErr_::Duplicate),
-            Option::None => {}
-        }
-        if let Option::Some(dock) = inner.docks_.get(&local_dock)
-            && dock.chan_count_ >= max_dock
-        {
-            return Result::Err(ReserveErr_::DockChanLimit);
-        }
+            // 先把限额取出来：下面要可变借用 `docks_`。
+            let max_dock = inner.opts_.max_dock_chan_count;
 
-        let state = new_owner_(inner.alloc_.clone());
-        let dock = inner
-            .docks_
-            .entry(local_dock)
-            .or_insert_with(DockCtx_::new_);
-        dock.chan_count_ += 1usize;
-        inner.bindings_.insert(
-            (local_dock, remote_dock),
-            BindingSlot_::Channel(ChanSlot_::new_(state.clone())),
-        );
-        inner.remote_index_.insert((remote_dock, local_dock));
-        inner.total_ += 1usize;
+            // 检查顺序与旧链表实现一致：用途 → 重复 → dock 限额。
+            if matches!(
+                inner.bindings_.get(&telegraph_key_(local_dock)),
+                Option::Some(BindingSlot_::Telegraph(_))
+            ) {
+                return Result::Err(ReserveErr_::DockInUse);
+            }
+            match inner.bindings_.get(&(local_dock, remote_dock)) {
+                Option::Some(BindingSlot_::WaitClose(_)) => {
+                    return Result::Err(ReserveErr_::WaitClose);
+                }
+                Option::Some(_) => return Result::Err(ReserveErr_::Duplicate),
+                Option::None => {}
+            }
+            if let Option::Some(dock) = inner.docks_.get(&local_dock)
+                && dock.chan_count_ >= max_dock
+            {
+                return Result::Err(ReserveErr_::DockChanLimit);
+            }
+
+            let state = new_owner_(inner.alloc_.clone());
+            // 两个时钟立刻用「现在」打点：连接的 epoch 可能远早于本条子流的诞生，
+            // 从 0 起算会让它第一条扫描就被判空闲超时。
+            state.mark_data_(now_millis);
+            let dock = inner
+                .docks_
+                .entry(local_dock)
+                .or_insert_with(DockCtx_::new_);
+            dock.chan_count_ += 1usize;
+            inner.bindings_.insert(
+                (local_dock, remote_dock),
+                BindingSlot_::Channel(ChanSlot_::new_(state.clone())),
+            );
+            inner.remote_index_.insert((remote_dock, local_dock));
+            inner.total_ += 1usize;
+            state
+        };
+        // 守卫已在上面那个块结束时释放：新身份要参与保活计时，因此现在才唤醒计时循环
+        // （**不得在持锁时唤醒**，理由见 `ChannelRegistry_::notify_timer_`）。
+        self.notify_timer_();
         Result::Ok(state)
     }
 
@@ -695,19 +783,18 @@ where
         Result::Ok(())
     }
 
-    pub(crate) async fn release_channel_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, cancel: K) -> Result<(), ReserveErr_> {
+    pub(crate) async fn release_channel_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, now_millis: u64, cancel: K) -> Result<(), ReserveErr_> {
         let mut session = self.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
-        let now = Instant::now();
-        inner.reap_wait_close_(now);
+        inner.reap_wait_close_(now_millis);
         if !matches!(
             inner.bindings_.get(&(local_dock, remote_dock)),
             Option::Some(BindingSlot_::Channel(_))
         ) {
             return Result::Ok(());
         }
-        let until = now + inner.opts_.max_channel_wait_close;
+        let until = now_millis.saturating_add(millis_of_(inner.opts_.max_channel_wait_close));
         inner.bindings_.insert(
             (local_dock, remote_dock),
             BindingSlot_::WaitClose(WaitCloseCtx_),
@@ -729,12 +816,11 @@ where
     ///
     /// 读循环用它区分两类「本地表里查不到」的帧：命中 → 刚关闭，静默丢弃；
     /// 未命中 → 真正的未知子流，按协议违例处理。查询顺带回收已到期的宽限态。
-    pub(crate) async fn is_wait_close_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, cancel: K) -> Result<bool, ReserveErr_> {
+    pub(crate) async fn is_wait_close_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, now_millis: u64, cancel: K) -> Result<bool, ReserveErr_> {
         let mut session = self.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
-        let now = Instant::now();
-        inner.reap_wait_close_(now);
+        inner.reap_wait_close_(now_millis);
         Result::Ok(matches!(
             inner.bindings_.get(&(local_dock, remote_dock)),
             Option::Some(BindingSlot_::WaitClose(_))
@@ -772,11 +858,12 @@ where
         local_dock: Dock,
         remote_dock: Dock,
         peer_report: WindowReport,
+        now_millis: u64,
         cancel: K,
     ) -> Result<ChannelOwner_<A>, ReserveErr_> {
         // 先登记身份（自带配额与重复检查），再标成「待决入向请求」。
         let state = self
-            .reserve_channel_(local_dock, remote_dock, cancel.child_token())
+            .reserve_channel_(local_dock, remote_dock, now_millis, cancel.child_token())
             .await?;
         let marked = {
             let mut session = self.inner_.acquire_session();
@@ -1093,6 +1180,109 @@ where
         Result::Ok(guard.fail_.is_some())
     }
 
+    /// **计时循环的扫描入口**：按 `bindings_` 的键序走一遍活跃子流，为每条认领一个
+    /// 保活动作，并算出下一次必须醒来的时刻。
+    ///
+    /// # 为什么整轮只取一次读锁、动作走调用方给的切片
+    ///
+    /// - 判定与认领（`claim_pulse_` / `claim_abort_`）全是**原子读改写**，因此整轮
+    ///   可以只取一次读锁；锁内**不做任何 `await`、不投递事件、不唤醒等待者**；
+    /// - 事件投递必须留到锁外（唤醒纪律，见 [`ChannelRegistry_::notify_timer_`]），
+    ///   所以动作先写进调用方的切片、由调用方在锁释放后投递；
+    /// - 切片的长度即「每轮最多投多少条事件」的**限频**：写满即提前返回并把
+    ///   [`TimerScan_::is_full_`] 置真，调用方立刻再扫一轮即可，动作不会丢。
+    ///
+    /// # 参数
+    ///
+    /// - `now_millis`：连接内毫秒（自连接 epoch 起算）；
+    /// - `pulse_millis`：发 `PULSE` 的空闲阈值；
+    /// - `timeout_millis`：判空闲超时的空闲上限（**不早于此值**）；
+    /// - `actions`：本轮动作的输出缓冲（长度即限频）。
+    ///
+    /// # Errors
+    ///
+    /// 等锁期间被取消 → [`ReserveErr_::Cancelled`]（连接正在收尾）。
+    pub(crate) async fn timer_scan_<K: TrCancellationToken>(
+        &self,
+        now_millis: u64,
+        pulse_millis: u64,
+        timeout_millis: u64,
+        actions: &mut [TimerAction_],
+        cancel: K,
+    ) -> Result<TimerScan_, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        let inner = &*guard;
+
+        let mut count = 0usize;
+        let mut full = false;
+        let mut next = u64::MAX;
+
+        for (key, slot) in inner.bindings_.iter() {
+            // 只有活跃 channel 参与保活：listener / telegraph / 宽限态都不参加。
+            let BindingSlot_::Channel(ctx) = slot else {
+                continue;
+            };
+            let owner = &ctx.rec_;
+            // 已中止（正在拆）的子流不再排任何期限。
+            if owner.is_aborted_() {
+                continue;
+            }
+            // 两个时钟都由活动点**就地**写下（`touch_` / `mark_data_`），这里只读：
+            // 存活时钟是 `max_channel_timeout` 的判据，保活职责时钟是 `PULSE` 的判据。
+            let last = owner.active_millis_();
+            let last_data = owner.data_millis_();
+
+            // 1. 存活时钟到顶：认领中止（只可能成功一次）。
+            //
+            //    **不早于** `timeout_millis`：判据是 `now - last >= timeout`，
+            //    因此只可能在该期限之后的第一轮扫描里触发。
+            if now_millis.saturating_sub(last) >= timeout_millis {
+                if count == actions.len() {
+                    full = true;
+                    break;
+                }
+                if owner.claim_abort_(AbortCode_::IdleTimeout) {
+                    actions[count] = TimerAction_::Abort {
+                        local_dock: key.0,
+                        remote_dock: key.1,
+                    };
+                    count += 1;
+                }
+                continue;
+            }
+
+            // 2. 保活职责：距上一次**非保活活动**（或上一次 `PULSE`）满一个保活周期
+            //    就发一条 `PULSE`，并把它记成「刚发过」。它与存活判定**无关**：
+            //    收到对端的 `PULSE` 不会让本端少发一条（见 `ChannelState_`）。
+            let mut duty = last_data.saturating_add(pulse_millis);
+            if now_millis >= duty {
+                if count == actions.len() {
+                    full = true;
+                    break;
+                }
+                actions[count] = TimerAction_::Pulse {
+                    local_dock: key.0,
+                    remote_dock: key.1,
+                    report: owner.flow_().recv_window().report(),
+                };
+                count += 1;
+                owner.set_data_millis_(now_millis);
+                duty = now_millis.saturating_add(pulse_millis);
+            }
+
+            // 3. 下一个期限 = min(存活到顶, 下一次保活职责)。
+            next = next.min(last.saturating_add(timeout_millis));
+            next = next.min(duty);
+        }
+
+        Result::Ok(TimerScan_ {
+            actions_: count,
+            full_: full,
+            next_millis_: next,
+        })
+    }
+
     /// 取第 `idx` 个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
     ///
     /// 令牌在锁外，因此本方法**不取锁**（构造路径与 `Drop` 路径都依赖这一点）。
@@ -1204,6 +1394,13 @@ mod tests_ {
             f: impl FnMut(Dock),
         ) -> impl core::future::Future<Output = ()>;
         fn notify_inbound_t_(&self, local_dock: Dock) -> impl core::future::Future<Output = ()>;
+        fn timer_scan_t_(
+            &self,
+            now_millis: u64,
+            pulse_millis: u64,
+            timeout_millis: u64,
+            actions: &mut [TimerAction_],
+        ) -> impl core::future::Future<Output = TimerScan_>;
     }
 
     impl RegistryTestExt_ for ChannelRegistry_<CoreAlloc> {
@@ -1212,13 +1409,13 @@ mod tests_ {
             local_dock: Dock,
             remote_dock: Dock,
         ) -> Result<ChannelOwner_<CoreAlloc>, ReserveErr_> {
-            self.reserve_channel_(local_dock, remote_dock, NonCancellableToken::new())
+            self.reserve_channel_(local_dock, remote_dock, TEST_NOW_MILLIS_, NonCancellableToken::new())
                 .await
         }
 
     async fn release_channel_t_(&self, local_dock: Dock, remote_dock: Dock) {
             let _ = self
-                .release_channel_(local_dock, remote_dock, NonCancellableToken::new())
+                .release_channel_(local_dock, remote_dock, TEST_NOW_MILLIS_, NonCancellableToken::new())
                 .await;
         }
 
@@ -1257,7 +1454,7 @@ mod tests_ {
         }
 
     async fn is_wait_close_t_(&self, local_dock: Dock, remote_dock: Dock) -> bool {
-            self.is_wait_close_(local_dock, remote_dock, NonCancellableToken::new())
+            self.is_wait_close_(local_dock, remote_dock, TEST_NOW_MILLIS_, NonCancellableToken::new())
                 .await
                 .expect("测试里不该被取消")
         }
@@ -1278,7 +1475,13 @@ mod tests_ {
             remote_dock: Dock,
             report: WindowReport,
         ) -> Result<ChannelOwner_<CoreAlloc>, ReserveErr_> {
-            self.reserve_inbound_(local_dock, remote_dock, report, NonCancellableToken::new())
+            self.reserve_inbound_(
+                local_dock,
+                remote_dock,
+                report,
+                TEST_NOW_MILLIS_,
+                NonCancellableToken::new(),
+            )
                 .await
         }
 
@@ -1341,6 +1544,24 @@ mod tests_ {
                 .await;
         }
 
+    async fn timer_scan_t_(
+            &self,
+            now_millis: u64,
+            pulse_millis: u64,
+            timeout_millis: u64,
+            actions: &mut [TimerAction_],
+        ) -> TimerScan_ {
+            self.timer_scan_(
+                now_millis,
+                pulse_millis,
+                timeout_millis,
+                actions,
+                NonCancellableToken::new(),
+            )
+            .await
+            .expect("测试里不该被取消")
+        }
+
     async fn notify_inbound_t_(&self, local_dock: Dock) {
             let _ = self
                 .notify_inbound_(local_dock, NonCancellableToken::new())
@@ -1370,11 +1591,18 @@ mod tests_ {
         }
     }
 
+    /// 注册表单测里的「现在」（连接内毫秒）：固定为 0。
+    ///
+    /// 这些用例只在**同一时刻**内验证身份表语义（宽限期取 0 ⇒ 立刻到期；取 60 秒
+    /// ⇒ 不过期），因此不需要推进时间——真正需要推进时间的验收在计时循环那侧用
+    /// 假时钟完成。
+    const TEST_NOW_MILLIS_: u64 = 0u64;
+
     /// 造一份「宽限期为 0」的协商结果，便于在不睡眠的前提下测到期回收。
     ///
     /// 协议规定 `max_channel_wait_close >= 1` 秒，这里刻意取 0 是为了让
-    /// `until_ == now`，下一次访问即可回收（`Instant` 单调，下一次取到的 `now`
-    /// 必然不小于它）；注册表本身不校验该范围。
+    /// `until_ == now`，下一次访问即可回收（`until_ > now` 为假）；注册表本身不
+    /// 校验该范围。
     fn opts_zero_grace_() -> BasicOpts {
         BasicOpts {
             max_channel_wait_close: Duration::ZERO,
@@ -1752,6 +1980,203 @@ mod tests_ {
         assert_index_consistent_(&registry);
     }
     dual_runtime_test_!(released_pair_enters_wait_close_and_blocks_reuse);
+    /// 造一个用缺省协商结果的注册表（计时扫描的阈值由调用方显式给出，与它无关）。
+    fn make_scan_registry_() -> ChannelRegistry_<CoreAlloc> {
+        ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc)
+    }
+
+    /// 扫描一次计时循环，返回结果（封装 `timer_scan_t_` 的样板）。
+    async fn scan_(
+        registry: &ChannelRegistry_<CoreAlloc>,
+        now_millis: u64,
+        pulse_millis: u64,
+        timeout_millis: u64,
+    ) -> (usize, u64, bool, [TimerAction_; 4usize]) {
+        let mut actions = [TimerAction_::Idle; 4usize];
+        let scan = registry
+            .timer_scan_t_(now_millis, pulse_millis, timeout_millis, &mut actions)
+            .await;
+        (scan.actions_(), scan.next_millis_(), scan.is_full_(), actions)
+    }
+
+    /// 测试计时扫描按「保活阈值 → 存活到顶」两级推进，且每级只产出一次动作。
+    ///
+    /// - 手段：登记一条子流（登记即打点 0 ms），以 `pulse = 500`、`timeout = 1000`
+    ///   依次在 `now = 0 / 499 / 500 / 999 / 1000 / 5000` 扫描，每次记录动作条数与
+    ///   下一次期限。
+    /// - 判断：`0` 与 `499` 无动作、期限指向 500；`500` 恰好一条 `Pulse`、期限落到
+    ///   1000；`999` 无动作；`1000` 恰好一条 `Abort`；已中止之后不再参与扫描
+    ///   （无动作、期限为 `u64::MAX`）。
+    async fn timer_scan_walks_pulse_then_abort() {
+        let registry = make_scan_registry_();
+        let dock_a = Dock::new(1u32);
+        let dock_b = Dock::new(9u32);
+        assert!(
+            registry.reserve_channel_t_(dock_a, dock_b).await.is_ok(),
+            "登记子流应当成功"
+        );
+
+        let (count, next, full, _) = scan_(&registry, 0u64, 500u64, 1000u64).await;
+        assert_eq!(count, 0usize, "刚登记不该有动作");
+        assert_eq!(next, 500u64, "下一个期限是保活阈值");
+        assert!(!full);
+
+        let (count, next, _, _) = scan_(&registry, 499u64, 500u64, 1000u64).await;
+        assert_eq!(count, 0usize, "阈值前一毫秒不该发 PULSE");
+        assert_eq!(next, 500u64);
+
+        let (count, next, _, actions) = scan_(&registry, 500u64, 500u64, 1000u64).await;
+        assert_eq!(count, 1usize, "到阈值应当发一条 PULSE");
+        assert!(matches!(
+            actions[0],
+            TimerAction_::Pulse { local_dock, remote_dock, .. }
+                if local_dock == dock_a && remote_dock == dock_b
+        ));
+        assert_eq!(next, 1000u64, "发过 PULSE 之后下一个期限是存活到顶");
+
+        let (count, next, _, _) = scan_(&registry, 999u64, 500u64, 1000u64).await;
+        assert_eq!(count, 0usize, "超时前一毫秒不该拆流");
+        assert_eq!(next, 1000u64);
+        assert!(
+            !registry.is_wait_close_t_(dock_a, dock_b).await,
+            "还没到超时，身份应当仍是活跃子流"
+        );
+
+        let (count, _, _, actions) = scan_(&registry, 1000u64, 500u64, 1000u64).await;
+        assert_eq!(count, 1usize, "到达超时应当拆流");
+        assert!(matches!(
+            actions[0],
+            TimerAction_::Abort { local_dock, remote_dock }
+                if local_dock == dock_a && remote_dock == dock_b
+        ));
+
+        let (count, next, _, _) = scan_(&registry, 5000u64, 500u64, 1000u64).await;
+        assert_eq!(count, 0usize, "已中止的子流不再参与扫描");
+        assert_eq!(next, u64::MAX, "没有其它子流时没有需要等待的期限");
+    }
+    dual_runtime_test_!(timer_scan_walks_pulse_then_abort);
+
+    /// 测试**收到对端 `PULSE` 不会让本端少发一条**——保活能收敛的关键。
+    ///
+    /// 若把「收到 `PULSE`」也算成本端的保活职责活动，两端会在同一时刻互相把对方的
+    /// 职责时钟清零，于是**都不发** `PULSE`；而各自的存活时钟又从最后一次真实活动
+    /// 起算，先停手的一侧必定先到 `max_channel_timeout` 被拆掉。
+    ///
+    /// - 手段：登记后先在 `now = 500` 扫出本端的第一条 `PULSE`；随后模拟对端也发了
+    ///   一条（`touch_(500)`，只刷存活时钟），再在 `now = 750` 扫描。
+    /// - 判断：`750` 处无动作，且下一个期限是 1000（本端的保活职责）而不是
+    ///   1500（存活到顶）——说明 `touch_` 没有把职责时钟推后。
+    async fn receiving_a_pulse_does_not_cancel_the_local_pulse_duty() {
+        let registry = make_scan_registry_();
+        let dock_a = Dock::new(2u32);
+        let dock_b = Dock::new(7u32);
+        let owner = registry
+            .reserve_channel_t_(dock_a, dock_b)
+            .await
+            .expect("登记子流应当成功");
+
+        let (count, next, _, _) = scan_(&registry, 500u64, 500u64, 1000u64).await;
+        assert_eq!(count, 1usize, "到阈值应当发 PULSE");
+        assert_eq!(next, 1000u64);
+
+        // 对端也在保活：只刷新本端的存活时钟。
+        owner.touch_(500u64);
+
+        let (count, next, _, _) = scan_(&registry, 750u64, 500u64, 1000u64).await;
+        assert_eq!(count, 0usize, "保活职责时钟在 500 刚推进过，此刻不该再发");
+        assert_eq!(next, 1000u64, "下一个期限是本端的保活职责，而不是存活到顶");
+        assert_eq!(owner.active_millis_(), 500u64, "收到的 PULSE 刷了存活时钟");
+        assert_eq!(owner.data_millis_(), 500u64, "职责时钟由本端发 PULSE 推进");
+    }
+    dual_runtime_test_!(receiving_a_pulse_does_not_cancel_the_local_pulse_duty);
+
+    /// 测试真实活动会同时推后两个时钟，且 `PULSE` 不会立刻重发。
+    /// - 手段：`mark_data_(300)` 之后在 `now = 300 / 799 / 800` 扫描。
+    /// - 判断：`300` 无动作且期限为 800（职责时钟 300 + 500）；`799` 无动作；
+    ///   `800` 一条 `Pulse`。
+    async fn data_activity_postpones_the_pulse_duty() {
+        let registry = make_scan_registry_();
+        let dock_a = Dock::new(3u32);
+        let dock_b = Dock::new(8u32);
+        let owner = registry
+            .reserve_channel_t_(dock_a, dock_b)
+            .await
+            .expect("登记子流应当成功");
+
+        owner.mark_data_(300u64);
+
+        let (count, next, _, _) = scan_(&registry, 300u64, 500u64, 1000u64).await;
+        assert_eq!(count, 0usize);
+        assert_eq!(next, 800u64, "职责时钟被真实活动推到了 300");
+
+        let (count, next, _, _) = scan_(&registry, 799u64, 500u64, 1000u64).await;
+        assert_eq!(count, 0usize);
+        assert_eq!(next, 800u64);
+
+        let (count, _, _, actions) = scan_(&registry, 800u64, 500u64, 1000u64).await;
+        assert_eq!(count, 1usize);
+        assert!(matches!(actions[0], TimerAction_::Pulse { .. }));
+    }
+    dual_runtime_test_!(data_activity_postpones_the_pulse_duty);
+
+    /// 测试动作批次写满时提前返回（`is_full_`），调用方据此立刻再扫一轮。
+    /// - 手段：登记三条子流，`actions` 切片只给 1 格，在三条都到保活点时扫描。
+    /// - 判断：本轮恰好 1 条动作且 `is_full_` 为真；随后再扫，仍能拿到动作（不丢）。
+    async fn timer_scan_reports_a_full_action_batch() {
+        let registry = make_scan_registry_();
+        for remote in 10u32..13u32 {
+            assert!(
+                registry
+                    .reserve_channel_t_(Dock::new(4u32), Dock::new(remote))
+                    .await
+                    .is_ok()
+            );
+        }
+
+        // `now = 5` 已经越过保活阈值（职责时钟 0 + 1），三条子流同时到点。
+        let mut actions = [TimerAction_::Idle; 1usize];
+        let scan = registry
+            .timer_scan_t_(5u64, 1u64, 10_000u64, &mut actions)
+            .await;
+        assert_eq!(scan.actions_(), 1usize, "切片只有一格，本轮至多一条动作");
+        assert!(scan.is_full_(), "批次写满必须报告给调用方");
+
+        let mut actions = [TimerAction_::Idle; 8usize];
+        let scan = registry
+            .timer_scan_t_(5u64, 1u64, 10_000u64, &mut actions)
+            .await;
+        assert!(
+            scan.actions_() >= 1usize,
+            "再扫一轮必须还能拿到剩下的动作（本轮 {} 条）",
+            scan.actions_()
+        );
+    }
+    dual_runtime_test_!(timer_scan_reports_a_full_action_batch);
+
+    /// 测试监听器 / 电传端点 / 宽限态都**不**参与保活扫描。
+    /// - 手段：登记一个 listener、一个 telegraph 与一条 channel，再把它释放成宽限态，
+    ///   然后扫描。
+    /// - 判断：扫描只对活跃 channel 产出动作（这里 timeout 极小 ⇒ 一条 `Abort`），
+    ///   且不 panic、不把 listener / telegraph 当成子流。
+    async fn timer_scan_ignores_non_channel_identities() {
+        let registry = make_scan_registry_();
+        assert!(registry.reserve_listener_t_(Dock::new(5u32)).await.is_ok());
+        assert!(registry.reserve_telegraph_t_(Dock::new(6u32)).await.is_ok());
+        assert!(
+            registry
+                .reserve_channel_t_(Dock::new(7u32), Dock::new(11u32))
+                .await
+                .is_ok()
+        );
+        registry
+            .release_channel_t_(Dock::new(7u32), Dock::new(11u32))
+            .await;
+
+        let (count, _, _, _) = scan_(&registry, 10_000u64, 1u64, 10u64).await;
+        assert_eq!(count, 0usize, "宽限态 / listener / telegraph 都不参与保活");
+    }
+    dual_runtime_test_!(timer_scan_ignores_non_channel_identities);
+
     /// 测试宽限期到期后宽限态被回收、键可复用。
     /// - 手段：用宽限期为 0 的配置登记并释放 `(1,9)`，随后查询一次触发回收，
     ///   再重新登记同一 dock 对。

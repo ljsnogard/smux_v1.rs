@@ -278,7 +278,8 @@ where
     /// 而且**收两个参数**（欢迎消息 + 环准备策略）。在 `ChannelHandle` 上再加一个同名的
     /// 固有方法会把 trait 方法**遮蔽**掉——它就只能用全限定语法调用，泛型下游代码
     /// （`handle.accept_async(&mut w, prep)`）会直接编不过。因此这里另起一个名字，
-    /// 与同族的 [`Self::accept_async_managed`] / [`Self::accept_async_closure`] 保持
+    /// 与同族的 [`Self::accept_async_managed`] / `accept_async_closure`（测试侧扩展
+    /// trait 提供的便捷包装）保持
     /// 同样的「加后缀」惯例。
     ///
     /// # Errors
@@ -662,6 +663,7 @@ mod tests_ {
                 local,
                 remote,
                 WindowReport::new(0u64, 64u32),
+                0u64,
                 buffex::x_deps::abs_cancel::NonCancellableToken::new(),
             )
             .await

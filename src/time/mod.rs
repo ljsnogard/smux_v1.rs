@@ -25,7 +25,7 @@
 //! | 层 | 归谁 | 为什么 |
 //! | --- | --- | --- |
 //! | 「睡一段 / 每周期醒」 | 后端（[`TrTime`]） | 只有运行时知道怎么等；三个后端各自的实现由 `abs_art-smoke` 的契约矩阵钉住 |
-//! | 「什么时候该醒」 | 本地（本模块 + 注入的 [`Clock`](embedded_timers::clock::Clock)） | 连接级 epoch、每子流空闲毫秒、宽限期判定都是**协议语义**；而注入式时钟让它们可以**用假时钟确定性验收** |
+//! | 「什么时候该醒」 | 本地（本模块 + 注入的 [`Clock`]） | 连接级 epoch、每子流空闲毫秒、宽限期判定都是**协议语义**；而注入式时钟让它们可以**用假时钟确定性验收** |
 //!
 //! 这条缝就是本轮把「绝对时刻」留在消费方的收益：`TrTime` 是 `Duration`-only 的
 //! （见 `abs_art::time` 模块文档），因此后端的真实时钟**不**会挤进本模块的判定，
@@ -37,11 +37,26 @@
 //! 计时能力**不**在这里定义实现，也不在这里重新导出成新名字：需要相对形式
 //! （`D::delay(Duration)` / `D::interval(period)` / `D::timeout(Duration, f)`）的
 //! 调用方直接用 `abs_art` 的 [`TrTime`]。本模块只补绝对形式。
+//!
+//! # 连接内部用的是「连接内毫秒」
+//!
+//! 连接层不直接在各处读 `Clock::now()`：它在建连时定一个 **epoch**，此后协议里的
+//! 时间量（每子流最后活动、拆流宽限期到期、空闲超时期限）一律记成
+//! **自 epoch 起算的毫秒数**（`u64`）。
+//!
+//! 绑定这件事的是 crate 内部的 `clock_::ConnClock_`：它把注入的 [`Clock`] 与 epoch
+//! 放在一起，并给出 `now_millis_()` / `deadline_(ms)` / `delay_until_(ms)` 三个入口。
+//! 于是「时刻类型」（`C::Instant`）只出现在那一个类型里，子流状态与注册表索引全都
+//! 是整数。缺省时钟见 [`SystemClock`]；需要确定性验收时由调用方注入假时钟。
 
+mod clock_;
 mod deadline_;
 
 pub use abs_art::{Elapsed, TrInterval, TrTime};
+pub use clock_::SystemClock;
+pub(crate) use clock_::{ConnClock_, millis_of_};
 pub use deadline_::TrDeadline;
+pub use embedded_timers::{clock::Clock, instant::Instant};
 
 #[cfg(test)]
 mod tests_;
