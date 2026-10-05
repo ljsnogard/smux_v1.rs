@@ -1,6 +1,8 @@
 use abs_sync::may_break::TrMayBreak;
-use atomic_sync::mutex::preemptive::SpinningMutexOwned;
-use atomic_sync::x_deps::abs_sync;
+use atomic_sync::{
+    mutex::preemptive::SpinningMutexOwned,
+    x_deps::abs_sync,
+};
 
 use crate::flow_ctrl::{Credit, FlowCtrlError, RecvTotal, TrFlowCtrlPolicy, WindowReport};
 

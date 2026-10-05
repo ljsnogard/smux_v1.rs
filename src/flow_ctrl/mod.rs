@@ -71,10 +71,7 @@ mod recv_window_;
 mod report_;
 mod send_window_;
 mod types_;
-#[cfg(test)]
-mod reset_tests_;
-#[cfg(test)]
-mod tests_;
+
 
 pub use error_::FlowCtrlError;
 pub use flow_::FlowCtrl;
@@ -83,3 +80,7 @@ pub use recv_window_::RecvWindow;
 pub use report_::WindowReport;
 pub use send_window_::SendWindow;
 pub use types_::{Credit, RecvTotal};
+
+#[cfg(test)]mod reset_tests_;
+
+#[cfg(test)]mod tests_;

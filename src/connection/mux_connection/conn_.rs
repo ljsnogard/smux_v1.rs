@@ -1,5 +1,5 @@
-use abs_buff::gen_may_cancel_future;
 use abs_art::{TrJoinHandle, TrLocalScope};
+use abs_buff::gen_may_cancel_future;
 use abs_cancel::TrCancellationToken;
 use abs_smux::{conn::TrConnection, dock::TrDock};
 use buffex::x_deps::{abs_buff, abs_cancel};
