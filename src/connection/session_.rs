@@ -262,7 +262,10 @@ type WriteTable_<B, A> = BTreeMap<(Dock, Dock), WriteEntry_<B, A>, A>;
 /// 而发送额度可能在中途用尽（`SendWindow::available() == 0`），此时循环不能 park
 /// 在这一条子流上（那会挡住别的子流的事件），只能把它记在这里、等额度回补充或
 /// 环被读空时再继续。见 [`finalize_entry_`]。
-type PendingFin_ = BTreeSet<(Dock, Dock)>;
+/// 分配器参数与两个本地表同源（调用方注入）：它的节点在**首次进入**该集合时分配，
+/// 用全局分配器会让「丢半边 + 额度为 0」这条收尾路径隐式落到全局堆上
+/// （`dev-notes/audit-heap-alloc-20261004-1122.md` N1）。
+type PendingFin_<A> = BTreeSet<(Dock, Dock), A>;
 
 /// 尝试把一条「已丢弃发送半边」的子流真正收尾：排空发送环 → 发 `CLOSE(FIN)` →
 /// 设置 `local_fin_sent_` → 从本地表移除。
@@ -281,7 +284,7 @@ async fn finalize_entry_<C, K>(
     shared: &MuxLoopShared_<C::Alloc>,
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
-    pending_fin: &mut PendingFin_,
+    pending_fin: &mut PendingFin_<C::Alloc>,
     read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     pair: (Dock, Dock),
     cancel: &K,
@@ -1196,7 +1199,8 @@ pub(crate) async fn mux_loop_async_<C, K>(
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
     // 「发送方向已丢弃、但发送环还没排空（或额度没回来）」的子流：它们还欠对端一条
     // `CLOSE(FIN)`，由下面第 2.5 步在有进展时继续收尾（见 `finalize_entry_`）。
-    let mut pending_fin: PendingFin_ = BTreeSet::new();
+    let mut pending_fin: PendingFin_<C::Alloc> =
+        BTreeSet::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())));
     // 环段字节的搬出暂存：`clone_items_from_buff` / `move_items_to_buff` 需要一个
     // 连续切片作为中间落点（段本身不能作为 `write_all_async_` 的源）。走调用方注入
     // 的分配器（`mm_ptr::Owned`），整条连接只分配一次。
@@ -1422,7 +1426,7 @@ async fn handle_write_event_<C, K>(
     tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
     table: &mut WriteTable_<C::Buff, C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
-    pending_fin: &mut PendingFin_,
+    pending_fin: &mut PendingFin_<C::Alloc>,
     shared: &MuxLoopShared_<C::Alloc>,
     read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: &K,
