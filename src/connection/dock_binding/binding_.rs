@@ -197,14 +197,14 @@ where
         .map_err(map_reserve_err_)?;
     // 登记 listener 身份（统一身份表里的 `(local, wildcard)`）：它既是「本 dock 在
     // 监听」的事实，也是入向等待者的落点；若该 dock 已作 telegraph 会被拒。
-    // 「本 dock 上有入向事件」的通知通道：生产端进注册表，消费端进 listener。
-    // 容量 1：通知是幂等的「可能有请求」提示。
-    let (notify_tx_, notify_rx_) = flume::bounded(1usize);
-    conn.core_()
-        .reserve_listener_(local, notify_tx_, cancel.child_token())
+    // 入向通知是身份节点里**内联的零分配通知槽**（不再是 `flume` 通道），listener
+    // 持节点句柄并在它上面等通知（协议见 `sync_::NotifySlot_`）。
+    let rec = conn
+        .core_()
+        .reserve_listener_(local, cancel.child_token())
         .await
         .map_err(map_reserve_err_)?;
-    Result::Ok(ChannelListener::new_(conn, local, notify_rx_))
+    Result::Ok(ChannelListener::new_(conn, local, rec))
 }
 
 /// [`TrDockBinding::open_telegraph_async`] 的 step 函数。
@@ -228,11 +228,12 @@ where
         .drain_session_events_(cancel.child_token())
         .await
         .map_err(map_reserve_err_)?;
-    conn.core_()
+    let rec = conn
+        .core_()
         .reserve_telegraph_(local, cancel.child_token())
         .await
         .map_err(map_reserve_err_)?;
-    Result::Ok(crate::connection::Telegraph::new_(conn, local))
+    Result::Ok(crate::connection::Telegraph::new_(conn, local, rec))
 }
 
 /// [`TrDockBinding::open_channel_async`] 的 step 函数。

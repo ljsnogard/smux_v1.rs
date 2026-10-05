@@ -42,7 +42,7 @@ use crate::{
     connection::{
         Dock, TrConnCfg,
         mux_connection::{ChannelRegistry_, ReserveErr_},
-        owner_::ChannelOwner_,
+        owner_::{ChannelOwner_, LsnOwner_, TgOwner_},
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
         sync_::CancelToken_,
     },
@@ -193,24 +193,21 @@ where
         self.reg_.bind_dock_(local_dock, cancel).await
     }
 
-    /// 登记 listener 身份。
+    /// 登记 listener 身份，并交出它的**身份节点句柄**（listener 在该句柄上等入向通知）。
     pub(crate) async fn reserve_listener_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
-        notify_tx_: flume::Sender<()>,
         cancel: K,
-    ) -> Result<(), ReserveErr_> {
-        self.reg_
-            .reserve_listener_(local_dock, notify_tx_, cancel)
-            .await
+    ) -> Result<LsnOwner_<C::Alloc>, ReserveErr_> {
+        self.reg_.reserve_listener_(local_dock, cancel).await
     }
 
-    /// 登记 telegraph 身份。
+    /// 登记 telegraph 身份，并交出它的**身份节点句柄**。
     pub(crate) async fn reserve_telegraph_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<(), ReserveErr_> {
+    ) -> Result<TgOwner_<C::Alloc>, ReserveErr_> {
         self.reg_.reserve_telegraph_(local_dock, cancel).await
     }
 

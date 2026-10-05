@@ -1,14 +1,27 @@
-//! 每条子流的**共享原子状态**：[`ChannelState_`]（经 [`ChannelOwner_`] 句柄共享）。
+//! 每条身份的**共享节点**与它的类型化句柄：[`DockBinding_`]（节点）/
+//! [`ChannelOwner_`]（channel 句柄）/ [`ChannelState_`]（节点内联的热状态）。
 //!
 //! 环半部**不在这里**：会话侧的两个半部在注册时**移交给对应的循环本地持有**，
 //! 因此它们不会藏在共享实体的锁后面，循环可以自由在这些半部上 park / await。
 //!
-//! # 一次分配、一个共享节点
+//! # 一个身份、一个节点、零内部堆分配
 //!
-//! 状态由**注册表在登记身份时**建立（`reserve_channel_` / `reserve_inbound_`），
-//! 注册表的身份记录持有它的句柄，两个循环的本地表与应用侧半部各持一份克隆。
-//! 因此「身份在 ⇒ 状态在」，不再有一个可以被提前丢弃的、另行 `attach` 上来的 owner。
-//! 状态本身的成员全是原子，**没有任何锁**：读写循环与建流路径都直接经句柄访问。
+//! 节点由**注册表在登记身份时**建立（`reserve_channel_` / `reserve_inbound_`），
+//! 注册表的**表槽**持有它的句柄，两个循环的本地表与应用侧半部各持一份克隆。
+//! 因此「身份在 ⇒ 状态在」，不再有一个可以被提前丢弃的、另行 `attach` 上来的 owner，
+//! 也**没有**「状态节点」与「身份记录」两个可独立死亡的对象
+//! （形状三，见 `dev-notes/identity-record-20261005-0648.md`）。
+//!
+//! 节点内部**零堆分配**：状态字是 `AtomicFlags`、两个窗口是「自旋锁 + 普通字段」、
+//! 建流通知是内联的 [`NotifySlot_`]。分配器参数只出现在**句柄**上（`Shared<_, A>`
+//! 要把分配器写进节点以便最后一个强引用归还内存）。
+//!
+//! # 取用路径零分支：构造时校验一次
+//!
+//! [`ChannelOwner_`] 是**类型化**句柄：字段私有、只能由 [`new_channel_owner_`] 从
+//! `DockBinding_::Channel` 变体的节点建出（构造期校验一次），此后
+//! [`Deref`](core::ops::Deref) 直接交出载荷引用——热路径（每次 `try_write`、每帧
+//! 流控记账）**零分支、零 panic**。安全论证见该类型的文档与构造函数的 `SAFETY` 注释。
 //!
 //! # 状态字：一个 `AtomicFlags<usize>`
 //!
@@ -457,25 +470,235 @@ impl ChannelState_ {
     }
 }
 
-/// 一条子流的共享句柄：指向 [`ChannelState_`] 的强引用。
+/// 一条身份的**共享节点**：非泛型、内部零堆分配（见 `dev-notes/identity-record-20261005-0648.md`）。
+///
+/// 每种身份内联自己那份内容，因此节点里**不允许**再出现任何堆分配（`Vec` / `flume`
+/// 通道 / 嵌套 `Shared` / `Arc` 都不行）。分配器参数 `A` 只出现在**句柄**上
+/// （[`Shared<DockBinding_, A>`](Shared)）：`mm_ptr::Shared` 把分配器写进节点以便最后一个
+/// 强引用归还内存，那是「谁负责归还」，与「节点内部要不要分配」无关。
+///
+/// 节点一旦建出，**变体终生不变**（身份释放换的是注册表**表槽**，不动节点），
+/// 这是 [`DockHandle_`] 那处无检查取用的安全前提。
+pub(crate) enum DockBinding_ {
+    /// 一条 channel 的身份节点：内联它的全部热状态。
+    Channel(ChannelState_),
+
+    /// 一个 telegraph 端点的身份节点（本轮仍是占位：收发队列待实现）。
+    Telegraph(TgRec_),
+
+    /// 一个 listener 的身份节点：内联它的入向通知槽。
+    Listener(LsnRec_),
+}
+
+impl DockBinding_ {
+    /// 取出 `Channel` 变体的载荷；不是该变体时返回 `None`（**只用于构造期校验**）。
+    fn channel_(&self) -> Option<&ChannelState_> {
+        match self {
+            DockBinding_::Channel(payload) => Option::Some(payload),
+            _ => Option::None,
+        }
+    }
+
+    /// 取出 `Telegraph` 变体的载荷；不是该变体时返回 `None`（**只用于构造期校验**）。
+    fn telegraph_(&self) -> Option<&TgRec_> {
+        match self {
+            DockBinding_::Telegraph(payload) => Option::Some(payload),
+            _ => Option::None,
+        }
+    }
+
+    /// 取出 `Listener` 变体的载荷；不是该变体时返回 `None`（**只用于构造期校验**）。
+    fn listener_(&self) -> Option<&LsnRec_> {
+        match self {
+            DockBinding_::Listener(payload) => Option::Some(payload),
+            _ => Option::None,
+        }
+    }
+}
+
+/// 一个 telegraph 端点的身份载荷（**占位**）。
+///
+/// telegraph 本轮只登记身份（独占 `local_dock`）与释放路径；`send_async` /
+/// `recv_async` 仍是 `todo!()`。落地时在这里挂收发队列与按 `remote_dock` 的分发状态
+/// ——因为节点里不许有堆分配，那些队列**不能**用 `flume`（见
+/// `dev-notes/identity-record-20261005-0648.md`）。
+#[derive(Debug, Default)]
+pub(crate) struct TgRec_;
+
+/// 一个 listener 的身份载荷：`local_dock` 上的**零分配**入向通知槽。
+///
+/// 取代原先的 `flume::bounded(1)`（audit-heap-alloc §3.1 #6：每个被监听 dock 一次
+/// **全局**分配）：通知语义完全一样是「可能有入向事件」的持久提示，而等待者只有一个
+/// （`ChannelListener` 是 `!Clone`、`income_async` 取 `&mut self`）。
+#[derive(Debug)]
+pub(crate) struct LsnRec_ {
+    /// 「本 dock 上可能有入向事件」的持久通知（协议见 [`NotifySlot_`]）。
+    notify_: NotifySlot_,
+}
+
+impl LsnRec_ {
+    /// 空载荷（注册 listener 身份时建立）。
+    pub(crate) fn new_() -> Self {
+        LsnRec_ {
+            notify_: NotifySlot_::new_(),
+        }
+    }
+
+    /// 提示「本 dock 上可能有入向事件」；幂等、不阻塞、零分配。
+    pub(crate) fn notify_(&self) {
+        self.notify_.notify_();
+    }
+
+    /// 等一次入向通知：消费已到达的提示，或登记 waker 后返回 [`Poll::Pending`]。
+    pub(crate) fn poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.notify_.poll_wait_(cx)
+    }
+}
+
+/// **类型化**的身份句柄：`T` 是它的身份节点里那份载荷的类型。
 ///
 /// # 生命周期
 ///
 /// 节点的建立与销毁都跟着**注册表的身份记录**：记录在 `reserve_channel_` /
-/// `reserve_inbound_` 时创建它，在身份释放（转宽限态 / 撤销）时丢掉自己那一份。
-/// 两个循环的本地表与应用侧半部各持一份克隆，因此「身份记录已被改写」不会让正在
-/// 收尾的一方失去状态——但也**不会**让状态永久泄漏：最后一份句柄消失即回收。
+/// `reserve_inbound_` / `reserve_listener_` / `reserve_telegraph_` 时创建它，在身份
+/// 释放（转宽限态 / 撤销）时丢掉自己那一份。应用侧对象与两个循环的本地表各持一份克隆，
+/// 因此「身份记录已被改写」不会让正在收尾的一方失去状态——但也**不会**让状态永久泄漏：
+/// 最后一份句柄消失即回收。
 ///
-/// 名字保留「Owner」的历史含义（这条子流的共享状态归它所有），实现上就是
-/// `Shared<ChannelState_, A>`：一次分配、可克隆、`Deref` 到 [`ChannelState_`]。
-pub(crate) type ChannelOwner_<A> = Shared<ChannelState_, A>;
+/// # 变体在构造时校验一次，取用不再检查
+///
+/// 字段一律私有，只能经 [`DockBinding_`] 的三个 `*_` 取值函数 + [`handle_from_node_`]
+/// 建出：构造时校验一次变体，此后 [`Deref`](core::ops::Deref) 直接交出那份载荷引用。
+/// 热路径（每次 `try_write` / 每帧流控记账）因此**零分支、零 panic**。
+pub(crate) struct DockHandle_<T, A>
+where
+    T: ?Sized + 'static,
+    A: AllocatorClone,
+{
+    /// 保活句柄：本句柄存活期间节点不会被释放，也**不会移动**（`Shared` 只交出 `&T`，
+    /// 拿不到 `&mut`，`try_into_inner` 在强引用多于一个时不会成功）。
+    node_: Shared<DockBinding_, A>,
 
-/// 建立一条子流的共享状态节点（登记身份时调用）。
+    /// 指向 `node_` 内对应变体载荷的引用（构造时已校验）。
+    ///
+    /// 生命周期被延长到 `'static` 是**本类型的私有实现细节**：真正的约束是
+    /// 「`node_` 活着」，而它与本字段同生共死；[`Deref`](core::ops::Deref) 只在
+    /// `&self` 的生命周期内把引用交出去，`'static` 不会泄漏到外部。
+    payload_: &'static T,
+}
+
+/// 一条 **channel** 身份的句柄。
+pub(crate) type ChannelOwner_<A> = DockHandle_<ChannelState_, A>;
+
+/// 一个 **telegraph 端点**身份的句柄。
+pub(crate) type TgOwner_<A> = DockHandle_<TgRec_, A>;
+
+/// 一个 **listener** 身份的句柄。
+pub(crate) type LsnOwner_<A> = DockHandle_<LsnRec_, A>;
+
+impl<T, A> Clone for DockHandle_<T, A>
+where
+    T: ?Sized + 'static,
+    A: AllocatorClone,
+{
+    fn clone(&self) -> Self {
+        DockHandle_ {
+            node_: self.node_.clone(),
+            payload_: self.payload_,
+        }
+    }
+}
+
+impl<T, A> core::ops::Deref for DockHandle_<T, A>
+where
+    T: ?Sized + 'static,
+    A: AllocatorClone,
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.payload_
+    }
+}
+
+impl<T, A> core::fmt::Debug for DockHandle_<T, A>
+where
+    T: ?Sized + 'static,
+    A: AllocatorClone,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DockHandle_").finish_non_exhaustive()
+    }
+}
+
+/// 由一条身份节点与「取哪个变体」的判据建出**类型化句柄**（构造期校验一次）。
+///
+/// 三个 `new_*_owner_` 都走这里，因此 `unsafe` 在整棵身份体系里只有**这一处**。
+///
+/// # Panics
+///
+/// 节点的变体不是 `pick` 认得的那一个时 panic：这是**构造路径**的编程错误，只有注册表
+/// 建身份时才会走到，因此冷路径上一次 `expect` 是可接受的代价（换来取用路径零分支）。
+fn handle_from_node_<T, A>(
+    node: Shared<DockBinding_, A>,
+    pick: impl FnOnce(&DockBinding_) -> Option<&T>,
+) -> DockHandle_<T, A>
+where
+    T: ?Sized + 'static,
+    A: AllocatorClone,
+{
+    let checked = pick(&node).expect("身份句柄只能由对应变体的身份节点构造");
+    let ptr = checked as *const T;
+    // SAFETY: 节点由 `Shared` 独占拥有、且只交出 `&T`（不会移动、不会给出 `&mut`），
+    // 因此 `ptr` 在句柄存活期间一直有效；句柄持有 `node_` 的强引用，保证节点活到句柄
+    // 之后才可能被释放。把引用的生命周期延长到 `'static` 只是为了让结构体自持，
+    // `'static` 不会经 `Deref` 泄漏（返回的生命周期绑定 `&self`）。
+    let payload: &'static T = unsafe { &*ptr };
+    DockHandle_ {
+        node_: node,
+        payload_: payload,
+    }
+}
+
+/// 由一条**已经是 `Channel` 变体**的身份节点建出 channel 句柄。
+fn new_channel_owner_<A>(node: Shared<DockBinding_, A>) -> ChannelOwner_<A>
+where
+    A: AllocatorClone,
+{
+    handle_from_node_(node, DockBinding_::channel_)
+}
+
+/// 建立一条 channel 身份的共享节点（登记身份时调用）。
 pub(crate) fn new_owner_<A>(alloc: A) -> ChannelOwner_<A>
 where
     A: AllocatorClone,
 {
-    Shared::new(ChannelState_::new_empty_(), alloc)
+    new_channel_owner_(Shared::new(
+        DockBinding_::Channel(ChannelState_::new_empty_()),
+        alloc,
+    ))
+}
+
+/// 建立一条 listener 身份的共享节点（登记身份时调用）。
+pub(crate) fn new_listener_owner_<A>(alloc: A) -> LsnOwner_<A>
+where
+    A: AllocatorClone,
+{
+    handle_from_node_(
+        Shared::new(DockBinding_::Listener(LsnRec_::new_()), alloc),
+        DockBinding_::listener_,
+    )
+}
+
+/// 建立一条 telegraph 端点身份的共享节点（登记身份时调用）。
+pub(crate) fn new_telegraph_owner_<A>(alloc: A) -> TgOwner_<A>
+where
+    A: AllocatorClone,
+{
+    handle_from_node_(
+        Shared::new(DockBinding_::Telegraph(TgRec_), alloc),
+        DockBinding_::telegraph_,
+    )
 }
 
 /// 等待建流完成：等对端的 `OPEN` + `ACCEPT` / `REJECT`，或被取消 / 连接失败打断。

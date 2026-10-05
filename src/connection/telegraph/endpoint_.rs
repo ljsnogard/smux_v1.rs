@@ -15,6 +15,7 @@ use buffex::x_deps::{abs_buff, anylr};
 
 use crate::connection::{
     Dock, MuxConnection, MuxError, TrConnCfg,
+    owner_::TgOwner_,
     signal_::SessionEvent_,
 };
 
@@ -45,17 +46,26 @@ where
 
     /// 本端 dock。
     local_dock_: Dock,
+
+    /// 本端点的**身份节点句柄**（收发队列落地后，按 `remote_dock` 的分发状态挂在
+    /// 这个节点里；当前只用来「持有身份」）。
+    rec_: TgOwner_<C::Alloc>,
 }
 
 impl<C, S> Telegraph<C, S>
 where
     C: TrConnCfg,
 {
-    /// 由连接与 `local_dock` 构造（只允许 `open_telegraph_async` 调用）。
-    pub(crate) fn new_(conn: MuxConnection<C, S>, local_dock: Dock) -> Self {
+    /// 由连接、`local_dock` 与身份节点句柄构造（只允许 `open_telegraph_async` 调用）。
+    pub(crate) fn new_(
+        conn: MuxConnection<C, S>,
+        local_dock: Dock,
+        rec_: TgOwner_<C::Alloc>,
+    ) -> Self {
         Telegraph {
             conn_: conn,
             local_dock_: local_dock,
+            rec_,
         }
     }
 }

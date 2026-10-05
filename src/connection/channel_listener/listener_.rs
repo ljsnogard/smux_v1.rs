@@ -3,12 +3,12 @@ use core::future::poll_fn;
 use abs_buff::{gen_may_cancel_future, x_deps::abs_cancel};
 use abs_cancel::TrCancellationToken;
 use abs_smux::conn::TrChannelListener;
-use flume::Receiver;
 use buffex::x_deps::abs_buff;
 
 use crate::connection::{
     Dock, MuxConnection, MuxError, TrConnCfg,
     channel_handle::ChannelHandle,
+    owner_::LsnOwner_,
     signal_::SessionEvent_,
 };
 
@@ -44,26 +44,27 @@ where
     /// 监听的 local_dock。
     local_dock_: Dock,
 
-    /// 「本 dock 上有入向事件（新请求 / 连接失败）」的通知消费端。
+    /// 「本 dock 上有入向事件（新请求 / 连接失败）」的**身份节点句柄**。
     ///
-    /// 由 `listen_async` 与注册表同时建立：注册表持生产端，本对象持消费端。
-    notify_rx_: Receiver<()>,
+    /// 通知槽内联在节点里（零堆分配），本对象持句柄并在它上面 park——句柄同时保证
+    /// 「只要 listener 还在，身份节点就还在」，因此等待期间不会被回收。
+    rec_: LsnOwner_<C::Alloc>,
 }
 
 impl<C, S> ChannelListener<C, S>
 where
     C: TrConnCfg,
 {
-    /// 由连接、监听 `local_dock` 与通知消费端构造（只允许 `listen_async` 调用）。
+    /// 由连接、监听 `local_dock` 与身份节点句柄构造（只允许 `listen_async` 调用）。
     pub(crate) fn new_(
         conn: MuxConnection<C, S>,
         local_dock: Dock,
-        notify_rx_: Receiver<()>,
+        rec_: LsnOwner_<C::Alloc>,
     ) -> Self {
         ChannelListener {
             conn_: conn,
             local_dock_: local_dock,
-            notify_rx_,
+            rec_,
         }
     }
 }
@@ -148,8 +149,10 @@ where
             Result::Ok(Option::None) => {}
         }
         // 3. 等一条通知（新请求或连接失败），与取消令牌竞争。
-        //    通道是持久的：第 1、2 步与这里之间的通知已经排在队列里，不会丢。
-        let mut notified = core::pin::pin!(listener.notify_rx_.recv_async());
+        //    槽的持久位是「先通知、后等待也不丢」的保证（协议见 `sync_::NotifySlot_`）：
+        //    第 1、2 步与这里之间到达的通知会被 `poll_wait_` 的复检消费掉。
+        let rec = &listener.rec_;
+        let mut notified = core::pin::pin!(poll_fn(|cx| rec.poll_wait_(cx)));
         let mut cancelled = core::pin::pin!(cancel.child_token().cancellation());
         let got = poll_fn(|cx| {
             if core::future::Future::poll(cancelled.as_mut(), cx).is_ready() {
