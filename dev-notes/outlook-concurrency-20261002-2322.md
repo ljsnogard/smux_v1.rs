@@ -491,15 +491,19 @@ enum EstablishReply_ { Accepted, Refused, Failed(MuxError<(), ()>) }
 
 ### T6 保活与空闲超时（写法 B：每连接一个 tick 循环）
 
-- **状态**：**设计已裁决、待实现**（下个会话按施工单做）；`embedded-timers v0.4.0` 已由人类
-  加入 `Cargo.toml`。
-- **做什么**：一个连接**一个**计数器（`embedded_timers::timer::Timer`），写成**第 5 个本地
+- **状态**：**第 1 步已落地**（2026-10-05 11:30）：公开模块 `src/time` 已实现
+  `Elapsed` / `Interval` / `Timer` 与 `sleep`/`sleep_until`/`timeout`/`timeout_at`/
+  `interval`/`interval_at`，含 13 个假时钟确定性用例——见 `time-mod-20261005-1130.md`。
+  **tick 循环、PULSE、超时落地仍未开工**（即 `keepalive…` §4 的第 3～7 步）。
+  `embedded-timers v0.4.0` 已由人类加入 `Cargo.toml`（commit `aa2be18`）。
+- **做什么**：一个连接**一个**计数器（本仓自建轮盘 `time::Timer`），写成**第 5 个本地
   循环**；它在完全静默时仍会醒来，并**激活其它可能已经静默的循环**（投 PULSE / 超时事件），
   从而补齐 `PULSE` 的发送点与 `MuxError::IdleTimeout` 的产生点。
-- **施工单与前置**：见 `keepalive-20261005-0901.md`（含 6 项待裁决、`embedded-timers` 的
-  真实能力边界、`Clock` 注入形状、时间表示统一为「连接级 epoch + 毫秒」，以及**当前环境
-  `cargo check` 因传递依赖 `embedded-hal`/`nb`/`void` 写不进只读 `CARGO_HOME` 而失败**这一
-  必须先处理的前置）。
+- **施工单与前置**：见 `keepalive-20261005-0901.md`（含 6 项待裁决——其中只有
+  「`Clock` 由调用方给值、模块泛型化」被第 1 步部分落地；`embedded-timers` 的真实能力
+  边界；时间表示统一为「连接级 epoch + 毫秒」）；原记的**只读 `CARGO_HOME` 构建前置已
+  消解**（见该文 §6.1 后记）。第 1 步另新增两条待裁决：轮盘的 `BTreeMap` 是否改走注入
+  分配器、是否把 `embedded_timers` 导出到 `x_deps`（见新文 §6）。
 - **关联**：T6 同时把「时间能力怎么注入」一并裁决（`TrDelay` 不在 `S: TrLocalScope` 上，
   见施工单 §2.2/§5.2）；事件通道的定额化（本列表最后一条）与 T6 的限频要求相互牵制。
 
