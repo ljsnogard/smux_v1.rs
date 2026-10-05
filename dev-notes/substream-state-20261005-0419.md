@@ -4,6 +4,12 @@
 性质：**跨模块技术决策 + 落地记录**（`flow_ctrl` / `connection::owner_` /
 `connection::mux_connection::registry_` / `connection::session_`）。
 
+> **修订：2026-10-05（形状三）**——本文 §4.1/§4.3 的**形状**已被取代：
+> `ChannelOwner_` 不再是 `Shared<ChannelState_>` 这个类型别名，而是**类型化句柄**
+> （`Shared<DockBinding_>` + 指向节点内载荷的引用），`ChanCtx_` 也被表槽
+> `ChanSlot_` 取代。本文的**因果**（状态与身份同寿命、窗口带锁、收尾判据）仍然成立。
+> 见 `identity-record-20261005-0648.md` §4.5。
+
 **修订：2026-10-05（同日）**——第一版把两个窗口做成**逐字段原子**；人类指出那是过度
 设计：窗口的并发面只有「整块状态的读改写」，应该把内部状态**打包放进一把零分配自旋锁**
 （`SpinningMutexOwned`），对外仍保持 `&self` 外观。已按后者返工，本文记录**最终形状**；
@@ -246,7 +252,8 @@ struct ChanCtx_<A> { state_: ChannelOwner_<A>, inbound_: Inbound_ }
 1. **`drop(rx)` 后到达数据的静默丢弃分支**：机制已就位并有连接存活回归用例，但「帧恰好
    落在丢弃分支」依赖调度，未强制命中；要强制命中需要在解复用循环注入探针或做确定性
    调度，属后续加固。
-2. `Establish_` 的 `flume::bounded(1)` 仍是每条子流一次全局分配（audit §3.1 #7）；
+2. ~~`Establish_` 的 `flume::bounded(1)` 仍是每条子流一次全局分配（audit §3.1 #7）~~
+   **已整改（2026-10-05 C1）**：换成零分配内联槽 `sync_::NotifySlot_`；
    `NotifySlot_` 化另开一轮，配丢唤醒压力用例。
 3. `Arc<dyn Allocator>` 降到每连接一份（audit §5.5-A）未做。
 4. audit §12-T4 的**计数分配器实测**仍未做：本轮把每条子流的 owner 分配从 3 次降到
