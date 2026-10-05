@@ -484,6 +484,24 @@ enum EstablishReply_ { Accepted, Refused, Failed(MuxError<(), ()>) }
   （超时 124），属本环境下的既有现象。
 - **要做**：先分清是环境依赖（真实 socket / 线程 / 运行时）还是实现竞态。在查清之前，
   `just test` 的这一步不能当作回归信号——否则下一次改动的成败会被误判。
+- **2026-10-05 复查**：本会话环境里 `cargo test --all-targets` **全绿**，其中 `layered_rpc`
+  2 passed / 0.01s，`smoke_tokio` 的 1024 子流真实 socket 场景也通过。也就是「挂死」在当前
+  环境**没有复现**（与当初 `git stash` 那次观测相反）。在把它当回归信号之前仍需定位当初的
+  触发条件（环境？调度？），但至少不应再默认它会挂死。
+
+### T6 保活与空闲超时（写法 B：每连接一个 tick 循环）
+
+- **状态**：**设计已裁决、待实现**（下个会话按施工单做）；`embedded-timers v0.4.0` 已由人类
+  加入 `Cargo.toml`。
+- **做什么**：一个连接**一个**计数器（`embedded_timers::timer::Timer`），写成**第 5 个本地
+  循环**；它在完全静默时仍会醒来，并**激活其它可能已经静默的循环**（投 PULSE / 超时事件），
+  从而补齐 `PULSE` 的发送点与 `MuxError::IdleTimeout` 的产生点。
+- **施工单与前置**：见 `keepalive-20261005-0901.md`（含 6 项待裁决、`embedded-timers` 的
+  真实能力边界、`Clock` 注入形状、时间表示统一为「连接级 epoch + 毫秒」，以及**当前环境
+  `cargo check` 因传递依赖 `embedded-hal`/`nb`/`void` 写不进只读 `CARGO_HOME` 而失败**这一
+  必须先处理的前置）。
+- **关联**：T6 同时把「时间能力怎么注入」一并裁决（`TrDelay` 不在 `S: TrLocalScope` 上，
+  见施工单 §2.2/§5.2）；事件通道的定额化（本列表最后一条）与 T6 的限频要求相互牵制。
 
 ### 已并入其他文档的待办（此处不重复）
 

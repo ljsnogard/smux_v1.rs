@@ -544,3 +544,20 @@ C4 的 A / B 任一方案落地后，右边应当变成「基准 + 1」（每连
 **上一条的拆流**（`TxClosed`/`RxClosed` → FIN/RESET → 释放事件）被算进了**下一条**的
 窗口，数字虚高一倍多（432 而非 278）。计数型用例必须让「被测动作」之间不夹带别的生命周期
 事件——四个半边一律留到最后统一释放。
+
+## G. 新依赖：`embedded-timers`（2026-10-05，为保活引入）
+
+保活机制（写法 B，见 `keepalive-20261005-0901.md` 与 `outlook-concurrency` §12 T6）引入了
+`embedded-timers = { git = …, tag = "v0.4.0" }`。按本文件的分配纪律核对：
+
+- **该 crate 自身零堆分配**：`src/` 无 `Vec` / `Box` / `alloc::`（只有 `core` 与 `nb`/`void`/
+  `embedded-hal` 的类型）。它只提供 `Clock` / `Instant` trait、一次性 `Timer`、阻塞式
+  `Delay`，因此**不新增任何注入分配点**，也不需要走调用方分配器。
+- **传递依赖（新增 3 个 crates.io 包）**：`embedded-hal 1.0.0`（只被阻塞式 `Delay` 与文档
+  示例使用）、`nb 1.1.0`、`void 1.0.2`。
+- **构建前置**：这三者不在本地 registry cache，而受限环境里 `CARGO_HOME` 只读 ⇒
+  `cargo check` 会在「下载成功、写 cache 失败」处中止（详见 `keepalive…` §6.1）。
+- **对分配基线的预期影响**：tick 循环每发一条 PULSE 就是一条 `WriteEvent_::Control`
+  （`flume` 消息 = 一次全局分配，即 §3.1 #9/#10 那两条「已承认的例外」）。因此
+  `tests/alloc_count.rs` 在实现保活后必须补一条**tick 期的全局分配上界**，否则 §F 的
+  「稳态读侧分配」基线会被悄悄改写。

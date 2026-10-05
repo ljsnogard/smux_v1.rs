@@ -17,6 +17,8 @@ atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch 
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
 
+embedded-timers = { git = "https://gitee.com/lino_snsalias/embedded-timers.git", tag = "v0.4.0" }
+
 crc = { version = "3.4.*" }
 flume = { version = "0.12.*" }
 thiserror = { version = "2.0.*", default-features = false }
