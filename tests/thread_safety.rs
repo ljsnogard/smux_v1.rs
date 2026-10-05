@@ -19,8 +19,10 @@
 //!
 //! # 实现品质要求（本文件**测不到**）
 //!
-//! 争用一律**零 CPU 忙等**：注册表与取消令牌都只走协作式锁的 `try_*` 快路径，
-//! 失败则 park 本线程等许可释放（见 `connection::sync_::TrBlockingAcquire_`）；
+//! 争用一律**零 CPU 忙等**：注册表与取消令牌都只走协作式锁的 `try_read` / `try_write`
+//! 快路径，失败则 `read_async` / `write_async()` 配 `may_cancel_with(cancel)` **异步等待**
+//! ——让出执行权、可被取消，既不自旋也不阻塞本线程
+//! （见 `connection::sync_::{acquire_read_, acquire_write_}`）；
 //! `Drop` 不取任何锁，只投一条释放消息。这两条是**实现约束**，行为断言覆盖不到，
 //! 因此写在这里作为阅读本文件时的前提。
 //!
