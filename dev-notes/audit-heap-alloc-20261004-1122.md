@@ -234,3 +234,98 @@
   但常量注释里的「字段最坏情况是三字节宽」是错的，落地 §5.1 时一并修正。
 - 依赖链上的分配（§3.5）是否需要向 `atomic_sync` / `abs_art` 提需求，留待分配纪律
   扩展到依赖链时再议。
+
+---
+
+# 第二轮重扫（2026-10-05）
+
+**触发**：`substream-state-20261005-0419.md` 那一轮（状态节点化 + T1 + 窗口带锁）落地后
+重扫一遍，核对 §3.1 的十条、找第一轮**漏掉**的项、并确认没有引入新分配。
+
+**口径**与第一轮相同：`src/**`，切掉 `#[cfg(test)] mod`（含 `connection/test_support_.rs`、
+`ring_::test_support_`）；容器 = `Vec` / `vec!` / `VecDeque` / `Box` / `String` / `format!` /
+`.collect()` / `HashMap` / `HashSet` / `BTreeMap::new()` / `BTreeSet::new()` / `Rc` / `Arc` /
+`flume::`。**第一轮的口径漏了 `BTreeSet::new()`**（只列了 `BTreeMap::new()`），本轮补上，
+并额外扫了 `Box::new` / `Rc::new` / `Arc::new` / `with_capacity` / `to_vec` / `to_owned` /
+`std::sync::Mutex` / `OnceLock` / `thread::spawn` 等，未再发现新项。
+
+## A. §3.1 十条的现状
+
+| # | 位置（第一轮） | 现状（第二轮） | 分配器 | 时机 |
+| --- | --- | --- | --- | --- |
+| 1 | `session_.rs:466` `encode_whole_frame_` | **待整改**（现 `session_.rs:573`） | 全局 | 每 DATA 帧 / 每控制帧 |
+| 2 | `util_.rs:23` `read_available_into_vec_` | **待整改**（现 `util_.rs:23`） | 全局 | 建流开场消息 / 拒绝理由 |
+| 3 | `registry_.rs:1074` `Vec<ChannelOwner_>` | **已整改** | — | `mark_failed_` 不再收集，锁内直接通知 |
+| 4 | `registry_.rs:1073` `Vec<Waker>` | **已整改**（死代码删除，§5.4） | — | — |
+| 5 | `ring_.rs:174` `Arc<dyn Allocator>` | **待整改**（§5.5-A 未做） | 全局 | 每子流一次（`MuxChanBuff` 配置） |
+| 6 | `binding_.rs:202` `flume::bounded(1)` | **待整改** | 全局 | 每个被监听 dock 一次 |
+| 7 | `owner_.rs:74` `flume::bounded(1)` | **待整改**（现 `owner_.rs:136`，`Establish_`） | 全局 | **每子流一次** |
+| 8 | `sync_.rs:193` `flume::bounded(1)` | **待整改**（现 `sync_.rs:196`） | 全局 | 每个取消令牌；**每连接 4 个**（`registry_.rs` 建 4 个循环令牌，`child_token()` 是 `clone()`，不再分配） |
+| 9 | `signal_.rs:341` `flume::unbounded()` | **待整改**（现 `signal_.rs:356`） | 全局 | 每连接 2 条（读 / 写事件通道） |
+| 10 | `signal_.rs:400` `flume::unbounded()` | **待整改**（现 `signal_.rs:415`） | 全局 | 每连接 1 条（`SessionMailbox_`） |
+
+## B. 本轮顺带消掉的分配（第一轮只记在 §3.3「合规」或 §3.5「依赖链」里）
+
+| 项 | 第一轮 | 现状 |
+| --- | --- | --- |
+| 每条子流的共享状态 | `ChannelOwner_::new_` **3 次 `Shared::new`**（注入）+ 热状态锁 `CooperativeRwLockOwned` **内部一个 `Arc<RwCore>`（全局）** | **1 次 `Shared<ChannelState_>`（注入）**，锁改 `SpinningMutexOwned`（内联，零分配） |
+| 每子流状态节点字节 | 3 块独立内存 + 1 个 Arc 控制块 | 1 块：`ChannelState_` = **192 B**（实测；其中两把锁 16 B，`FlowCtrl` 144 B） |
+| 连接级失败路径 | `Vec<ChannelOwner_>`（全局）+ 死 `Vec<Waker>` | 零分配（#3/#4） |
+
+即：**每子流的堆分配次数 4 → 2**（注入 3→1；全局 1→1，全局那一份是 #7 的建流通知），
+另少一个 Arc 控制块。
+
+## C. 新发现（第一轮漏项）
+
+| # | 位置 | 容器 | 分配器 | 时机 |
+| --- | --- | --- | --- | --- |
+| N1 | `session_.rs:1200` `mux_loop_async_` 的 `pending_fin` | `BTreeSet<(Dock, Dock)>`（`BTreeSet::new()`） | **全局** | 「发送方向已丢、环还没排空」每条子流**首次入集合**时分配一个节点 |
+
+- 类型定义在 `session_.rs:266`（`type PendingFin_ = BTreeSet<(Dock, Dock)>;`），**没有**像
+  两个循环的本地表那样走 `new_in(allocator)`；第一轮的匹配式只写了 `BTreeMap::new()`，
+  因此漏了它（`registry_.rs:1409` 的 `BTreeMap::new()` 在测试模块里，不在口径内）。
+- 触发频率低于其它项（只在 `drop(tx)` 时发送环仍有数据、且额度为 0 时入集合），但它是
+  **真实存在的全局分配**，且属于本仓可以自行整改的那一类。
+- 整改方向：`PendingFin_` 的类型带上分配器参数 `BTreeSet<(Dock, Dock), C::Alloc>`，构造时
+  `BTreeSet::new_in(...)`（与 `ReadTable_` / `WriteTable_` 同款；循环建表时已经从注册表拿到
+  分配器克隆）。
+
+## D. 有没有引入新问题
+
+**分配维度：没有。** 本轮新增的运行时结构逐项核对：
+
+| 新结构 | 是否分配 | 说明 |
+| --- | --- | --- |
+| `SpinningMutexOwned<SendInner>` / `<RecvInner>`（每子流 2 把） | **否** | `AtomicUsize` + `UnsafeCell<T>`，内联在状态节点里 |
+| `AtomicFlags<usize>` 状态字 | **否** | 内联 `AtomicUsize` |
+| `Shared<ChannelState_>`（每子流 1 个） | 是（注入分配器） | 取代原来的 3 次；见 B |
+| `wait_or(|| unreachable!())` 等闭包 | **否** | ZST |
+
+**非分配维度的两点代价（如实记录，不构成缺陷）**：
+
+1. **状态节点常驻字节**（实测，64 位）：`ChannelState_` = **192 B**，其中 `FlowCtrl` 144 B
+   （`SendWindow` 56 + `RecvWindow` 88）、两把锁共 16 B、两个 inner 共 128 B。与中间那版
+   「逐字段原子」实现相比，多出的是锁字与对齐（原子字与锁字同宽，量级相同，未逐字节实测）；
+   但对照第一轮的 **3 块独立内存 + 1 个 Arc 控制块**，堆分配次数与元数据开销都是下降的。
+2. **`flow_ctrl` 多了一个并发原语依赖**：它现在 `use atomic_sync::mutex::preemptive`。
+   模块自述「可被将来别的复用协议复用」，这条复用现在会带上 `atomic_sync` 依赖——已在模块
+   文档里写明选型理由（`cooperative` 会引入每实例的全局分配）。
+
+**没有新增**：`#[global_allocator]`、`Box` / `Rc` / `String` / `format!` / `.collect()` / `thread::spawn` /
+`std::sync` 容器在 `src/**` 的生产代码里仍然为 0；新增依赖为零（`atomic_sync` 本就是直接依赖）。
+
+## E. 当前生产分配清单（按生命周期归口）
+
+| 粒度 | 全局分配器 | 注入分配器 |
+| --- | --- | --- |
+| 每连接 | 4（取消令牌通知）× `flume::bounded` + 2（事件通道）+ 1（会话邮箱）+ 1（注册表协作锁内部 `Arc<RwCore>`） | `Shared<MuxCore>`、注册表节点、4 本索引（惰性）、4 个取消令牌标志 |
+| 每子流 | 1（`Establish_` 建流通知，#7）+ 1（`MuxChanBuff` 的 `Arc<dyn Allocator>`，#5） | `Shared<ChannelState_>`（本轮 3→1）、2 × `Shared<Ring>` |
+| 每被监听 dock | 1（listener 通知，#6） | — |
+| 每 DATA 帧 | 1（`encode_whole_frame_` 的 `Vec`，#1） | — |
+| 每次建流 | 0~1（开场消息 / 拒绝理由的 `Vec<u8>`，#2） | — |
+| 首次进入 `pending_fin` | 1（BTreeSet 节点，**N1**） | — |
+
+**结论**：第一轮 10 条里 **2 条已整改（#3/#4）**，**8 条待整改**；另有 1 条第一轮只当
+「合规/依赖链」记着的（每子流 3 次 `Shared` + 协作锁的 `Arc`）本轮**顺带消掉**。
+新发现 1 条漏项（N1）；**没有引入新的分配问题**。最高优先仍是 #1（每帧一次全局分配 +
+数据面多一跳拷贝）。
