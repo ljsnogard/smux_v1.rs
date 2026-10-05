@@ -167,6 +167,27 @@ async fn mux_per_channel_alloc_dual_() {
 }
 dual_runtime_test_!(mux_per_channel_alloc_dual_);
 
+/// 测试目标（**T1 验收点**）：应用丢掉接收半边之后到达的数据被**静默丢弃**，连接
+/// 继续服务同一条连接上的其它子流。
+///
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_recv_dropped_scenario_`]：子流 1 上 A 写满一整个接收窗口后保持
+///   `tx` 打开，B 接受后**立刻丢掉 `rx`**；随后 A / B 在子流 2 上完成一次完整往返。
+///   场景由 `scope.run_until` 驱动。
+/// - 判断：子流 2 的载荷逐字节相等且半关闭后读到 EOF。若「丢弃接收半边」被实现成
+///   传输错误（写进已关闭的接收环）或协议违例（读侧表项被提前摘掉），连接会被终止，
+///   子流 2 必然失败——这正是本用例要钉住的那条路径。
+async fn mux_recv_dropped_dual_() {
+
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let scope = LocalScope::new();
+    let scenario = common::run_recv_dropped_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+dual_runtime_test_!(mux_recv_dropped_dual_);
+
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 收尾：丢弃连接 ⇒ 两个循环退出并把传输交还
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----

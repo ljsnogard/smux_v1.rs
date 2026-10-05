@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
 use crate::flow_ctrl::{Credit, FlowCtrlError, RecvTotal, TrFlowCtrlPolicy, WindowReport};
 
 /// 提醒的**分区**：只分「临界」与「非临界」，判据一律看**剩余容量**。
@@ -29,7 +31,6 @@ pub(crate) enum Zone_ {
     Critical,
 }
 
-
 /// 接收窗口：本端**还愿意接收**多少字节，以及提醒所需的状态。
 ///
 /// 三个量各自累积：累计已收 `R`、累计已消费 `C`、以及最近一次通告出去的快照
@@ -40,101 +41,143 @@ pub(crate) enum Zone_ {
 /// ```
 ///
 /// 而越权判定用的是**已通告**的额度：对端最多只能发到 `R₀ + W₀`。
+///
+/// # 原子化（2026-10 改造）
+///
+/// 字段改为原子、方法改取 `&self`，好让本类型能放进一个**可克隆的共享节点**里。
+/// 并发上比发送侧更简单：**生产路径上本类型只有解复用循环一个任务访问**
+/// （建流期由应用线程 `install_` 写一次，早于任何帧）；没有任何字段需要跨任务打包，
+/// 逐字段原子即足够。
 pub struct RecvWindow {
     /// 接收窗口容量（由策略从环容量推导，同时也是本端通告的上界）。
-    capacity_: Credit,
+    capacity_: AtomicU32,
 
     /// 累计已收字节数（`R`）。
-    received_: RecvTotal,
+    received_: AtomicU64,
 
     /// 累计已消费（交给应用）字节数（`C`）。
-    consumed_: RecvTotal,
+    consumed_: AtomicU64,
 
-    /// 最近一次通告的快照 `(R₀, W₀)`；`None` 表示还没通告过。
-    reported_: Option<(RecvTotal, Credit)>,
+    /// 最近一次通告的快照 `R₀`；有效性与 `reported_window_` 一起由
+    /// `reported_valid_` 决定。
+    reported_: AtomicU64,
 
+    /// 最近一次通告的快照 `W₀`。
+    reported_window_: AtomicU32,
 
+    /// 是否已经通告过（`reported_` / `reported_window_` 是否有效）。
+    reported_valid_: AtomicBool,
 
     /// 自上次提醒以来累计的**变动量**（字节）：收到多少 + 消费多少。
     ///
     /// 只在**非临界区**的频率门限里用到。量字节而不量帧数，是为了让「哪一侧在动」都
     /// 能推进它（理由见 [`TrFlowCtrlPolicy::min_advance_between_reports`]）。
-    activity_since_report_: RecvTotal,
+    activity_since_report_: AtomicU64,
 
-    /// 判定分区所需的策略快照；由 `new_` 展开一次。
+    /// 判定分区所需的策略快照（`install_` 时展开）。
     ///
     /// 存下来是为了让**不持有策略**的入口（[`RecvWindow::should_report`] /
     /// [`RecvWindow::report`]）也能自己判断，不必把调用方的 `C`/`P` 带进读写循环。
-    thresholds_: ReportThresholds_,
+    critical_: AtomicU32,
+
+    /// 非临界区两次提醒之间至少要积累的变动量（字节）。
+    min_advance_: AtomicU32,
 
     /// 当前 epoch 的起点（绝对累计量）：每次重置后推进到当时的累计已收量。
-    epoch_base_: RecvTotal,
+    epoch_base_: AtomicU64,
 
     /// 本端累计量的 epoch 规格：涨到它就重置。
-    epoch_limit_: RecvTotal,
+    epoch_limit_: AtomicU64,
 }
 
-
 impl RecvWindow {
+    /// 建一条**尚未安装**的接收窗口：容量 0、还没有通告。
+    pub(crate) const fn new_empty_() -> Self {
+        RecvWindow {
+            capacity_: AtomicU32::new(0u32),
+            received_: AtomicU64::new(0u64),
+            consumed_: AtomicU64::new(0u64),
+            reported_: AtomicU64::new(0u64),
+            reported_window_: AtomicU32::new(0u32),
+            reported_valid_: AtomicBool::new(false),
+            activity_since_report_: AtomicU64::new(0u64),
+            critical_: AtomicU32::new(0u32),
+            min_advance_: AtomicU32::new(0u32),
+            epoch_base_: AtomicU64::new(0u64),
+            epoch_limit_: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// 以策略算出的参数安装容量与阈值。
+    pub(crate) fn install_<P>(&self, policy: &P, ring_capacity: usize)
+    where
+        P: TrFlowCtrlPolicy,
+    {
+        let initial = policy.initial_window(ring_capacity);
+        let thresholds = ReportThresholds_::new_(policy, initial);
+        self.capacity_.store(initial, Ordering::Release);
+        self.critical_.store(thresholds.critical_, Ordering::Release);
+        self.min_advance_
+            .store(thresholds.min_advance_, Ordering::Release);
+        self.epoch_limit_
+            .store(policy.recv_total_epoch(), Ordering::Release);
+    }
+
+    #[cfg(test)]
     /// 以策略算出的参数构造。
     pub(crate) fn new_<P>(policy: &P, ring_capacity: usize) -> Self
     where
         P: TrFlowCtrlPolicy,
     {
-        let initial = policy.initial_window(ring_capacity);
-        let thresholds_ = ReportThresholds_::new_(policy, initial);
-        RecvWindow {
-            capacity_: initial,
-            thresholds_,
-            received_: 0u64,
-            consumed_: 0u64,
-            reported_: Option::None,
-            activity_since_report_: 0u64,
-            epoch_base_: 0u64,
-            epoch_limit_: policy.recv_total_epoch(),
-        }
+        let window = Self::new_empty_();
+        window.install_(policy, ring_capacity);
+        window
     }
 
     /// 本端承诺的最大可接收字节数（初始窗口 = `OPEN` 通告的值）。
-    pub const fn capacity(&self) -> Credit {
-        self.capacity_
+    pub fn capacity(&self) -> Credit {
+        self.capacity_.load(Ordering::Acquire)
     }
 
     /// 当前可通告的接收窗口 `W`（物理剩余）。
     pub fn window(&self) -> Credit {
-        let buffered = self.received_.saturating_sub(self.consumed_);
+        let buffered = self
+            .received_
+            .load(Ordering::Acquire)
+            .saturating_sub(self.consumed_.load(Ordering::Acquire));
         let buffered = Credit::try_from(buffered).unwrap_or(Credit::MAX);
-        self.capacity_.saturating_sub(buffered)
+        self.capacity().saturating_sub(buffered)
     }
 
     /// **绝对**累计已收字节数（自子流建立以来的总量）。
-    pub const fn recv_total(&self) -> RecvTotal {
-        self.received_
+    pub fn recv_total(&self) -> RecvTotal {
+        self.received_.load(Ordering::Acquire)
     }
 
     /// 当前 epoch 内、将要写进线格式的累计已收量（= 绝对量 − epoch 起点）。
-    pub const fn encoded_recv_total(&self) -> RecvTotal {
-        self.received_.saturating_sub(self.epoch_base_)
+    pub fn encoded_recv_total(&self) -> RecvTotal {
+        self.recv_total()
+            .saturating_sub(self.epoch_base_.load(Ordering::Acquire))
     }
 
     /// 累计量是否已经涨到当前 epoch 规格，必须在下次通告里宣告重置。
-    pub const fn reset_due(&self) -> bool {
-        self.encoded_recv_total() >= self.epoch_limit_
+    pub fn reset_due(&self) -> bool {
+        self.encoded_recv_total() >= self.epoch_limit_.load(Ordering::Acquire)
     }
 
     /// 累计已消费字节数（`C`）。
-    pub const fn consumed_total(&self) -> RecvTotal {
-        self.consumed_
+    pub fn consumed_total(&self) -> RecvTotal {
+        self.consumed_.load(Ordering::Acquire)
     }
 
     /// 最近一次通告出去的窗口（诊断用）。
-    pub const fn reported_window(&self) -> Option<Credit> {
-        match self.reported_ {
-            Option::Some((_, w)) => Option::Some(w),
-            Option::None => Option::None,
+    pub fn reported_window(&self) -> Option<Credit> {
+        if self.reported_valid_.load(Ordering::Acquire) {
+            Option::Some(self.reported_window_.load(Ordering::Acquire))
+        } else {
+            Option::None
         }
     }
-
 
     /// 对端又发来 `amount` 字节（一次调用 = 一个数据帧），计入在途并推进帧计数。
     ///
@@ -142,38 +185,58 @@ impl RecvWindow {
     ///
     /// 超过**已通告**额度（`R₀ + W₀`）时返回 [`FlowCtrlError::PeerViolation`]——
     /// 这是协议违例，不是「丢弃即可」。
-    pub fn on_data(&mut self, amount: Credit) -> Result<(), FlowCtrlError> {
-        let authorized = match self.reported_ {
-            Option::Some((r0, w0)) => r0.saturating_add(w0 as u64),
+    pub fn on_data(&self, amount: Credit) -> Result<(), FlowCtrlError> {
+        let authorized = if self.reported_valid_.load(Ordering::Acquire) {
+            self.reported_
+                .load(Ordering::Acquire)
+                .saturating_add(self.reported_window_.load(Ordering::Acquire) as u64)
+        } else {
             // 还没通告过任何窗口：对端本来就不该发数据。
-            Option::None => 0u64,
+            0u64
         };
-        let next = self.received_.saturating_add(amount as u64);
+        let next = self
+            .received_
+            .load(Ordering::Acquire)
+            .saturating_add(amount as u64);
         if next > authorized {
             return Result::Err(FlowCtrlError::PeerViolation);
         }
-        self.received_ = next;
+        self.received_.store(next, Ordering::Release);
         // 只有**被接受的**数据才算变动量：违例帧（上面已返回）不算，否则对端可以靠
         // 灌违例帧把门限刷开。零字节帧自然也不贡献变动量。
-        self.activity_since_report_ = self.activity_since_report_.saturating_add(amount as u64);
+        self.activity_since_report_
+            .fetch_add(amount as u64, Ordering::AcqRel);
         Result::Ok(())
     }
 
     /// 应用又消费（取走）了 `amount` 字节，窗口相应变大。
-    pub fn on_consumed(&mut self, amount: Credit) {
-        self.consumed_ = self.consumed_.saturating_add(amount as u64);
+    pub fn on_consumed(&self, amount: Credit) {
+        self.consumed_.fetch_add(amount as u64, Ordering::AcqRel);
         // 消费同样是「真实进展」，同样推进非临界区的频率门限（见
         // [`TrFlowCtrlPolicy::min_advance_between_reports`] 的口径说明）。
-        self.activity_since_report_ = self.activity_since_report_.saturating_add(amount as u64);
+        self.activity_since_report_
+            .fetch_add(amount as u64, Ordering::AcqRel);
     }
 
-    /// 当前剩余容量落在哪个分区（用预先展开好的阈值快照判）。
+    /// 当前剩余容量落在哪个分区（用给定的阈值快照判）。
     pub(crate) fn zone_with_(&self, thresholds: &ReportThresholds_) -> Zone_ {
-        let free = self.window();
-        if free <= thresholds.critical_ {
+        if self.window() <= thresholds.critical_ {
             Zone_::Critical
         } else {
             Zone_::Normal
+        }
+    }
+
+    /// 当前剩余容量落在哪个分区（用安装时存下的阈值判）。
+    fn zone_(&self) -> Zone_ {
+        self.zone_with_(&self.thresholds_())
+    }
+
+    /// 安装时存下的阈值快照（重建为值类型，供分区判定使用）。
+    fn thresholds_(&self) -> ReportThresholds_ {
+        ReportThresholds_ {
+            min_advance_: self.min_advance_.load(Ordering::Acquire),
+            critical_: self.critical_.load(Ordering::Acquire),
         }
     }
 
@@ -201,36 +264,33 @@ impl RecvWindow {
     where
         P: TrFlowCtrlPolicy,
     {
-        self.should_report_with_(&self.thresholds_)
+        self.should_report_()
     }
 
-    /// 与 [`RecvWindow::should_report`] 同判据，但用**预先展开好的阈值快照**。
-    ///
-    /// 读写循环不持有调用方的 `C`/`P`，因此在连接建立时把策略展开成
-    /// [`ReportThresholds_`] 交给它们即可（见 `connection/session_.rs`）。
-    pub(crate) fn should_report_with_(&self, thresholds: &ReportThresholds_) -> bool {
-        let Option::Some((_, last)) = self.reported_ else {
+    /// 与 [`RecvWindow::should_report`] 同判据；读写循环不持有策略，因此用它。
+    pub(crate) fn should_report_(&self) -> bool {
+        if !self.reported_valid_.load(Ordering::Acquire) {
             return true;
-        };
+        }
         // 重置是**编码前提**（窄规格要放不下了），不受任何门限约束。
         if self.reset_due() {
             return true;
         }
-        // 「窗口与上次通告相同」即没有新信息：无论哪个分区都不发。反向也成立——窗口
-        // 变了就必然越过一次分区边界或留在原分区，两种情形下面各自处理。
+        // 「窗口与上次通告相同」即没有新信息：无论哪个分区都不发。
         //
         // （不需要再比一次「上次所在分区」：分区是当前窗口的函数，窗口相同则分区必然
         // 相同；而窗口不同时，「进入临界区」本身就是一次变化，会被下面第 1 条无条件
         // 放行。）
-        if self.window() == last {
+        if self.window() == self.reported_window_.load(Ordering::Acquire) {
             return false;
         }
         // 1. 临界区：任何变化都提醒（含「刚跌进临界区」那一次）。
-        if self.zone_with_(thresholds) == Zone_::Critical {
+        if self.zone_() == Zone_::Critical {
             return true;
         }
         // 2. 非临界区：变化 + 变动量门限（防抖），上不封顶。
-        self.activity_since_report_ >= thresholds.min_advance_ as u64
+        self.activity_since_report_.load(Ordering::Acquire)
+            >= self.min_advance_.load(Ordering::Acquire) as u64
     }
 
     /// 生成一份通告快照并把它记为「已通告」（此后越权判定以它为准、变动量清零）。
@@ -241,38 +301,45 @@ impl RecvWindow {
     ///
     /// 保活 `PULSE` 无条件用它取当前窗口；按阈值通告则由
     /// [`RecvWindow::should_report`] 先判断。
-    pub fn report(&mut self) -> WindowReport {
+    pub fn report(&self) -> WindowReport {
+        let received = self.received_.load(Ordering::Acquire);
         let report = if self.reset_due() {
-            let reset = WindowReport::new_reset(self.received_, self.window());
-            self.epoch_base_ = self.received_;
+            let reset = WindowReport::new_reset(received, self.window());
+            self.epoch_base_.store(received, Ordering::Release);
             reset
         } else {
-            WindowReport::new(self.encoded_recv_total(), self.window())
+            WindowReport::new(
+                received.saturating_sub(self.epoch_base_.load(Ordering::Acquire)),
+                self.window(),
+            )
         };
         // 越权判定始终按**绝对**量记账：通告发出时对端最多能发到「当前已收 + W」。
-        self.reported_ = Option::Some((self.received_, report.window()));
-        self.activity_since_report_ = 0u64;
+        self.reported_.store(received, Ordering::Release);
+        self.reported_window_
+            .store(report.window(), Ordering::Release);
+        self.reported_valid_.store(true, Ordering::Release);
+        self.activity_since_report_.store(0u64, Ordering::Release);
         report
     }
 }
-
 
 /// 通告判定所需的策略快照。
 ///
 /// 读写循环运行在 `abs_art` spawn 出来的任务里（`'static`），既拿不到
 /// [`TrMuxConfig`](crate::connection::TrMuxConfig) 也借不到 `TrFlowCtrlPolicy`；
-/// 因此在连接建立时把「是否该通告」用到的两个量**展开一次**，此后判定只用它。
-/// 两个量都只依赖策略与初始窗口，而初始窗口由环容量唯一确定，所以整条连接共享
-/// 一份即可。
+/// 因此在连接建立时把「是否该通告」用到的量**展开一次**，此后判定只用它。整条连接
+/// 共享一份即可（见 `connection/session_.rs`）。
+///
+/// 本类型是**建流期的值**：`install_` 把它展开进 [`RecvWindow`] 的原子字段，此后判定
+/// 不再需要它。用例仍用它构造出与窗口一致的分区阈值做断言。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReportThresholds_ {
     /// 非临界区两次提醒之间至少要积累的变动量（字节）。
-    min_advance_: Credit,
+    pub(crate) min_advance_: Credit,
 
     /// **临界区**的上界：剩余 `≤ critical_` 即进入临界区（任何变化都提醒）。
-    critical_: Credit,
+    pub(crate) critical_: Credit,
 }
-
 
 impl ReportThresholds_ {
     /// 从策略与初始窗口展开。

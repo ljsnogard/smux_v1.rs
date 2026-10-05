@@ -222,7 +222,11 @@ where
     C: TrConnCfg,
 {
     /// 丢弃发送半边 = 半关闭：显式关闭环的生产端，并通知写循环排空后发 `FIN`。
+    ///
+    /// 先在**原子状态字**上记下「应用已丢弃发送半边」（无锁、同步）：循环侧的收尾
+    /// 判据据此起算，不依赖事件何时被处理。
     fn drop(&mut self) {
+        self.owner_.set_app_tx_closed_();
         self.ring_.close();
         let _ = self
             .conn_
@@ -441,7 +445,11 @@ where
     C: TrConnCfg,
 {
     /// 丢弃接收半边：关掉环的消费端，并通知写循环发 `RESET` 拆掉该方向。
+    ///
+    /// 先在**原子状态字**上记下「应用已丢弃接收半边」（无锁、同步）：解复用循环据此
+    /// 把在途数据静默丢弃，而不是写进一条消费端已关闭的环、把连接判成传输错误。
     fn drop(&mut self) {
+        self.owner_.set_app_rx_closed_();
         self.ring_.close();
         let _ = self
             .conn_
@@ -529,11 +537,11 @@ mod tests_ {
 
     use crate::{
         connection::{
-            owner_::ChannelState_,
+            owner_::new_owner_,
             ring_::test_support_::make_test_channel_,
             test_support_::{NullScope_, TestMuxConfig_, make_test_conn_},
         },
-        flow_ctrl::{DefaultPolicy, FlowCtrl, ReportThresholds_},
+        flow_ctrl::DefaultPolicy,
     };
 
     use super::*;
@@ -549,14 +557,8 @@ mod tests_ {
     /// - 判断：返回的 `(Tx, Rx)` 即被测对象；构建失败即测试失败。
     fn make_halves_() -> (TestTx, TestRx) {
         let (half_tx, half_rx) = make_test_channel_(64usize);
-        let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
-        let owner = ChannelOwner_::new_(
-            ChannelState_::new_(
-                flow,
-                ReportThresholds_::new_(&DefaultPolicy, 64u32),
-            ),
-            CoreAlloc,
-        );
+        let owner = new_owner_(CoreAlloc);
+        owner.install_(&DefaultPolicy, 64usize);
         let conn = make_test_conn_();
         let local = Dock::new(3u32);
         let remote = Dock::new(7u32);

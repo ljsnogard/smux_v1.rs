@@ -1,4 +1,4 @@
-use super::recv_window_::Zone_;
+use super::recv_window_::{ReportThresholds_, Zone_};
 use super::*;
 
 /// 把非临界区的**变动量门限**固定成 `容量/4` 的同构策略（用于验门限本身）。
@@ -54,7 +54,7 @@ fn default_policy_window_and_zone() {
 #[test]
 fn recv_window_zone_boundaries() {
     let p = DefaultPolicy::new();
-    let mut w = RecvWindow::new_(&p, 512usize);
+    let w = RecvWindow::new_(&p, 512usize);
     let thresholds = ReportThresholds_::new_(&p, 512u32);
     assert_eq!(w.window(), 512u32);
     assert_eq!(w.zone_with_(&thresholds), Zone_::Normal, "满窗口属非临界区");
@@ -92,7 +92,7 @@ fn recv_window_zone_boundaries() {
 fn recv_window_reports_every_change_in_critical_zone() {
     let p = DefaultPolicy::new();
     // 容量 1024 ⇒ 临界上界 256。
-    let mut w = RecvWindow::new_(&p, 1024usize);
+    let w = RecvWindow::new_(&p, 1024usize);
     w.report();
 
     // 收 800：剩余 224 ≤ 256，进临界区。
@@ -122,7 +122,7 @@ fn recv_window_reports_every_change_in_critical_zone() {
 #[test]
 fn recv_window_rate_limits_outside_critical_zone() {
     let p = GatedPolicy;
-    let mut w = RecvWindow::new_(&p, 2048usize);
+    let w = RecvWindow::new_(&p, 2048usize);
     w.report();
 
     // 剩余 1048：非临界区（临界上界 512）。
@@ -163,7 +163,7 @@ fn recv_window_rate_limits_outside_critical_zone() {
 #[test]
 fn recv_window_reports_above_three_quarters_once_advance_reached() {
     let p = DefaultPolicy::new();
-    let mut w = RecvWindow::new_(&p, 512usize);
+    let w = RecvWindow::new_(&p, 512usize);
     w.report();
 
     w.on_data(96u32).expect("在额度内");
@@ -185,7 +185,7 @@ fn recv_window_reports_above_three_quarters_once_advance_reached() {
 #[test]
 fn recv_window_silent_when_unchanged() {
     let p = DefaultPolicy::new();
-    let mut w = RecvWindow::new_(&p, 512usize);
+    let w = RecvWindow::new_(&p, 512usize);
     w.report();
     assert!(!w.should_report(&p), "窗口没变：不发");
     assert_eq!(w.report().window(), 512u32, "重复 report 仍是同一快照");
@@ -201,7 +201,7 @@ fn recv_window_silent_when_unchanged() {
 #[test]
 fn recv_window_zero_and_refill_need_no_special_case() {
     let p = DefaultPolicy::new();
-    let mut w = RecvWindow::new_(&p, 512usize);
+    let w = RecvWindow::new_(&p, 512usize);
     w.report();
 
     w.on_data(512u32).expect("刚好用满已通告额度");
@@ -225,7 +225,7 @@ fn recv_window_zero_and_refill_need_no_special_case() {
 /// - 判断：预扣后可用 70；新通告后可用 50（在途被精确扣掉）；过期通告不生效。
 #[test]
 fn send_window_subtracts_inflight_and_ignores_stale_reports() {
-    let mut w = SendWindow::new_(1024u32);
+    let w = SendWindow::new_(1024u32);
     assert_eq!(w.available(), 0u32, "未收到对端 OPEN 通告前没有额度");
     assert!(w.is_exhausted());
 
@@ -257,7 +257,7 @@ fn send_window_subtracts_inflight_and_ignores_stale_reports() {
 ///   再喂一份 `R` 不变、`W` 更小的 `(4096, 256)` 时**不覆盖**较新的快照。
 #[test]
 fn send_window_accepts_window_growth_with_same_recv_total() {
-    let mut w = SendWindow::new_(4096u32);
+    let w = SendWindow::new_(4096u32);
     w.on_report(WindowReport::new(0u64, 4096u32))
         .expect("开场通告");
 
@@ -288,7 +288,7 @@ fn send_window_accepts_window_growth_with_same_recv_total() {
 /// - 判断：两次获批分别为 4 与 6；用尽后 `is_exhausted` 为真；归还后可用 3。
 #[test]
 fn send_window_reserve_exhaust_and_refund() {
-    let mut w = SendWindow::new_(1024u32);
+    let w = SendWindow::new_(1024u32);
     w.on_report(WindowReport::new(0u64, 10u32)).expect("通告");
     assert_eq!(w.reserve(4u32), 4u32);
     assert_eq!(w.available(), 6u32);
@@ -305,7 +305,7 @@ fn send_window_reserve_exhaust_and_refund() {
 /// - 判断：第二次返回 [`FlowCtrlError::Overflow`]，且原快照仍然生效。
 #[test]
 fn send_window_rejects_report_beyond_cap() {
-    let mut w = SendWindow::new_(12u32);
+    let w = SendWindow::new_(12u32);
     w.on_report(WindowReport::new(0u64, 12u32)).expect("刚好到上限");
     assert_eq!(w.available(), 12u32);
     assert_eq!(
@@ -323,20 +323,20 @@ fn send_window_rejects_report_beyond_cap() {
 #[test]
 fn flow_ctrl_new_wires_both_directions() {
     let p = DefaultPolicy::new();
-    let mut ctrl = FlowCtrl::new(&p, 100usize);
+    let ctrl = FlowCtrl::new(&p, 100usize);
     assert_eq!(ctrl.recv_window().capacity(), 100u32);
     assert_eq!(ctrl.recv_window().window(), 100u32);
     assert_eq!(ctrl.send_window().available(), 0u32);
 
-    ctrl.send_window_mut()
+    ctrl.send_window()
         .on_report(WindowReport::new(0u64, 40u32))
         .expect("通告");
     assert_eq!(ctrl.send_window().available(), 40u32);
 
-    ctrl.recv_window_mut().report();
-    assert!(ctrl.recv_window_mut().on_data(100u32).is_ok());
+    ctrl.recv_window().report();
+    assert!(ctrl.recv_window().on_data(100u32).is_ok());
     assert_eq!(
-        ctrl.recv_window_mut().on_data(1u32),
+        ctrl.recv_window().on_data(1u32),
         Result::Err(FlowCtrlError::PeerViolation)
     );
 }
@@ -348,7 +348,7 @@ fn flow_ctrl_new_wires_both_directions() {
 #[test]
 fn report_is_idempotent_snapshot() {
     let p = DefaultPolicy::new();
-    let mut w = RecvWindow::new_(&p, 4096usize);
+    let w = RecvWindow::new_(&p, 4096usize);
     let a = w.report();
     let b = w.report();
     assert_eq!(a, b);

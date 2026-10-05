@@ -83,7 +83,6 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use core::{
     alloc::AllocatorClone,
     ops::Bound,
-    task::Waker,
 };
 use std::time::Instant;
 
@@ -97,7 +96,7 @@ use mm_ptr::Shared;
 use crate::{
     connection::{
         Dock, MuxError,
-        owner_::ChannelOwner_,
+        owner_::{ChannelOwner_, new_owner_},
         signal_::{SessionEvent_, SessionMailbox_},
         sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
     },
@@ -205,15 +204,20 @@ pub(crate) enum Inbound_ {
 }
 
 /// 一条 channel 的身份状态。
+///
+/// # 状态与身份同寿命（2026-10 改造）
+///
+/// `state_` 是这条子流的**共享原子状态句柄**（`Shared<ChannelState_>`），在
+/// [`ChannelRegistry_::reserve_channel_`] 登记身份的那一刻建立，并随身份记录一起
+/// 消亡。它**不是**建流后期再 `attach` 上来的独立对象：过去那种「状态比身份记录
+/// 活得久 / 身份记录先被改写而状态还在」的分离生命周期，正是收尾路径可以提前释放
+/// 身份的根源。
 struct ChanCtx_<A>
 where
     A: AllocatorClone,
 {
-    /// 该子流的共享状态句柄。
-    ///
-    /// `None` 表示环尚未建立（被动方的入向请求在 `accept` 之前）。主动方在
-    /// `open_channel_async` 建好环后立刻挂上；被动方在 `accept_async` 挂上。
-    owner_: Option<ChannelOwner_<A>>,
+    /// 该子流的共享状态句柄（登记身份时建立；窗口参数在最终裁决时安装）。
+    state_: ChannelOwner_<A>,
 
     /// 入向建流请求的状态。
     inbound_: Inbound_,
@@ -223,10 +227,10 @@ impl<A> ChanCtx_<A>
 where
     A: AllocatorClone,
 {
-    /// 新登记的子流：环未建、不是入向请求。
-    const fn new_() -> Self {
+    /// 新登记的子流：状态已建（窗口参数待安装）、不是入向请求。
+    fn new_(state: ChannelOwner_<A>) -> Self {
         ChanCtx_ {
-            owner_: Option::None,
+            state_: state,
             inbound_: Inbound_::None,
         }
     }
@@ -604,7 +608,10 @@ where
         Result::Ok(guard.total_)
     }
 
-    /// 为 `(local_dock, remote_dock)` 登记一条 channel。
+    /// 为 `(local_dock, remote_dock)` 登记一条 channel，并返回它的共享状态句柄。
+    ///
+    /// **状态随身份一起建立**：调用方拿到句柄后，在最终裁决（`accept_async`）时
+    /// 把窗口参数安装进去（`ChannelState_::install_`）。
     ///
     /// # Errors
     ///
@@ -618,7 +625,7 @@ where
         local_dock: Dock,
         remote_dock: Dock,
         cancel: K,
-    ) -> Result<(), ReserveErr_> {
+    ) -> Result<ChannelOwner_<A>, ReserveErr_> {
         let mut session = self.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
@@ -650,17 +657,19 @@ where
             return Result::Err(ReserveErr_::DockChanLimit);
         }
 
+        let state = new_owner_(inner.alloc_.clone());
         let dock = inner
             .docks_
             .entry(local_dock)
             .or_insert_with(DockCtx_::new_);
         dock.chan_count_ += 1usize;
-        inner
-            .bindings_
-            .insert((local_dock, remote_dock), DockBinding_::Channel(ChanCtx_::new_()));
+        inner.bindings_.insert(
+            (local_dock, remote_dock),
+            DockBinding_::Channel(ChanCtx_::new_(state.clone())),
+        );
         inner.remote_index_.insert((remote_dock, local_dock));
         inner.total_ += 1usize;
-        Result::Ok(())
+        Result::Ok(state)
     }
 
     /// 拆掉一条 channel：**不删键**，改成宽限态 [`DockBinding_::WaitClose`]；不存在
@@ -743,31 +752,10 @@ where
         ))
     }
 
-    /// 把建好环之后的共享状态句柄挂到已有 channel 上。
+    /// 取一条子流的共享状态句柄（克隆）；不存在时返回 `None`。
     ///
-    /// 主动方在 `open_channel_async`、被动方在 `accept_async` 调用；节点必须已经由
-    /// [`ChannelRegistry_::reserve_channel_`] 登记过，否则返回 `false`（调用方按
-    /// 内部错误处理）。
-    pub(crate) async fn attach_owner_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        remote_dock: Dock,
-        owner: ChannelOwner_<A>,
-        cancel: K,
-    ) -> Result<bool, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
-        let mut guard = acquire_write_(&mut session, cancel).await?;
-        let inner = &mut *guard;
-        Result::Ok(match inner.bindings_.get_mut(&(local_dock, remote_dock)) {
-            Option::Some(DockBinding_::Channel(ctx)) => {
-                ctx.owner_ = Option::Some(owner);
-                true
-            }
-            _ => false,
-        })
-    }
-
-    /// 取一条子流的共享状态句柄（克隆）；不存在或尚未挂上时返回 `None`。
+    /// 身份记录里始终有一份状态句柄——它随身份在 `reserve_channel_` 建立、随身份记录
+    /// 消亡，因此不存在「登记了身份但状态还没挂上」的中间态。
     pub(crate) async fn channel_owner_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
@@ -778,13 +766,13 @@ where
         let guard = acquire_read_(&mut session, cancel).await?;
         let inner = &*guard;
         Result::Ok(match inner.bindings_.get(&(local_dock, remote_dock)) {
-            Option::Some(DockBinding_::Channel(ctx)) => ctx.owner_.clone(),
+            Option::Some(DockBinding_::Channel(ctx)) => Option::Some(ctx.state_.clone()),
             _ => Option::None,
         })
     }
 
     /// 被动方收到 `OPEN`：登记 channel 并把它标为「待决入向请求」，随后唤醒该 dock
-    /// 上的监听者。
+    /// 上的监听者。返回这条子流的共享状态句柄。
     ///
     /// # Errors
     ///
@@ -796,9 +784,10 @@ where
         remote_dock: Dock,
         peer_report: WindowReport,
         cancel: K,
-    ) -> Result<(), ReserveErr_> {
+    ) -> Result<ChannelOwner_<A>, ReserveErr_> {
         // 先登记身份（自带配额与重复检查），再标成「待决入向请求」。
-        self.reserve_channel_(local_dock, remote_dock, cancel.child_token())
+        let state = self
+            .reserve_channel_(local_dock, remote_dock, cancel.child_token())
             .await?;
         let marked = {
             let mut session = self.inner_.acquire_session();
@@ -814,10 +803,11 @@ where
         if marked {
             self.notify_inbound_(local_dock, cancel.child_token()).await?;
         }
-        Result::Ok(())
+        Result::Ok(state)
     }
 
-    /// 取走 `local_dock` 上最早的一个待决入向请求（改成 `HandedOut`），返回对端 dock。
+    /// 取走 `local_dock` 上最早的一个待决入向请求（改成 `HandedOut`），返回对端 dock
+    /// 与这条子流的共享状态句柄。
     ///
     /// 返回 `None` 表示当前没有待决请求（调用方应当先登记 waker 再重试）。
     ///
@@ -825,7 +815,11 @@ where
     /// 的取出顺序不同；协议不要求入向请求按到达顺序配对（每条请求各自独立），
     /// 但**同一 dock 上的请求本就串行化**（`income_async` 取一个、处理完再取下一个），
     /// 因此顺序变化不影响语义。
-    pub(crate) async fn take_pending_inbound_<K: TrCancellationToken>(&self, local_dock: Dock, cancel: K) -> Result<Option<Dock>, ReserveErr_> {
+    pub(crate) async fn take_pending_inbound_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        cancel: K,
+    ) -> Result<Option<(Dock, ChannelOwner_<A>)>, ReserveErr_> {
         let mut session = self.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
@@ -836,7 +830,7 @@ where
                 && let Inbound_::Pending(report) = ctx.inbound_
             {
                 ctx.inbound_ = Inbound_::HandedOut(report);
-                found = Option::Some(key.1);
+                found = Option::Some((key.1, ctx.state_.clone()));
                 break;
             }
         }
@@ -1062,41 +1056,26 @@ where
         err: &MuxError,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
-        // 1. 记下首个失败原因，并收集要唤醒的「建流等待者」句柄。
-        //    子流热状态有**自己的**锁，因此不能在第一把锁里取它：先把 owner 收集出来。
-        let (wakers, owners) = {
+        // 子流状态是**无锁**的原子字，因此通知建流等待者不需要离开注册表锁：直接在
+        // 同一次遍历里投持久通知即可（旧实现要先把 owner 收集出来、再逐个取子流锁）。
+        {
             let mut session = self.inner_.acquire_session();
             let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
             if guard.fail_.is_none() {
                 guard.fail_ = Option::Some(*err);
             }
-            let wakers: Vec<Waker> = Vec::new();
-            let mut owners: Vec<ChannelOwner_<A>> = Vec::new();
-            for binding in guard.bindings_.values_mut() {
+            for binding in guard.bindings_.values() {
                 match binding {
                     DockBinding_::Listener(ctx) => {
                         // 连接失败也要唤醒监听者（否则它会一直等入向）。
                         let _ = ctx.notify_tx_.try_send(());
                     }
                     DockBinding_::Channel(ctx) => {
-                        if let Option::Some(owner) = ctx.owner_.as_ref() {
-                            owners.push(owner.clone());
-                        }
+                        ctx.state_.notify_establish_();
                     }
                     _ => {}
                 }
             }
-            (wakers, owners)
-        };
-        // 2. 逐个通知子流热状态里的建流等待者（各自取锁，可取消）。
-        for owner in owners {
-            let _ = owner
-                .with_mut_async_(cancel.child_token(), |state| state.notify_establish_())
-                .await;
-        }
-        // 3. 唤醒监听者 + 取消两个循环。
-        for waker in wakers {
-            waker.wake();
         }
         self.cancel_loops_();
         Result::Ok(())
@@ -1171,7 +1150,7 @@ mod tests_ {
             &self,
             local_dock: Dock,
             remote_dock: Dock,
-        ) -> impl core::future::Future<Output = Result<(), ReserveErr_>>;
+        ) -> impl core::future::Future<Output = Result<ChannelOwner_<CoreAlloc>, ReserveErr_>>;
         fn release_channel_t_(
             &self,
             local_dock: Dock,
@@ -1203,12 +1182,6 @@ mod tests_ {
             local_dock: Dock,
             remote_dock: Dock,
         ) -> impl core::future::Future<Output = bool>;
-        fn attach_owner_t_(
-            &self,
-            local_dock: Dock,
-            remote_dock: Dock,
-            owner: ChannelOwner_<CoreAlloc>,
-        ) -> impl core::future::Future<Output = bool>;
         fn channel_owner_t_(
             &self,
             local_dock: Dock,
@@ -1219,11 +1192,11 @@ mod tests_ {
             local_dock: Dock,
             remote_dock: Dock,
             report: WindowReport,
-        ) -> impl core::future::Future<Output = Result<(), ReserveErr_>>;
+        ) -> impl core::future::Future<Output = Result<ChannelOwner_<CoreAlloc>, ReserveErr_>>;
         fn take_pending_inbound_t_(
             &self,
             local_dock: Dock,
-        ) -> impl core::future::Future<Output = Option<Dock>>;
+        ) -> impl core::future::Future<Output = Option<(Dock, ChannelOwner_<CoreAlloc>)>>;
         fn take_inbound_report_t_(
             &self,
             local_dock: Dock,
@@ -1248,7 +1221,7 @@ mod tests_ {
             &self,
             local_dock: Dock,
             remote_dock: Dock,
-        ) -> Result<(), ReserveErr_> {
+        ) -> Result<ChannelOwner_<CoreAlloc>, ReserveErr_> {
             self.reserve_channel_(local_dock, remote_dock, NonCancellableToken::new())
                 .await
         }
@@ -1302,17 +1275,6 @@ mod tests_ {
                 .expect("测试里不该被取消")
         }
 
-    async fn attach_owner_t_(
-            &self,
-            local_dock: Dock,
-            remote_dock: Dock,
-            owner: ChannelOwner_<CoreAlloc>,
-        ) -> bool {
-            self.attach_owner_(local_dock, remote_dock, owner, NonCancellableToken::new())
-                .await
-                .expect("测试里不该被取消")
-        }
-
     async fn channel_owner_t_(
             &self,
             local_dock: Dock,
@@ -1328,12 +1290,15 @@ mod tests_ {
             local_dock: Dock,
             remote_dock: Dock,
             report: WindowReport,
-        ) -> Result<(), ReserveErr_> {
+        ) -> Result<ChannelOwner_<CoreAlloc>, ReserveErr_> {
             self.reserve_inbound_(local_dock, remote_dock, report, NonCancellableToken::new())
                 .await
         }
 
-    async fn take_pending_inbound_t_(&self, local_dock: Dock) -> Option<Dock> {
+    async fn take_pending_inbound_t_(
+            &self,
+            local_dock: Dock,
+        ) -> Option<(Dock, ChannelOwner_<CoreAlloc>)> {
             self.take_pending_inbound_(local_dock, NonCancellableToken::new())
                 .await
                 .expect("测试里不该被取消")
@@ -1839,16 +1804,22 @@ mod tests_ {
         assert!(registry.has_pending_inbound_t_(Dock::new(2u32)));
 
         assert_eq!(
-            registry.take_pending_inbound_t_(Dock::new(2u32))
-            .await,
+            registry
+                .take_pending_inbound_t_(Dock::new(2u32))
+                .await
+                .map(|(dock, _state)| dock),
             Option::Some(Dock::new(7u32))
         );
         assert!(
             !registry.has_pending_inbound_t_(Dock::new(2u32)),
             "取走之后不应再报告有待决请求"
         );
-        assert_eq!(registry.take_pending_inbound_t_(Dock::new(2u32))
-            .await, Option::None);
+        assert!(
+            registry
+                .take_pending_inbound_t_(Dock::new(2u32))
+                .await
+                .is_none()
+        );
 
         assert_eq!(
             registry.take_inbound_report_t_(Dock::new(2u32), Dock::new(7u32))
@@ -1889,19 +1860,25 @@ mod tests_ {
         assert!(!registry.has_pending_inbound_t_(Dock::new(1u32)));
 
         assert_eq!(
-            registry.take_pending_inbound_t_(Dock::new(2u32))
-            .await,
+            registry
+                .take_pending_inbound_t_(Dock::new(2u32))
+                .await
+                .map(|(dock, _state)| dock),
             Option::Some(Dock::new(7u32)),
             "dock 2 上应当按 remote_dock 升序先取到 7"
         );
         assert_eq!(
-            registry.take_pending_inbound_t_(Dock::new(2u32))
-            .await,
+            registry
+                .take_pending_inbound_t_(Dock::new(2u32))
+                .await
+                .map(|(dock, _state)| dock),
             Option::Some(Dock::new(9u32))
         );
         assert_eq!(
-            registry.take_pending_inbound_t_(Dock::new(3u32))
-            .await,
+            registry
+                .take_pending_inbound_t_(Dock::new(3u32))
+                .await
+                .map(|(dock, _state)| dock),
             Option::Some(Dock::new(7u32)),
             "dock 3 自己的待决请求不应被 dock 2 的取走影响"
         );
@@ -2033,42 +2010,29 @@ mod tests_ {
         ));
     }
     dual_runtime_test_!(empty_dock_entry_is_pruned_unless_bound);
-    /// 测试建好环之后挂上的共享状态句柄能被按 dock 对查回。
-    /// - 手段：登记 `(3,8)`，用 `FlowCtrl::new` 建一个 owner 并 `attach_owner_`；
-    ///   再查 `channel_owner_`。
-    /// - 判断：挂上之前查不到；挂上之后能查到同一个句柄（改一处、另一处可见）。
-        async fn attached_owner_is_visible_by_dock_pair() {
-        use crate::flow_ctrl::{DefaultPolicy, FlowCtrl};
-
+    /// 测试状态句柄随身份登记一起建立，且按 dock 对查回的与 `reserve` 返回的是
+    /// **同一个**共享节点。
+    /// - 手段：`reserve_channel_` 拿到句柄，直接查 `channel_owner_`；再在一个句柄上
+    ///   置去重位、看另一个句柄是否可见。
+    /// - 判断：查回的句柄存在；两者共享同一份锁外去重位（改一处、另一处可见）。
+        async fn owner_is_created_with_the_identity() {
         let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
-        assert!(registry.reserve_channel_t_(Dock::new(3u32), Dock::new(8u32))
-            .await.is_ok());
-        assert!(registry.channel_owner_t_(Dock::new(3u32), Dock::new(8u32))
-            .await.is_none());
-
-        let flow = FlowCtrl::new(&DefaultPolicy, 64usize);
-        let owner = ChannelOwner_::new_(
-            crate::connection::owner_::ChannelState_::new_(
-                flow,
-                crate::flow_ctrl::ReportThresholds_::new_(&crate::flow_ctrl::DefaultPolicy, 64u32),
-            ),
-            CoreAlloc,
-        );
-        assert!(registry.attach_owner_t_(Dock::new(3u32), Dock::new(8u32), owner.clone())
-            .await);
+        let reserved = registry.reserve_channel_t_(Dock::new(3u32), Dock::new(8u32))
+            .await
+            .expect("登记身份应当成功");
 
         let found = registry
             .channel_owner_t_(Dock::new(3u32), Dock::new(8u32))
             .await
-            .expect("挂上之后应当能查到");
-        assert!(owner.mark_tx_queued_(), "首次置位应当是 fresh");
+            .expect("状态随身份建立，应当能查到");
+        assert!(reserved.mark_tx_queued_(), "首次置位应当是 fresh");
         assert!(
             !found.mark_tx_queued_(),
-            "查回的应是同一个共享句柄（去重位在共享的锁外单元上）"
+            "查回的应是同一个共享句柄（去重位在共享的原子字上）"
         );
         found.clear_tx_queued_();
-        assert!(owner.mark_tx_queued_(), "清位对同一份共享单元可见");
+        assert!(reserved.mark_tx_queued_(), "清位对同一份共享节点可见");
         assert_index_consistent_(&registry);
     }
-    dual_runtime_test_!(attached_owner_is_visible_by_dock_pair);
+    dual_runtime_test_!(owner_is_created_with_the_identity);
 }

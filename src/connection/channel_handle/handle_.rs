@@ -18,13 +18,13 @@ use crate::{
     connection::{
         Dock, FrameKind, MuxConnection, MuxError, ReserveErr_, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
-        owner_::{ChannelOwner_, ChannelState_, EstablishOutcome_, wait_establish_},
+        owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
         ring_::new_buffered_channel_,
         signal_::{ControlFrame_, ReadEvent_, SessionEvent_, TrEventSender_, WriteEvent_},
             util_::read_available_into_vec_,
     },
     flow_ctrl::{
-        Credit, FlowCtrl, FlowCtrlError, RecvTotal, ReportThresholds_, TrFlowCtrlPolicy,
+        Credit, FlowCtrlError, RecvTotal, TrFlowCtrlPolicy,
     },
 };
 
@@ -80,8 +80,12 @@ where
     /// 发起方暂存的开场消息（响应方恒为空）：`OPEN` 要等 `accept_async` 才发。
     message_: Vec<u8>,
 
-    /// 成功接受后的**子流共享状态**。
-    accepted_owner_: Option<ChannelOwner_<C::Alloc>>,
+    /// 这条子流的**共享原子状态句柄**。
+    ///
+    /// 它在**登记身份**（`reserve_channel_` / `reserve_inbound_`）时建立，句柄随
+    /// `ChannelHandle` 一路持有到 `accept_async`，因此「状态与身份同寿命」在这一侧
+    /// 就是「句柄与句柄同寿命」。窗口参数直到 `accept_async` 拿到环容量才安装。
+    accepted_owner_: ChannelOwner_<C::Alloc>,
 
     /// 接受后本端要通告的**接收窗口**（由接收环实际容量算出）。
     accepted_initial_window_: Credit,
@@ -94,11 +98,13 @@ impl<C, S> ChannelHandle<C, S>
 where
     C: TrConnCfg,
 {
-    /// 由连接与 dock 对构造**响应方**句柄（只允许 `income_async` 调用）。
+    /// 由连接、dock 对与**登记身份时建立的共享状态句柄**构造**响应方**句柄
+    /// （只允许 `income_async` 调用）。
     pub(crate) fn new_(
         conn: MuxConnection<C, S>,
         local_dock: Dock,
         remote_dock: Dock,
+        owner: ChannelOwner_<C::Alloc>,
     ) -> Self {
         ChannelHandle {
             conn_: conn,
@@ -106,17 +112,18 @@ where
             remote_dock_: remote_dock,
             is_initiator_: false,
             message_: Vec::new(),
-            accepted_owner_: Option::None,
+            accepted_owner_: owner,
             accepted_initial_window_: 0u32 as Credit,
             settled_: false,
         }
     }
 
-    /// 由连接、dock 对与开场消息构造**发起方**句柄。
+    /// 由连接、dock 对、共享状态句柄与开场消息构造**发起方**句柄。
     pub(crate) fn new_initiator_(
         conn: MuxConnection<C, S>,
         local_dock: Dock,
         remote_dock: Dock,
+        owner: ChannelOwner_<C::Alloc>,
         message: Vec<u8>,
     ) -> Self {
         ChannelHandle {
@@ -125,7 +132,7 @@ where
             remote_dock_: remote_dock,
             is_initiator_: true,
             message_: message,
-            accepted_owner_: Option::None,
+            accepted_owner_: owner,
             accepted_initial_window_: 0u32 as Credit,
             settled_: false,
         }
@@ -219,11 +226,10 @@ where
         // 调用方 / managed 路径已经给出本子流的环存储。
         let ChannelBuffAlloc { tx_buff, rx_buff, .. } = buffs;
 
-        // 建环（纯本地；注册表登记在 step 函数里做）。
-        let (owner, tx, rx, initial) =
-            install_channel_(&conn, local, remote, tx_buff, rx_buff)?;
+        // 建环 + 安装窗口参数（纯本地；注册表登记在身份登记时已经完成）。
+        let (tx, rx, initial) =
+            install_channel_(&conn, local, remote, self.accepted_owner_.clone(), tx_buff, rx_buff)?;
         self.accepted_initial_window_ = initial;
-        self.accepted_owner_ = Option::Some(owner);
         Result::Ok((tx, rx))
     }
 
@@ -378,6 +384,8 @@ where
 
     // 环已经建好（同步、不取锁）；下面**取注册表锁的两步都在可取消的异步上下文里**。
     let (tx, rx) = accepted?;
+    // 共享状态在登记身份时就建立了，句柄一直在本对象手里；不再有「挂 owner」这一步。
+    let owner = handle.accepted_owner_.clone();
 
     // 1. 对端窗口通告：响应方在登记入向请求时已由读循环存下。
     if !handle.is_initiator_ {
@@ -392,15 +400,7 @@ where
             }
             _ => return Result::Err(HandleError::Mux(MuxError::Closed)),
         };
-        let Some(owner) = handle.accepted_owner_.clone() else {
-            return Result::Err(HandleError::Mux(MuxError::Closed));
-        };
-        let applied = owner
-            .with_mut_async_(cancel.child_token(), |state| {
-                state.flow_mut_().send_window_mut().on_report(report)
-            })
-            .await;
-        if let Result::Ok(Result::Err(err)) = applied {
+        if let Result::Err(err) = owner.send_on_report_(report) {
             let _ = conn
                 .core_()
                 .release_channel_(local, remote, cancel.child_token())
@@ -410,14 +410,6 @@ where
         }
     }
 
-    // 2. 把共享状态句柄挂到身份表上（失败由调用方按内部错误处理，与旧行为一致）。
-    if let Some(owner) = handle.accepted_owner_.clone() {
-        let _ = conn
-            .core_()
-            .attach_owner_(local, remote, owner, cancel.child_token())
-            .await;
-    }
-
     if handle.is_initiator_ {
         // 发起方：此刻才发 `OPEN`（通告的接收窗口取决于接收环容量）。
         let message = core::mem::take(&mut handle.message_);
@@ -425,10 +417,6 @@ where
         send_open_(&conn, local, remote, initial, message);
         // 对端的 `OPEN` 到达时，读循环会把它的接收窗口写进发送窗口；`ACCEPT` /
         // `REJECT` 到达时唤醒这里。
-        let Some(owner) = handle.accepted_owner_.clone() else {
-            handle.settled_ = true;
-            return Result::Err(HandleError::Mux(MuxError::Closed));
-        };
         match wait_establish_(conn.core_().reg_(), &owner, cancel.child_token()).await? {
             EstablishOutcome_::Accepted => {
                 handle.settled_ = true;
@@ -474,18 +462,18 @@ type AcceptOutcomeProj_<C, S> = Result<(ChannelTx<C, S>, ChannelRx<C, S>), Handl
 
 /// 建流最终裁决的产物。
 type InstallOutcome_<C, S> = (
-    ChannelOwner_<<C as TrConnCfg>::Alloc>,
     ChannelTx<C, S>,
     ChannelRx<C, S>,
     Credit,
 );
 
-/// 建流最终裁决的公共部分：按调用方给的缓冲建两条环、登记共享状态、把会话侧半部
-/// 交给两个循环。
+/// 建流最终裁决的公共部分：按调用方给的缓冲建两条环、把会话侧半部交给两个循环，
+/// 并把**登记身份时建立的共享状态**安装上窗口参数。
 fn install_channel_<C, S>(
     conn: &MuxConnection<C, S>,
     local: Dock,
     remote: Dock,
+    owner: ChannelOwner_<<C as TrConnCfg>::Alloc>,
     tx_buff: C::Buff,
     mut rx_buff: C::Buff,
 ) -> Result<InstallOutcome_<C, S>, HandleError>
@@ -498,14 +486,15 @@ where
     let rx_cap = BorrowMut::<[MaybeUninit<u8>]>::borrow_mut(&mut rx_buff).len();
 
     // 本端接收窗口由**接收环容量**决定；发送窗口先按同一初值起算，随后被对端 `OPEN`
-    // 的通告覆盖。
+    // 的通告覆盖。窗口参数安装进**随身份一起建立**的共享状态里。
     let initial = policy.initial_window(rx_cap);
     // 发送环的临界水位：与接收侧同源（`容量 × 1/N`）。发送环容量与接收环同批给出，
     // 用同一个 `initial` 即可。
     let backlog = initial / policy.critical_denominator().max(1u32);
-    let thresholds = ReportThresholds_::new_(policy, initial);
-    let mut flow = FlowCtrl::new(policy, rx_cap);
-    flow.recv_window_mut().report();
+    owner.install_(policy, rx_cap);
+    // 建流那次通告就是初始窗口：先记为「已通告」，此后 `should_report_` 只在窗口真的
+    // 变化时才产出新快照。
+    owner.flow_().recv_window().report();
 
     // 两条环：应用写 / 循环读的是发送环，循环写 / 应用读的是接收环。
     // 环被拒时**投一条释放消息**（不取锁）：身份由核心在下一轮 drain 里归还。
@@ -530,7 +519,6 @@ where
         }
     };
 
-    let owner = ChannelOwner_::new_(ChannelState_::new_(flow, thresholds), alloc.clone());
     let _ = core.w_events_().try_send_event_(WriteEvent_::Attach {
         local_dock: local,
         remote_dock: remote,
@@ -545,9 +533,8 @@ where
     });
 
     Result::Ok((
-        owner.clone(),
         ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote, backlog),
-        ChannelRx::new_(rx_r, owner.clone(), conn.clone(), local, remote),
+        ChannelRx::new_(rx_r, owner, conn.clone(), local, remote),
         initial,
     ))
 }
@@ -668,7 +655,8 @@ mod tests_ {
         let mut welcome: [u8; 0] = [];
         let mut welcome_slice: &mut [u8] = &mut welcome[..];
 
-        conn.core_()
+        let owner = conn
+            .core_()
             .reg_()
             .reserve_inbound_(
                 local,
@@ -678,7 +666,7 @@ mod tests_ {
             )
             .await
             .expect("登记入向请求应当成功");
-        let mut handle = ChannelHandle::new_(conn.clone(), local, remote);
+        let mut handle = ChannelHandle::new_(conn.clone(), local, remote, owner);
 
         let t0 = Instant::now();
         let accepted = handle.accept_async_managed(&mut welcome_slice, 4096).await;

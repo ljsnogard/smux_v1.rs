@@ -214,13 +214,15 @@ where
         self.reg_.reserve_telegraph_(local_dock, cancel).await
     }
 
-    /// 为一条子流登记身份（dock 对即身份）。
+    /// 为一条子流登记身份（dock 对即身份），并返回它的共享状态句柄。
+    ///
+    /// 状态与身份**一起建立**：调用方拿到句柄后，在建流最终裁决时把窗口参数安装进去。
     pub(crate) async fn reserve_channel_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
         cancel: K,
-    ) -> Result<(), ReserveErr_> {
+    ) -> Result<ChannelOwner_<C::Alloc>, ReserveErr_> {
         self.reg_
             .reserve_channel_(local_dock, remote_dock, cancel)
             .await
@@ -262,12 +264,12 @@ where
             .await
     }
 
-    /// 取走一个待决入向请求。
+    /// 取走一个待决入向请求（对端 dock + 该子流的共享状态句柄）。
     pub(crate) async fn take_pending_inbound_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<Option<Dock>, ReserveErr_> {
+    ) -> Result<Option<(Dock, ChannelOwner_<C::Alloc>)>, ReserveErr_> {
         self.reg_.take_pending_inbound_(local_dock, cancel).await
     }
 
@@ -277,19 +279,6 @@ where
         cancel: K,
     ) -> Result<Option<crate::connection::MuxError>, ReserveErr_> {
         self.reg_.failure_(cancel).await
-    }
-
-    /// 把建好环之后的共享状态句柄挂到已有 channel 上。
-    pub(crate) async fn attach_owner_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        remote_dock: Dock,
-        owner: ChannelOwner_<C::Alloc>,
-        cancel: K,
-    ) -> Result<bool, ReserveErr_> {
-        self.reg_
-            .attach_owner_(local_dock, remote_dock, owner, cancel)
-            .await
     }
 }
 

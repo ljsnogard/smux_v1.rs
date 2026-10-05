@@ -30,11 +30,9 @@
 //! channel 卡死，控制帧丢了就是建流永远完不成。因此改为**无界通道**，靠两条约束
 //! 让队列长度天然有界：
 //!
-//! 1. 每条子流的「有数据」事件至多一条在队列里（由
-//!    [`ChannelOwner_::mark_tx_queued_`](super::owner_::ChannelOwner_::mark_tx_queued_)
-//!    去重）、「消费了」事件同样至多一条（由
-//!    [`ChannelOwner_::mark_rx_consumed_`](super::owner_::ChannelOwner_::mark_rx_consumed_)
-//!    去重）；
+//! 1. 每条子流的「有数据」事件至多一条在队列里（由状态字上的
+//!    `mark_tx_queued_` 去重）、「消费了」事件同样至多一条（由
+//!    `mark_rx_consumed_` 去重）；
 //! 2. 控制帧与拆流事件的产生频率由协议状态机约束（每条子流建流 / 拆流各一次）。
 //!
 //! 于是 `try_send` 不会失败，「全扫标志」整个机制不再需要。这与 §11.4 的「定容」
@@ -253,9 +251,8 @@ where
     /// 而一次并发写入就会把同一区间里的读出完全掩盖，额度被永久漏记、两端互等
     /// （因果链见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
     ///
-    /// 投递按子流去重（见
-    /// [`ChannelOwner_::mark_rx_consumed_`](super::owner_::ChannelOwner_::mark_rx_consumed_)）：
-    /// 每条子流至多一条待处理通知。
+    /// 投递按子流去重（`ChannelState_::mark_rx_consumed_`）：每条子流至多一条待处理
+    /// 通知。
     RxConsumed {
         /// 本端 dock。
         local_dock: Dock,

@@ -108,6 +108,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use abs_buff::{
     Demand, TrBuffWrite,
     buffer::TrBuffSegmMut,
+    error::{TrTaggedError, WriteErrTag},
     x_deps::{abs_cancel, anylr::SomeOf},
 };
 use abs_cancel::{TrCancellationToken, TrMayCancel};
@@ -314,12 +315,8 @@ where
         cancel.child_token(),
     )
     .await?;
-    if let Option::Some(entry) = table.get_mut(&pair) {
-        lock_or_fail_!(entry
-            .owner_
-            .with_mut_async_(cancel.child_token(), |state| {
-                state.set_local_fin_sent_();
-            }));
+    if let Option::Some(entry) = table.get(&pair) {
+        entry.owner_.set_local_fin_sent_();
     }
     table.remove(&pair);
     pending_fin.remove(&pair);
@@ -374,15 +371,13 @@ where
 
 /// 提示建流等待者（`open_channel_async`）：状态可能变了。
 ///
-/// 走子流热状态的**通知通道**（异步取锁、可取消）；通道持久，因此不丢唤醒。
-async fn wake_establish_<A, K>(owner: &ChannelOwner_<A>, cancel: K)
+/// 建流状态标志在**原子字**里、通知通道是持久的，因此这一步是纯同步的一次 CAS +
+/// 一次非阻塞投递——不需要取锁，也没有 `await`。
+fn wake_establish_<A>(owner: &ChannelOwner_<A>)
 where
-    A: AllocatorClone + Send + Sync,
-    K: TrCancellationToken,
+    A: AllocatorClone,
 {
-    let _ = owner
-        .with_mut_async_(cancel, |state| state.notify_establish_())
-        .await;
+    owner.notify_establish_();
 }
 
 /// 内侧循环的连接级失败处理：**取消导致的收尾不算失败**。
@@ -745,15 +740,15 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     fail_mux_loop_(&shared, &cancel, &MuxError::MalformedFrame).await;
                     return;
                 };
-                lock_or_exit_!(entry.owner_.with_mut_async_(cancel.child_token(), |state| {
-                    state.touch_();
-                }));
-                let counted = lock_or_exit_!(entry
-                    .owner_
-                    .with_mut_async_(cancel.child_token(), |state| state
-                        .flow_mut_()
-                        .recv_window_mut()
-                        .on_data(amount)));
+                if entry.owner_.is_app_rx_closed_() {
+                    // 应用已丢弃接收半边：本端（已经或即将）向对端发 `RESET`，此刻到达的
+                    // 数据都是「它在收到我们 `RESET` 之前发出的在途帧」。写进一条消费端
+                    // 已关闭的环只会得到 `ProducerError::Closing`，并把整条连接判成传输
+                    // 错误（旧实现的实测形态）；因此这里**静默丢弃**。
+                    continue;
+                }
+                entry.owner_.touch_();
+                let counted = entry.owner_.recv_on_data_(amount);
                 if let Result::Err(err) = counted {
                     fail_mux_loop_(&shared, &cancel, &MuxError::FlowCtrl(err)).await;
                     return;
@@ -768,17 +763,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 // 仍是旧值**（上面的 `on_data` 不推进它），对端会一直按「还有一整个窗口」
                 // 行动。判据全在 `RecvWindow::should_report_with_` 里（窗口归零落在
                 // **临界区**，临界区每变必报）。
-                let imminent = lock_or_exit_!(entry
-                    .owner_
-                    .with_mut_async_(cancel.child_token(), |state| {
-                        let thresholds = state.thresholds_();
-                        let recv = state.flow_mut_().recv_window_mut();
-                        if recv.should_report_with_(&thresholds) {
-                            Option::Some(recv.report())
-                        } else {
-                            Option::None
-                        }
-                    }));
+                let imminent = entry.owner_.recv_take_report_();
                 if let Option::Some(report) = imminent {
                     let _ = events_tx.try_send_event_(WriteEvent_::Control {
                         frame_: window_update_frame_(pair, report),
@@ -792,6 +777,10 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 match wrote {
                     Option::None => return,
                     Option::Some(Result::Ok(())) => {}
+                    // 消费端在检查之后、写进环之前被应用丢掉：这批字节已经没人要了，
+                    // 静默丢弃即可（**不能**按传输错误终止整条连接）。
+                    Option::Some(Result::Err(err))
+                        if err.err_tag() == WriteErrTag::Closing => {}
                     Option::Some(Result::Err(_err)) => {
                         fail_mux_loop_(&shared, &cancel, &MuxError::Transport { write: true })
                             .await;
@@ -804,15 +793,13 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     fail_mux_loop_(&shared, &cancel, &MuxError::MalformedFrame).await;
                     return;
                 };
-                if let Option::Some(entry) = table.get_mut(&pair) {
+                if let Option::Some(entry) = table.get(&pair) {
                     // 本端主动发起的子流：这是对端回的 `OPEN`，带上它的接收窗口。
                     let owner = entry.owner_.clone();
-                    lock_or_exit_!(owner.with_mut_async_(cancel.child_token(), |state| {
-                        let _ = state.flow_mut_().send_window_mut().on_report(report);
-                        state.set_peer_opened_();
-                        state.touch_();
-                    }));
-                    wake_establish_(&owner, cancel.child_token()).await;
+                    let _ = owner.send_on_report_(report);
+                    owner.set_peer_opened_();
+                    owner.touch_();
+                    wake_establish_(&owner);
                 } else {
                     // 入向请求：**只登记，不回帧**。
                     //
@@ -825,7 +812,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         .reserve_inbound_(local, remote, report, cancel.child_token())
                         .await;
                     match reserved {
-                        Result::Ok(()) => {}
+                        Result::Ok(_) => {}
                         // 等锁被取消：连接正在收尾，本循环退出。
                         Result::Err(ReserveErr_::Cancelled) => return,
                         Result::Err(_) => {
@@ -845,49 +832,35 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 }
             }
             FrameKind::Accept | FrameKind::Reject => {
-                if let Option::Some(entry) = table.get_mut(&pair) {
+                if let Option::Some(entry) = table.get(&pair) {
                     let owner = entry.owner_.clone();
                     let outcome = if header.kind() == FrameKind::Accept {
                         crate::connection::owner_::EstablishOutcome_::Accepted
                     } else {
                         crate::connection::owner_::EstablishOutcome_::Refused
                     };
-                    lock_or_exit_!(owner.with_mut_async_(cancel.child_token(), |state| {
-                        state.set_establish_outcome_(outcome);
-                        state.touch_();
-                    }));
-                    wake_establish_(&owner, cancel.child_token()).await;
+                    owner.set_establish_outcome_(outcome);
+                    owner.touch_();
+                    wake_establish_(&owner);
                 }
             }
             FrameKind::Close => {
                 let reset = header.flags() & flags::K_RESET != 0;
                 if let Option::Some(entry) = table.get_mut(&pair) {
-                    // 关掉接收环写端：应用先把已缓存数据读完，再读到 EOF。
-                    entry.writer_.close();
-                    let owner = entry.owner_.clone();
-                    lock_or_exit_!(owner.with_mut_async_(cancel.child_token(), |state| {
-                        if reset {
-                            state.set_peer_reset_();
-                        } else {
-                            state.set_peer_fin_();
-                        }
-                        state.touch_();
-                    }));
-                    let claimed = lock_or_exit_!(owner.with_mut_async_(
-                        cancel.child_token(),
-                        |state| {
-                            if !state.is_done_() {
-                                return false;
-                            }
-                            state.claim_release_()
-                        }
-                    ));
-                    if claimed {
-                        let _ = shared
-                            .reg_
-                            .release_channel_(local, remote, cancel.child_token())
-                            .await;
+                    if reset {
+                        // 对端宣告**不再接收**：收尾的是**本端的发送方向**，与本端
+                        // 接收方向无关。因此**不**关接收环写端——那会把对端仍在途、
+                        // 且已经写进本端接收环的数据一起丢掉（旧实现正是如此，实测
+                        // 少一个窗口，见 `dev-notes/flow-ctrl…` §3.3）。
+                        entry.owner_.set_peer_reset_();
+                    } else {
+                        // 对端宣告**不再发送**：关掉接收环写端，应用读完已缓存数据
+                        // 之后读到 EOF。
+                        entry.writer_.close();
+                        entry.owner_.set_peer_fin_();
                     }
+                    entry.owner_.touch_();
+                    // 拆流记账（移除写侧表项、释放身份）交给复用循环的统一入口。
                     let _ = events_tx.try_send_event_(WriteEvent_::PeerClosed {
                         local_dock: local,
                         remote_dock: remote,
@@ -896,14 +869,12 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 }
             }
             FrameKind::WindowUpdate | FrameKind::Pulse => {
-                if let Option::Some(entry) = table.get_mut(&pair)
+                if let Option::Some(entry) = table.get(&pair)
                     && let Option::Some(report) = window_report_of_(&header)
                 {
                     let owner = entry.owner_.clone();
-                    lock_or_exit_!(owner.with_mut_async_(cancel.child_token(), |state| {
-                        let _ = state.flow_mut_().send_window_mut().on_report(report);
-                        state.touch_();
-                    }));
+                    let _ = owner.send_on_report_(report);
+                    owner.touch_();
                     // **必须叫醒复用循环**：这条子流的额度刚刚（可能）变大，而写循环
                     // 完全可能正 park 在事件通道上——它上一次尝试发送时额度为 0，
                     // 于是「环里有数据但发不出去」，此后应用不再写入（环是满的），
@@ -943,7 +914,8 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
 /// 投一条 `RxConsumed`），若「处理完为止」而不设上限，事件队列始终非空时本循环就
 /// 永远走不到「读一个帧头」那一步。
 ///
-/// `RxConsumed` 的处理要取子流热状态锁，因此本函数是 `async`。
+/// `RxConsumed` 的处理是纯原子读改写（不取锁），但通告要经事件通道投给写循环，
+/// 因此本函数仍是 `async`。
 async fn drain_read_events_<C, K>(
     events: &mut EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
     table: &mut ReadTable_<C::Buff, C::Alloc>,
@@ -1016,7 +988,7 @@ where
             };
             // **先清位、再读环内积压**：顺序不可反，否则「清位与读积压之间」发生的
             // 那次消费会既没有置位、也没有被这次核对看到（见
-            // `ChannelOwner_::clear_rx_consumed_`）。
+            // `ChannelState_::clear_rx_consumed_`）。
             entry.owner_.clear_rx_consumed_();
             let owner = entry.owner_.clone();
             // 环内**实际积压**（已提交、应用还没取走）。本循环是接收环唯一的写入
@@ -1050,25 +1022,9 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
+    let _ = cancel;
     let buffered = Credit::try_from(buffered).unwrap_or(Credit::MAX);
-    let report = lock_or_fail_!(owner.with_mut_async_(cancel.child_token(), |state| {
-        let recv = state.flow_mut_().recv_window_mut();
-        // 权威的累计已消费量。`R` 可能已经把「尚未写进环」的字节记在账上（`on_data`
-        // 先于入环），因此这里用饱和减法兜住那个瞬间。
-        let consumed = recv.recv_total().saturating_sub(buffered as u64);
-        let delta = consumed.saturating_sub(recv.consumed_total());
-        if delta > 0 {
-            recv.on_consumed(Credit::try_from(delta).unwrap_or(Credit::MAX));
-            state.touch_();
-        }
-        let thresholds = state.thresholds_();
-        let recv = state.flow_mut_().recv_window_mut();
-        if recv.should_report_with_(&thresholds) {
-            Option::Some(recv.report())
-        } else {
-            Option::None
-        }
-    }));
+    let report = owner.recv_recheck_(buffered);
     if let Option::Some(report) = report {
         let _ = events_tx.try_send_event_(WriteEvent_::Control {
             frame_: window_update_frame_(pair, report),
@@ -1408,12 +1364,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 // 处理，不唤醒——那同样是安全方向。
                 if let Option::Some(pair) = last_ready
                     && let Option::Some(entry) = table.get_mut(&pair)
-                    && matches!(
-                        entry
-                            .owner_
-                            .try_with_(|state| state.flow_().send_window().available() > 0u32),
-                        Result::Ok(true)
-                    )
+                    && entry.owner_.send_available_() > 0u32
                 {
                     let ring_fut = core::pin::pin!(core::future::IntoFuture::into_future(
                         entry.reader_.read_async(&ring_demand),
@@ -1526,12 +1477,8 @@ where
             // 额度可能中途用尽。因此这里不再「无条件发 FIN」，而是交给
             // [`finalize_entry_`]——它在「环已排空」时才发 FIN，否则把这条子流记进
             // `pending_fin`，等窗口通告 / 环推进之后由主循环第 2.5 步继续。
-            if let Option::Some(entry) = table.get_mut(&pair) {
-                lock_or_fail_!(entry
-                    .owner_
-                    .with_mut_async_(cancel.child_token(), |state| {
-                        state.set_app_tx_closed_();
-                    }));
+            if let Option::Some(entry) = table.get(&pair) {
+                entry.owner_.set_app_tx_closed_();
             }
             // 返回值只表示「本轮有进展」；成功收尾与暂时受阻两种结果都已经由
             // [`finalize_entry_`] 自己落实（受阻时它已登记进 `pending_fin`），
@@ -1553,27 +1500,40 @@ where
             remote_dock,
         } => {
             let pair = (local_dock, remote_dock);
-            if let Option::Some(entry) = table.get_mut(&pair) {
-                lock_or_fail_!(entry
-                    .owner_
-                    .with_mut_async_(cancel.child_token(), |state| {
-                        state.set_app_rx_closed_();
-                    }));
+            // 找到 owner：本地表里可能已经没有（例如对端先发了 `RESET`），用注册表兜底。
+            let owner = match table.get(&pair).map(|entry| entry.owner_.clone()) {
+                Option::Some(owner) => Option::Some(owner),
+                Option::None => {
+                    lock_or_fail_!(shared
+                        .reg_
+                        .channel_owner_(local_dock, remote_dock, cancel.child_token()))
+                }
+            };
+            if let Option::Some(owner) = owner {
+                owner.set_app_rx_closed_();
+                // 向对端宣告「我不再接收」：这条通知与发送方向无关，`RESET` 只关对端
+                // 的发送方向（见 `connection` 模块文档 §7 的半关闭映射）。
+                if owner.claim_local_reset_() {
+                    control_close_via_::<C, _>(
+                        tx_stage,
+                        shared.max_packet_size_,
+                        local_dock,
+                        remote_dock,
+                        true,
+                        cancel.child_token(),
+                    )
+                    .await?;
+                }
             }
-            let _ = read_events.try_send_event_(ReadEvent_::Release {
-                local_dock,
-                remote_dock,
-            });
-            table.remove(&pair);
-            control_close_via_::<C, _>(
-                tx_stage,
-                shared.max_packet_size_,
-                local_dock,
-                remote_dock,
-                true,
-                cancel.child_token(),
-            )
-            .await?;
+            // **绝不在这里摘写侧表项、也不在这里丢掉读侧表项**：
+            //
+            // - 写侧：`drop(rx)` 只结束接收方向，发送方向写进环里的字节仍是承诺要送达
+            //   的，`FIN` 还没发。旧实现无条件 `table.remove`，于是已入 `pending_fin` 的
+            //   条目变成查不到表项的僵尸、在途数据被放弃；
+            // - 读侧：读表项要留到**身份真正释放**（`maybe_release_`）时由 `Release`
+            //   摘掉。否则对端在收到我们 `RESET` 之前发出的在途帧会掉进「未知子流」
+            //   分支，把整条连接判成协议违例。留着的这段窗口里，数据分支按
+            //   `is_app_rx_closed_` 静默丢弃。
             maybe_release_::<C, _>(
                 shared,
                 read_events,
@@ -1590,8 +1550,10 @@ where
         } => {
             let pair = (local_dock, remote_dock);
             if reset_ {
-                // 对端不再接收：停止发送并释放该方向。
+                // 对端不再接收：本端发送方向就此作废——未发出的数据与「欠一条 FIN」的
+                // 登记一起放弃（这是唯一允许放弃已提交字节的情形，`RESET` 就是它的授权）。
                 table.remove(&pair);
+                pending_fin.remove(&pair);
             }
             maybe_release_::<C, _>(
                 shared,
@@ -1606,7 +1568,12 @@ where
     Result::Ok(())
 }
 
-/// 两个方向都收尾时释放注册表条目与接收环。
+/// 两个方向都在**协议层**收尾时释放注册表身份与接收环。
+///
+/// 「两个方向都收尾」的判据由 [`ChannelState_::claim_release_`] 在一次 CAS 里完成
+/// （见 `dev-notes/outlook-concurrency…` §12 T1）：发送方向要等 `FIN` 真的发出
+/// （即发送环已排空），接收方向要等应用丢半边或对端 `FIN`。**应用丢弃发送半边不算
+/// 完成**——那只是「不再写」的意图。
 async fn maybe_release_<C, K>(
     shared: &MuxLoopShared_<C::Alloc>,
     read_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
@@ -1628,13 +1595,7 @@ where
     let Some(owner) = owner else {
         return Result::Ok(());
     };
-    let release = lock_or_fail_!(owner.with_mut_async_(cancel.child_token(), |state| {
-        if !state.is_done_() {
-            return false;
-        }
-        state.claim_release_()
-    }));
-    if release {
+    if owner.claim_release_() {
         let _ = shared
             .reg_
             .release_channel_(pair.0, pair.1, cancel.child_token())
@@ -1793,10 +1754,7 @@ where
     // 去重位在锁外：同步清位，不取锁。
     owner.clear_tx_queued_();
 
-    let available = lock_or_fail_!(owner.with_async_(cancel.child_token(), |state| state
-        .flow_()
-        .send_window()
-        .available()));
+    let available = owner.send_available_();
     if available == 0 {
         return Result::Ok(false);
     }
@@ -1878,16 +1836,9 @@ where
     };
 
     // 预扣窗口（`take <= available`，因此必定足额）。
-    let granted = lock_or_fail_!(owner.with_mut_async_(cancel.child_token(), |state| state
-        .flow_mut_()
-        .send_window_mut()
-        .reserve(take as Credit)));
+    let granted = owner.send_reserve_(take as Credit);
     if granted < take as Credit {
-        let _ = owner
-            .with_mut_async_(cancel.child_token(), |state| {
-                state.flow_mut_().send_window_mut().refund(granted)
-            })
-            .await;
+        owner.send_refund_(granted);
         return Result::Ok(false);
     }
 
@@ -1895,15 +1846,9 @@ where
         enqueue_frame_::<C, _>(tx_stage, &frame, token.child_token()).await
     {
         // 写环已结束：把预扣的窗口退回去，再按连接级失败处理。
-        let _ = owner
-            .with_mut_async_(cancel.child_token(), |state| {
-                state.flow_mut_().send_window_mut().refund(take as Credit)
-            })
-            .await;
+        owner.send_refund_(take as Credit);
         return Result::Err(err);
     }
-    let _ = owner
-        .with_mut_async_(cancel.child_token(), |state| state.touch_())
-        .await;
+    owner.touch_();
     Result::Ok(true)
 }

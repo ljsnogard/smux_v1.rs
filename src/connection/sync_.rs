@@ -9,10 +9,12 @@
 //!
 //! # 共享单元：`acquire_session` + 可取消的异步获取
 //!
-//! 需要共享可变状态的地方都用 `atomic_sync` 的**协作式读写锁**：
+//! 需要共享可变状态的地方用 `atomic_sync` 的**协作式读写锁**：现在只剩
+//! `mux_connection::registry_` 的**身份表**（dock / 子流索引与配额）一处——它是
+//! 冷路径（登记 / 释放 / 入向待决），且临界区不跨 `await`。
 //!
-//! - `mux_connection::registry_` 的身份表与取消令牌 [`CancelToken_`]；
-//! - `owner_::ChannelOwner_` 的每条子流热状态。
+//! 每条子流的状态**不在**这里：`owner_::ChannelState_` 是一个原子字 + 原子窗口，
+//! 由读写循环与 API 面经共享句柄**无锁**访问（见该模块文档）。
 //!
 //! 取锁一律 `acquire_session()` 之后走 [`acquire_read_`] / [`acquire_write_`]：
 //! `try_read` / `try_write` 快路径；失败则 `read_async` / `write_async()` 配
@@ -23,9 +25,10 @@
 //!
 //! # 没有 `await` 可用的地方
 //!
-//! `Drop` 与同步 trait 方法里没有 `await`，因此那两处的共享状态**不取锁**：
-//! `Drop` 只投 [`SessionEvent_`](crate::connection::signal_::SessionEvent_) 消息；
-//! 同步路径唯一需要共享的可变量（「发送环有数据」去重位）是锁外的原子。
+//! `Drop` 与同步 trait 方法里没有 `await`，因此那两处不取任何锁：
+//! `Drop` 只投 [`SessionEvent_`](crate::connection::signal_::SessionEvent_) 消息，
+//! 并顺手在**原子状态字**上记下「应用丢了这一边」；同步路径需要的共享可变量
+//! （两个去重位）也都在那个字里。
 //!
 //! # 取消令牌是无锁的
 //!

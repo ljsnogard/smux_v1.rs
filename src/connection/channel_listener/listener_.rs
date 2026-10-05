@@ -141,8 +141,8 @@ where
             .take_pending_inbound_(local, cancel.child_token())
             .await
         {
-            Result::Ok(Option::Some(remote)) => {
-                return Result::Ok(ChannelHandle::new_(conn, local, remote));
+            Result::Ok(Option::Some((remote, owner))) => {
+                return Result::Ok(ChannelHandle::new_(conn, local, remote, owner));
             }
             Result::Err(_) => return Result::Err(ListenerError::Cancelled),
             Result::Ok(Option::None) => {}

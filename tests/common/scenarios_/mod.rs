@@ -15,6 +15,9 @@ mod smoke_;
 pub use bind_::{run_bind_exclusivity_scenario_, run_unsettled_handle_scenario_};
 pub use buffers_::{run_per_channel_alloc_scenario_, run_ring_rejected_scenario_};
 pub use connect_::connect_pair_;
-pub use flow_ctrl_::{run_flow_ctrl_isolation_scenario_, run_flow_ctrl_socket_scenario_};
+pub use flow_ctrl_::{
+    run_flow_ctrl_isolation_scenario_, run_flow_ctrl_socket_scenario_,
+    run_recv_dropped_scenario_,
+};
 pub use small_::run_small_mux_scenario_;
 pub use smoke_::run_smoke_scenario_;

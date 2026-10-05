@@ -33,7 +33,7 @@ impl TrFlowCtrlPolicy for TinyEpochPolicy {
 #[test]
 fn recv_window_reset_carries_pre_reset_total() {
     let p = TinyEpochPolicy;
-    let mut w = RecvWindow::new_(&p, 4096usize);
+    let w = RecvWindow::new_(&p, 4096usize);
     assert!(!w.reset_due());
     w.report();
 
@@ -69,7 +69,7 @@ fn recv_window_reset_carries_pre_reset_total() {
 #[test]
 fn reset_bypasses_report_rate_limit() {
     let p = TinyEpochPolicy;
-    let mut w = RecvWindow::new_(&p, 64usize);
+    let w = RecvWindow::new_(&p, 64usize);
     w.report();
 
     w.on_data(9u32).expect("在额度内");
@@ -87,7 +87,7 @@ fn reset_bypasses_report_rate_limit() {
 /// - 判断：重置后可用 = 50（在途 0）；普通通告后可用 = 40 − (40 − 35) = 35。
 #[test]
 fn send_window_rebases_on_reset_report() {
-    let mut w = SendWindow::new_(1024u32);
+    let w = SendWindow::new_(1024u32);
     w.on_report(WindowReport::new(0u64, 100u32)).expect("通告");
     assert_eq!(w.reserve(30u32), 30u32);
     assert_eq!(w.available(), 70u32);

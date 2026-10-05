@@ -82,6 +82,7 @@ pub use scenarios_::{
     run_flow_ctrl_isolation_scenario_,
     run_flow_ctrl_socket_scenario_,
     run_per_channel_alloc_scenario_,
+    run_recv_dropped_scenario_,
     run_ring_rejected_scenario_,
     run_small_mux_scenario_,
     run_smoke_scenario_,

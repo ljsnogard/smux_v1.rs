@@ -270,8 +270,9 @@ where
         .drain_session_events_(cancel.child_token())
         .await
         .map_err(map_reserve_err_)?;
-    // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）。
-    conn.core_()
+    // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）；共享状态随身份一起建立。
+    let owner = conn
+        .core_()
         .reserve_channel_(local, remote_dock, cancel.child_token())
         .await
         .map_err(map_reserve_err_)?;
@@ -284,5 +285,11 @@ where
     )
     .await;
 
-    Result::Ok(ChannelHandle::new_initiator_(conn, local, remote_dock, payload))
+    Result::Ok(ChannelHandle::new_initiator_(
+        conn,
+        local,
+        remote_dock,
+        owner,
+        payload,
+    ))
 }

@@ -69,7 +69,6 @@ pub use error_::FlowCtrlError;
 pub use flow_::FlowCtrl;
 pub use policy_::{DefaultPolicy, TrFlowCtrlPolicy};
 pub use recv_window_::RecvWindow;
-pub(crate) use recv_window_::ReportThresholds_;
 pub use report_::WindowReport;
 pub use send_window_::SendWindow;
 pub use types_::{Credit, RecvTotal};
