@@ -6,16 +6,20 @@
 # 设备适配 crate 不同**（tokio 走 `buffex_tokio_adapt`，compio 走
 # `buffex_compio_adapt`），无法用同一个函数体同时表达。于是：
 #
-# - `test-tokio-runtime` / `test-compio-runtime` 两个 feature **都在缺省里**；
-# - `tests/smoke_common.inc`（两个冒烟 target 共用的场景）按「`test-tokio-runtime`
-#   是否打开」二选一分派装配；
-# - 两个冒烟 target 各自用 `required-features` 选中自己那一侧。
+# **缺省只开 `test-compio-runtime`**，与「默认后端 = compio」这条设计一致：
 #
-# 因此**一条 cargo 命令跑不完所有格子**：
+# - `cargo test --all-targets`（缺省）⇒ **compio 装配的全量**（含 compio 冒烟与
+#   keepalive_compio），一条命令就是一个完整、对称的装配；
+# - `--no-default-features --features test-tokio-runtime` ⇒ tokio 装配的全量
+#   （含 smoke_tokio 与 keepalive）；
+# - `--no-default-features --features test-compio-runtime` ⇒ 与缺省等价（用于确认
+#   「不开任何 feature」之外的显式写法）。
 #
-# - `cargo test --all-targets`（缺省）⇒ tokio 侧冒烟 + 其余全部集成用例；
-# - `--no-default-features` ⇒ compio 侧冒烟 + 其余全部（tokio 侧冒烟被 cfg 掉）；
-# - 两个「只开一侧」组合 ⇒ 验证单侧编译与另一套设备适配。
+# 为什么**不**把两个 feature 都放缺省里：`TrConnCfg::Rt` 取的是
+# `default_rt_()`——「哪个后端是默认」由 feature 唯一决定。两个都开时缺省解是 compio，
+# 于是 `tests/keepalive.rs`（tokio 装配）会在自己的 tokio 上下文里调 compio 的
+# `current()` 而 panic；同时 `examples/` 无法开启测试 feature，示例也就跟着坏掉。
+# 相关因果见 `dev-notes/timer-mock-clock-and-generic-drop-20261006-1625.md` §6。
 #
 # `test` 配方把这三类组合都跑一遍，因此不需要任何参数即可覆盖全部 feature 组合。
 # 因果与踩过的坑见 `dev-notes/testing-dual-runtime-20261122-0000.md`。
@@ -46,27 +50,23 @@ test-doc: test-compio
     @echo "== 测试：文档 =="
     cargo test --manifest-path {{manifest}} --doc
 
-# compio 侧冒烟（单独指定 target + --no-default-features）
+# 默认装配的全量（缺省 feature = compio）
 test-compio: test-tokio
-    @echo "== 测试：compio 侧冒烟（--no-default-features --features test-compio-runtime）=="
-    @echo "注：必须 --no-default-features，否则 test-tokio-runtime 仍会被默认打开、"
-    @echo "    共享场景会走 tokio 分支；本 target 在 --all-targets 下被 cfg 掉。"
-    cargo test --manifest-path {{manifest}} --test smoke_compio --no-default-features --features test-compio-runtime
-    cargo test --manifest-path {{manifest}} --test keepalive_compio --no-default-features --features test-compio-runtime
-    @echo "注：inmem_mux / layered_rpc 的用例体按 feature 选作用域（第五个循环必须跑在"
-    @echo "    真正支持计时的后端上），因此它们也要在 compio 侧单独跑一遍。"
-    cargo test --manifest-path {{manifest}} --test inmem_mux --test layered_rpc --no-default-features --features test-compio-runtime
-
-# tokio 侧全部集成用例（缺省 feature 下的 `--all-targets`）
-test-tokio: check-all-features
-    @echo "== 测试：tokio 侧（缺省 feature，--all-targets）=="
+    @echo "== 测试：默认装配（缺省 feature = compio，--all-targets）=="
     cargo test --manifest-path {{manifest}} --all-targets
+
+# tokio 装配的全量（显式 opt-in）
+test-tokio: check-all-features
+    @echo "== 测试：tokio 装配（--no-default-features --features test-tokio-runtime）=="
+    cargo test --manifest-path {{manifest}} --all-targets --no-default-features --features test-tokio-runtime
 
 # 编译矩阵：三种非缺省 feature 组合都要能编过
 check-all-features: clippy
     @echo "注：这里用 check 而不是 test —— 这几格要的是「能编译」，"
     @echo "    运行覆盖由 test-tokio / test-compio 两步负责。"
-    @echo "== 编译：无运行时 feature（compio 分支）=="
+    @echo "== 编译：缺省（compio）=="
+    cargo check --manifest-path {{manifest}} --all-targets
+    @echo "== 编译：一个后端 feature 都不开 =="
     cargo check --manifest-path {{manifest}} --all-targets --no-default-features
     @echo "== 编译：只开 tokio feature =="
     cargo check --manifest-path {{manifest}} --all-targets --no-default-features --features test-tokio-runtime

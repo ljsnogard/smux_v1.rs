@@ -47,7 +47,7 @@ fn idle_channel_times_out_compio_() {
     let timed = ManualTime::new(value, clock.clone());
     scope.block_on_advancing(
         &clock,
-        keepalive_common::idle_channel_times_out_(&timed, &scope),
+        keepalive_common::idle_channel_times_out_(&timed),
     );
 }
 
@@ -64,6 +64,6 @@ fn keepalive_pulses_compio_() {
     let timed = ManualTime::new(value, clock.clone());
     scope.block_on_advancing(
         &clock,
-        keepalive_common::keepalive_pulses_(&timed, &scope),
+        keepalive_common::keepalive_pulses_(&timed),
     );
 }

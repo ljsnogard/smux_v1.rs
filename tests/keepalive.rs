@@ -24,6 +24,14 @@
 //! tokio 运行时，在**上下文之外**调 `block_on_advancing`（此时它直接
 //! `Handle::block_on` + `LocalSet::run_until`）。
 
+//! # 只在 **tokio** 装配下编译
+//!
+//! 本文件用 `abs_art_tokio::Runtime::with_handle` + `LocalScope::block_on_advancing`
+//! 驱动虚拟时间，因此「默认后端」必须也是 tokio——`TrConnCfg::Rt` 取的是
+//! `DefaultRt_`，它在缺省（compio）装配下是 compio 类型，本文件会在自己的 tokio
+//! 上下文里调 compio 的 `current()` 而 panic。compio 侧的对应物是同名的
+//! `keepalive_compio.rs`。
+
 #![cfg(feature = "test-tokio-runtime")]
 
 #[path = "common/mod.rs"]
@@ -57,7 +65,7 @@ fn idle_channel_times_out_tokio_() {
     let timed = ManualTime::new(value, clock.clone());
     scope.block_on_advancing(
         &clock,
-        keepalive_common::idle_channel_times_out_(&timed, &scope),
+        keepalive_common::idle_channel_times_out_(&timed),
     );
 }
 
@@ -74,6 +82,6 @@ fn keepalive_pulses_tokio_() {
     let timed = ManualTime::new(value, clock.clone());
     scope.block_on_advancing(
         &clock,
-        keepalive_common::keepalive_pulses_(&timed, &scope),
+        keepalive_common::keepalive_pulses_(&timed),
     );
 }

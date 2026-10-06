@@ -1,5 +1,21 @@
 # 适配 `abs_art` 值化改造：`MuxConnection<C, R>` 与虚拟时间验收
 
+> **⚠ 本文描述的形态已被同日更晚的改动取代（2026-10-06 16:25）。**
+> 取代者是 [`timer-mock-clock-and-generic-drop-20261006-1625.md`](timer-mock-clock-and-generic-drop-20261006-1625.md) §6。
+>
+> 具体差异（读本文时请以这里为准）：
+>
+> | 本文的说法 | 现行事实 |
+> | --- | --- |
+> | `MuxConnection<C, R>`，运行时值进类型参数 | **`MuxConnection<C>`**：运行时值进 `TrConnCfg::Rt`（`type Rt` + `fn runtime()`），类型参数只剩配置 |
+> | `new(rt, scope, ..)`，运行时值与作用域都是入参 | **`new(delivery, config, read_buff, write_buff)`**：两者由 `TrConnCfg::runtime()` 与该值的 `local_scope()` 自己取；显式控制走 `new_with_rt(rt, scope, ..)` |
+> | §2.2 否决「运行时值进 `TrConnCfg`」 | **已采纳该路线**——它是「只剩 `C`」与「`MuxCore` 无条件 `Send + Sync`」**同时**成立的唯一形状（因果见日志 §6.1–6.2） |
+> | §6 遗留 1（`x_deps` 是否导出 `abs_art`）、遗留 2（`local_scope` 只能由调用方递入） | 遗留 1：改经 `abs_art-bridge`，无需再选后端；遗留 2：由本地 trait `ScopeHost` 补上那条缺口，仍是调用方/上游的固有方法，但连接能自己取 |
+> | §6 遗留 4（compio 下句柄不再 `Send`：「smux 侧没有低成本绕法」） | **已绕开**：核心不再持有运行时值，于是 `MuxCore` 无条件 `Send + Sync`；连接的 `Send` 与否只看配置里的运行时值 |
+>
+> §1、§3、§4 里关于**上游变了什么**与**删掉了什么**的记述仍然有效（那是历史事实），
+> 受影响的只有「形状」那部分。
+
 日期：2026-10-06 13:52
 分支：`feat/abs-art-runtime`（从 `feat/timer` 切出）
 性质：**实现记录 + 决策因果**。

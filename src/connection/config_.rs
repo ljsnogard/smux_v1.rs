@@ -3,7 +3,7 @@
 //! 上游 [`abs_smux::conf::TrMuxConfig`] 已收敛 `Data` / `Dock` / `Buff` 三个
 //! 类型；本 trait 只补上连接内部还需要、但上游不关心的两样东西：内部结构使用的
 //! 分配器，以及流控策略。两条传输半边的类型也放在这里，公开类型因此只需要
-//! `MuxConnection<C, R>` 两个参数。
+//! `MuxConnection<C>` 一个参数（运行时值由本 trait 的 `Rt` 关联类型给出）。
 //!
 //! # 子流环的存储
 //!
@@ -223,11 +223,11 @@ impl<W, R, P: core::fmt::Debug, Rt: core::fmt::Debug> core::fmt::Debug
     }
 }
 
-impl<W, R, P> DefaultConnCfg<W, R, P>
+impl<W, R, P> DefaultConnCfg<W, R, P, super::DefaultRt_>
 where
     P: TrFlowCtrlPolicy,
 {
-    /// 用**默认后端**的运行时值（`abs_art_bridge::current()`）与策略造出配置。
+    /// 用**默认后端**的运行时值与策略造出配置。
     ///
     /// `delivery` 原样交回：握手交付物与配置总是成对出现，调用方一行就能拿到两者，
     /// 因此这里不去拆它。
@@ -241,9 +241,20 @@ where
         delivery: HandshakeDelivery<W, R>,
         policy: P,
     ) -> (HandshakeDelivery<W, R>, Self) {
-        Self::new_with_rt(delivery, policy, crate::connection::default_rt_())
+        let cfg = DefaultConnCfg {
+            rt_: super::default_rt_(),
+            policy_: policy,
+            _use_w_: PhantomData,
+            _use_r_: PhantomData,
+        };
+        (delivery, cfg)
     }
+}
 
+impl<W, R, P, Rt> DefaultConnCfg<W, R, P, Rt>
+where
+    P: TrFlowCtrlPolicy,
+{
     /// 用**调用者给定**的运行时值与策略造出配置。
     ///
     /// 这是「特别的需要」那条接口：想在无上下文处建连、想用虚拟时钟、或想固定某个
@@ -251,7 +262,7 @@ where
     pub fn new_with_rt(
         delivery: HandshakeDelivery<W, R>,
         policy: P,
-        rt: super::DefaultRt_,
+        rt: Rt,
     ) -> (HandshakeDelivery<W, R>, Self) {
         let cfg = DefaultConnCfg {
             rt_: rt,

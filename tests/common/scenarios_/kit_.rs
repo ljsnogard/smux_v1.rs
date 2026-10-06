@@ -28,7 +28,7 @@ use crate::common::{
 /// 循环）→ 两端并发跑「`dock_count` 个 dock × 每个 `per_dock` 条子流」的双向收发与
 /// 半关闭（[`drive_side_`]）。1024 条的冒烟场景只是它的 `16 × 64` 特例。
 ///
-/// `rt` 是**运行时值**（进连接的类型参数），`scope` 是**本地作用域**（投递五个循环）。
+/// `rt` 是**运行时值**（用来构造连接配置），`scope` 是**本地作用域**（驱动本地队列）。
 pub(super) async fn run_mux_scenario_<RA, WA, RB, WB, S, RT>(
     rt: &RT,
     scope: &S,

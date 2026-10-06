@@ -56,6 +56,9 @@ use core::{
     task::{Context, Poll, Waker},
     time::Duration,
 };
+// 只有「真实后端」那两格需要墙钟；两个运行时 feature 都没开时它们被 cfg 掉，
+// 因此这个导入也要跟着门控（否则 `--no-default-features` 下是未用导入）。
+#[cfg(any(feature = "test-tokio-runtime", feature = "test-compio-runtime"))]
 use std::time::Instant as StdInstant;
 
 use abs_art::{TrClock, TrDelay};

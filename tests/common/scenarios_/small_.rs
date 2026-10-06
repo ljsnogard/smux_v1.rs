@@ -17,7 +17,7 @@ use super::kit_::run_mux_scenario_;
 /// 它同时是进程内直连（`tests/inmem_mux.rs`）与 socket 版
 /// （[`run_small_socket_scenario_`]）快速回归的挂点。
 ///
-/// 参数是**运行时值** `rt` 与**本地作用域** `scope`：前者进连接的类型参数并提供
+/// 参数是**运行时值** `rt` 与**本地作用域** `scope`：前者用来构造连接配置并提供
 /// 计时与时刻，后者交给 [`MuxConnection::new`] 投递读写循环。
 ///
 /// # Panics

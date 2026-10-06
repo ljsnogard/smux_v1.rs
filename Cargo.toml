@@ -9,6 +9,12 @@ description = "流复用协议第一版"
 # 【本地 spike，未提交】`abs_art` 家族改用**本地路径**依赖，以便试用
 # `feat/time` 分支新增的计时能力（`TrTime`）。正式落地时应当改回 git tag/branch。
 abs_art = { path = "../abs_art/abs_art" }
+# 示例与下游可能直接用**后端 crate 自己的**运行时类型（`abs_art_tokio::Runtime` 等），
+# 而不是 bridge 的具名别名——两者是同一个类型，但只有当对应 feature 打开时别名才存在。
+# 因此这里无条件依赖两个后端，供「显式挑后端」的用例使用（bridge 已把它们作为
+# 传递依赖拉进来，这里只是把类型路径变短）。
+abs_art-tokio = { path = "../abs_art/abs_art-tokio" }
+abs_art-compio = { path = "../abs_art/abs_art-compio" }
 # **桥接 crate**：业务库只依赖它就能拿到运行时值（`Runtime` / `current`）与本地
 # 作用域（`LocalScope`），而不直接按后端写代码——后端由 `Cargo.toml` 的 feature
 # 选定（见下方 `[features]` 的说明）。

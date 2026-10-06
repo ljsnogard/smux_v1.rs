@@ -1,5 +1,20 @@
 # 保活与空闲超时（写法 B）：**第五个循环落地**
 
+> **⚠ 历史记录（形态已被取代，2026-10-06 16:25）。** 本文记的是当时那一轮的方案与
+> 因果，其中「`MuxConnection` 的类型/入参形状」与「作用域是否携带计时能力」两处
+> **已经不再成立**。现行事实见
+> [`timer-mock-clock-and-generic-drop-20261006-1625.md`](timer-mock-clock-and-generic-drop-20261006-1625.md) §6：
+>
+> - `MuxConnection<C>`——**只有配置一个类型参数**；运行时值由
+>   `TrConnCfg::Rt`（`type Rt` + `fn runtime()`）提供，类型是 `C::Rt`；
+> - `new(delivery, config, read_buff, write_buff)` 自己取运行时值与本地作用域
+>   （后端经 `abs_art-bridge` 选定，缺省 compio）；要显式控制走 `new_with_rt`；
+> - `TrLocalScope` **不**携带计时能力：`TrDelay` / `TrClock` / `TrTime` 都实现在
+>   运行时值上（本文多处「作用域也实现 `TrTime`」的说法属于当时的中间形态）。
+>
+> 本文的**问题分析、实测证据与协议侧结论**仍然有效；受影响的是 API 形状。
+
+
 日期：2026-10-05 14:20
 性质：**实现记录 + 裁决落实 + 三处关键修正**。
 取代：`keepalive-20261005-0901.md` 的 §4（施工顺序）与 §5（待裁决）——那些都已

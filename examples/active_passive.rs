@@ -29,15 +29,23 @@ use buffex::{
 };
 use buffex_tokio_adapt::x_deps::abs_buff_tokio_adapt::{ReadAsInput, WriteAsOutput};
 use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
-use smux_v1::connection::{DefaultConnCfg, Dock, MuxConnection};
+use smux_v1::connection::{DefaultConnCfg, Dock, MuxConnection, TrConnCfg};
+use smux_v1::flow_ctrl::DefaultPolicy;
 use smux_v1::handshake::{
     agent::{AcceptAllEntries, HandshakeAgent},
     opts::BasicOpts,
 };
 use tokio::net::UnixStream;
 
-/// 本示例用的**运行时值**类型：计时与时刻的来源，进 `MuxConnection` 的类型参数。
+/// 本示例用的**运行时值**类型：计时与时刻的来源。
+///
+/// 它由**配置**携带（[`TrConnCfg::Rt`]），而不是作为 `MuxConnection` 的类型参数——
+/// 因此下面用 `abs_art_bridge` 的具名别名，而不是 `abs_art_tokio::Runtime`：
+/// 连接建连时要经 [`smux_v1::connection::ScopeHost`] 自己取作用域，那条实现只挂在
+/// bridge 的别名上（见 `src/connection/scope_host_.rs`）。
 type Rt = abs_art_tokio::Runtime;
+/// 本示例的连接配置：默认资源策略 + **显式传入的 tokio 运行时值**。
+type Cfg = DefaultConnCfg<Tx, Rx, smux_v1::flow_ctrl::DefaultPolicy, Rt>;
 /// 本示例用的**本地作用域**类型：五个循环的投递点，由运行时值交出。
 type Scope = LocalScope;
 /// 全被动环的存储类型（连接级帧暂存也用它）。
@@ -111,18 +119,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// **主动端**：连上去，开一条子流，发消息，半关闭。
 async fn active(
-    _rt: &Rt,
+    rt: &Rt,
     _scope: &Scope,
     rx: Rx,
     tx: Tx,
-) -> Result<MuxConnection<DefaultConnCfg<Tx, Rx>>, Box<dyn std::error::Error>> {
+) -> Result<MuxConnection<Cfg>, Box<dyn std::error::Error>> {
     // ① 握手（不需要运行时值，也不需要作用域）
     let delivery = HandshakeAgent::new(tx, rx)
         .invite_async(&BasicOpts::default(), AcceptAllEntries)
         .await?;
 
     // ② 建连接：需要环境提供运行时值（计时）与本地作用域（投递五个循环）。
-    let conn = MuxConnection::from_delivery(delivery)?;
+    // `MuxConnection::from_delivery` 取的是**默认后端**（集成方在 Cargo.toml 里选的
+    // 那个，本仓缺省 compio）的运行时值。本示例跑在 tokio 上，属于「特别的需要」，
+    // 因此显式把运行时值传进配置——这正是 `DefaultConnCfg::new_with_rt` 的用途。
+    let (delivery, cfg) =
+        <DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>>::new_with_rt(
+            delivery,
+            DefaultPolicy,
+            rt.clone(),
+        );
+    let (stage_r, stage_w) = cfg.make_stage_buffs(cfg.allocator())?;
+    let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
 
     let local_dock = Dock::new(0x2001);
     let remote_dock = Dock::new(1);
@@ -140,18 +158,28 @@ async fn active(
 
 /// **被动端**：等对端来找这个 dock，收到子流后读到 EOF。
 async fn passive(
-    _rt: &Rt,
+    rt: &Rt,
     _scope: &Scope,
     rx: Rx,
     tx: Tx,
-) -> Result<MuxConnection<DefaultConnCfg<Tx, Rx>>, Box<dyn std::error::Error>> {
+) -> Result<MuxConnection<Cfg>, Box<dyn std::error::Error>> {
     // ① 握手（不需要运行时值，也不需要作用域）
     let delivery = HandshakeAgent::new(tx, rx)
         .listen_async(&BasicOpts::default(), AcceptAllEntries)
         .await?;
 
     // ② 建连接：需要环境提供运行时值（计时）与本地作用域（投递五个循环）。
-    let conn = MuxConnection::from_delivery(delivery)?;
+    // `MuxConnection::from_delivery` 取的是**默认后端**（集成方在 Cargo.toml 里选的
+    // 那个，本仓缺省 compio）的运行时值。本示例跑在 tokio 上，属于「特别的需要」，
+    // 因此显式把运行时值传进配置——这正是 `DefaultConnCfg::new_with_rt` 的用途。
+    let (delivery, cfg) =
+        <DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>>::new_with_rt(
+            delivery,
+            DefaultPolicy,
+            rt.clone(),
+        );
+    let (stage_r, stage_w) = cfg.make_stage_buffs(cfg.allocator())?;
+    let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
 
     let local_dock = Dock::new(1);
     let mut listener = conn

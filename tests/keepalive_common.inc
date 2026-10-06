@@ -59,7 +59,7 @@ use smux_v1::{
 
 use crate::common::{
     K_CHANNEL_CAPACITY, K_NET_BUFFER_SIZE, SmokeBuff, SmokeConn, SmokeMuxConfig, TrSmokeRt,
-    TrSmokeScope, make_passive_ring_, read_channel_exact_, write_channel_all_,
+    make_passive_ring_, read_channel_exact_, write_channel_all_,
 };
 
 // ── 具体类型：两条环由同一个构造器造出，因此两端传输类型相同 ────────────────
@@ -92,7 +92,7 @@ const K_SILENT_TIMEOUT: Duration = Duration::from_secs(3600u64);
 /// 建一对连接，**两端各自的**空闲超时可不同。
 ///
 /// `rt` 是**运行时值**（进连接的类型参数，并提供计时与时刻），`scope` 是**本地作用域**
-/// （交给 [`MuxConnection::new`] 投递五个循环）。
+/// （由连接自己经 [`smux_v1::connection::ScopeHost`] 取得并投递五个循环）。
 ///
 /// # 为什么要显式改写协商结果
 ///
@@ -100,9 +100,8 @@ const K_SILENT_TIMEOUT: Duration = Duration::from_secs(3600u64);
 /// 「一端活跃、一端静默」这种非对称配置：对端可能因为版本或配置不同而不做保活，
 /// 这正是空闲超时要覆盖的真实情形。因此握手完成后直接改写各自的
 /// [`HandshakeDelivery::opts`](smux_v1::handshake::agent::HandshakeDelivery)（字段公开）。
-async fn connect_asymmetric_<S, RT>(
+async fn connect_asymmetric_<RT>(
     rt: &RT,
-    scope: &S,
     tx_a: RingTx,
     rx_a: RingRx,
     tx_b: RingTx,
@@ -111,7 +110,6 @@ async fn connect_asymmetric_<S, RT>(
     timeout_b: Duration,
 ) -> (Conn<RT>, Conn<RT>)
 where
-    S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt + smux_v1::connection::ScopeHost,
 {
     let invite_opts = BasicOpts {
@@ -149,9 +147,7 @@ where
     let (stage_br, stage_bw) = config_b
         .make_stage_buffs(config_b.allocator())
         .expect("B 侧连接级帧暂存应当分配成功");
-    // 运行时值与作用域都由配置解决（`TrConnCfg::runtime` + `ScopeHost`）；
-    // `scope` 在本路径不再需要，保留参数是为了不改动调用点的驱动结构。
-    let _ = scope;
+    // 运行时值与作用域都由配置解决（`TrConnCfg::runtime` + `ScopeHost`）。
     let conn_a: Conn<RT> =
         MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw);
     let conn_b: Conn<RT> =
@@ -304,9 +300,8 @@ where
 ///   2. B 侧**没有**中止原因——它对端是「收到 `CLOSE(FIN)` + `CLOSE(RESET)`」，属正常
 ///      关闭，这正是「保活判定」与「对端主动关闭」在应用侧可区分的判据；
 ///   3. 同一条连接上再建一条子流并双向往返成功 ⇒ 拆的只是那条子流，连接还活着。
-pub async fn idle_channel_times_out_<S, RT>(rt: &RT, scope: &S)
+pub async fn idle_channel_times_out_<RT>(rt: &RT)
 where
-    S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt + smux_v1::connection::ScopeHost,
 {
     let (a_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
@@ -314,7 +309,7 @@ where
 
     std::eprintln!("[probe] idle: begin connect");
     let (conn_a, conn_b) =
-        connect_asymmetric_(rt, scope, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_SILENT_TIMEOUT).await;
+        connect_asymmetric_(rt, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_SILENT_TIMEOUT).await;
     std::eprintln!("[probe] idle: connected; begin establish");
     let (tx_a, rx_a, tx_b, rx_b) =
         establish_one_channel_(&conn_a, &conn_b, 0x1000u32, 1u32).await;
@@ -386,16 +381,15 @@ where
 ///   虚拟时间上等 2.5 个超时周期（跨过 5 个保活周期，每个都由驱动推进并执行）。
 /// - 判断：两侧都没有中止原因、两个方向的环都还开着，且这条「一直空闲」的子流仍能
 ///   双向往返。
-pub async fn keepalive_pulses_<S, RT>(rt: &RT, scope: &S)
+pub async fn keepalive_pulses_<RT>(rt: &RT)
 where
-    S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt + smux_v1::connection::ScopeHost,
 {
     let (a_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
 
     let (conn_a, conn_b) =
-        connect_asymmetric_(rt, scope, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_TIMEOUT).await;
+        connect_asymmetric_(rt, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_TIMEOUT).await;
     let (mut tx_a, mut rx_a, mut tx_b, mut rx_b) =
         establish_one_channel_(&conn_a, &conn_b, 0x2000u32, 2u32).await;
 

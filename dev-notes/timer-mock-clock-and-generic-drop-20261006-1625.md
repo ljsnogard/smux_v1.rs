@@ -251,3 +251,80 @@ impl<C> MuxConnection<C> where C: TrConnCfg {
 决定：`DefaultConnCfg` 里装着运行时值，而缺省后端 compio 的 `Runtime` 是 `!Send`。
 因此本文件加 `#![cfg(feature = "test-tokio-runtime")]`——它验的是「**tokio 装配**下
 句柄可跨线程」，这条性质在 tokio 后端仍然成立，只是不再覆盖默认（compio）装配。
+
+
+---
+
+## 7. 追加：文档清理、demo 修复，与「全量测试跑不完」的病因
+
+### 7.1 demo 曾真的坏了（已修）
+
+`examples/active_passive.rs` 跑在 **tokio** 上，而 `MuxConnection::from_delivery`
+在建连时取的是**默认后端**（缺省 compio）的运行时值 → 在 tokio 上下文里调
+`abs_art_compio::current()` → panic「not in a compio runtime」。
+
+处置：示例改走「显式挑后端」那条路（`DefaultConnCfg::new_with_rt` 把 tokio 运行时值
+传进配置），并把 `ScopeHost` 的实现从「bridge 具名别名」改挂到**后端 crate 自己的
+类型**上（`abs_art_tokio::Runtime` / `abs_art_compio::Runtime`）——两者本是同一类型，
+但后者的存在不依赖 bridge 的 feature，示例与下游因此都能直接用后端路径。
+
+顺带两处 API 打磨：
+
+- `DefaultConnCfg::new_with_rt` 泛型化到任意 `Rt`（原先写死 `DefaultRt_`）；
+  `new()` 收回到 `DefaultConnCfg<W, R, P, DefaultRt_>` 这个具体形态上，因此
+  `DefaultConnCfg::new(..)` 仍然不需要任何类型标注。
+- `abs_art_bridge` 从 `crate::x_deps` 转出口，下游只依赖 smux 也能取到运行时值。
+
+`cargo run --example active_passive` 已恢复输出两行预期文案。
+
+### 7.2 全量测试跑不完的两个病因（都修了）
+
+**病因 A：feature 缺省集与「默认后端」自相矛盾。**
+
+`test-tokio-runtime` 与 `test-compio-runtime` 都在 `default` 里，而「谁是默认后端」由
+feature 唯一决定 —— 缺省解是 compio。于是 `tests/keepalive.rs`（tokio 装配）在自己的
+tokio 上下文里调 compio 的 `current()` 而 panic；`examples/` 更麻烦：示例**无法**开启
+测试 feature，任何依赖默认后端的示例都会跟着坏。
+
+处置：`default` 收敛为 `["test-compio-runtime"]`（与「默认后端 = compio」一致），
+tokio 侧改为**显式 opt-in**；`tests/keepalive.rs` 加 `#![cfg(feature = "test-tokio-runtime")]`。
+`justfile` 的配方与注释同步（`test-compio` = 缺省全量，`test-tokio` = 显式 opt-in）。
+
+**效果**：`cargo test --all-targets`（缺省）从「**永远挂住**」变成 **约 20 秒跑完**，
+唯一失败是下面 7.3 那条 `keepalive_pulses_compio_`。
+
+**病因 B（真 bug）：空闲超时拆流之后，同一条连接上再建一条子流会挂住。**
+
+`keepalive_pulses_compio_` 是它的一种表现（B 侧被判 `IdleTimeout`）；tokio 侧的
+`idle_channel_times_out_tokio_` 则是**挂起**。带探针定位到的确切位置：
+
+```text
+[probe] idle: slept; asserting
+[probe] idle: assert-1 (A 侧 abort_reason) 通过     ← 前两条断言都过了
+[probe] idle: begin establish-2                     ← 卡在这里
+...（此后无输出，虚拟时钟停在 2500ms）
+```
+
+即 `establish_one_channel_(&conn_a, &conn_b, 0x1001, 1)` **不返回**；`virtual_sleep`
+在那之后又推进了 5 轮（2000→2500 ms）就再无动静，说明**已经没有待唤醒的本地任务在
+跑了**——怀疑是拆流路径把连接的某个循环或某条发送路径停住了（而不是简单死锁）。
+`keepalive_pulses_compio_` 的 `IdleTimeout` 很可能是同一条因果链的另一端。
+
+**待查（下一步）**：`timer_::deliver_action_` 的 `Abort` 分支（`release_channel_` +
+`LocalAbort` + `Release` 三连）之后，复用 / 解复用两条循环的本地表与注册表是否都回到
+可继续建流的状态；以及 `binding_a` 在空闲拆流后是否仍能发起新的 `open`。
+
+### 7.3 文档清理清单
+
+- `README.md`：§2 的建连路径改成 `from_delivery(delivery)`（不再有 `scope` 入参）、
+  新增 §2.1「想自己挑后端：显式传入运行时值」、§5 补第 5 条（后端在 `Cargo.toml` 选、
+  连接 `Send` 与否看配置里的运行时值）、§4 的冒烟命令改用 `smoke_compio`（缺省装配）。
+- `runtime-adoption-20261006-1352.md`：文首加**取代说明表**（`<C, R>` → `<C>`、
+  `new` 入参、§2.2 的否决被推翻、§6 遗留 1/2/4 的现状）。
+- `keepalive-timer-loop-20261005-1420.md`：加**历史记录**标注（作用域携带计时能力
+  那一版是中间形态，现已回到运行时值上）。
+- `src/connection/mux_connection/core_.rs`、`config_.rs`、`connection/mod.rs`、
+  `tests/layered_rpc.rs`、`tests/common/scenarios_/{small_,kit_}.rs`：把
+  「运行时值进类型参数」一类过时描述改为现状。
+- `tests/keepalive_common.inc`：删掉「保留 `scope` 参数是为了不改动调用点」的过渡
+  注释与那个参数本身（建连已经不需要它）。
