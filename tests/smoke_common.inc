@@ -23,22 +23,23 @@ use crate::common;
 ///   open / accept 的配对顺序），丢弃发送半边后对端读到 `Closing`（EOF）。任一
 ///   不满足即 panic。
 ///
-/// 下面每个运行时一个实例：作用域类型是运行时**具体**的（tokio 的 `LocalScope` 与
-/// compio 的零大小作用域是两个类型），因此这里只把同一个场景体重写两遍**签名**，
-/// 场景本体与断言完全共用。
+/// 下面每个运行时一个实例：**运行时值**与**本地作用域**都是运行时**具体**的（tokio
+/// 与 compio 的 `Runtime` / `LocalScope` 是两对不同的类型），因此这里只把同一个场景体
+/// 重写两遍**签名**，场景本体与断言完全共用。`rt` 进连接的类型参数并提供计时与时刻，
+/// `scope` 交给 [`MuxConnection::new`] 投递五个循环。
 #[cfg(feature = "test-tokio-runtime")]
-pub async fn smoke_socket_body_(scope: &abs_art_tokio::LocalScope) {
+pub async fn smoke_socket_body_(rt: &abs_art_tokio::Runtime, scope: &abs_art_tokio::LocalScope) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
-        common::run_smoke_scenario_(scope, a_tx, a_rx, b_tx, b_rx).await;
+        common::run_smoke_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
     })
     .await;
 }
 
 /// 见 tokio 版说明。
 #[cfg(not(feature = "test-tokio-runtime"))]
-pub async fn smoke_socket_body_(scope: &abs_art_compio::LocalScope) {
+pub async fn smoke_socket_body_(rt: &abs_art_compio::Runtime, scope: &abs_art_compio::LocalScope) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
-        common::run_smoke_scenario_(scope, a_tx, a_rx, b_tx, b_rx).await;
+        common::run_smoke_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
     })
     .await;
 }
@@ -50,18 +51,18 @@ pub async fn smoke_socket_body_(scope: &abs_art_compio::LocalScope) {
 ///   [`common::run_small_mux_scenario_`]。
 /// - 判断：4 条子流的 open / accept / 双向收发 / 半关闭全部成功；失败即 panic。
 #[cfg(feature = "test-tokio-runtime")]
-pub async fn small_socket_body_(scope: &abs_art_tokio::LocalScope) {
+pub async fn small_socket_body_(rt: &abs_art_tokio::Runtime, scope: &abs_art_tokio::LocalScope) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
-        common::run_small_mux_scenario_(scope, a_tx, a_rx, b_tx, b_rx).await;
+        common::run_small_mux_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
     })
     .await;
 }
 
 /// 见 tokio 版说明。
 #[cfg(not(feature = "test-tokio-runtime"))]
-pub async fn small_socket_body_(scope: &abs_art_compio::LocalScope) {
+pub async fn small_socket_body_(rt: &abs_art_compio::Runtime, scope: &abs_art_compio::LocalScope) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
-        common::run_small_mux_scenario_(scope, a_tx, a_rx, b_tx, b_rx).await;
+        common::run_small_mux_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
     })
     .await;
 }
@@ -80,10 +81,10 @@ pub async fn small_socket_body_(scope: &abs_art_compio::LocalScope) {
 ///   误判为过期（本仓库修掉的那个缺陷），这条用例会死锁而不是失败，超时是它唯一的
 ///   可观测征兆。
 #[cfg(feature = "test-tokio-runtime")]
-pub async fn flow_ctrl_socket_body_(scope: &abs_art_tokio::LocalScope) {
+pub async fn flow_ctrl_socket_body_(rt: &abs_art_tokio::Runtime, scope: &abs_art_tokio::LocalScope) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
         let scenario =
-            common::run_flow_ctrl_socket_scenario_(scope, a_tx, a_rx, b_tx, b_rx);
+            common::run_flow_ctrl_socket_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
         match tokio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
             Result::Ok(()) => {}
             Result::Err(_) => panic!(
@@ -97,10 +98,10 @@ pub async fn flow_ctrl_socket_body_(scope: &abs_art_tokio::LocalScope) {
 
 /// 见 tokio 版说明。
 #[cfg(not(feature = "test-tokio-runtime"))]
-pub async fn flow_ctrl_socket_body_(scope: &abs_art_compio::LocalScope) {
+pub async fn flow_ctrl_socket_body_(rt: &abs_art_compio::Runtime, scope: &abs_art_compio::LocalScope) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
         let scenario =
-            common::run_flow_ctrl_socket_scenario_(scope, a_tx, a_rx, b_tx, b_rx);
+            common::run_flow_ctrl_socket_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
         match compio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
             Result::Ok(()) => {}
             Result::Err(_) => panic!(
@@ -120,10 +121,13 @@ pub async fn flow_ctrl_socket_body_(scope: &abs_art_compio::LocalScope) {
 ///   子流 2 正常双向收发），同样包在 [`common::K_FLOW_CTRL_WATCHDOG_`] 之内。
 /// - 判断：子流 2 逐字节相等且收到 `Closing`；子流 1 的 `Tx` 仍可用；超时即 panic。
 #[cfg(feature = "test-tokio-runtime")]
-pub async fn flow_ctrl_isolation_socket_body_(scope: &abs_art_tokio::LocalScope) {
+pub async fn flow_ctrl_isolation_socket_body_(
+    rt: &abs_art_tokio::Runtime,
+    scope: &abs_art_tokio::LocalScope,
+) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
         let scenario =
-            common::run_flow_ctrl_isolation_scenario_(scope, a_tx, a_rx, b_tx, b_rx);
+            common::run_flow_ctrl_isolation_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
         match tokio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
             Result::Ok(()) => {}
             Result::Err(_) => panic!(
@@ -137,10 +141,13 @@ pub async fn flow_ctrl_isolation_socket_body_(scope: &abs_art_tokio::LocalScope)
 
 /// 见 tokio 版说明。
 #[cfg(not(feature = "test-tokio-runtime"))]
-pub async fn flow_ctrl_isolation_socket_body_(scope: &abs_art_compio::LocalScope) {
+pub async fn flow_ctrl_isolation_socket_body_(
+    rt: &abs_art_compio::Runtime,
+    scope: &abs_art_compio::LocalScope,
+) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
         let scenario =
-            common::run_flow_ctrl_isolation_scenario_(scope, a_tx, a_rx, b_tx, b_rx);
+            common::run_flow_ctrl_isolation_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
         match compio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
             Result::Ok(()) => {}
             Result::Err(_) => panic!(

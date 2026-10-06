@@ -29,11 +29,11 @@
 /// # 与 `dual_runtime_test_!` 的分工
 ///
 /// `dual_runtime_test_!` 生成**两个**变体（tokio + compio），前提是用例本身与运行时
-/// 无关。但连接的第五个循环（保活 / 空闲超时）要**真正等一段时间**，而等待能力挂在
-/// 后端类型上：tokio 的 `LocalScope` 与 compio 的 `LocalScope` 是两个类型，同一个
-/// 用例体不可能同时是两者。于是这类用例改用本宏：**每个 feature 组合只生成一个变体**，
-/// 用例体按同一个 feature 选作用域类型（见 `tests/inmem_mux.rs` 顶部的 `LocalScope`
-/// 选择）。
+/// 无关。但连接的第五个循环（保活 / 空闲超时）要**真正等一段时间**，而计时与时刻来自
+/// **运行时值**（`abs_art::TrTime`）：tokio 的 `Runtime` 与 compio 的 `Runtime` 是两个
+/// 类型（作用域 `LocalScope` 亦然），同一个用例体不可能同时是两者。于是这类用例改用
+/// 本宏：**每个 feature 组合只生成一个变体**，用例体按同一个 feature 选运行时值与
+/// 作用域（见 `tests/inmem_mux.rs` 顶部的选择）。
 ///
 /// 反例（本宏诞生的直接原因）：`tests/inmem_mux.rs` 原先一律用 tokio 的 `LocalScope`
 /// 再套 `dual_runtime_test_!`。前四个循环不碰计时器，所以那种写法一直「看起来能跑」

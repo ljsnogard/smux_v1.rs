@@ -9,6 +9,20 @@ description = "流复用协议第一版"
 # 【本地 spike，未提交】`abs_art` 家族改用**本地路径**依赖，以便试用
 # `feat/time` 分支新增的计时能力（`TrTime`）。正式落地时应当改回 git tag/branch。
 abs_art = { path = "../abs_art/abs_art" }
+# **桥接 crate**：业务库只依赖它就能拿到运行时值（`Runtime` / `current`）与本地
+# 作用域（`LocalScope`），而不直接按后端写代码——后端由 `Cargo.toml` 的 feature
+# 选定（见下方 `[features]` 的说明）。
+#
+# 缺省后端 = **compio**（bridge 的 `default = ["default-backend-compio"]`）。
+# 注意 bridge 的守卫：**同时启用多个 backend** 时必须显式声明 `default-backend-*`，
+# 否则裸名 `Runtime` 没有唯一解，直接编译失败——因此本仓不启用 bridge 的裸名，
+# 而是在 `connection/scope_host_.rs` 里用**具名别名**（`CompioRuntime` /
+# `TokioRuntime`）配合自己的 feature 二选一。
+abs_art-bridge = { path = "../abs_art/abs_art-bridge" }
+# 虚拟时间（仅测试装配需要）：连接的建连路径要自己取作用域（`ScopeHost`），而
+# `ManualTime` 是外部类型，它的 `ScopeHost` 实现只能写在**拥有该 trait 的本 crate**
+# 里（孤儿规则）。因此这里开一个可选依赖 + 测试 feature，生产依赖图里不出现它。
+abs_art-mock_clock = { path = "../abs_art/abs_art-mock_clock", optional = true }
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
 abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
 # abs_smux = { path = "../abs_smux" }
@@ -19,32 +33,35 @@ atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch 
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
 
-# `std` feature：让 `std::time::Instant` 实现 `embedded_timers::instant::Instant`，
-# 从而缺省时钟 `time::SystemClock` 能把它当作 `Clock::Instant`。没有它就只能用
-# `Instant32` / `Instant64` 这类 tick 计数器，而本 crate 没有产出真实 tick 的时钟源。
-embedded-timers = { git = "https://gitee.com/lino_snsalias/embedded-timers.git", tag = "v0.4.0", features = ["std"] }
-
 crc = { version = "3.4.*" }
 flume = { version = "0.12.*" }
 thiserror = { version = "2.0.*", default-features = false }
 
 [features]
-# 测试装配用：让 `tests/common` 与 `tests/smoke_common` 知道当前测试 target 跑在
-# 哪个运行时上（tokio 与 compio 的 socket / 适配类型不同，无法用同一个函数体同时
-# 表达）。两个冒烟 target 各选中其一 —— 因此同一份场景只写一次、两个运行时各跑一遍。
-test-tokio-runtime = []
+# **后端选择**（经 `abs_art-bridge`）：缺省 = compio；`test-tokio-runtime` 把它换成
+# tokio（用于在 tokio 装配下再跑一遍同一批场景）。
+#
+# 为什么不用 bridge 的裸名 `Runtime`：bridge 的守卫要求「同时启用多个 backend 时
+# 必须显式声明 default-backend-*」，而这里两个后端会同时出现在 `cargo test` 的
+# feature 并集里；用了裸名就会踩那条守卫（或更糟：按优先级悄悄选中一个）。
+# 因此 smux 侧用**具名别名**（`CompioRuntime` / `TokioRuntime`）二选一，
+# 见 `src/connection/scope_host_.rs`。
+test-tokio-runtime = ["abs_art-bridge/backend-tokio", "test-mock-clock"]
 # compio 侧：与 tokio feature 构成**互斥二选一**（共享文件按「compio feature 是否
-# 打开」分派设备类型）。**两个都默认打开**：这样 `cargo test --all-targets` 不带任何
+# 打开」分派设备类型）。两个都在缺省集里：这样 `cargo test --all-targets` 不带任何
 # 参数就能把两个冒烟 target 各按自己的运行时编译一遍，与改动前 `smoke_tokio.rs` +
 # `smoke_compio.rs` 两个文件各自运行的效果一致；单独跑某一个 target 时用
 # `--no-default-features --features <该侧>` 即可。
-test-compio-runtime = []
-default = ["test-tokio-runtime", "test-compio-runtime"]
+test-compio-runtime = ["abs_art-bridge/backend-compio", "test-mock-clock"]
+# 虚拟时钟（`abs_art_mock_clock`）只在这两个测试 feature 下被拉进来。
+test-mock-clock = ["dep:abs_art-mock_clock"]
+default = ["test-compio-runtime"]
 
 [dev-dependencies]
-# 测试在 compio 上运行（目标 3），因此运行时桥接与内存分配器只在
-# dev-dependencies 中出现（`buffex` 已是正式依赖，不在此重复）。
-abs_art-bridge = { version = "0.2.2", default-features = false, features = ["backend-compio"] }
+# 测试在 compio 上运行（目标 3），因此内存分配器只在 dev-dependencies 中出现
+# （`buffex` 已是正式依赖，不在此重复）。
+# 注意：`abs_art-bridge` **不在这里**——它已是正式依赖（见上），Cargo 不允许同一个
+# 依赖有两个来源（path 与 registry 混用会直接拒绝解析 manifest）。
 
 # 集成冒烟测试（tests/）用两个运行时各跑一遍同一场景，且都跑真实 UNIX socket：
 # - 两个运行时都用「调用方驱动的泵 + 全被动 buffex 环」搬运 socket 数据；
@@ -54,13 +71,21 @@ buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt
 buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_compio_adapt.git" }
 
 # 连接层经 `abs_art` 的**值化本地作用域**（`TrLocalScope`）投递读 / 写循环，
-# 因此冒烟测试要给出具体的后端作用域值：tokio 版用 `abs_art_tokio::LocalScope`，
-# compio 版用 `abs_art_compio::LocalScope`。两者从与 `abs_art` 同一个 git 源取，
-# 保证两边用的是同一个 `TrLocalScope` trait。
-# 【本地 spike，未提交】同 `abs_art`：改本地路径，保证两边用的是同一个
+# 并从一个**运行时值**（`abs_art::TrTime`：计时 + 时刻）取时间能力。因此测试要给出
+# 具体的后端值：tokio 版用 `abs_art_tokio::current()` + 它交出的 `LocalScope`，
+# compio 版同理。两者从与 `abs_art` 同一个源取，保证 trait 是同一份。
+# 【本地 spike，未提交】同 `abs_art`：改本地路径，保证两边用的是同一份
 # `TrLocalScope` / `TrTime` trait（否则两个 abs_art 版本会让 trait 对不上）。
-abs_art-tokio = { path = "../abs_art/abs_art-tokio" }
-abs_art-compio = { path = "../abs_art/abs_art-compio" }
+#
+# `mock-clock`：各后端的手动时钟驱动入口（`LocalScope::block_on_advancing`）。
+# keepalive 的端到端验收靠它把「等 1 秒 / 2.5 秒」变成**虚拟时间**，
+# 场景本体与设计见 `tests/keepalive_common.inc` 与 `dev-notes/runtime-adoption-20261006-1352.md`。
+abs_art-tokio = { path = "../abs_art/abs_art-tokio", features = ["mock-clock"] }
+abs_art-compio = { path = "../abs_art/abs_art-compio", features = ["mock-clock"] }
+
+# 手动（虚拟）时钟本体：`ManualClock` / `ManualTime` / `Supervisor`。
+# 它只出现在测试里（正式依赖不需要），因此留在 dev-dependencies。
+abs_art-mock_clock = { path = "../abs_art/abs_art-mock_clock" }
 
 # 场景并发用与运行时无关的组合子（join! / join_all / select），因此只需要
 # `futures`，不需要为两个运行时各写一份并发代码。

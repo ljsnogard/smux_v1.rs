@@ -10,7 +10,7 @@
 //! # 为什么它是「演员」而不是「连接对象」
 //!
 //! [`MuxConnection`](super::MuxConnection) 只是指向本类型的智能指针
-//! （`mm_ptr::Shared<MuxCore<C, S>, C::Alloc>`）：句柄与两个循环各自持有一份，
+//! （`mm_ptr::Shared<MuxCore<C, R>, C::Alloc>`）：句柄与两个循环各自持有一份，
 //! 因此「谁借用谁」被换成「谁持有谁的一份指针」，生命周期参数从公开类型上消失。
 //! 对共享状态的修改一律经内部读写锁串行化（不使用 actor 框架、不使用消息通道）。
 //!
@@ -25,18 +25,26 @@
 //! 若循环持有强引用，核心将永远无法析构、取消令牌永远不会被触发，两个任务与
 //! 整个连接状态会永久泄漏——这是本设计里最容易写错的一处，务必保持。
 //!
-//! # 作用域保活槽
+//! # 队列保活：由五个循环各自承担，核心不再持有作用域
 //!
-//! [`MuxCore::scope_`] 存一份调用方注入的本地作用域克隆（`abs_art::TrLocalScope`
-//! 的实现值）。它**不参与** spawn 之后的任何调用，只保证「连接活着，本地队列就
-//! 活着」——否则调用方一旦先丢弃作用域值，两个循环会被连带销毁，症状是连接
-//! 静默失去响应。
+//! 本地队列（tokio 的 `LocalSet`、smol 的 `LocalExecutor`）**随作用域值存活**，
+//! 所以「连接活着 ⇒ 队列活着」这条保证必须有人兑现。上一版由
+//! `MuxCore::scope_` 持有作用域克隆来兑现。
+//!
+//! 本版把作用域**从核心的类型参数里拿掉**（`MuxConnection<C, R>` 只表达资源策略与
+//! 运行时值），保活改为**五个循环各持一份克隆**：投递时把克隆 move 进循环 future，
+//! 于是只要还有一个循环在跑，队列就不会被回收。
+//!
+//! 这样会在 tokio / smol 上形成 `队列 → 任务 → 队列` 的引用环，但**不会泄漏**：
+//! 最后一个应用面强引用消失时核心析构、取消令牌触发（令牌是独立的可克隆句柄，
+//! 不依赖作用域），五个循环随即退出并从队列中移除，环就解开了。
 //!
 //! 注意队列**是否被驱动**仍然由调用方负责（tokio 需要 `scope.run_until(..)`、
-//! compio 由运行时驱动）；本槽位只保证队列不被提前回收。两个循环也是经同一个
-//! 字段投递的（[`MuxCore::scope_`]），因此「谁提供队列」在核心上只有一处。
+//! compio 由运行时驱动）；循环持有的克隆只保证队列不被提前回收。
 
 use buffex::x_deps::abs_cancel::TrCancellationToken;
+
+use abs_art::TrClock;
 
 use crate::{
     connection::{
@@ -48,23 +56,34 @@ use crate::{
     },
     flow_ctrl::WindowReport,
     handshake::opts::HandshakeOpts,
-    time::ConnClock_,
 };
 
 /// 复用连接的**演员核心**：连接的全部共享状态与全部资源句柄。
 ///
-/// 泛型参数：
+/// 泛型参数只有 `C`：资源策略（见 [`TrConnCfg`](crate::connection::TrConnCfg)），
+/// 它同时给出**运行时值**（[`C::Rt`](crate::connection::TrConnCfg::Rt)：时刻与计时）。
 ///
-/// - `C`：资源策略，见 [`TrConnCfg`](crate::connection::TrConnCfg)；
-/// - `S`：调用方注入的本地作用域类型（`abs_art::TrLocalScope` 的实现值）。
-///   本类型只**保存**它，不要求它在类型上实现任何 trait；`spawn_local` 所需的
-///   bound 只出现在 [`MuxConnection::new`](super::MuxConnection::new) 上。
+/// # 为什么核心**不**持有运行时值
+///
+/// 本类型是 `mm_ptr::Shared` 的被指对象，而
+/// `Shared<T, A>: Send + Sync` 要求 `T: Send + Sync`。compio 后端的
+/// `Runtime` 是 `!Send + !Sync`（内含线程本地执行器），一旦核心持有它就再也不可能
+/// `Send + Sync`——那不是加约束能解决的，是结构性的。
+///
+/// 因此核心只留**建连 epoch**（一个纯数据），需要「现在」时经
+/// [`TrConnCfg::runtime`](crate::connection::TrConnCfg::runtime) 取一个运行时值
+/// （克隆句柄，廉价）再相减。于是 `MuxCore<C>: Send + Sync` 与后端是否为
+/// `Send` **无关**。
+///
+/// 本地作用域**不在**本类型的参数里：它只出现在
+/// [`MuxConnection::new`](super::MuxConnection::new) 的方法级泛型上，投递完五个循环
+/// 之后由循环各自持有（见模块文档「队列保活」）。
 ///
 /// # 生命周期
 ///
 /// 最后一个应用面强引用消失时本类型析构，`Drop` 触发五个循环的取消令牌
 /// （`ChannelRegistry_::cancel_loops_`），循环随即在下一个 await 点自行退出。
-pub(crate) struct MuxCore<C, S>
+pub(crate) struct MuxCore<C>
 where
     C: TrConnCfg,
 {
@@ -74,13 +93,10 @@ where
     /// 握手协商结果（连接级配额）。
     opts_: HandshakeOpts,
 
-    /// 本地作用域：既用于建连时 `spawn_local`，也作为队列的保活槽。
-    scope_: S,
-
-    /// 连接级时钟（注入的时钟 + 建连 epoch）：API 路径要用它取「现在」。
+    /// **建连时刻**：一切「连接内毫秒」的零点。
     ///
-    /// 五个循环各持一份克隆，与这里共享**同一个** epoch，因此各处算出的毫秒可比。
-    conn_clock_: ConnClock_<C::Clock>,
+    /// 存的是**纯数据**（时刻类型来自运行时值），不是运行时值本身——理由见类型文档。
+    epoch_: <C::Rt as TrClock>::Instant,
 
     /// dock / 子流身份索引、失败标志与两个循环的取消令牌。
     reg_: ChannelRegistry_<C::Alloc>,
@@ -100,21 +116,20 @@ where
     loops_: [CancelToken_<C::Alloc>; 5],
 }
 
-impl<C, S> MuxCore<C, S>
+impl<C> MuxCore<C>
 where
     C: TrConnCfg,
 {
     /// 由建连路径展开后的全部量构造（成员私有，构造只能走这里）。
     ///
-    /// 参数确实多（策略 / 协商结果 / 作用域 / 注册表 / 时钟 / 两条通道 / 五个令牌）：
+    /// 参数确实多（策略 / 协商结果 / 注册表 / 建连时刻 / 两条通道 / 五个令牌）：
     /// 它们全部来自同一个建连路径，打成一个中间结构只会多一层壳而没有别的收益。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_(
         config: C,
         opts: HandshakeOpts,
-        scope: S,
         reg: ChannelRegistry_<C::Alloc>,
-        conn_clock: ConnClock_<C::Clock>,
+        epoch: <C::Rt as TrClock>::Instant,
         w_events: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
         r_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
         loops: [CancelToken_<C::Alloc>; 5],
@@ -122,8 +137,7 @@ where
         MuxCore {
             config_: config,
             opts_: opts,
-            scope_: scope,
-            conn_clock_: conn_clock,
+            epoch_: epoch,
             reg_: reg,
             w_events_: w_events,
             r_events_: r_events,
@@ -140,14 +154,12 @@ where
         &self.opts_
     }
 
-    /// 本地作用域：建连时经它投递两个循环（队列的保活也由本字段承担）。
-    pub(crate) fn scope_(&self) -> &S {
-        &self.scope_
-    }
-
-    /// 「现在」的连接内毫秒（等价于 `conn_clock_().now_millis_()` 的便捷入口）。
+    /// 「现在」的连接内毫秒（自建连 epoch 起算、向下取整、饱和）。
+    ///
+    /// 时刻来源是配置给出的运行时值——每次调用取一个克隆句柄，随后相减。这是核心
+    /// 不持有运行时值的代价，也是它无条件 `Send + Sync` 的来源。
     pub(crate) fn now_millis_(&self) -> u64 {
-        self.conn_clock_.now_millis_()
+        crate::time::millis_of_(self.config_.runtime().now() - self.epoch_)
     }
 
     /// dock / 子流身份索引与失败标志。
@@ -181,7 +193,7 @@ where
 ///
 /// 每个方法都是**异步且可取消**的：等锁走协作式锁的异步获取，取消经调用方传进来的
 /// token 生效（见 `sync_::acquire_read_` / `acquire_write_`）。
-impl<C, S> MuxCore<C, S>
+impl<C> MuxCore<C>
 where
     C: TrConnCfg,
 {
@@ -300,7 +312,7 @@ where
     }
 }
 
-impl<C, S> Drop for MuxCore<C, S>
+impl<C> Drop for MuxCore<C>
 where
     C: TrConnCfg,
 {

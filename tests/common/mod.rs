@@ -50,8 +50,10 @@ pub use buff_::{
     make_stage_buffs_with_,
 };
 pub use channel_io_::{expect_eof_, read_channel_exact_, write_channel_all_};
+pub use scenarios_::{TestConnCfg, connect_pair_};
 pub use closure_::{AcceptAsyncClosureExt, ClosurePrepare};
 pub use config_::{
+    DefaultRt, default_rt_,
     FlowCtrlConfig,
     K_CHANNELS_PER_DOCK,
     K_CHANNEL_CAPACITY,
@@ -68,6 +70,7 @@ pub use config_::{
     SmokeConn,
     SmokeMuxConfig,
     TrLocalScope,
+    TrSmokeRt,
     TrSmokeScope,
     TrTime,
 };
@@ -79,7 +82,6 @@ pub use socket_::{
     run_socket_scenario_on_runtime_,
 };
 pub use scenarios_::{
-    connect_pair_,
     run_bind_exclusivity_scenario_,
     run_flow_ctrl_isolation_scenario_,
     run_flow_ctrl_socket_scenario_,

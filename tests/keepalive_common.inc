@@ -2,11 +2,23 @@
 //!
 //! # 为什么是一份 `.inc` 而不是普通测试文件
 //!
-//! 这两个场景需要真实时间（`max_channel_timeout` 按整秒协商，最小可用值是 1 秒），
-//! 因此计时循环必须跑在**真正支持计时的后端**上：tokio 用 `abs_art_tokio::LocalScope`、
-//! compio 用 `abs_art_compio::LocalScope`。两者是不同的类型，而测试 target 各自是独立
-//! crate，无法共享模块定义——按仓内既有约定（`tests/smoke_common.inc`），把场景放进本
-//! 文件，由两个薄壳（`keepalive.rs` / `keepalive_compio.rs`）各 `#[path]` 引入一次。
+//! 计时与时刻挂在**运行时值**上：tokio 用 `abs_art_tokio::Runtime`、compio 用
+//! `abs_art_compio::Runtime`（本地作用域各自从对应的运行时值经 `rt.local_scope()`
+//! 取得）。两对类型都不同，而测试 target 各自是独立 crate，无法共享模块定义——按仓内
+//! 既有约定（`tests/smoke_common.inc`），把场景放进本文件，由两个薄壳
+//! （`keepalive.rs` / `keepalive_compio.rs`）各 `#[path]` 引入一次。
+//!
+//! # 时间：**虚拟**的
+//!
+//! 本文件的两个场景都靠 `abs_art_mock_clock` 把时间变成虚拟的：壳用
+//! `ManualTime::new(运行时值, 手动时钟)` 装饰出运行时值 `RT`，再用
+//! `LocalScope::block_on_advancing(&clock, body)` 驱动——驱动在「没有别的活可干」时把
+//! 虚拟时钟推进到下一个到期时刻并唤醒到期任务，因此真实耗时几乎为零，而**事件顺序**
+//! 与真实时间下相同（`max_channel_timeout` 仍是协议协商出的整秒值）。
+//!
+//! 正因如此，本文件里**不能**写 `rt.delay(1.6s)` 来「等 1.6 秒」：那会让驱动一次把时钟
+//! 推到底，中间的 `PULSE` 与空闲超时判定全被跳过。等待一律走 `virtual_sleep_`——它只
+//! **让出**，由驱动按定时器粒度逐格推进。
 //!
 //! 反例（本文件诞生时撞到的）：用一个 tokio 作用域在 `#[compio::test]` 下跑同一份场景。
 //! 连接的前四个循环不碰计时器，那种写法一直「看起来能跑」；第五个循环一落地就会在
@@ -42,11 +54,12 @@ use smux_v1::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::{BasicOpts, HandshakeOpts},
     },
+    time::TrClock,
 };
 
 use crate::common::{
-    K_CHANNEL_CAPACITY, K_NET_BUFFER_SIZE, SmokeBuff, SmokeConn, SmokeMuxConfig, TrSmokeScope,
-    make_passive_ring_, read_channel_exact_, write_channel_all_,
+    K_CHANNEL_CAPACITY, K_NET_BUFFER_SIZE, SmokeBuff, SmokeConn, SmokeMuxConfig, TrSmokeRt,
+    TrSmokeScope, make_passive_ring_, read_channel_exact_, write_channel_all_,
 };
 
 // ── 具体类型：两条环由同一个构造器造出，因此两端传输类型相同 ────────────────
@@ -57,14 +70,14 @@ type RingTx = BufferedTx<SmokeBuff, CoreAlloc>;
 /// 内存环的接收半边。
 type RingRx = BufferedRx<SmokeBuff, CoreAlloc>;
 
-/// 本文件使用的连接类型（传输由上面的两个别名固定）。
-type Conn<S> = SmokeConn<RingRx, RingTx, S>;
+/// 本文件使用的连接类型（传输由上面的两个别名固定；第三个参数是**运行时值**）。
+type Conn<RT> = SmokeConn<RingRx, RingTx, RT>;
 
 /// 本文件使用的两个半部类型。
-type Tx<S> = ChannelTx<SmokeMuxConfig<RingTx, RingRx>, S>;
+type Tx<RT> = ChannelTx<SmokeMuxConfig<RingTx, RingRx, RT>>;
 
 /// 本文件使用的接收半部类型。
-type Rx<S> = ChannelRx<SmokeMuxConfig<RingTx, RingRx>, S>;
+type Rx<RT> = ChannelRx<SmokeMuxConfig<RingTx, RingRx, RT>>;
 
 // ── 量级 ──────────────────────────────────────────────────────────────────
 
@@ -78,13 +91,17 @@ const K_SILENT_TIMEOUT: Duration = Duration::from_secs(3600u64);
 
 /// 建一对连接，**两端各自的**空闲超时可不同。
 ///
+/// `rt` 是**运行时值**（进连接的类型参数，并提供计时与时刻），`scope` 是**本地作用域**
+/// （交给 [`MuxConnection::new`] 投递五个循环）。
+///
 /// # 为什么要显式改写协商结果
 ///
 /// `max_channel_timeout` 是双方协商出来的**同一个**值，而本文件的两条路线都需要
 /// 「一端活跃、一端静默」这种非对称配置：对端可能因为版本或配置不同而不做保活，
 /// 这正是空闲超时要覆盖的真实情形。因此握手完成后直接改写各自的
 /// [`HandshakeDelivery::opts`](smux_v1::handshake::agent::HandshakeDelivery)（字段公开）。
-async fn connect_asymmetric_<S>(
+async fn connect_asymmetric_<S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: RingTx,
     rx_a: RingRx,
@@ -92,9 +109,10 @@ async fn connect_asymmetric_<S>(
     rx_b: RingRx,
     timeout_a: Duration,
     timeout_b: Duration,
-) -> (Conn<S>, Conn<S>)
+) -> (Conn<RT>, Conn<RT>)
 where
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt + smux_v1::connection::ScopeHost,
 {
     let invite_opts = BasicOpts {
         max_channel_timeout: timeout_a,
@@ -123,16 +141,21 @@ where
         },
     };
 
-    let config_a = SmokeMuxConfig::<RingTx, RingRx>::new();
-    let config_b = SmokeMuxConfig::<RingTx, RingRx>::new();
+    let config_a = SmokeMuxConfig::<RingTx, RingRx, RT>::new(rt.clone());
+    let config_b = SmokeMuxConfig::<RingTx, RingRx, RT>::new(rt.clone());
     let (stage_ar, stage_aw) = config_a
         .make_stage_buffs(config_a.allocator())
         .expect("A 侧连接级帧暂存应当分配成功");
     let (stage_br, stage_bw) = config_b
         .make_stage_buffs(config_b.allocator())
         .expect("B 侧连接级帧暂存应当分配成功");
-    let conn_a: Conn<S> = MuxConnection::new(scope, delivery_a, config_a, stage_ar, stage_aw);
-    let conn_b: Conn<S> = MuxConnection::new(scope, delivery_b, config_b, stage_br, stage_bw);
+    // 运行时值与作用域都由配置解决（`TrConnCfg::runtime` + `ScopeHost`）；
+    // `scope` 在本路径不再需要，保留参数是为了不改动调用点的驱动结构。
+    let _ = scope;
+    let conn_a: Conn<RT> =
+        MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw);
+    let conn_b: Conn<RT> =
+        MuxConnection::new(delivery_b, config_b, stage_br, stage_bw);
     (conn_a, conn_b)
 }
 
@@ -141,14 +164,14 @@ where
 ///
 /// 建流阶段本身会产生帧（`OPEN` / `ACCEPT`），因此两个方向都会被 `touch`，空闲计时
 /// 从这一刻起算。
-async fn establish_one_channel_<S>(
-    conn_a: &Conn<S>,
-    conn_b: &Conn<S>,
+async fn establish_one_channel_<RT>(
+    conn_a: &Conn<RT>,
+    conn_b: &Conn<RT>,
     local_a: u32,
     listen_b: u32,
-) -> (Tx<S>, Rx<S>, Tx<S>, Rx<S>)
+) -> (Tx<RT>, Rx<RT>, Tx<RT>, Rx<RT>)
 where
-    S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt + smux_v1::connection::ScopeHost,
 {
     let dock_a = Dock::new(local_a);
     let dock_b = Dock::new(listen_b);
@@ -220,84 +243,132 @@ where
     assert_eq!(got, bytes, "往返载荷应当逐字节相等");
 }
 
+// ── 虚拟时间：让出驱动，由它按定时器粒度推进时钟 ──────────────────────────
+
+/// 让出一次执行权：自唤醒一次后返回 `Pending`。
+///
+/// 这是 [`virtual_sleep_`] 的步进单位。每次让出都给驱动一次「推进虚拟时钟到下一个
+/// 到期时刻并驱动本地队列」的机会，因此保活 `PULSE` 与超时判定都会按真实顺序发生。
+async fn yield_once_() {
+    let mut first = true;
+    core::future::poll_fn(move |cx| {
+        if first {
+            first = false;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        } else {
+            core::task::Poll::Ready(())
+        }
+    })
+    .await;
+}
+
+/// 在**虚拟时间**上等待 `duration`：只让出，由驱动逐格推进时钟。
+///
+/// 判据是运行时值自己报的 `now`——它与连接内部的计时器**同源**（`TrTime: TrDelay +
+/// TrClock`），因此这里等到的「1.6 秒」与连接看到的「1.6 秒」在同一条时间轴上。
+async fn virtual_sleep_<RT>(rt: &RT, duration: Duration)
+where
+    RT: TrClock,
+{
+    let start = rt.now();
+    let mut rounds = 0u32;
+    while rt.now() - start < duration {
+        rounds += 1;
+        if rounds % 200 == 0 {
+            std::eprintln!(
+                "[probe] virtual_sleep rounds={rounds} elapsed_ms={}",
+                (rt.now() - start).as_millis()
+            );
+        }
+        yield_once_().await;
+    }
+    std::eprintln!(
+        "[probe] virtual_sleep DONE rounds={rounds} elapsed_ms={}",
+        (rt.now() - start).as_millis()
+    );
+}
+
 // ── 用例一：对端静默 ⇒ 拆子流、不拆连接 ────────────────────────────────────
 
 /// 测试目标：**对端不做保活**时，本端在 `max_channel_timeout` 之后拆掉该子流并报
 /// 空闲超时，而**整条连接不受影响**。
 ///
 /// - 手段：A 侧超时 1 秒、B 侧超时 1 小时（B 因此在本用例的时间尺度内不发 `PULSE`）；
-///   建立一条子流后两端都不发数据，`S::delay` 等 1.6 秒。
+///   建立一条子流后两端都不发数据，用 [`virtual_sleep_`] 在虚拟时间上等 1.6 秒
+///   （驱动会按定时器粒度推进，因此 A 侧那 500 ms 的 `PULSE` 与 1 秒处的超时判定
+///   都按真实顺序发生）。
 /// - 判断：
 ///   1. A 侧两个半部的 `abort_reason()` 都是 `Some(IdleTimeout)`（原因在共享状态里，
 ///      两个半部读到同一个），且环已进入关闭态；
 ///   2. B 侧**没有**中止原因——它对端是「收到 `CLOSE(FIN)` + `CLOSE(RESET)`」，属正常
 ///      关闭，这正是「保活判定」与「对端主动关闭」在应用侧可区分的判据；
 ///   3. 同一条连接上再建一条子流并双向往返成功 ⇒ 拆的只是那条子流，连接还活着。
-pub async fn idle_channel_times_out_<S>(scope: &S)
+pub async fn idle_channel_times_out_<S, RT>(rt: &RT, scope: &S)
 where
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt + smux_v1::connection::ScopeHost,
 {
     let (a_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
 
-    let scenario = async {
-        let (conn_a, conn_b) =
-            connect_asymmetric_(scope, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_SILENT_TIMEOUT)
-                .await;
-        let (tx_a, rx_a, tx_b, rx_b) =
-            establish_one_channel_(&conn_a, &conn_b, 0x1000u32, 1u32).await;
+    std::eprintln!("[probe] idle: begin connect");
+    let (conn_a, conn_b) =
+        connect_asymmetric_(rt, scope, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_SILENT_TIMEOUT).await;
+    std::eprintln!("[probe] idle: connected; begin establish");
+    let (tx_a, rx_a, tx_b, rx_b) =
+        establish_one_channel_(&conn_a, &conn_b, 0x1000u32, 1u32).await;
+    std::eprintln!("[probe] idle: established; begin virtual_sleep");
 
-        // 两端都不发数据：A 侧应当在自己那 500 ms 的保活阈值上发一条 `PULSE`，
-        // 但在 1 秒处判定空闲超时；B 侧的超时是 1 小时，不会主动拆。
-        S::delay(Duration::from_millis(1600u64)).await;
+    // 两端都不发数据：A 侧应当在自己那 500 ms 的保活阈值上发一条 `PULSE`，
+    // 但在 1 秒处判定空闲超时；B 侧的超时是 1 小时，不会主动拆。
+    virtual_sleep_(rt, Duration::from_millis(1600u64)).await;
+    std::eprintln!("[probe] idle: slept; asserting");
 
-        // 1. A 侧：子流被空闲超时拆掉。
-        assert_eq!(
-            tx_a.abort_reason(),
-            Option::Some(MuxError::IdleTimeout),
-            "A 侧发送半部应当报空闲超时"
-        );
-        assert_eq!(
-            rx_a.abort_reason(),
-            Option::Some(MuxError::IdleTimeout),
-            "两个半部共享同一个中止原因"
-        );
-        assert!(
-            rx_a.is_tx_closed(),
-            "被拆子流的接收方向应当读到 EOF（环写端已关闭）"
-        );
-        assert!(
-            tx_a.is_rx_closed(),
-            "被拆子流的发送方向应当看到消费端消失"
-        );
+    // 1. A 侧：子流被空闲超时拆掉。
+    assert_eq!(
+        tx_a.abort_reason(),
+        Option::Some(MuxError::IdleTimeout),
+        "A 侧发送半部应当报空闲超时"
+    );
+    assert_eq!(
+        rx_a.abort_reason(),
+        Option::Some(MuxError::IdleTimeout),
+        "两个半部共享同一个中止原因"
+    );
+    assert!(
+        rx_a.is_tx_closed(),
+        "被拆子流的接收方向应当读到 EOF（环写端已关闭）"
+    );
+    assert!(
+        tx_a.is_rx_closed(),
+        "被拆子流的发送方向应当看到消费端消失"
+    );
 
-        // 2. B 侧：只是收到对端的关闭帧，不是超时。
-        assert_eq!(
-            tx_b.abort_reason(),
-            Option::None,
-            "B 侧不该被自己的保活判定中止"
-        );
-        assert_eq!(
-            rx_b.abort_reason(),
-            Option::None,
-            "B 侧两个半部同样没有中止原因"
-        );
-        assert!(
-            rx_b.is_tx_closed(),
-            "A 侧的 CLOSE(FIN) 应当让 B 侧读到 EOF"
-        );
-        // 注意：对端 `RESET` **不**关闭 B 侧发送环的消费端——协议只要求「允许放弃已
-        // 提交字节」，而既有验收 `mux_recv_dropped_dual_` 钉住了「对端丢弃接收半边
-        // 之前写入的字节仍然写得完」。这条不对称记在 dev-notes 的遗留里。
+    // 2. B 侧：只是收到对端的关闭帧，不是超时。
+    assert_eq!(
+        tx_b.abort_reason(),
+        Option::None,
+        "B 侧不该被自己的保活判定中止"
+    );
+    assert_eq!(
+        rx_b.abort_reason(),
+        Option::None,
+        "B 侧两个半部同样没有中止原因"
+    );
+    assert!(
+        rx_b.is_tx_closed(),
+        "A 侧的 CLOSE(FIN) 应当让 B 侧读到 EOF"
+    );
+    // 注意：对端 `RESET` **不**关闭 B 侧发送环的消费端——协议只要求「允许放弃已
+    // 提交字节」，而既有验收 `mux_recv_dropped_dual_` 钉住了「对端丢弃接收半边
+    // 之前写入的字节仍然写得完」。这条不对称记在 dev-notes 的遗留里。
 
-        // 3. 连接本身还活着：换一个临时 dock 再建一条子流并往返。
-        let (mut tx_a2, mut rx_a2, mut tx_b2, mut rx_b2) =
-            establish_one_channel_(&conn_a, &conn_b, 0x1001u32, 1u32).await;
-        round_trip_(&mut tx_a2, &mut rx_b2, b"after-timeout-a-to-b").await;
-        round_trip_(&mut tx_b2, &mut rx_a2, b"after-timeout-b-to-a").await;
-    };
-
-    scope.run_until(scenario).await;
+    // 3. 连接本身还活着：换一个临时 dock 再建一条子流并往返。
+    let (mut tx_a2, mut rx_a2, mut tx_b2, mut rx_b2) =
+        establish_one_channel_(&conn_a, &conn_b, 0x1001u32, 1u32).await;
+    round_trip_(&mut tx_a2, &mut rx_b2, b"after-timeout-a-to-b").await;
+    round_trip_(&mut tx_b2, &mut rx_a2, b"after-timeout-b-to-a").await;
 }
 
 
@@ -311,45 +382,42 @@ where
 /// [`idle_channel_times_out_`] 会失败（对端已静默，
 /// 本端却永远不拆）。两条必须同时成立。
 ///
-/// - 手段：两端超时都设 1 秒；建立一条子流后不发任何数据，等 2.5 个超时周期。
+/// - 手段：两端超时都设 1 秒；建立一条子流后不发任何数据，用 [`virtual_sleep_`] 在
+///   虚拟时间上等 2.5 个超时周期（跨过 5 个保活周期，每个都由驱动推进并执行）。
 /// - 判断：两侧都没有中止原因、两个方向的环都还开着，且这条「一直空闲」的子流仍能
 ///   双向往返。
-pub async fn keepalive_pulses_<S>(scope: &S)
+pub async fn keepalive_pulses_<S, RT>(rt: &RT, scope: &S)
 where
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt + smux_v1::connection::ScopeHost,
 {
     let (a_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
 
-    let scenario = async {
-        let (conn_a, conn_b) =
-            connect_asymmetric_(scope, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_TIMEOUT).await;
-        let (mut tx_a, mut rx_a, mut tx_b, mut rx_b) =
-            establish_one_channel_(&conn_a, &conn_b, 0x2000u32, 2u32).await;
+    let (conn_a, conn_b) =
+        connect_asymmetric_(rt, scope, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_TIMEOUT).await;
+    let (mut tx_a, mut rx_a, mut tx_b, mut rx_b) =
+        establish_one_channel_(&conn_a, &conn_b, 0x2000u32, 2u32).await;
 
-        // 超过两个超时周期（PULSE 阈值是它的一半，因此这里跨过 4 个保活周期）。
-        S::delay(Duration::from_millis(2500u64)).await;
+    // 超过两个超时周期（PULSE 阈值是它的一半，因此这里跨过 5 个保活周期）。
+    virtual_sleep_(rt, Duration::from_millis(2500u64)).await;
 
-        assert_eq!(
-            tx_a.abort_reason(),
-            Option::None,
-            "两端互发 PULSE ⇒ A 侧不该被判空闲超时"
-        );
-        assert_eq!(rx_a.abort_reason(), Option::None);
-        assert_eq!(
-            tx_b.abort_reason(),
-            Option::None,
-            "两端互发 PULSE ⇒ B 侧不该被判空闲超时"
-        );
-        assert_eq!(rx_b.abort_reason(), Option::None);
-        assert!(!tx_a.is_rx_closed(), "子流不应被拆掉（发送方向仍可用）");
-        assert!(!rx_a.is_tx_closed(), "子流不应被拆掉（接收方向仍是 EOF 之前）");
+    assert_eq!(
+        tx_a.abort_reason(),
+        Option::None,
+        "两端互发 PULSE ⇒ A 侧不该被判空闲超时"
+    );
+    assert_eq!(rx_a.abort_reason(), Option::None);
+    assert_eq!(
+        tx_b.abort_reason(),
+        Option::None,
+        "两端互发 PULSE ⇒ B 侧不该被判空闲超时"
+    );
+    assert_eq!(rx_b.abort_reason(), Option::None);
+    assert!(!tx_a.is_rx_closed(), "子流不应被拆掉（发送方向仍可用）");
+    assert!(!rx_a.is_tx_closed(), "子流不应被拆掉（接收方向仍是 EOF 之前）");
 
-        // 「一直空闲」的子流仍然可用。
-        round_trip_(&mut tx_a, &mut rx_b, b"still-alive-a-to-b").await;
-        round_trip_(&mut tx_b, &mut rx_a, b"still-alive-b-to-a").await;
-    };
-
-    scope.run_until(scenario).await;
+    // 「一直空闲」的子流仍然可用。
+    round_trip_(&mut tx_a, &mut rx_b, b"still-alive-a-to-b").await;
+    round_trip_(&mut tx_b, &mut rx_a, b"still-alive-b-to-a").await;
 }
-

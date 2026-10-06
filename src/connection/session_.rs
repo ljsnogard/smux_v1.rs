@@ -128,7 +128,7 @@ use crate::{
         },
     },
     flow_ctrl::{Credit, WindowReport},
-    time::{Clock, ConnClock_},
+    time::{ConnClock_, TrTime},
     wire_io_::{CursorError, ReadCursor},
 };
 
@@ -153,16 +153,20 @@ const K_MAX_DATA_CHUNK: usize = 16usize * 1024usize;
 /// 按该子流的接收缓冲容量算出，存进该子流的 [`ChannelState_`]（见
 /// [`crate::connection::owner_`]）。循环侧不再需要任何连接级窗口快照。
 ///
-/// # 时钟参数 `K`
+/// # 时钟与运行时值
 ///
 /// 注册表里与时间有关的操作（拆流宽限期回收、进入宽限态、判宽限态）都要「现在」，
 /// 而两个内侧循环恰好都要调它们（解复用循环判宽限态、复用循环进宽限态）。把
 /// [`ConnClock_`] 放在共享量里，五个循环因此都拿得到**同一个 epoch** 下的毫秒。
+///
+/// 运行时值在这里是「配置给的」（[`TrConnCfg::Rt`]），**不是**共享量自己的类型参数：
+/// 核心已经因为「必须无条件 `Send + Sync`」而不持有运行时值，共享量只在**本地**
+/// 循环里活着，因此可以自由持有它。
 #[derive(Clone)]
-pub(crate) struct MuxLoopShared_<A, K>
+pub(crate) struct MuxLoopShared_<A, R>
 where
     A: AllocatorClone + Send + Sync,
-    K: Clock,
+    R: TrTime,
 {
     /// 注册表（dock / 子流索引与配额、失败标志、取消令牌、计时唤醒槽）。
     reg_: ChannelRegistry_<A>,
@@ -170,30 +174,31 @@ where
     /// 协商出的单帧总长上限。
     max_packet_size_: usize,
 
-    /// 连接级时钟（注入的时钟 + 建连 epoch）。
-    conn_clock_: ConnClock_<K>,
+    /// 连接级时钟（运行时值 + 建连 epoch）。
+    conn_clock_: ConnClock_<R>,
 
     /// 协商出的**活跃子流空闲超时**（毫秒）；计时循环的判据。
     channel_timeout_millis_: u64,
 }
 
-/// [`MuxLoopShared_`] 在具体连接策略上的简写：`C` 同时给出分配器与时钟类型。
+/// [`MuxLoopShared_`] 在具体连接策略上的简写：分配器与运行时值都取自 `C`。
 ///
-/// 循环与事件处理的签名里满是这个类型，用别名把两个关联类型摊平，读起来只剩
-/// 「哪个连接策略」一个变化维度。
+/// 循环与事件处理的签名里满是这个类型，用别名把两个关联类型摊平；而只依赖
+/// 「注册表 + 分配器」的辅助函数（例如 [`fail_mux_loop_`]）仍写成泛型于
+/// `A` / `R` 的形状，不必被绑到某个 `C` 上。
 pub(crate) type MuxShared_<C> =
-    MuxLoopShared_<<C as TrConnCfg>::Alloc, <C as TrConnCfg>::Clock>;
+    MuxLoopShared_<<C as TrConnCfg>::Alloc, <C as TrConnCfg>::Rt>;
 
-impl<A, K> MuxLoopShared_<A, K>
+impl<A, R> MuxLoopShared_<A, R>
 where
     A: AllocatorClone + Send + Sync,
-    K: Clock,
+    R: TrTime,
 {
     /// 由建连路径展开后的量构造（成员私有，构造只能走这里）。
     pub(crate) fn new_(
         reg: ChannelRegistry_<A>,
         max_packet_size: usize,
-        conn_clock: ConnClock_<K>,
+        conn_clock: ConnClock_<R>,
         channel_timeout_millis: u64,
     ) -> Self {
         MuxLoopShared_ {
@@ -205,10 +210,10 @@ where
     }
 }
 
-impl<A, K> MuxLoopShared_<A, K>
+impl<A, R> MuxLoopShared_<A, R>
 where
     A: AllocatorClone + Send + Sync,
-    K: Clock,
+    R: TrTime,
 {
     /// 注册表句柄。
     pub(crate) fn reg_(&self) -> &ChannelRegistry_<A> {
@@ -216,7 +221,7 @@ where
     }
 
     /// 连接级时钟。
-    pub(crate) fn conn_clock_(&self) -> &ConnClock_<K> {
+    pub(crate) fn conn_clock_(&self) -> &ConnClock_<R> {
         &self.conn_clock_
     }
 
@@ -339,6 +344,7 @@ async fn finalize_entry_<C, K>(
 ) -> Result<bool, MuxError>
 where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
     // 1. 先尽力把环里剩下的字节送出去（额度用尽时 `drain_one_` 静默返回 `false`）。
@@ -435,13 +441,13 @@ where
 /// 连接被丢弃时 [`MuxCore::drop`](super::mux_connection::core_::MuxCore) 触发取消
 /// 令牌，循环在 await 点上以「取消错误」的形式收到通知并退出——那是正常关闭，
 /// 不应在注册表上留下失败标志（否则收尾路径会伪造出一个假的连接级失败）。
-pub(crate) async fn fail_mux_loop_<A, KC, K>(
-    shared: &MuxLoopShared_<A, KC>,
+pub(crate) async fn fail_mux_loop_<A, R, K>(
+    shared: &MuxLoopShared_<A, R>,
     cancel: &K,
     err: &MuxError,
 ) where
     A: AllocatorClone + Send + Sync,
-    KC: Clock,
+    R: TrTime,
     K: TrCancellationToken,
 {
     if !cancel.is_cancelled() {
@@ -663,6 +669,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
     cancel: K,
 ) where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
     let mut table: ReadTable_<C::Buff, C::Alloc> =
@@ -1296,6 +1303,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
     cancel: K,
 ) where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
     let mut table: WriteTable_<C::Buff, C::Alloc> =
@@ -1540,6 +1548,7 @@ async fn handle_write_event_<C, K>(
 ) -> Result<(), MuxError>
 where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
     match event {
@@ -1707,6 +1716,7 @@ async fn maybe_release_<C, K>(
 ) -> Result<(), MuxError>
 where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
     // 找到 owner：表里可能已经移除，因此用注册表兜底（异步取锁、可取消）。
@@ -1798,6 +1808,7 @@ async fn flush_entry_<C, K>(
 ) -> Result<(), MuxError>
 where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
     loop {
@@ -1828,6 +1839,7 @@ async fn drain_once_<C, K>(
 ) -> Result<bool, MuxError>
 where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
     // 逐个 dock 对轮转。这里**不能**先把键收集成 `Vec`：那会在每次轮转时引入一次
@@ -1874,6 +1886,7 @@ async fn drain_one_<C, K>(
 ) -> Result<bool, MuxError>
 where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
     let token = cancel.child_token();

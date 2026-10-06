@@ -15,6 +15,7 @@ use crate::common::{
     K_FLOW_CTRL_READ_STEP,
     K_FLOW_CTRL_RING_CAPACITY,
     K_FLOW_CTRL_SMALL_LEN,
+    TrSmokeRt,
     TrSmokeScope,
     connect_pair_,
     expect_eof_,
@@ -44,7 +45,8 @@ use crate::common::{
 ///   不丢任何字节；(2) 收尾读到 `Closing`——`FIN` 确实到达且排在全部数据之后（若实现
 ///   提前发 `FIN`，第 (1) 条会先失败）；(3) 场景在超时前返回——回补通告若被误判为
 ///   过期，这条用例会**死锁**而不是通过。
-pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -56,16 +58,17 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     let (conn_a, conn_b) = connect_pair_::<
-        FlowCtrlConfig<WA, RA>,
-        FlowCtrlConfig<WB, RB>,
+        FlowCtrlConfig<WA, RA, RT>,
+        FlowCtrlConfig<WB, RB, RT>,
         RA,
         WA,
         RB,
         WB,
         S,
-    >(scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
     .await;
 
     let listener_dock = Dock::new(1u32);
@@ -159,7 +162,8 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S>(
 ///   `Closing`。
 /// - 判断：子流 2 的载荷逐字节相等且 `FIN` 正常到达；子流 1 的 `Tx` 仍可用
 ///   （`is_tx_closed()` 为假）——被阻塞的只是它自己的发送方向。
-pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -171,18 +175,19 @@ pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     use abs_smux::chan::TrChannelHalf;
 
     let (conn_a, conn_b) = connect_pair_::<
-        FlowCtrlConfig<WA, RA>,
-        FlowCtrlConfig<WB, RB>,
+        FlowCtrlConfig<WA, RA, RT>,
+        FlowCtrlConfig<WB, RB, RT>,
         RA,
         WA,
         RB,
         WB,
         S,
-    >(scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
     .await;
 
     let dock_blocked = Dock::new(1u32);
@@ -333,7 +338,8 @@ pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S>(
 /// 说明：在途帧恰好落在「表项还在且已标记不再接收」还是「已进墓碑」这两条路径之一，
 /// 取决于调度；两者都必须安全。本用例不强制定时，但任何一条走成连接级错误都会让
 /// 子流 2 失败。
-pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -345,16 +351,17 @@ pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     let (conn_a, conn_b) = connect_pair_::<
-        FlowCtrlConfig<WA, RA>,
-        FlowCtrlConfig<WB, RB>,
+        FlowCtrlConfig<WA, RA, RT>,
+        FlowCtrlConfig<WB, RB, RT>,
         RA,
         WA,
         RB,
         WB,
         S,
-    >(scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
     .await;
 
     let drop_dock = Dock::new(1u32);

@@ -34,12 +34,12 @@ pub enum ListenerError {
 /// [`TrChannelListener::income_async`] 每次返回一个**待决句柄**
 /// [`ChannelHandle`]；调用方决定 accept 还是 reject，之后该 dock 才能继续接受
 /// 下一个请求（同一 dock 的请求串行化，便于用户侧实现「排队 / 限流」）。
-pub struct ChannelListener<C, S>
+pub struct ChannelListener<C>
 where
     C: TrConnCfg,
 {
     /// 连接智能指针：accept 时要用它的配置（`policy` 等）建子流环。
-    conn_: MuxConnection<C, S>,
+    conn_: MuxConnection<C>,
 
     /// 监听的 local_dock。
     local_dock_: Dock,
@@ -51,13 +51,13 @@ where
     rec_: LsnOwner_<C::Alloc>,
 }
 
-impl<C, S> ChannelListener<C, S>
+impl<C> ChannelListener<C>
 where
     C: TrConnCfg,
 {
     /// 由连接、监听 `local_dock` 与身份节点句柄构造（只允许 `listen_async` 调用）。
     pub(crate) fn new_(
-        conn: MuxConnection<C, S>,
+        conn: MuxConnection<C>,
         local_dock: Dock,
         rec_: LsnOwner_<C::Alloc>,
     ) -> Self {
@@ -77,7 +77,7 @@ where
 /// 之前会先清空释放邮箱，因此「丢弃后立刻复用同一 dock」仍然是确定的。
 ///
 /// 注意这不影响该 dock 上已经建立、且在应用手里的子流半部。
-impl<C, S> Drop for ChannelListener<C, S>
+impl<C> Drop for ChannelListener<C>
 where
     C: TrConnCfg,
 {
@@ -92,15 +92,15 @@ where
     }
 }
 
-impl<C, S> TrChannelListener<C> for ChannelListener<C, S>
+impl<C> TrChannelListener<C> for ChannelListener<C>
 where
     C: TrConnCfg,
 {
     type Err = ListenerError;
 
-    type ChannelHandle = ChannelHandle<C, S>;
+    type ChannelHandle = ChannelHandle<C>;
 
-    type IncomeAsync<'f> = MuxIncomeAsync<'f, 'f, C, S>
+    type IncomeAsync<'f> = MuxIncomeAsync<'f, 'f, C>
     where
         Self: 'f;
 
@@ -115,13 +115,13 @@ where
 
 /// [`TrChannelListener::income_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxIncome, pub, new(pub(crate)))]
-async fn mux_income_async_<'f, C, S, K>(
-    listener: &'f mut ChannelListener<C, S>,
+async fn mux_income_async_<'f, C, K>(
+    listener: &'f mut ChannelListener<C>,
     cancel: K,
-) -> Result<ChannelHandle<C, S>, ListenerError>
+) -> Result<ChannelHandle<C>, ListenerError>
 where
     C: TrConnCfg + 'f,
-    S: 'f,
+
     K: TrCancellationToken,
 {
     let conn = listener.conn_.clone();

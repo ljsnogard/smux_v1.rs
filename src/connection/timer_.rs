@@ -16,8 +16,8 @@
 //! | 取消令牌 | 与其它四个循环同一条收尾纪律 |
 //!
 //! 与另外四个循环一致：**不持有 [`MuxCore`](super::mux_connection::core_) 的强引用**，
-//! 否则核心永远不会析构、取消令牌永远不会触发。等待用后端计时
-//! （`S: TrTime` 的 `delay`），「什么时候该醒」用连接级时钟在本地算。
+//! 否则核心永远不会析构、取消令牌永远不会触发。等待用运行时值的 `delay`
+//! （`R: TrTime`），「什么时候该醒」用连接级时钟在本地算。
 //!
 //! # 一轮做什么
 //!
@@ -68,9 +68,10 @@
 use core::{
     future::poll_fn,
     task::Poll,
+    time::Duration,
 };
 
-use abs_art::TrTime;
+use abs_art::TrDelay;
 use buffex::x_deps::abs_cancel::TrCancellationToken;
 
 use crate::{
@@ -80,7 +81,6 @@ use crate::{
         signal_::{ControlFrame_, EventSender_, ReadEvent_, TrEventSender_, WriteEvent_},
     },
     flow_ctrl::WindowReport,
-    time::TrDeadline,
 };
 
 /// 每轮最多认领 / 投递多少条保活动作。
@@ -123,17 +123,20 @@ pub(crate) enum TimerAction_ {
 ///
 /// # 参数
 ///
-/// - `S`：**后端计时类型**（最终二进制选中的那个，例如 `abs_art_tokio::LocalScope`）。
-///   它只需实现 [`TrTime`]；本循环不要求它是作用域，也不持有任何作用域值。
-/// - `C`：连接资源策略（`TrConnCfg`），提供分配器与**连接级时钟**类型。
-pub(crate) async fn timer_loop_async_<C, S, K>(
+/// - `R`：**运行时值**（最终二进制选中的那个，例如
+///   `abs_art_tokio::Runtime<{ FULL }>`）。它既报时刻（[`TrClock`]）又管等待
+///   （[`TrDelay`]）——**同源**，因此虚拟时间下不会有「睡在虚拟时钟、读在墙上时钟」
+///   的错配。本循环只要求 [`TrTime`]（= `TrDelay + TrClock`）。
+/// - `C`：连接资源策略（`TrConnCfg`），提供分配器与两条传输半边。
+///
+/// [`TrClock`]: abs_art::TrClock
+pub(crate) async fn timer_loop_async_<C, K>(
     shared: MuxShared_<C>,
     w_events: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
     r_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: K,
 ) where
     C: TrConnCfg,
-    S: TrTime,
     K: TrCancellationToken,
 {
     let clock = shared.conn_clock_().clone();
@@ -192,9 +195,14 @@ pub(crate) async fn timer_loop_async_<C, S, K>(
         //    期限才会被纳入考虑（登记处虽然已经用「现在」给它打了点，但它的
         //    `PULSE` 职责与存活期限都要等下一轮扫描才算）；不挂取消令牌则连接被丢弃
         //    后本任务会一直睡下去，连同它的状态永久泄漏。
-        let deadline = clock.deadline_(next);
-        let clock_value = clock.clock_();
-        let mut sleep_fut = core::pin::pin!(<S as TrDeadline>::sleep_until(clock_value, deadline));
+        //
+        //    `delay` 只吃**相对时长**：期限与「现在」都已经是自 epoch 起算的毫秒，
+        //    相减即可，不需要把绝对时刻还原成后端的时间类型（`saturating_sub` 让
+        //    「期限已过」退化为 `delay(0)`，按契约立刻就绪）。
+        let wait_millis = next.saturating_sub(now);
+        let mut sleep_fut = core::pin::pin!(clock
+            .rt_()
+            .delay(Duration::from_millis(wait_millis)));
         let cancel_fut = cancel.child_token().cancellation();
         let mut cancel_fut = core::pin::pin!(cancel_fut);
         let mut cancelled = false;

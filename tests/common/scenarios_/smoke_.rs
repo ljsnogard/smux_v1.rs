@@ -3,21 +3,22 @@
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 
-use crate::common::{K_CHANNELS_PER_DOCK, K_DOCK_COUNT, TrSmokeScope};
+use crate::common::{K_CHANNELS_PER_DOCK, K_DOCK_COUNT, TrSmokeRt, TrSmokeScope};
 
 use super::kit_::run_mux_scenario_;
 
 /// 场景主体：握手 → 建立复用连接 → 并发驱动连接与全部子流（`16 dock × 64 条`）。
 ///
-/// 参数是两端的 `Rx` / `Tx`（`A` 端发起握手，`B` 端等待）。连接接管 `Rx` / `Tx`
-/// 后在内部自行 spawn 读写循环，本函数只是 [`run_mux_scenario_`] 在
-/// `K_DOCK_COUNT × K_CHANNELS_PER_DOCK` 规模下的特例。
+/// 参数是**运行时值** `rt`、**本地作用域** `scope` 与两端的 `Rx` / `Tx`（`A` 端发起
+/// 握手，`B` 端等待）。连接接管 `Rx` / `Tx` 后在内部自行 spawn 读写循环，本函数只是
+/// [`run_mux_scenario_`] 在 `K_DOCK_COUNT × K_CHANNELS_PER_DOCK` 规模下的特例。
 ///
 /// # Panics
 ///
 /// 握手失败、任意一次 open / accept / 读写 / 半关闭校验失败，或读写会话在场景完成
 /// 前退出时 panic——本函数是测试专用，失败即测试失败。
-pub async fn run_smoke_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_smoke_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -31,8 +32,10 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
-    run_mux_scenario_::<_, _, _, _, S>(
+    run_mux_scenario_::<_, _, _, _, S, RT>(
+        rt,
         scope,
         tx_a,
         rx_a,

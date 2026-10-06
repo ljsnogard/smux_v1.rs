@@ -81,23 +81,23 @@ fn map_reserve_err_(err: ReserveErr_) -> BindingError {
 /// （[`TrDockBinding::open_telegraph_async`]）或向对端发起子流
 /// （[`TrDockBinding::open_channel_async`]）。不同 binding 之间只在注册表上
 /// 交集，因此可以并行持有。
-pub struct DockBinding<C, S>
+pub struct DockBinding<C>
 where
     C: TrConnCfg,
 {
     /// 连接智能指针（`bind_async` 取 `&self`，克隆廉价）。
-    conn_: MuxConnection<C, S>,
+    conn_: MuxConnection<C>,
 
     /// 本会话绑定的 local_dock。
     local_dock_: Dock,
 }
 
-impl<C, S> DockBinding<C, S>
+impl<C> DockBinding<C>
 where
     C: TrConnCfg,
 {
     /// 由连接与 `local_dock` 构造（只允许 `bind_async` 调用）。
-    pub(crate) fn new_(conn: MuxConnection<C, S>, local_dock: Dock) -> Self {
+    pub(crate) fn new_(conn: MuxConnection<C>, local_dock: Dock) -> Self {
         DockBinding {
             conn_: conn,
             local_dock_: local_dock,
@@ -113,7 +113,7 @@ where
 ///
 /// 注意解绑**不**影响已经由该 binding 建立、且仍在应用手里的子流半部：那些
 /// [`ChannelTx`] / [`ChannelRx`] 不借用 binding，`unbind_dock_` 也不会动它们。
-impl<C, S> Drop for DockBinding<C, S>
+impl<C> Drop for DockBinding<C>
 where
     C: TrConnCfg,
 {
@@ -128,26 +128,26 @@ where
     }
 }
 
-impl<C, S> TrDockBinding<C> for DockBinding<C, S>
+impl<C> TrDockBinding<C> for DockBinding<C>
 where
     C: TrConnCfg,
 {
     type Err = BindingError;
 
-    type ChannelHandle = ChannelHandle<C, S>;
+    type ChannelHandle = ChannelHandle<C>;
 
-    type Listener = ChannelListener<C, S>;
+    type Listener = ChannelListener<C>;
 
-    type ListenAsync<'f> = MuxListenAsync<'f, 'f, C, S> where Self: 'f;
+    type ListenAsync<'f> = MuxListenAsync<'f, 'f, C> where Self: 'f;
 
-    type Telegraph = crate::connection::Telegraph<C, S>;
+    type Telegraph = crate::connection::Telegraph<C>;
 
-    type OpenTelegraphAsync<'f> = MuxOpenTelegraphAsync<'f, 'f, C, S> where Self: 'f;
+    type OpenTelegraphAsync<'f> = MuxOpenTelegraphAsync<'f, 'f, C> where Self: 'f;
 
-    type Tx = ChannelTx<C, S>;
-    type Rx = ChannelRx<C, S>;
+    type Tx = ChannelTx<C>;
+    type Rx = ChannelRx<C>;
 
-    type OpenChannelAsync<'f, M> = MuxOpenChannelAsync<'f, 'f, C, S, M>
+    type OpenChannelAsync<'f, M> = MuxOpenChannelAsync<'f, 'f, C, M>
     where
         Self: 'f,
         M: 'f + TrBuffRead<C::Data>;
@@ -178,13 +178,13 @@ where
 
 /// [`TrDockBinding::listen_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxListen, pub, new(pub(crate)))]
-async fn mux_listen_async_<'f, C, S, K>(
-    binding: &'f mut DockBinding<C, S>,
+async fn mux_listen_async_<'f, C, K>(
+    binding: &'f mut DockBinding<C>,
     cancel: K,
-) -> Result<ChannelListener<C, S>, BindingError>
+) -> Result<ChannelListener<C>, BindingError>
 where
     C: TrConnCfg + 'f,
-    S: 'f,
+
     K: TrCancellationToken,
 {
     let conn = binding.conn_.clone();
@@ -212,13 +212,13 @@ where
 /// 本轮只登记端点身份（telegraph **独占**该 `local_dock`）并交付端点对象；
 /// 端点的收发方法仍是 `todo!()`（见 [`crate::connection::Telegraph`]）。
 #[gen_may_cancel_future(MuxOpenTelegraph, pub, new(pub(crate)))]
-async fn mux_open_telegraph_async_<'f, C, S, K>(
-    binding: &'f mut DockBinding<C, S>,
+async fn mux_open_telegraph_async_<'f, C, K>(
+    binding: &'f mut DockBinding<C>,
     cancel: K,
-) -> Result<crate::connection::Telegraph<C, S>, BindingError>
+) -> Result<crate::connection::Telegraph<C>, BindingError>
 where
     C: TrConnCfg + 'f,
-    S: 'f,
+
     K: TrCancellationToken,
 {
     let conn = binding.conn_.clone();
@@ -248,15 +248,15 @@ where
 /// 给出，而本端 `OPEN` 要通告的接收窗口正是由那块接收缓冲的容量算出来的。因此在
 /// 拿到缓冲之前**不能**发 `OPEN`——否则通告值与真实容量不符（要么违约、要么浪费）。
 #[gen_may_cancel_future(MuxOpenChannel, pub, new(pub(crate)))]
-async fn mux_open_channel_async_<'f, C, S, M, K>(
-    binding: &'f mut DockBinding<C, S>,
+async fn mux_open_channel_async_<'f, C, M, K>(
+    binding: &'f mut DockBinding<C>,
     remote_dock: Dock,
     message: &'f mut M,
     cancel: K,
-) -> Result<ChannelHandle<C, S>, BindingError>
+) -> Result<ChannelHandle<C>, BindingError>
 where
     C: TrConnCfg + 'f,
-    S: 'f,
+
     M: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {

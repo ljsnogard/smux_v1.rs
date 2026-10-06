@@ -3,7 +3,9 @@
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 
-use crate::common::{K_SMALL_CHANNELS_PER_DOCK, K_SMALL_DOCK_COUNT, TrSmokeScope};
+use crate::common::{
+    K_SMALL_CHANNELS_PER_DOCK, K_SMALL_DOCK_COUNT, TrSmokeRt, TrSmokeScope,
+};
 
 use super::kit_::run_mux_scenario_;
 
@@ -15,10 +17,14 @@ use super::kit_::run_mux_scenario_;
 /// 它同时是进程内直连（`tests/inmem_mux.rs`）与 socket 版
 /// （[`run_small_socket_scenario_`]）快速回归的挂点。
 ///
+/// 参数是**运行时值** `rt` 与**本地作用域** `scope`：前者进连接的类型参数并提供
+/// 计时与时刻，后者交给 [`MuxConnection::new`] 投递读写循环。
+///
 /// # Panics
 ///
 /// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
-pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -30,8 +36,10 @@ pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
-    run_mux_scenario_::<_, _, _, _, S>(
+    run_mux_scenario_::<_, _, _, _, S, RT>(
+        rt,
         scope,
         tx_a,
         rx_a,

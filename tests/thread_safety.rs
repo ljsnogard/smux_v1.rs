@@ -4,18 +4,30 @@
 //!
 //! 1. 同一个 `MuxCore` 的两个 `MuxConnection` 实例分处两条线程、**并发**对同一个
 //!    dock 调 `bind_async` 时，绑定独占性成立：恰有一个成功，另一个拿到
-//!    `BindError::DockInUse`（[`mux_bind_cross_thread_is_exclusive_compio_`]）；
+//!    `BindError::DockInUse`（[`mux_bind_cross_thread_is_exclusive_tokio_`]）；
 //! 2. 一条线程丢弃 `DockBinding`（`Drop` 只向核心投递释放消息），**另一条线程**
 //!    立刻重绑同一个 dock 必须成功
-//!    （[`mux_rebind_after_cross_thread_drop_compio_`]）。
+//!    （[`mux_rebind_after_cross_thread_drop_tokio_`]）。
 //!
-//! # 为什么放在 compio 上
+//! # 为什么是 tokio 装配（性质在两个后端之间对调了）
 //!
-//! compio 的作用域是零大小的（运行时本身是线程本地的，且由它自己驱动本地队列），
-//! 因此 `MuxConnection` 在 compio 下**已经是 `Send + Sync`**：跨线程的只有连接句柄，
-//! 读写循环仍留在建连线程的本地队列上。这正是
-//! `dev-notes/outlook-concurrency-20261002-2322.md` §3 所说的「句柄可以走，reactor
-//! 不走」；也是 `dev-notes/thread-safety-20261003-1425.md` 记录的本轮改造对象。
+//! 运行时值现在进 [`MuxConnection`] 的类型参数（`MuxConnection<C, R>`），于是连接与
+//! 各句柄是否 `Send` 由**运行时值**决定：
+//!
+//! | 装配 | 运行时值 | `MuxConnection` / 各句柄 |
+//! | --- | --- | --- |
+//! | tokio | `abs_art_tokio::Runtime`（`tokio::runtime::Handle` 把手） | `Send + Sync` |
+//! | compio | `abs_art_compio::Runtime`（线程本地的运行时实例） | `!Send` |
+//!
+//! 这与改造前**恰好相反**：当时类型参数是零大小的作用域**标记**，tokio 的
+//! `LocalScope` 含 `Rc<LocalSet>` 而 `!Send`，compio 的作用域是零大小的值而 `Send`。
+//! 因此这两条「句柄跨线程」的用例现在只能跑在 **tokio** 装配下；compio 侧不可能等价
+//! 迁移——`abs_art_compio::Runtime` 持有 `compio::runtime::Runtime`（`Rc` 构成，
+//! 绑定创建它的线程），含该值的连接移动不到别的线程，而且它的 `Runtime::current()`
+//! 还要求调用点已在 compio 上下文内，连「在上下文之外先造一个值」都做不到。
+//!
+//! 这正是 `dev-notes/outlook-concurrency-20261002-2322.md` §3 所说的「句柄可以走，
+//! reactor 不走」：跨线程的只有连接句柄，读写循环仍留在建连线程的本地队列上。
 //!
 //! # 实现品质要求（本文件**测不到**）
 //!
@@ -26,26 +38,28 @@
 //! `Drop` 不取任何锁，只投一条释放消息。这两条是**实现约束**，行为断言覆盖不到，
 //! 因此写在这里作为阅读本文件时的前提。
 //!
-//! # 为什么这两个用例只有 compio 版、且**刻意**用 `block_on`
+//! # 为什么这两个用例用 `block_on`
 //!
-//! 本文件验的是「`MuxConnection` 与各句柄在 **compio** 装配下是 `Send`，可以跨线程
-//! 持有并操作」这条边界（见 `src/connection/mod.rs` §6）。tokio 的作用域含
-//! `Rc<LocalSet>`，同一套公开类型在那套装配下是 `!Send`，**构造不出**同样的跨线程
-//! 场景——所以这里不是「漏了一个运行时的用例」，而是该场景在 tokio 下不成立。
-//!
-//! 同理，`block_on` 在这里不是「把异步压成同步」的偷懒写法，而是**被测对象本身**：
-//! 每个竞争线程必须自建一个运行时、在自己的运行时上 `block_on` 一次绑定操作，才能
-//! 证明「句柄跨线程可用」。按项目纪律，只有这种「特意测 `block_on` 效果本身」的
-//! 用例才允许保留它。
+//! 每个竞争线程必须**自建一个 tokio 运行时**、在自己的运行时上 `block_on` 一次绑定
+//! 操作，才能证明「句柄跨线程可用」；主线程同样要有一个运行时来驱动建连时的本地队列
+//! （`scope.run_until(..)`）。同理，`block_on` 在这里不是「把异步压成同步」的偷懒写法，
+//! 而是**被测对象本身**。按项目纪律，只有这种「特意测 `block_on` 效果本身」的用例才
+//! 允许保留它。
+
+#![cfg(feature = "test-tokio-runtime")]
 
 mod common;
 
-/// 本文件用到的连接配置别名：两侧同构的冒烟策略（传输类型由 `connect_pair_` 的
-/// 类型参数推断，这里只固定「配置」这一层，便于给泛化的 `connect_pair_` 标注）。
+/// 本文件用到的连接配置别名：两侧同构的冒烟策略（传输类型由 [`common::connect_pair_`]
+/// 的类型参数推断，这里只固定「配置」这一层，便于给连接类型起名）。
 type SmokeCfg_ = common::SmokeMuxConfig<
     smux_v1::connection::BufferedTx<common::SmokeBuff, mm_ptr::x_deps::abs_mm::CoreAlloc>,
     smux_v1::connection::BufferedRx<common::SmokeBuff, mm_ptr::x_deps::abs_mm::CoreAlloc>,
+    common::DefaultRt,
 >;
+
+/// 本文件使用的连接类型：**tokio** 运行时值（`Send + Sync` 的 `Handle` 把手）。
+type Conn_ = smux_v1::connection::MuxConnection<SmokeCfg_>;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -53,6 +67,7 @@ use std::{
     sync::Arc,
 };
 
+use abs_art::TrLocalScope;
 use abs_smux::conn::TrConnection;
 use smux_v1::connection::{BindError, Dock};
 
@@ -68,6 +83,19 @@ const K_FIRST_DOCK: u32 = 0x4000;
 /// 自旋等待对侧进展的上限（纯兜底：正常路径上对侧在微秒级就会到达；即便对侧真的
 /// 在 `catch_unwind` 之外消失，本用例也应当以断言失败收场，而不是挂死）。
 const K_SPIN_LIMIT: usize = 1_000_000;
+
+/// 编译期性质断言：**tokio** 装配下连接与句柄是 `Send + Sync`，所以它们可以跨线程
+/// 持有并操作——[`mux_bind_cross_thread_is_exclusive_tokio_`] 与
+/// [`mux_rebind_after_cross_thread_drop_tokio_`] 正是靠这条性质才写得出来。
+///
+/// 反方向（compio 装配下 `!Send`）无法用同样的断言表达（Rust 没有「不实现某 trait」
+/// 的稳定写法），只能由 `abs_art_compio::Runtime` 的类型文档与 `src/connection/mod.rs`
+/// §6 的说明钉住。**刻意不执行**，只为把这条结论钉在编译期。
+#[allow(dead_code)]
+fn assert_tokio_conn_is_send_sync_() {
+    fn assert_send_sync_<T: Send + Sync>() {}
+    assert_send_sync_::<Conn_>();
+}
 
 /// 自旋等待一个标志置位（有界；每 1024 圈让出一次 CPU，避免单核上互相饿死）。
 fn wait_flag_(flag: &AtomicBool) {
@@ -123,14 +151,22 @@ impl core::fmt::Debug for RaceOutcome_ {
     }
 }
 
+/// 在当前线程新建一个 **tokio** 运行时（竞争线程各自一个）。
+fn new_tokio_rt_() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio 运行时应当创建成功")
+}
+
 /// 测试目标：同一 `MuxCore` 的两个 `MuxConnection` 克隆分处两条线程、各自在独立的
-/// compio 运行时上并发 `bind_async` 同一个 dock 时，必须恰好一个成功、另一个报
+/// **tokio** 运行时上并发 `bind_async` 同一个 dock 时，必须恰好一个成功、另一个报
 /// `BindError::DockInUse`；既不允许两个都成功（身份被写坏），也不允许以 panic 收场
 /// （合法竞争不是临界区重入）。
 ///
-/// - 手段：先用两条被动内存环在主线程的 compio 运行时里完成握手并建出连接（读写循环
+/// - 手段：先用两条被动内存环在主线程的 tokio 运行时里完成握手并建出连接（读写循环
 ///   留在主线程的本地队列，跨线程的只有连接句柄）；随后逐轮起两条线程，各持一份连接
-///   克隆、各自新建一个 compio 运行时：两条线程先自旋对齐起跑线，再立刻对**同一个**
+///   克隆、各自新建一个 tokio 运行时：两条线程先自旋对齐起跑线，再立刻对**同一个**
 ///   dock 调 `bind_async`，并把 panic 收进结果里（`catch_unwind`）；随后经「已出结果 /
 ///   等对侧也出结果」两阶段汇合，最后才丢弃 binding（= 解绑）。主线程等两条线程报到
 ///   后放行，并 `join` 收集两侧结果。每轮换一个新的 dock。
@@ -138,18 +174,23 @@ impl core::fmt::Debug for RaceOutcome_ {
 ///   「两个都成功 / 两个都失败 / 其它错误 / panic」即判失败，并在断言消息里指出轮次与
 ///   两侧结果。
 #[test]
-fn mux_bind_cross_thread_is_exclusive_compio_() {
+fn mux_bind_cross_thread_is_exclusive_tokio_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    // 握手与建连都在主线程的 compio 运行时里完成：两个循环因此投在主线程的本地队列，
+    // 握手与建连都在主线程的 tokio 运行时里完成：两个循环因此投在主线程的本地队列，
     // 后面两条竞争线程只借用连接句柄，不碰循环。
-    let scope = abs_art_compio::LocalScope::new();
-    let rt = compio::runtime::Runtime::new().expect("compio 运行时应当创建成功");
-    let (conn_a, _conn_b) =
-        rt.block_on(common::connect_pair_::<SmokeCfg_, SmokeCfg_, _, _, _, _, _>(
-            &scope, a_tx, a_rx, b_tx, b_rx,
-        ));
+    let tokio_rt = new_tokio_rt_();
+    let (conn_a, _conn_b, _scope) = tokio_rt.block_on(async {
+        let art_rt = abs_art_tokio::current();
+        let scope = art_rt.local_scope();
+        let (a, b): (Conn_, Conn_) = scope
+            .run_until(common::connect_pair_(
+                &art_rt, &scope, a_tx, a_rx, b_tx, b_rx,
+            ))
+            .await;
+        (a, b, scope)
+    });
 
     for round in 0..K_RACE_ROUNDS {
         let dock = Dock::new(K_FIRST_DOCK + round as u32);
@@ -164,7 +205,7 @@ fn mux_bind_cross_thread_is_exclusive_compio_() {
             let start = Arc::clone(&start);
             let done = Arc::clone(&done);
             handles.push(std::thread::spawn(move || {
-                let rt = compio::runtime::Runtime::new().expect("compio 运行时应当创建成功");
+                let rt = new_tokio_rt_();
                 // 报到 + 自旋对齐起跑线：两条线程尽量在同一瞬间进入 `bind_async`，
                 // 这是本条用例唯一要制造的「合法并发竞争」。
                 let raced = catch_unwind(AssertUnwindSafe(|| {
@@ -223,23 +264,29 @@ fn mux_bind_cross_thread_is_exclusive_compio_() {
 /// 重绑的那次 `bind_async` 会先把释放邮箱清空，因此「另一条线程丢弃 binding 后，
 /// 本线程立刻重绑同一个 dock」仍然**确定**成功。
 ///
-/// - 手段：主线程建连后起一条线程 A（自带 compio 运行时）：A 绑定 dock、置「已绑定」
-///   标志，等主线程放行后才丢弃 binding，再置「已丢弃」标志。主线程在「已绑定」之后
-///   先对同一个 dock 调 `bind_async`（必须报 `DockInUse`），然后放行 A、等「已丢弃」
-///   标志，最后**立刻**再次 `bind_async`（不得等任何循环被调度）。
+/// - 手段：主线程在 **tokio** 运行时里建连后起一条线程 A（自带 tokio 运行时）：
+///   A 绑定 dock、置「已绑定」标志，等主线程放行后才丢弃 binding，再置「已丢弃」标志。
+///   主线程在「已绑定」之后先对同一个 dock 调 `bind_async`（必须报 `DockInUse`），
+///   然后放行 A、等「已丢弃」标志，最后**立刻**再次 `bind_async`（不得等任何循环被
+///   调度）。
 /// - 判断：主线程第一次绑定必须是 `BindError::DockInUse`；A 丢弃之后主线程的第二次
 ///   绑定必须成功。任一不满足即 panic。
 #[test]
-fn mux_rebind_after_cross_thread_drop_compio_() {
+fn mux_rebind_after_cross_thread_drop_tokio_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scope = abs_art_compio::LocalScope::new();
-    let rt = compio::runtime::Runtime::new().expect("compio 运行时应当创建成功");
-    let (conn_a, _conn_b) =
-        rt.block_on(common::connect_pair_::<SmokeCfg_, SmokeCfg_, _, _, _, _, _>(
-            &scope, a_tx, a_rx, b_tx, b_rx,
-        ));
+    let tokio_rt = new_tokio_rt_();
+    let (conn_a, _conn_b, _scope) = tokio_rt.block_on(async {
+        let art_rt = abs_art_tokio::current();
+        let scope = art_rt.local_scope();
+        let (a, b): (Conn_, Conn_) = scope
+            .run_until(common::connect_pair_(
+                &art_rt, &scope, a_tx, a_rx, b_tx, b_rx,
+            ))
+            .await;
+        (a, b, scope)
+    });
 
     let dock = Dock::new(K_FIRST_DOCK);
     let bound = Arc::new(AtomicBool::new(false));
@@ -252,7 +299,7 @@ fn mux_rebind_after_cross_thread_drop_compio_() {
         let release = Arc::clone(&release);
         let dropped = Arc::clone(&dropped);
         std::thread::spawn(move || {
-            let rt = compio::runtime::Runtime::new().expect("compio 运行时应当创建成功");
+            let rt = new_tokio_rt_();
             let binding = rt
                 .block_on(async { conn.bind_async(dock).await })
                 .expect("线程 A 上的首次绑定应当成功");
@@ -266,7 +313,7 @@ fn mux_rebind_after_cross_thread_drop_compio_() {
 
     wait_flag_(&bound);
     // 同一个 dock 已被另一条线程占用：本线程必须看到 `DockInUse`。
-    let taken = rt
+    let taken = tokio_rt
         .block_on(async { conn_a.bind_async(dock).await })
         .err();
     assert_eq!(
@@ -278,7 +325,7 @@ fn mux_rebind_after_cross_thread_drop_compio_() {
     // 放行 A 丢弃 binding；等它公布「已丢弃」后**立刻**重绑，不 await 任何循环推进。
     release.store(true, Ordering::Release);
     wait_flag_(&dropped);
-    let rebound = rt
+    let rebound = tokio_rt
         .block_on(async { conn_a.bind_async(dock).await })
         .err();
     assert!(

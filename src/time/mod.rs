@@ -1,62 +1,60 @@
-//! # 时间：**绝对期限的算术层**
+//! # 时间：**连接内毫秒**的记账层
 //!
-//! 本模块只做一件事：把**绝对期限**（`C::Instant`）折算成 [`TrTime`] 能接受的
-//! **相对时长**（`Duration`），以及把 `abs_art` 的计时能力与错误类型转出来给连接层用。
+//! 本模块只做一件事：把**运行时值**（[`TrClock`] 的实现值，例如
+//! `abs_art_tokio::Runtime<{ FULL }>`）报出的绝对时刻，折算成
+//! **自建连时刻（epoch）起算的毫秒数**（`u64`）。
 //!
 //! # 为什么这里这么薄
 //!
 //! 保活（T6）施工单里原先设想「在 `smux_v1` 自建一个轮盘式计时器」，那是
 //! **`abs_art` 还没有计时能力时的补救**：轮盘（`Rc<RefCell<BTreeMap>>` + waker 槽 +
 //! 每条等待者一个节点）存在的唯一理由，是当时拿不到一个可等待的「睡到某时刻」。
+//! 那一步已经在上游完成（trait 在 `abs_art::time`，实现在三个后端），于是轮盘整个
+//! 删除。
 //!
-//! 现在能力已经在 `abs_art` 家族里（trait 在 `abs_art::time`，实现在三个后端），
-//! 于是轮盘整个删除，本模块只剩下**算术**：
+//! 随后一轮又把**时刻**也从「消费方注入」收回到**运行时值**上（`abs_art::TrClock`，
+//! 且 `TrTime: TrDelay + TrClock`）。于是上一版残留的「注入式时钟 + 绝对期限算术层」
+//! （`embedded_timers::Clock` + 本模块的 `deadline_.rs`）也一并删除：
 //!
 //! ```text
-//! D::sleep_until(&clock, t)   =  D::delay(t − clock.now())
-//! D::timeout_at(&clock, t, f) =  D::timeout(t − clock.now(), f)
+//! 过去：注入式 Clock 报时刻 ─┐
+//!                            ├─ 两个来源，可能错配
+//!        后端 TrTime 管等待 ─┘
+//!
+//! 现在：运行时值 R 既报时刻（TrClock::now）又管等待（TrDelay::delay）
+//!       ── 二者同源，错配在类型层面不成立
 //! ```
 //!
-//! 两个都是**运行时类型的关联函数**（`D` 是最终二进制选中的后端），与 `abs_art`
-//! 家族既有的 `Runtime::block_on(..)` / `Runtime::delay(..)` 同形——见 [`TrDeadline`]。
+//! 本模块剩下的全部内容是**算术**：`epoch` 与「自 epoch 起算的毫秒」之间的换算，
+//! 见 crate 内部的 `clock_::ConnClock_`。
 //!
-//! # 分层：等待层归后端，算术与判定层留本地
+//! # 分层：等待层归运行时值，记账层留本地
 //!
 //! | 层 | 归谁 | 为什么 |
 //! | --- | --- | --- |
-//! | 「睡一段 / 每周期醒」 | 后端（[`TrTime`]） | 只有运行时知道怎么等；三个后端各自的实现由 `abs_art-smoke` 的契约矩阵钉住 |
-//! | 「什么时候该醒」 | 本地（本模块 + 注入的 [`Clock`]） | 连接级 epoch、每子流空闲毫秒、宽限期判定都是**协议语义**；而注入式时钟让它们可以**用假时钟确定性验收** |
+//! | 「睡一段 / 每周期醒 / 现在几点」 | 运行时值（[`TrTime`]） | 只有运行时知道怎么等、以什么为时间基准；三个后端各自的实现由 `abs_art-smoke` 的契约矩阵钉住 |
+//! | 「什么时候该醒」 | 本地（本模块） | 连接级 epoch、每子流空闲毫秒、宽限期判定都是**协议语义**；而换成假的运行时值就能让它们**用虚拟时间确定性验收** |
 //!
-//! 这条缝就是本轮把「绝对时刻」留在消费方的收益：`TrTime` 是 `Duration`-only 的
-//! （见 `abs_art::time` 模块文档），因此后端的真实时钟**不**会挤进本模块的判定，
-//! 而 [`TrDeadline::sleep_until`] / [`TrDeadline::timeout_at`] 这两个绝对形式在这里
-//! 由本地时钟补上。
+//! # 连接内部用的是「连接内毫秒」
+//!
+//! 连接层不直接在各处读 `R::now()`：它在建连时定一个 **epoch**，此后协议里的时间量
+//! （每子流最后活动、拆流宽限期到期、空闲超时期限）一律记成**自 epoch 起算的毫秒数**
+//! （`u64`）。
+//!
+//! 绑定这件事的是 crate 内部的 `clock_::ConnClock_<R>`：它把运行时值与 epoch 放在一起，
+//! 并给出 `now_millis_()` / `rt_()` 两个入口。于是「时刻类型」（`R::Instant`）只出现在
+//! 那一个类型里，子流状态与注册表索引全都是整数。
 //!
 //! # 与 `abs_art` 的关系
 //!
 //! 计时能力**不**在这里定义实现，也不在这里重新导出成新名字：需要相对形式
-//! （`D::delay(Duration)` / `D::interval(period)` / `D::timeout(Duration, f)`）的
-//! 调用方直接用 `abs_art` 的 [`TrTime`]。本模块只补绝对形式。
-//!
-//! # 连接内部用的是「连接内毫秒」
-//!
-//! 连接层不直接在各处读 `Clock::now()`：它在建连时定一个 **epoch**，此后协议里的
-//! 时间量（每子流最后活动、拆流宽限期到期、空闲超时期限）一律记成
-//! **自 epoch 起算的毫秒数**（`u64`）。
-//!
-//! 绑定这件事的是 crate 内部的 `clock_::ConnClock_`：它把注入的 [`Clock`] 与 epoch
-//! 放在一起，并给出 `now_millis_()` / `deadline_(ms)` / `delay_until_(ms)` 三个入口。
-//! 于是「时刻类型」（`C::Instant`）只出现在那一个类型里，子流状态与注册表索引全都
-//! 是整数。缺省时钟见 [`SystemClock`]；需要确定性验收时由调用方注入假时钟。
+//! （`rt.delay(Duration)` / `rt.interval(period)` / `rt.timeout(Duration, f)`）的调用方
+//! 直接用 `abs_art` 的 [`TrTime`]。本模块只把绝对时刻记成整数毫秒。
 
 mod clock_;
-mod deadline_;
 
-pub use abs_art::{Elapsed, TrInterval, TrTime};
-pub use clock_::SystemClock;
+pub use abs_art::{Elapsed, TrClock, TrDelay, TrInterval, TrTime};
 pub(crate) use clock_::{ConnClock_, millis_of_};
-pub use deadline_::TrDeadline;
-pub use embedded_timers::{clock::Clock, instant::Instant};
 
 #[cfg(test)]
 mod tests_;

@@ -36,6 +36,10 @@ use smux_v1::handshake::{
 };
 use tokio::net::UnixStream;
 
+/// 本示例用的**运行时值**类型：计时与时刻的来源，进 `MuxConnection` 的类型参数。
+type Rt = abs_art_tokio::Runtime;
+/// 本示例用的**本地作用域**类型：五个循环的投递点，由运行时值交出。
+type Scope = LocalScope;
 /// 全被动环的存储类型（连接级帧暂存也用它）。
 type Buf = Owned<[MaybeUninit<u8>], CoreAlloc>;
 /// 交给 smux 当 `Tx` 的写半边。
@@ -51,7 +55,10 @@ const K_PUMP_CHUNK: usize = 4096usize;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (socket_a, socket_b) = UnixStream::pair()?;
-    let scope = LocalScope::new();
+    // 运行时值只能从「当前运行时上下文」取得（`#[tokio::main]` 满足）；作用域不再能
+    // 凭空构造，只能由运行时值交出。
+    let rt = abs_art_tokio::current();
+    let scope = rt.local_scope();
 
     // -- 传输装配：每端两个全被动环，四个半部按「谁贴 socket、谁贴 smux」分派。
     //    两个泵与场景在同一个任务里轮询，因此不需要 `Send`／`'static`。
@@ -63,7 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (b_tx, b_out_rx) = passive_ring_();
 
     let scenario = async {
-        let (a, b) = futures::join!(active(&scope, a_rx, a_tx), passive(&scope, b_rx, b_tx));
+        let (a, b) = futures::join!(
+            active(&rt, &scope, a_rx, a_tx),
+            passive(&rt, &scope, b_rx, b_tx)
+        );
         // 两个连接交回这里保管：**drop 连接 = 拆连接**，四个循环会随之收尾，
         // 因此发送方必须把连接活到「数据真的上网」为止。
         let (conn_a, conn_b) = (a?, b?);
@@ -101,17 +111,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// **主动端**：连上去，开一条子流，发消息，半关闭。
 async fn active(
-    scope: &LocalScope,
+    _rt: &Rt,
+    _scope: &Scope,
     rx: Rx,
     tx: Tx,
-) -> Result<MuxConnection<DefaultConnCfg<Tx, Rx>, LocalScope>, Box<dyn std::error::Error>> {
-    // ① 握手
+) -> Result<MuxConnection<DefaultConnCfg<Tx, Rx>>, Box<dyn std::error::Error>> {
+    // ① 握手（不需要运行时值，也不需要作用域）
     let delivery = HandshakeAgent::new(tx, rx)
         .invite_async(&BasicOpts::default(), AcceptAllEntries)
         .await?;
 
-    // ② 建连接：需要环境提供一个 LocalScope。
-    let conn = MuxConnection::from_delivery(scope, delivery)?;
+    // ② 建连接：需要环境提供运行时值（计时）与本地作用域（投递五个循环）。
+    let conn = MuxConnection::from_delivery(delivery)?;
 
     let local_dock = Dock::new(0x2001);
     let remote_dock = Dock::new(1);
@@ -129,17 +140,18 @@ async fn active(
 
 /// **被动端**：等对端来找这个 dock，收到子流后读到 EOF。
 async fn passive(
-    scope: &LocalScope,
+    _rt: &Rt,
+    _scope: &Scope,
     rx: Rx,
     tx: Tx,
-) -> Result<MuxConnection<DefaultConnCfg<Tx, Rx>, LocalScope>, Box<dyn std::error::Error>> {
-    // ① 握手
+) -> Result<MuxConnection<DefaultConnCfg<Tx, Rx>>, Box<dyn std::error::Error>> {
+    // ① 握手（不需要运行时值，也不需要作用域）
     let delivery = HandshakeAgent::new(tx, rx)
         .listen_async(&BasicOpts::default(), AcceptAllEntries)
         .await?;
 
-    // ② 建连接：需要环境提供一个 LocalScope。
-    let conn = MuxConnection::from_delivery(scope, delivery)?;
+    // ② 建连接：需要环境提供运行时值（计时）与本地作用域（投递五个循环）。
+    let conn = MuxConnection::from_delivery(delivery)?;
 
     let local_dock = Dock::new(1);
     let mut listener = conn

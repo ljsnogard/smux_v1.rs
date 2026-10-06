@@ -61,12 +61,12 @@ pub enum HandleError {
 ///
 /// **不借用连接**：自己持有一份 [`MuxConnection`] 克隆，因此生命周期参数从公开
 /// 类型上消失，可以存进结构体、可以从函数返回。
-pub struct ChannelHandle<C, S>
+pub struct ChannelHandle<C>
 where
     C: TrConnCfg,
 {
     /// 连接智能指针：`accept_async` 用它建子流环并登记会话侧半部。
-    conn_: MuxConnection<C, S>,
+    conn_: MuxConnection<C>,
 
     /// 本端 dock。
     local_dock_: Dock,
@@ -94,14 +94,14 @@ where
     settled_: bool,
 }
 
-impl<C, S> ChannelHandle<C, S>
+impl<C> ChannelHandle<C>
 where
     C: TrConnCfg,
 {
     /// 由连接、dock 对与**登记身份时建立的共享状态句柄**构造**响应方**句柄
     /// （只允许 `income_async` 调用）。
     pub(crate) fn new_(
-        conn: MuxConnection<C, S>,
+        conn: MuxConnection<C>,
         local_dock: Dock,
         remote_dock: Dock,
         owner: ChannelOwner_<C::Alloc>,
@@ -120,7 +120,7 @@ where
 
     /// 由连接、dock 对、共享状态句柄与开场消息构造**发起方**句柄。
     pub(crate) fn new_initiator_(
-        conn: MuxConnection<C, S>,
+        conn: MuxConnection<C>,
         local_dock: Dock,
         remote_dock: Dock,
         owner: ChannelOwner_<C::Alloc>,
@@ -140,7 +140,7 @@ where
 }
 
 /// 未裁决就丢弃句柄 = **放弃建立**。
-impl<C, S> Drop for ChannelHandle<C, S>
+impl<C> Drop for ChannelHandle<C>
 where
     C: TrConnCfg,
 {
@@ -162,8 +162,8 @@ where
 /// **不取注册表锁**（本函数由 `Drop` 调用）：身份表改动一律投成
 /// [`SessionEvent_`]，由核心执行者 drain 后落实。协议帧（响应方的 `REJECT`）本来
 /// 就是投事件，保持原样。
-fn abort_pending_<C, S>(
-    conn: &MuxConnection<C, S>,
+fn abort_pending_<C>(
+    conn: &MuxConnection<C>,
     local: Dock,
     remote: Dock,
     is_initiator: bool,
@@ -198,13 +198,13 @@ fn abort_pending_<C, S>(
     });
 }
 
-impl<C, S> ChannelHandle<C, S>
+impl<C> ChannelHandle<C>
 where
     C: TrConnCfg,
 {
     /// 「接受」这一步：校验调用方给的两块缓冲，建两条环，并把会话侧半部交给两个
     /// 循环。
-    fn accept_prepare_<P>(&mut self, prepare: P) -> AcceptOutcomeProj_<C, S>
+    fn accept_prepare_<P>(&mut self, prepare: P) -> AcceptOutcomeProj_<C>
     where
         P: TrPrepareChannelRing<C::Buff, C::Data>,
     {
@@ -218,7 +218,7 @@ where
     fn accept_buffs_(
         &mut self,
         buffs: ChannelBuffAlloc<C::Buff, C::Data>,
-    ) -> AcceptOutcomeProj_<C, S> {
+    ) -> AcceptOutcomeProj_<C> {
         let conn = self.conn_.clone();
         let local = self.local_dock_;
         let remote = self.remote_dock_;
@@ -242,10 +242,10 @@ where
         &'f mut self,
         welcome: &'f mut W,
         ring_cap: usize,
-    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>
+    ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
         W: 'f + TrBuffWrite<u8>,
-        S: 'f,
+
     {
         let conn = self.conn_.clone();
         let config = conn.core_().config_();
@@ -287,29 +287,29 @@ where
     /// 与 [`Self::accept_async_managed`] 相同。
     pub async fn accept_async_default(
         &mut self,
-    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError> {
+    ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError> {
         let ring_cap = <C as TrConnCfg>::RING_CAPACITY;
         let mut empty: &mut [u8] = &mut [];
         self.accept_async_managed(&mut empty, ring_cap).await
     }
 }
 
-impl<C, S> TrChannelHandle<C> for ChannelHandle<C, S>
+impl<C> TrChannelHandle<C> for ChannelHandle<C>
 where
     C: TrConnCfg,
 {
     type Err = HandleError;
 
-    type Tx = ChannelTx<C, S>;
-    type Rx = ChannelRx<C, S>;
+    type Tx = ChannelTx<C>;
+    type Rx = ChannelRx<C>;
 
-    type AcceptAsync<'f, Wb, P> = MuxAcceptAsync<'f, 'f, C, S, Wb>
+    type AcceptAsync<'f, Wb, P> = MuxAcceptAsync<'f, 'f, C, Wb>
     where
         Self: 'f,
         Wb: 'f + TrBuffWrite<C::Data>,
         P: TrPrepareChannelRing<C::Buff, C::Data>;
 
-    type RejectAsync<'f, Rb> = MuxRejectAsync<'f, 'f, C, S, Rb>
+    type RejectAsync<'f, Rb> = MuxRejectAsync<'f, 'f, C, Rb>
     where
         Self: 'f,
         Rb: 'f + TrBuffRead<C::Data>;
@@ -344,7 +344,7 @@ where
     }
 }
 
-impl<C, S> TrChannelHalf<C> for ChannelHandle<C, S>
+impl<C> TrChannelHalf<C> for ChannelHandle<C>
 where
     C: TrConnCfg,
 {
@@ -367,15 +367,15 @@ where
 
 /// [`TrChannelHandle::accept_async`] 的 step 函数：**建流最终裁决**。
 #[gen_may_cancel_future(MuxAccept, pub, new(pub(crate)))]
-async fn mux_accept_async_<'f, C, S, Wb, K>(
-    handle: &'f mut ChannelHandle<C, S>,
+async fn mux_accept_async_<'f, C, Wb, K>(
+    handle: &'f mut ChannelHandle<C>,
     welcome: &'f mut Wb,
-    accepted: AcceptOutcomeProj_<C, S>,
+    accepted: AcceptOutcomeProj_<C>,
     cancel: K,
-) -> AcceptOutcomeProj_<C, S>
+) -> AcceptOutcomeProj_<C>
 where
     C: TrConnCfg + 'f,
-    S: 'f,
+
     Wb: TrBuffWrite<u8> + 'f,
     K: TrCancellationToken,
 {
@@ -458,26 +458,26 @@ where
 }
 
 /// 「接受」这一步的产物：该 channel 的收发半边，或一个连接错误。
-type AcceptOutcomeProj_<C, S> = Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>;
+type AcceptOutcomeProj_<C> = Result<(ChannelTx<C>, ChannelRx<C>), HandleError>;
 
 
 /// 建流最终裁决的产物。
-type InstallOutcome_<C, S> = (
-    ChannelTx<C, S>,
-    ChannelRx<C, S>,
+type InstallOutcome_<C> = (
+    ChannelTx<C>,
+    ChannelRx<C>,
     Credit,
 );
 
 /// 建流最终裁决的公共部分：按调用方给的缓冲建两条环、把会话侧半部交给两个循环，
 /// 并把**登记身份时建立的共享状态**安装上窗口参数。
-fn install_channel_<C, S>(
-    conn: &MuxConnection<C, S>,
+fn install_channel_<C>(
+    conn: &MuxConnection<C>,
     local: Dock,
     remote: Dock,
     owner: ChannelOwner_<<C as TrConnCfg>::Alloc>,
     tx_buff: C::Buff,
     mut rx_buff: C::Buff,
-) -> Result<InstallOutcome_<C, S>, HandleError>
+) -> Result<InstallOutcome_<C>, HandleError>
 where
     C: TrConnCfg,
 {
@@ -541,8 +541,8 @@ where
 }
 
 /// 把 `OPEN` 投给写循环。
-fn send_open_<C, S>(
-    conn: &MuxConnection<C, S>,
+fn send_open_<C>(
+    conn: &MuxConnection<C>,
     local: Dock,
     remote: Dock,
     window: Credit,
@@ -567,14 +567,14 @@ fn send_open_<C, S>(
 
 /// [`TrChannelHandle::reject_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxReject, pub, new(pub(crate)))]
-async fn mux_reject_async_<'f, C, S, Rb, K>(
-    handle: &'f mut ChannelHandle<C, S>,
+async fn mux_reject_async_<'f, C, Rb, K>(
+    handle: &'f mut ChannelHandle<C>,
     reason: &'f mut Rb,
     cancel: K,
 ) -> Result<usize, HandleError>
 where
     C: TrConnCfg + 'f,
-    S: 'f,
+
     Rb: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {
@@ -622,7 +622,7 @@ mod tests_ {
 
     use crate::{
         connection::test_support_::{
-            ErasedTestMuxConfig_, NullScope_, TestMuxConfig_,
+            ErasedTestMuxConfig_, TestMuxConfig_,
         },
         flow_ctrl::WindowReport,
         handshake::opts::{BasicOpts, HandshakeOpts},
@@ -633,12 +633,11 @@ mod tests_ {
     const BENCH_WARMUP: usize = 2_000;
     const BENCH_ITERS: usize = 50_000;
 
-    fn make_conn_<C>(config: C) -> MuxConnection<C, NullScope_>
+    fn make_conn_<C>(config: C) -> MuxConnection<C>
     where
         C: TrConnCfg,
     {
         MuxConnection::new_test_(
-            &NullScope_,
             HandshakeOpts {
                 basic_opts: BasicOpts::default(),
             },
@@ -647,10 +646,9 @@ mod tests_ {
     }
 
     /// 测一次 responder accept 的建环 + 登记 + 返回半部 + drop 半部。
-    async fn accept_once_<C, S>(conn: &MuxConnection<C, S>, remote: Dock) -> u128
+    async fn accept_once_<C>(conn: &MuxConnection<C>, remote: Dock) -> u128
     where
         C: TrConnCfg,
-        S: Clone + 'static,
     {
         let local = Dock::new(2u32);
         let mut welcome: [u8; 0] = [];

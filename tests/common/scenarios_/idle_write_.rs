@@ -27,7 +27,7 @@ use futures::{
 use smux_v1::connection::Dock;
 
 use crate::common::{
-    K_CHANNEL_CAPACITY, SmokeMuxConfig, TrSmokeScope, connect_pair_, expect_eof_,
+    K_CHANNEL_CAPACITY, SmokeMuxConfig, TrSmokeRt, TrSmokeScope, connect_pair_, expect_eof_,
     read_channel_exact_, write_channel_all_,
 };
 
@@ -71,14 +71,15 @@ async fn watchdog_(rounds: usize) {
 }
 
 /// `connect_pair_` 需要的冒烟配置别名（只把两侧的传输类型参数化）。
-type PassiveSmokeCfg_<W, R> = SmokeMuxConfig<W, R>;
+type PassiveSmokeCfg_<W, R, RT> = SmokeMuxConfig<W, R, RT>;
 
 /// 场景：建连 → 一条静默子流 → 写 512 B → 在有看门狗保护的等待里读回。
 ///
 /// # Panics
 ///
 /// 建流失败、载荷不一致、半关闭后读不到 EOF，或看门狗超限（丢唤醒）都会 panic。
-pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -90,16 +91,17 @@ pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     let (conn_a, conn_b) = connect_pair_::<
-        PassiveSmokeCfg_<WA, RA>,
-        PassiveSmokeCfg_<WB, RB>,
+        PassiveSmokeCfg_<WA, RA, RT>,
+        PassiveSmokeCfg_<WB, RB, RT>,
         RA,
         WA,
         RB,
         WB,
         S,
-    >(scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
     .await;
 
     let dock_b = Dock::new(0x7101u32);

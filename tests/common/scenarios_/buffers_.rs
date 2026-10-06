@@ -9,6 +9,7 @@ use crate::common::{
     AcceptAsyncClosureExt,
     K_CHANNEL_CAPACITY,
     SmokeMuxConfig,
+    TrSmokeRt,
     TrSmokeScope,
     connect_pair_,
     make_channel_buff_,
@@ -26,7 +27,8 @@ use super::kit_::exchange_and_half_close_;
 /// - 判断：B 侧裁决必须得到 [`HandleError::RingRejected`]；A 侧必须得到
 ///   [`HandleError::Refused`]（拒绝发生在发出任何帧之前，B 按角色补 `REJECT`）；
 ///   随后的那条子流必须成功——若拒绝把连接或注册表弄脏了，这一段会失败。
-pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -38,17 +40,18 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     let (conn_a, conn_b) =
         connect_pair_::<
-            SmokeMuxConfig<WA, RA>,
-            SmokeMuxConfig<WB, RB>,
+            SmokeMuxConfig<WA, RA, RT>,
+            SmokeMuxConfig<WB, RB, RT>,
             RA,
             WA,
             RB,
             WB,
             S,
-        >(scope, tx_a, rx_a, tx_b, rx_b)
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     let local_a = Dock::new(0x3100u32);
@@ -162,7 +165,8 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S>(
 /// # Panics
 ///
 /// 握手 / 绑定 / 监听 / 交互任一环节失败都会 panic。
-pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -174,17 +178,18 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     let (conn_a, conn_b) =
         connect_pair_::<
-            SmokeMuxConfig<WA, RA>,
-            SmokeMuxConfig<WB, RB>,
+            SmokeMuxConfig<WA, RA, RT>,
+            SmokeMuxConfig<WB, RB, RT>,
             RA,
             WA,
             RB,
             WB,
             S,
-        >(scope, tx_a, rx_a, tx_b, rx_b)
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     let local_a = Dock::new(0x4000u32);

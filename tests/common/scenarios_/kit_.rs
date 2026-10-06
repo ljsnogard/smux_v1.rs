@@ -12,6 +12,7 @@ use crate::common::{
     AcceptAsyncClosureExt,
     SmokeBuff,
     SmokeMuxConfig,
+    TrSmokeRt,
     TrSmokeScope,
     connect_pair_,
     expect_eof_,
@@ -26,7 +27,10 @@ use crate::common::{
 /// 这是全部场景的唯一实现：握手 → 建两个 [`MuxConnection`]（内部各自 spawn 读 / 写
 /// 循环）→ 两端并发跑「`dock_count` 个 dock × 每个 `per_dock` 条子流」的双向收发与
 /// 半关闭（[`drive_side_`]）。1024 条的冒烟场景只是它的 `16 × 64` 特例。
-pub(super) async fn run_mux_scenario_<RA, WA, RB, WB, S>(
+///
+/// `rt` 是**运行时值**（进连接的类型参数），`scope` 是**本地作用域**（投递五个循环）。
+pub(super) async fn run_mux_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -40,17 +44,18 @@ pub(super) async fn run_mux_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt + smux_v1::connection::ScopeHost,
 {
     let (conn_a, conn_b) =
         connect_pair_::<
-            SmokeMuxConfig<WA, RA>,
-            SmokeMuxConfig<WB, RB>,
+            SmokeMuxConfig<WA, RA, RT>,
+            SmokeMuxConfig<WB, RB, RT>,
             RA,
             WA,
             RB,
             WB,
             S,
-        >(scope, tx_a, rx_a, tx_b, rx_b)
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     futures::join!(
@@ -73,14 +78,13 @@ pub(super) async fn run_mux_scenario_<RA, WA, RB, WB, S>(
 /// # Panics
 ///
 /// 任何一次 open / accept / 读写 / 半关闭校验失败都会 panic——失败即测试失败。
-pub(super) async fn drive_side_<C, S>(
-    conn: &MuxConnection<C, S>,
+pub(super) async fn drive_side_<C>(
+    conn: &MuxConnection<C>,
     side: u32,
     dock_count: u32,
     per_dock: usize,
 ) where
     C: TrConnCfg + TrMuxConfig<Buff = SmokeBuff>,
-    S: Clone,
 {
     let conn_ref = conn;
 

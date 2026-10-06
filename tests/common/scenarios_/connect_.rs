@@ -10,7 +10,39 @@ use smux_v1::{
     },
 };
 
-use crate::common::{SmokeBuff, TrSmokeScope};
+use crate::common::{SmokeBuff, TrSmokeRt, TrSmokeScope};
+
+/// 测试配置的统一构造契约：由**运行时值**造出配置。
+///
+/// 这是测试侧对上位 trait 的镜像——生产的 [`TrConnCfg`] 从配置里**取**运行时值
+/// （`runtime()`），测试则在构造时把它**放**进去。有了它，`connect_pair_` 才能在
+/// 「配置类型是类型参数」的同时把 `rt` 喂进去。
+pub trait TestConnCfg: TrConnCfg {
+    /// 由运行时值构造配置。
+    fn new_(rt: Self::Rt) -> Self;
+}
+
+impl<W, R, RT> TestConnCfg for crate::common::SmokeMuxConfig<W, R, RT>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+    RT: TrSmokeRt,
+{
+    fn new_(rt: Self::Rt) -> Self {
+        crate::common::SmokeMuxConfig::new(rt)
+    }
+}
+
+impl<W, R, RT> TestConnCfg for crate::common::FlowCtrlConfig<W, R, RT>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+    RT: TrSmokeRt,
+{
+    fn new_(rt: Self::Rt) -> Self {
+        crate::common::FlowCtrlConfig::new(rt)
+    }
+}
 
 /// 握手（A 端发起、B 端等待）并由交付物建立两个 [`MuxConnection`]。
 ///
@@ -20,13 +52,19 @@ use crate::common::{SmokeBuff, TrSmokeScope};
 /// **连接配置是泛型参数** `C`：默认调用点是 [`SmokeMuxConfig`]，而「极小帧暂存」
 /// 验收用例传入一个只把 `make_stage_buffs` 换成一字节缓冲的同构配置——两条子流环
 /// 与其余策略完全一致，避免把「容量」以外的差异带进对照。
+///
+/// **运行时值**（`rt: &CA::Rt`）与**本地作用域**（`scope: &S`）是两个入参：前者用来
+/// 构造两端配置（运行时值进配置，`TrConnCfg::Rt`）并提供计时与时刻，后者只作为
+/// [`MuxConnection::new`] 的方法级泛型用来投递五个循环。两个配置各拿一份 `rt` 克隆
+/// ——克隆只是同一个运行时的两个把手（见 `abs_art` 各后端的类型文档）。
 pub async fn connect_pair_<CA, CB, RA, WA, RB, WB, S>(
+    rt: &CA::Rt,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
     tx_b: WB,
     rx_b: RB,
-) -> (MuxConnection<CA, S>, MuxConnection<CB, S>)
+) -> (MuxConnection<CA>, MuxConnection<CB>)
 where
     // 连接把 Rx / Tx 移交给 `'static` 的读写循环（`spawn_local` 要求 `'static`；
     // 本地投递**不要求** `Send`，因此 `!Send` 的传输也能直接当 `Rx` / `Tx`）。
@@ -44,7 +82,7 @@ where
             Alloc = CoreAlloc,
             Buff = SmokeBuff,
             StageBuff = SmokeBuff,
-        > + Default
+        > + TestConnCfg
         + Clone
         + 'static,
     CB: TrConnCfg<
@@ -53,11 +91,15 @@ where
             Alloc = CoreAlloc,
             Buff = SmokeBuff,
             StageBuff = SmokeBuff,
-        > + Default
+        > + TestConnCfg
         + Clone
         + 'static,
     CA::StageBuff: Send + Sync,
     CB::StageBuff: Send + Sync,
+    // 两端的运行时值类型必须一致（传进来的 `rt` 同时喂给两个配置），且必须能
+    // 交出本地作用域（连接自己取）。
+    CA::Rt: TrSmokeRt + smux_v1::connection::ScopeHost,
+    CB: TrConnCfg<Rt = CA::Rt>,
 {
     let invite_opts = BasicOpts::default();
     let listen_opts = BasicOpts::default();
@@ -69,16 +111,23 @@ where
 
     // 两块连接级缓冲**由配置提供**（`TrConnCfg::make_stage_buffs`）：容量是连接级
     // 策略，测试装配不该在这里另写一份固定的 64 KiB。
-    let config_a = CA::default();
-    let config_b = CB::default();
+    //
+    // 配置则由 `rt` 构造：运行时值进了配置（`TrConnCfg::Rt`），因此连接的类型参数
+    // 只剩 `C` 一个——`rt.clone()` 只是同一个运行时的又一个把手。
+    let config_a = CA::new_(rt.clone());
+    let config_b = CB::new_(rt.clone());
     let (stage_ar, stage_aw) = config_a
         .make_stage_buffs(config_a.allocator())
         .expect("A 侧连接级帧暂存应当分配成功");
     let (stage_br, stage_bw) = config_b
         .make_stage_buffs(config_b.allocator())
         .expect("B 侧连接级帧暂存应当分配成功");
+    // 运行时值与作用域都由**配置**解决（`TrConnCfg::runtime` + `ScopeHost`），
+    // 因此这里不再有运行时/作用域入参；`scope` 仅在自动取作用域不可用时才需要
+    // 走 `new_with_rt`（本测试路径不需要）。
+    let _ = scope;
     (
-        MuxConnection::new(scope, delivery_a, config_a, stage_ar, stage_aw),
-        MuxConnection::new(scope, delivery_b, config_b, stage_br, stage_bw),
+        MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw),
+        MuxConnection::new(delivery_b, config_b, stage_br, stage_bw),
     )
 }

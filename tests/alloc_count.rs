@@ -1,5 +1,14 @@
 //! 堆分配计数基线（`dev-notes/audit-heap-alloc-20261004-1122.md` §12-T4）。
 //!
+//! # 只在 **tokio** 装配下编译
+//!
+//! 本目标本来就是「一个进程、一条用例、一个运行时」的形状（见下），那个运行时是
+//! tokio。改成「默认后端由 feature 决定」之后，缺省 feature 集里的默认后端是 compio，
+//! 而 compio 的 `current()` 只在 compio 上下文里可用——因此这里整文件门控到
+//! `test-tokio-runtime`：该 feature 下默认后端恰好就是 tokio，运行时值、作用域与
+//! 连接配置三者一致。
+#![cfg(feature = "test-tokio-runtime")]
+//!
 //! # 这个测试目标为什么单独存在、且只有一条用例、一个运行时
 //!
 //! `#[global_allocator]` 是**进程级**的：整个测试二进制只能装一个，而且它统计的是
@@ -52,7 +61,6 @@ use core::{
 use std::alloc::{GlobalAlloc, System};
 
 use abs_art::TrLocalScope;
-use abs_art_tokio::LocalScope;
 use abs_smux::{
     conf::TrMuxConfig,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
@@ -70,7 +78,6 @@ use smux_v1::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
     },
-    time::SystemClock,
 };
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -171,27 +178,36 @@ type CountBuff = Owned<[MaybeUninit<u8>], CountingAlloc>;
 
 /// 用[注入分配器](CountingAlloc)记账的连接配置。
 #[derive(Debug)]
-struct CountMuxConfig<W, R> {
+struct CountMuxConfig<W, R, RT> {
     /// 传输写半边的类型占位。
     _use_w_: PhantomData<fn() -> W>,
 
     /// 传输读半边的类型占位。
     _use_r_: PhantomData<fn() -> R>,
+
+    /// 运行时值（`TrConnCfg::runtime` 要交出建连时抓住的那一个）。
+    rt_: RT,
 }
 
-impl<W, R> Copy for CountMuxConfig<W, R> {}
+impl<W, R, RT: Copy> Copy for CountMuxConfig<W, R, RT> {}
 
-impl<W, R> Clone for CountMuxConfig<W, R> {
+impl<W, R, RT: Clone> Clone for CountMuxConfig<W, R, RT> {
     fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<W, R> Default for CountMuxConfig<W, R> {
-    fn default() -> Self {
         CountMuxConfig {
             _use_w_: PhantomData,
             _use_r_: PhantomData,
+            rt_: self.rt_.clone(),
+        }
+    }
+}
+
+impl<W, R, RT> CountMuxConfig<W, R, RT> {
+    /// 由运行时值构造。
+    fn new_(rt: RT) -> Self {
+        CountMuxConfig {
+            _use_w_: PhantomData,
+            _use_r_: PhantomData,
+            rt_: rt,
         }
     }
 }
@@ -199,7 +215,18 @@ impl<W, R> Default for CountMuxConfig<W, R> {
 /// 测试用流控策略（与冒烟配置一致）。
 static COUNT_POLICY: DefaultPolicy = DefaultPolicy;
 
-impl<W, R> TrMuxConfig for CountMuxConfig<W, R>
+impl<W, R, RT> common::TestConnCfg for CountMuxConfig<W, R, RT>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+    RT: common::TrSmokeRt,
+{
+    fn new_(rt: Self::Rt) -> Self {
+        CountMuxConfig::new_(rt)
+    }
+}
+
+impl<W, R, RT> TrMuxConfig for CountMuxConfig<W, R, RT>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
@@ -209,24 +236,25 @@ where
     type Buff = CountBuff;
 }
 
-impl<W, R> TrConnCfg for CountMuxConfig<W, R>
+impl<W, R, RT> TrConnCfg for CountMuxConfig<W, R, RT>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
+    RT: common::TrSmokeRt,
 {
+    type Rt = RT;
     type Alloc = CountingAlloc;
-    type Clock = SystemClock;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
     type StageBuff = CountBuff;
 
-    fn allocator(&self) -> Self::Alloc {
-        CountingAlloc
+    fn runtime(&self) -> Self::Rt {
+        self.rt_.clone()
     }
 
-    fn clock(&self) -> Self::Clock {
-        SystemClock
+    fn allocator(&self) -> Self::Alloc {
+        CountingAlloc
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -263,32 +291,52 @@ where
 /// （audit-heap-alloc §3.1 #5 / §5.5-A）。本配置存在的意义就是量出这笔开销，
 /// 为「#5 怎么改（公开 API 加性新增还是改签名）」提供数字。
 #[derive(Debug)]
-struct ErasedMuxConfig<W, R> {
+struct ErasedMuxConfig<W, R, RT> {
     /// 传输写半边的类型占位。
     _use_w_: PhantomData<fn() -> W>,
 
     /// 传输读半边的类型占位。
     _use_r_: PhantomData<fn() -> R>,
+
+    /// 运行时值（`TrConnCfg::runtime` 要交出建连时抓住的那一个）。
+    rt_: RT,
 }
 
-impl<W, R> Copy for ErasedMuxConfig<W, R> {}
+impl<W, R, RT: Copy> Copy for ErasedMuxConfig<W, R, RT> {}
 
-impl<W, R> Clone for ErasedMuxConfig<W, R> {
+impl<W, R, RT: Clone> Clone for ErasedMuxConfig<W, R, RT> {
     fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<W, R> Default for ErasedMuxConfig<W, R> {
-    fn default() -> Self {
         ErasedMuxConfig {
             _use_w_: PhantomData,
             _use_r_: PhantomData,
+            rt_: self.rt_.clone(),
         }
     }
 }
 
-impl<W, R> TrMuxConfig for ErasedMuxConfig<W, R>
+impl<W, R, RT> ErasedMuxConfig<W, R, RT> {
+    /// 由运行时值构造。
+    fn new_(rt: RT) -> Self {
+        ErasedMuxConfig {
+            _use_w_: PhantomData,
+            _use_r_: PhantomData,
+            rt_: rt,
+        }
+    }
+}
+
+impl<W, R, RT> common::TestConnCfg for ErasedMuxConfig<W, R, RT>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+    RT: common::TrSmokeRt,
+{
+    fn new_(rt: Self::Rt) -> Self {
+        ErasedMuxConfig::new_(rt)
+    }
+}
+
+impl<W, R, RT> TrMuxConfig for ErasedMuxConfig<W, R, RT>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
@@ -300,13 +348,14 @@ where
     type Buff = MuxChanBuff;
 }
 
-impl<W, R> TrConnCfg for ErasedMuxConfig<W, R>
+impl<W, R, RT> TrConnCfg for ErasedMuxConfig<W, R, RT>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
+    RT: common::TrSmokeRt,
 {
+    type Rt = RT;
     type Alloc = CountingAlloc;
-    type Clock = SystemClock;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -314,12 +363,12 @@ where
     /// 连接级帧暂存仍用 `Owned`（与基准场景一致），把差异**隔离在子流环存储**上。
     type StageBuff = CountBuff;
 
-    fn allocator(&self) -> Self::Alloc {
-        CountingAlloc
+    fn runtime(&self) -> Self::Rt {
+        self.rt_.clone()
     }
 
-    fn clock(&self) -> Self::Clock {
-        SystemClock
+    fn allocator(&self) -> Self::Alloc {
+        CountingAlloc
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -411,15 +460,15 @@ fn report_(phase: &str, global: Usage_, injected: Usage_) {
 type RingTx = BufferedTx<common::SmokeBuff, CoreAlloc>;
 type RingRx = BufferedRx<common::SmokeBuff, CoreAlloc>;
 
-/// 本文件用的连接类型（分配器换成计数用的那个）。
-type CountingConn<S> = MuxConnection<CountMuxConfig<RingTx, RingRx>, S>;
+/// 本文件用的连接类型（分配器换成计数用的那个；第三个参数是**运行时值**）。
+type CountingConn<RT> = MuxConnection<CountMuxConfig<RingTx, RingRx, RT>>;
 
 /// 本文件用的子流半边类型。
-type CountingTx<S> = ChannelTx<CountMuxConfig<RingTx, RingRx>, S>;
-type CountingRx<S> = ChannelRx<CountMuxConfig<RingTx, RingRx>, S>;
+type CountingTx<RT> = ChannelTx<CountMuxConfig<RingTx, RingRx, RT>>;
+type CountingRx<RT> = ChannelRx<CountMuxConfig<RingTx, RingRx, RT>>;
 
 /// 本文件用的监听器类型。
-type CountingListener<S> = ChannelListener<CountMuxConfig<RingTx, RingRx>, S>;
+type CountingListener<RT> = ChannelListener<CountMuxConfig<RingTx, RingRx, RT>>;
 
 
 /// 两次用量相加。
@@ -446,17 +495,20 @@ where
 /// 建连：握手 + 两个 `MuxConnection`，配置由调用方给出（分配器已是计数用的那个）。
 ///
 /// 与 `common::connect_pair_` 逐语句同构，**只**把配置换成泛型参数，以免把
-/// 「容量 / 策略」以外的差异带进计数。
+/// 「容量 / 策略」以外的差异带进计数。`rt` 是**运行时值**（进连接的类型参数），
+/// `scope` 是**本地作用域**（投递五个循环）。
 async fn connect_with_<C, S>(
-    scope: &S,
+    rt: &C::Rt,
+    _scope: &S,
     tx_a: RingTx,
     rx_a: RingRx,
     tx_b: RingTx,
     rx_b: RingRx,
-) -> (MuxConnection<C, S>, MuxConnection<C, S>)
+) -> (MuxConnection<C>, MuxConnection<C>)
 where
     S: common::TrSmokeScope + Clone + 'static,
-    C: TrConnCfg<ConnRx = RingRx, ConnTx = RingTx> + Default + Clone + 'static,
+    C: TrConnCfg<ConnRx = RingRx, ConnTx = RingTx> + common::TestConnCfg + Clone + 'static,
+    C::Rt: common::TrSmokeRt,
     C::StageBuff: Send + Sync,
 {
     let invite_opts = BasicOpts::default();
@@ -467,8 +519,8 @@ where
     let delivery_a = invited.expect("发起方握手应当成功");
     let delivery_b = accepted.expect("等待方握手应当成功");
 
-    let config_a = C::default();
-    let config_b = C::default();
+    let config_a = C::new_(rt.clone());
+    let config_b = C::new_(rt.clone());
     let (stage_ar, stage_aw) = config_a
         .make_stage_buffs(config_a.allocator())
         .expect("A 侧连接级帧暂存应当分配成功");
@@ -476,23 +528,25 @@ where
         .make_stage_buffs(config_b.allocator())
         .expect("B 侧连接级帧暂存应当分配成功");
     (
-        MuxConnection::new(scope, delivery_a, config_a, stage_ar, stage_aw),
-        MuxConnection::new(scope, delivery_b, config_b, stage_br, stage_bw),
+        MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw),
+        MuxConnection::new(delivery_b, config_b, stage_br, stage_bw),
     )
 }
 
 /// 基准场景的建连（配置 = [`CountMuxConfig`]）。
-async fn connect_counting_<S>(
+async fn connect_counting_<S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: RingTx,
     rx_a: RingRx,
     tx_b: RingTx,
     rx_b: RingRx,
-) -> (CountingConn<S>, CountingConn<S>)
+) -> (CountingConn<RT>, CountingConn<RT>)
 where
     S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
-    connect_with_::<CountMuxConfig<RingTx, RingRx>, S>(scope, tx_a, rx_a, tx_b, rx_b).await
+    connect_with_::<CountMuxConfig<RingTx, RingRx, RT>, S>(rt, scope, tx_a, rx_a, tx_b, rx_b).await
 }
 
 /// 每条子流在稳态阶段往返的轮数。
@@ -506,9 +560,10 @@ const K_PAYLOAD: usize = 512;
 const K_CHANNELS: usize = 8;
 
 /// 分配计数的基线场景（四个阶段：建连 / 绑定监听 / 建流 / 稳态搬运 / 拆流）。
-async fn run_baseline_<S>(scope: &S) -> (Usage_, Usage_)
+async fn run_baseline_<S, RT>(rt: &RT, scope: &S) -> (Usage_, Usage_)
 where
     S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     // 两条全被动环：`(a_tx, b_rx)` 承载 A→B，`(b_tx, a_rx)` 承载 B→A。环的两端分别
     // 交给两个连接的传输半边，中间没有泵（与 `tests/inmem_mux.rs` 的装配一致）。
@@ -519,7 +574,7 @@ where
     let g0 = global_usage_();
     let i0 = injected_usage_();
     arm_();
-    let (conn_a, conn_b) = connect_counting_(scope, a_tx, a_rx, b_tx, b_rx).await;
+    let (conn_a, conn_b) = connect_counting_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
     disarm_();
     report_("建连", Usage_::since_(global_usage_(), g0), Usage_::since_(injected_usage_(), i0));
 
@@ -532,7 +587,7 @@ where
     let dock_a = Dock::new(0x5001u32);
     // 测试脚手架自己的 `Vec` 一律在**武装之前**分配：它们走全局分配器，落在被测区间
     // 里就成了噪声（第一版正是如此，于是「监听期 3 次全局分配」里有一次半是脚手架）。
-    let mut listeners_b: Vec<CountingListener<S>> = Vec::with_capacity(K_CHANNELS);
+    let mut listeners_b: Vec<CountingListener<RT>> = Vec::with_capacity(K_CHANNELS);
     let mut dock_bs: Vec<Dock> = Vec::with_capacity(K_CHANNELS);
 
     let g0 = global_usage_();
@@ -574,10 +629,10 @@ where
 
     // -- 阶段 3：建 K_CHANNELS 条子流（不含数据）；逐条打印注入分配的增量。
     // 脚手架容器在**武装之前**分配（同「绑定 + 监听」阶段：它们走全局分配器）。
-    let mut txs_a: Vec<CountingTx<S>> = Vec::with_capacity(K_CHANNELS);
-    let mut rxs_a: Vec<CountingRx<S>> = Vec::with_capacity(K_CHANNELS);
-    let mut txs_b: Vec<CountingTx<S>> = Vec::with_capacity(K_CHANNELS);
-    let mut rxs_b: Vec<CountingRx<S>> = Vec::with_capacity(K_CHANNELS);
+    let mut txs_a: Vec<CountingTx<RT>> = Vec::with_capacity(K_CHANNELS);
+    let mut rxs_a: Vec<CountingRx<RT>> = Vec::with_capacity(K_CHANNELS);
+    let mut txs_b: Vec<CountingTx<RT>> = Vec::with_capacity(K_CHANNELS);
+    let mut rxs_b: Vec<CountingRx<RT>> = Vec::with_capacity(K_CHANNELS);
 
     let g0 = global_usage_();
     let i0 = injected_usage_();
@@ -731,17 +786,19 @@ where
 /// `Arc::new(alloc)`」。
 ///
 /// 与 [`run_baseline_`] 的建流阶段逐语句同构，只有子流环存储的类型不同。
-async fn run_erased_buffers_<S>(scope: &S) -> (Usage_, Usage_)
+async fn run_erased_buffers_<S, RT>(rt: &RT, scope: &S) -> (Usage_, Usage_)
 where
     S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (conn_a, conn_b) =
-        connect_with_::<ErasedMuxConfig<RingTx, RingRx>, S>(scope, a_tx, a_rx, b_tx, b_rx).await;
+        connect_with_::<ErasedMuxConfig<RingTx, RingRx, RT>, S>(rt, scope, a_tx, a_rx, b_tx, b_rx)
+            .await;
 
     let dock_a = Dock::new(0x6001u32);
-    let mut listeners_b: Vec<ChannelListener<ErasedMuxConfig<RingTx, RingRx>, S>> =
+    let mut listeners_b: Vec<ChannelListener<ErasedMuxConfig<RingTx, RingRx, RT>>> =
         Vec::with_capacity(K_CHANNELS);
     let mut dock_bs: Vec<Dock> = Vec::with_capacity(K_CHANNELS);
     let mut binding_a = conn_a
@@ -764,13 +821,13 @@ where
     // 四个半边**全部留着**（与基准场景一致）：一旦在这里丢掉 B 侧半边，上一条子流的
     // 拆流（`TxClosed` / `RxClosed` → FIN/RESET → 释放）就会被算进**下一条**的窗口，
     // 数字立刻不可比（第一版就是这么错的）。
-    let mut txs_a: Vec<ChannelTx<ErasedMuxConfig<RingTx, RingRx>, S>> =
+    let mut txs_a: Vec<ChannelTx<ErasedMuxConfig<RingTx, RingRx, RT>>> =
         Vec::with_capacity(K_CHANNELS);
-    let mut rxs_a: Vec<ChannelRx<ErasedMuxConfig<RingTx, RingRx>, S>> =
+    let mut rxs_a: Vec<ChannelRx<ErasedMuxConfig<RingTx, RingRx, RT>>> =
         Vec::with_capacity(K_CHANNELS);
-    let mut txs_b: Vec<ChannelTx<ErasedMuxConfig<RingTx, RingRx>, S>> =
+    let mut txs_b: Vec<ChannelTx<ErasedMuxConfig<RingTx, RingRx, RT>>> =
         Vec::with_capacity(K_CHANNELS);
-    let mut rxs_b: Vec<ChannelRx<ErasedMuxConfig<RingTx, RingRx>, S>> =
+    let mut rxs_b: Vec<ChannelRx<ErasedMuxConfig<RingTx, RingRx, RT>>> =
         Vec::with_capacity(K_CHANNELS);
 
     let g0 = global_usage_();
@@ -837,12 +894,15 @@ where
 ///   方案落地后，右边应当变成「基线 + 1」（每连接一份），本断言随之收紧。
 #[tokio::test]
 async fn alloc_count_baseline_tokio_() {
-    let scope = LocalScope::new();
-    let (build_global, build_injected) = scope.run_until(run_baseline_(&scope)).await;
+    // 默认后端（`test-mock-clock`/`test-tokio-runtime` 下即 tokio）的运行时值：
+    // 连接要自己取作用域，因此必须用 bridge 的具名别名（`ScopeHost` 只对它们实现）。
+    let rt = common::default_rt_();
+    let scope = rt.local_scope();
+    let (build_global, build_injected) = scope.run_until(run_baseline_(&rt, &scope)).await;
 
     // 第二个场景（擦除缓冲）另起一个作用域：两个连接的循环互不干扰。
-    let scope = LocalScope::new();
-    let (erased_global, erased_injected) = scope.run_until(run_erased_buffers_(&scope)).await;
+    let scope = rt.local_scope();
+    let (erased_global, erased_injected) = scope.run_until(run_erased_buffers_(&rt, &scope)).await;
 
     assert_eq!(
         erased_injected.allocs_, build_injected.allocs_,

@@ -37,12 +37,12 @@ pub enum TelegraphError {
 ///
 /// **不借用连接**：自己持有一份 [`MuxConnection`] 克隆，因此生命周期参数从公开
 /// 类型上消失，可以存进结构体、可以从函数返回。
-pub struct Telegraph<C, S>
+pub struct Telegraph<C>
 where
     C: TrConnCfg,
 {
     /// 连接智能指针：端点被 drop 时用它解除身份登记。
-    conn_: MuxConnection<C, S>,
+    conn_: MuxConnection<C>,
 
     /// 本端 dock。
     local_dock_: Dock,
@@ -52,13 +52,13 @@ where
     rec_: TgOwner_<C::Alloc>,
 }
 
-impl<C, S> Telegraph<C, S>
+impl<C> Telegraph<C>
 where
     C: TrConnCfg,
 {
     /// 由连接、`local_dock` 与身份节点句柄构造（只允许 `open_telegraph_async` 调用）。
     pub(crate) fn new_(
-        conn: MuxConnection<C, S>,
+        conn: MuxConnection<C>,
         local_dock: Dock,
         rec_: TgOwner_<C::Alloc>,
     ) -> Self {
@@ -76,7 +76,7 @@ where
 ///
 /// **本 `Drop` 不取锁、不阻塞**；认领身份的 API 操作在动身份表之前会先清空释放
 /// 邮箱。
-impl<C, S> Drop for Telegraph<C, S>
+impl<C> Drop for Telegraph<C>
 where
     C: TrConnCfg,
 {
@@ -91,18 +91,18 @@ where
     }
 }
 
-impl<C, S> TrTelegraph<C> for Telegraph<C, S>
+impl<C> TrTelegraph<C> for Telegraph<C>
 where
     C: TrConnCfg,
 {
     type Err = TelegraphError;
 
-    type SendAsync<'f, M> = MuxSendAsync<'f, 'f, C, S, M>
+    type SendAsync<'f, M> = MuxSendAsync<'f, 'f, C, M>
     where
         Self: 'f,
         M: 'f + TrBuffRead<C::Data>;
 
-    type RecvAsync<'f, M> = MuxRecvAsync<'f, 'f, C, S, M>
+    type RecvAsync<'f, M> = MuxRecvAsync<'f, 'f, C, M>
     where
         Self: 'f,
         M: 'f + TrBuffWrite<C::Data>;
@@ -136,15 +136,15 @@ where
 
 /// [`TrTelegraph::send_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxSend, pub, new(pub(crate)))]
-async fn mux_send_async_<'f, C, S, M, K>(
-    telegraph: &'f mut Telegraph<C, S>,
+async fn mux_send_async_<'f, C, M, K>(
+    telegraph: &'f mut Telegraph<C>,
     remote_dock: Dock,
     packet: &'f mut M,
     _cancel: K,
 ) -> SomeOf<usize, TelegraphError>
 where
     C: TrConnCfg + 'f,
-    S: 'f,
+
     M: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {
@@ -153,15 +153,15 @@ where
 
 /// [`TrTelegraph::recv_async`] 的 step 函数。
 #[gen_may_cancel_future(MuxRecv, pub, new(pub(crate)))]
-async fn mux_recv_async_<'f, C, S, M, K>(
-    telegraph: &'f mut Telegraph<C, S>,
+async fn mux_recv_async_<'f, C, M, K>(
+    telegraph: &'f mut Telegraph<C>,
     remote_dock: Dock,
     buffer: &'f mut M,
     _cancel: K,
 ) -> SomeOf<usize, TelegraphError>
 where
     C: TrConnCfg + 'f,
-    S: 'f,
+
     M: TrBuffWrite<u8> + 'f,
     K: TrCancellationToken,
 {

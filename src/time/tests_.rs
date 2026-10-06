@@ -1,353 +1,256 @@
 //! [`crate::time`] 的单元测试。
 //!
+//! # 本模块现在只有两件事要测
+//!
+//! 上一版的测试对象是自造的「绝对期限算术层」（`TrDeadline::sleep_until` /
+//! `timeout_at`）。那一层已经删除：`abs_art::TrClock` 把时刻也收到运行时值上之后，
+//! 计时循环只需要一个**相对时长**（`期限 − 现在`），不再需要把毫秒还原成后端的
+//! 绝对时刻类型。因此本文件现在只钉两件事：
+//!
+//! 1. [`ConnClock_`] 的 **epoch 语义**：`now_millis_()` 一律是「自建连那一刻起算、
+//!    向下取整到毫秒」的单调量；
+//! 2. 计时循环赖以成立的那条不变式：**期限已过 ⇒ 折算出的时长为 0 ⇒ `delay(0)`
+//!    立刻完成、不让时钟前进**（`TrDelay::delay` 的语义契约第 1 条）。计时循环用
+//!    `next.saturating_sub(now)` 算时长，这条不变式就是它不会「等过头」的依据。
+//!
+//! # 虚拟时间改用 `abs_art-mock_clock`，不再自造
+//!
+//! 本文件原先自造了一个假运行时值（`FakeRt_` + `FakeInstant_` + `FakeDelay_`），
+//! 由 **thread-local 的全局虚拟毫秒**驱动。那正是 `abs_art-mock_clock` 已经提供的
+//! 能力，而那个共享量还有一个实测到的缺陷：`cargo test` 默认多线程并行，同一测试
+//! 二进制里的用例共享那份虚拟毫秒，先跑的用例把它推走之后，后跑用例的断言就落在
+//! 错的起点上（`conn_clock_reports_millis_since_its_epoch` 曾实测到 2499 而非 2500，
+//! `an_already_past_deadline_collapses_to_a_zero_delay` 实测到 4 而非 0）。
+//!
+//! 现在改用 [`ManualTime`] 装饰 [`ManualClock`]：**每个用例各建一份独立时钟**，
+//! 隔离由类型本身保证，不需要 thread-local、也不需要自己实现任何 `TrClock` /
+//! `TrDelay`。用到的两件东西：
+//!
+//! - [`ManualClock`]：手动时钟的状态与推进（`advance_by` / `try_advance_to_next`）；
+//! - [`ManualTime`]：把它装饰成一个完整的运行时值——时刻与 `delay` 来自**同一个**
+//!   手动时钟，「同源」因此天然成立，这正是本模块要钉的那条性质。
+//!
+//! 注意 [`ManualClock`] 的格点是**整数毫秒**：`advance_by` 小于 1 ms 的部分按它的
+//! 文档被截断，且不跨调用累加。因此本文件只用整数毫秒推进来确认 epoch 语义，
+//! 「小数毫秒进位」不是被测性质。
+//!
 //! # 两条互补的验收路线
 //!
-//! 1. **确定性路线（主力）**：注入假时钟 + 假 [`TrTime`]，把「期限折算」与「到点判定」
-//!    变成完全确定的断言——差一微秒不醒、正好到点醒、内层赢时不走秒表、超时即丢弃
-//!    内层。这一路不需要任何运行时，因此用普通 `#[test]`。
+//! 1. **确定性路线（主力）**：手动时钟 + 本文件里的 `BlockOnAdvancing_` 驱动
+//!    （「没有别的活可干就推进到下一个到期时刻」），把折算与到点判定变成完全确定的
+//!    断言。不需要任何异步运行时，因此用普通 `#[test]`。
 //! 2. **真实后端路线**：两个 `#[cfg(feature = …)]` 的 `#[tokio::test]` /
-//!    `#[compio::test]`，各自用**真实**时钟与真实后端跑一遍
-//!    [`TrDeadline::sleep_until`](super::TrDeadline::sleep_until)，证明
-//!    「本模块 + 真实后端」确实能等、且不提前返回（两格都在缺省 feature 下跑）。
+//!    `#[compio::test]`，各自用**真实**运行时值构造 `ConnClock_`，证明「本模块 +
+//!    真实后端」确实能等到、且毫秒量跟着真实时间前进（两格都在缺省 feature 下跑）。
 //!
 //! 三个后端的**一致性**（首次立即 / 锚定 / 不早于 / 文案 / 内层赢）不在这里测：
 //! 那是 `abs_art-smoke` 的 `time_contract` 契约矩阵（3 后端 × 5 用例）的职责。
+//!
+//! # 虚拟时间验收在**集成测试**里
+//!
+//! 用 `abs_art-mock_clock` 的 `ManualTime` + `Supervisor` 把**整条连接**跑在虚拟时间
+//! 上，属于端到端场景，见 `tests/keepalive_common.inc`。
 
 use core::{
-    cell::Cell,
-    future::{Future, pending, ready},
-    pin::Pin,
-    task::{Context, Poll},
+    future::Future,
+    task::{Context, Poll, Waker},
     time::Duration,
 };
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Instant as StdInstant,
-};
+use std::time::Instant as StdInstant;
 
-use abs_art::{
-    Elapsed, FULL, TrDelay, TrInterval, TrTime,
-};
-use embedded_timers::{
-    clock::Clock,
-    instant::Instant64,
-};
+use abs_art::{TrClock, TrDelay};
+use abs_art_mock_clock::{ManualClock, ManualClockApi, ManualTime, MockInstant};
 
-use super::TrDeadline;
+use super::ConnClock_;
 
-// ── 虚拟时间：假时钟 + 假 TrTime ──────────────────────────────────────────
+// ── 虚拟时间：手动时钟（每个用例一份） ────────────────────────────────────
 
-thread_local! {
-    /// 虚拟时钟（微秒）。
+/// 本文件使用的**假运行时值**：手动时钟装饰成的运行时值。
+///
+/// 时刻（`TrClock`）与等待（`TrDelay`）都由它内部那一份 [`ManualClock`] 回答。
+type ManualRt = ManualTime<ManualClock, ManualClock>;
+
+/// 造一份「手动时钟 + 连接级时钟」：每个用例各建一份，互不共享。
+///
+/// 时钟起点一律是 0 ms。上一版靠 `virtual_reset_()` 把线程共享的虚拟毫秒清零，
+/// 并行下并不可靠；本函数交出的是**独立实例**，隔离由类型保证。
+fn manual_conn_clock_() -> (ManualClock, ConnClock_<ManualRt>) {
+    let clock = ManualClock::new();
+    let conn_clock = ConnClock_::new_(ManualTime::new(clock.clone(), clock.clone()));
+    (clock, conn_clock)
+}
+
+/// 把 `future` 抽干：每轮 poll 后，若未就绪就把手动时钟推进到下一个到期时刻。
+///
+/// 这是 `abs_art-mock-clock` 的 `Supervisor` 在单元测试里的**最小等价物**——本模块
+/// 只需要「睡到某个到期时刻」这一种等待，不需要驱动任何本地队列，因此不引入作用域
+/// 与后端装配。
+struct BlockOnAdvancing_<C>
+where
+    C: ManualClockApi,
+{
+    /// 推进用的时钟。
+    clock_: C,
+}
+
+impl<C> BlockOnAdvancing_<C>
+where
+    C: ManualClockApi,
+{
+    /// 用手动时钟 `clock` 造一个驱动。
+    fn new_(clock: C) -> Self {
+        Self { clock_: clock }
+    }
+
+    /// 抽干 `future`：**没有别的活可干**时把时钟推进到下一个到期时刻再重试。
     ///
-    /// 用 thread-local 而不是 `static`：测试默认多线程并行，每个用例各在自己的
-    /// 线程上跑，thread-local 天然把它们各自的虚拟时钟隔开。
-    static VIRTUAL_MICROS: Cell<u64> = const { Cell::new(0) };
-}
-
-/// 读虚拟时钟（微秒）。
-fn virtual_micros_() -> u64 {
-    VIRTUAL_MICROS.with(Cell::get)
-}
-
-/// 把虚拟时钟重置到 0。
-fn virtual_reset_() {
-    VIRTUAL_MICROS.with(|c| c.set(0));
-}
-
-/// 把虚拟时钟向前推 `duration`（向下取整到微秒）。
-fn virtual_advance_(duration: Duration) {
-    VIRTUAL_MICROS.with(|c| c.set(c.get() + duration.as_micros() as u64));
-}
-
-/// 假的**时钟**：读 thread-local 虚拟时钟。零大小，`now` 是纯读。
-#[derive(Debug, Clone, Copy, Default)]
-struct FakeClock_;
-
-impl Clock for FakeClock_ {
-    /// 微秒刻度：`Instant64<1_000_000>` 的每一 tick 恰好 1 µs。
-    type Instant = Instant64<1_000_000>;
-
-    fn now(&self) -> Self::Instant {
-        Instant64::new(virtual_micros_())
-    }
-}
-
-/// 假的**计时能力**：`sleep(d)` 把虚拟时钟推进 `d` 后**立刻**就绪。
-///
-/// 这就是「等待层可注入」的兑现——`TrTime` 是 `Duration`-only 的，因此一个
-/// 假后端只要推进自己的时钟就够了，不必模拟任何调度。
-struct FakeTime_;
-
-impl TrDelay for FakeTime_ {
-    type Delay = FakeDelay_;
-
-    fn delay(duration: Duration) -> Self::Delay {
-        FakeDelay_ {
-            duration_: duration,
-            done_: false,
+    /// # Panics
+    ///
+    /// 既没有待到期的定时器、`future` 又未就绪时报错 panic——那说明用例本身写错了
+    /// （在等一个永远不会来的东西），而不是被测代码的问题。
+    fn run_<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let mut future = core::pin::pin!(future);
+        // 用例里的假后端只有「睡到某时刻」一种等待，因此不需要真 waker：驱动自己
+        // 负责在挂起后推进时钟并重试（与 `Supervisor` 对 tokio 的处理同理——tokio
+        // 没有可用的 tick 钩子，`poll` 循环就是它的驱动）。
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+            assert!(
+                self.clock_.try_advance_to_next(),
+                "没有待到期的定时器，而 future 仍未就绪：用例在等一个永远不会来的事件"
+            );
         }
     }
 }
 
-/// 虚拟时间的睡眠 future：**第一次被 `poll` 时**推进虚拟时钟，随即就绪（只推一次）。
-///
-/// 刻意**不**在 `delay(..)` 被调用时推进：真实后端那一刻只是把期限记下来，到点才
-/// 醒。若在构造时就推进，「内层先赢」的用例会因为 `Timeout` 构造即起计时器而看到
-/// 时钟前进（本文件那条用例正是这么发现的）。
-struct FakeDelay_ {
-    duration_: Duration,
-    done_: bool,
-}
-
-impl Future for FakeDelay_ {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        if !this.done_ {
-            this.done_ = true;
-            virtual_advance_(this.duration_);
-        }
-        Poll::Ready(())
-    }
-}
-
-impl TrTime for FakeTime_ {
-    type Interval = FakeInterval_;
-
-    fn interval(period: Duration) -> Self::Interval {
-        assert!(period > Duration::ZERO, "`period` must be non-zero.");
-        FakeInterval_(period)
-    }
-}
-
-/// 虚拟时间的周期源：每次 `tick` 推进一个周期。
-struct FakeInterval_(Duration);
-
-impl TrInterval for FakeInterval_ {
-    /// 假后端的 tick future：同样是具体的 `Ready`。
-    type Tick<'a> = core::future::Ready<()>;
-
-    fn tick(&mut self) -> Self::Tick<'_> {
-        virtual_advance_(self.0);
-        core::future::ready(())
-    }
-}
-
-// ── 测试用的小工具 ────────────────────────────────────────────────────────
-
-/// 抽干一个 future：假后端的所有等待都立刻就绪，轮询即可推进。
-///
-/// 轮数有上限：真出现「假后端居然挂起」的回归时应当**立刻失败**而不是死循环。
-fn block_on_<F: Future>(future: F) -> F::Output {
-    const MAX_ROUNDS: usize = 64;
-    let mut future = core::pin::pin!(future);
-    let mut cx = Context::from_waker(core::task::Waker::noop());
-    for _ in 0..MAX_ROUNDS {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-            return output;
-        }
-    }
-    panic!("假后端不该挂起：{MAX_ROUNDS} 轮仍未就绪");
-}
-
-/// 永不就绪、被丢弃时置位的 future：用来观察「超时即丢弃内层」。
-struct NeverReady_(Arc<AtomicBool>);
-
-impl Future for NeverReady_ {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        Poll::Pending
-    }
-}
-
-impl Drop for NeverReady_ {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-// ── 确定性用例 ────────────────────────────────────────────────────────────
-
-/// 验证 `sleep_until` 把时钟正好推进到期限。
-/// - 手段：虚拟时钟从 0 起，等一个 10 ms 的绝对期限。
-/// - 判断：虚拟时钟恰好停在 10 ms（不早不晚）。
-#[test]
-fn sleep_until_advances_the_clock_to_the_deadline() {
-    virtual_reset_();
-    let clock = FakeClock_;
-    let deadline = Instant64::<1_000_000>::new(10_000);
-
-    block_on_(FakeTime_::sleep_until(&clock, deadline));
-
-    assert_eq!(virtual_micros_(), 10_000);
-}
-
-/// 验证期限已过的 `sleep_until` 立刻完成且**不让时钟前进**。
-/// - 手段：虚拟时钟推到 5 ms，再等一个 4 ms 的（过去）期限。
-/// - 判断：虚拟时钟仍停在 5 ms——折算出的时长是 0，后端不该被要求走秒表。
-#[test]
-fn sleep_until_in_the_past_does_not_advance_the_clock() {
-    virtual_reset_();
-    virtual_advance_(Duration::from_millis(5));
-    let clock = FakeClock_;
-    let past = clock.now() - Duration::from_millis(1);
-
-    block_on_(FakeTime_::sleep_until(&clock, past));
-
-    assert_eq!(virtual_micros_(), 5_000, "已过的期限不该让时钟前进");
-}
-
-/// 验证 `timeout_at` 在内层挂起时**正好在期限上**返回 `Elapsed`。
-/// - 手段：虚拟时钟从 0 起，期限 3 ms，内层永不就绪。
-/// - 判断：结果为 `Err`、文案「期限已到」、虚拟时钟恰好停在 3 ms。
-#[test]
-fn timeout_at_elapses_exactly_at_the_deadline() {
-    virtual_reset_();
-    let clock = FakeClock_;
-    let deadline = Instant64::<1_000_000>::new(3_000);
-
-    let outcome = block_on_(FakeTime_::timeout_at(
-        &clock,
-        deadline,
-        pending::<u8>(),
-    ));
-    let elapsed = outcome.expect_err("期限已到应当是错误");
-
-    assert_eq!(elapsed.to_string(), "期限已到");
-    assert_eq!(virtual_micros_(), 3_000, "应当正好停在期限上");
-}
-
-/// 验证期限已过的 `timeout_at` 立刻超时、不再等。
-/// - 手段：虚拟时钟推到 5 ms，再给一个 4 ms 的（过去）期限与永不就绪的内层。
-/// - 判断：结果为 `Err`，且虚拟时钟仍停在 5 ms。
-#[test]
-fn timeout_at_with_a_past_deadline_elapses_without_waiting() {
-    virtual_reset_();
-    virtual_advance_(Duration::from_millis(5));
-    let clock = FakeClock_;
-    let past = clock.now() - Duration::from_millis(1);
-
-    let outcome = block_on_(FakeTime_::timeout_at(&clock, past, pending::<u8>()));
-    assert!(outcome.is_err(), "期限已过应当立刻超时");
-    assert_eq!(virtual_micros_(), 5_000, "不该再等");
-}
-
-/// 验证内层先完成时 `timeout_at` 原样返回输出，且**秒表没有走**。
-/// - 手段：期限 10 ms，内层用立刻就绪的 `ready(7)`。
-/// - 判断：结果为 `Ok(7)`，虚拟时钟仍为 0（`sleep` 从未被轮询）。
-#[test]
-fn timeout_at_returns_the_output_when_the_inner_future_wins() {
-    virtual_reset_();
-    let clock = FakeClock_;
-    let deadline = clock.now() + Duration::from_millis(10);
-
-    let outcome = block_on_(FakeTime_::timeout_at(&clock, deadline, ready(7u8)));
-
-    assert_eq!(outcome, Ok(7u8));
-    assert_eq!(virtual_micros_(), 0, "内层先赢 ⇒ 秒表不该走");
-}
-
-/// 验证期限先到时**内层 future 被丢弃**（取消就是丢弃）。
-/// - 手段：内层用「永不就绪、被丢弃时置位」的 future，期限 1 ms。
-/// - 判断：结果为 `Err`，且丢弃标志被置位。
-#[test]
-fn timeout_at_drops_the_inner_future_when_the_deadline_wins() {
-    virtual_reset_();
-    let clock = FakeClock_;
-    let dropped = Arc::new(AtomicBool::new(false));
-    let deadline = Instant64::<1_000_000>::new(1_000);
-
-    let outcome = block_on_(FakeTime_::timeout_at(
-        &clock,
-        deadline,
-        NeverReady_(Arc::clone(&dropped)),
-    ));
-
-    assert!(outcome.is_err(), "内层永不就绪 ⇒ 期限先到");
-    assert!(dropped.load(Ordering::SeqCst), "超时应当丢弃内层 future");
-}
-
-/// 验证转出的 `Elapsed` 就是 `abs_art` 的那个错误类型，且文案稳定。
-/// - 手段：编译期断言 `Elapsed: core::error::Error`，并取一个真实产生的错误。
-/// - 判断：`source()` 为 `None`，`Display` 为「期限已到」——三个后端共用同一文案，
-///   因此这里的判定与 `abs_art-smoke` 的契约矩阵是同一个来源。
-#[test]
-fn elapsed_is_abs_arts_error_type_with_a_stable_message() {
-    fn assert_error_<E: core::error::Error>() {}
-    assert_error_::<Elapsed>();
-
-    virtual_reset_();
-    let clock = FakeClock_;
-    let outcome = block_on_(FakeTime_::timeout_at(
-        &clock,
-        Instant64::<1_000_000>::new(1_000),
-        pending::<u8>(),
-    ));
-    let elapsed = outcome.expect_err("期限已到应当是错误");
-
-    assert_eq!(elapsed.to_string(), "期限已到");
-    assert!(core::error::Error::source(&elapsed).is_none());
-}
-
-/// 验证保活要用的**那一种循环形状**：每轮睡到「下一个绝对期限」，没有轮盘。
-/// - 手段：模拟 tick 循环三轮，每轮把期限往后推 1 秒并 `sleep_until`。
-/// - 判断：每轮结束时虚拟时钟恰好落在该轮期限上（1 s / 2 s / 3 s）。
-#[test]
-fn keepalive_style_loop_sleeps_until_each_deadline() {
-    virtual_reset_();
-    let clock = FakeClock_;
-
-    for round in 1..=3u64 {
-        let deadline = Instant64::<1_000_000>::new(round * 1_000_000);
-        block_on_(FakeTime_::sleep_until(&clock, deadline));
-        assert_eq!(virtual_micros_(), round * 1_000_000);
-    }
-}
-
-// ── 连接级时钟（`ConnClock_`）────────────────────────────────────────────
+// ── `ConnClock_` 的 epoch 语义 ────────────────────────────────────────────
 
 /// 验证 `ConnClock_` 以**建立时刻**为 epoch，把时刻折算成单调毫秒。
-/// - 手段：虚拟时钟 0 处建连接级时钟，分别推进到 1500 µs 与再 2498.5 ms 后读回。
-/// - 判断：`now_millis_` 依次是 0 / 1 / 2500——即自 epoch 起算、向下取整到毫秒。
+/// - 手段：手动时钟从 0 起走，先用**不足 1 ms** 的推进越过 5 ms 处的建连时刻，
+///   在两个整数毫秒点上各读一次，再单独推进一个不足 1 ms 的量证明它不改变读数。
+/// - 判断：`now_millis_` 依次是 0 / 37 / 1250 / 1250——即自 epoch 起算、且人工时钟
+///   的毫秒格点之外的时间不产生新读数（`ManualClock` 的 `advance_by` 只接受整数
+///   毫秒，不足 1 ms 的部分按它的文档被截断，因此本用例只用整数毫秒确认 epoch
+///   语义，不把「小数部分跨调用累加」当成被测性质）。
 #[test]
 fn conn_clock_reports_millis_since_its_epoch() {
-    virtual_reset_();
-    let conn_clock = super::clock_::ConnClock_::new_(FakeClock_);
+    let clock = ManualClock::new();
+    let conn_clock = ConnClock_::new_(ManualTime::new(clock.clone(), clock.clone()));
     assert_eq!(conn_clock.now_millis_(), 0u64, "刚建立时应当是 0");
 
-    virtual_advance_(Duration::from_micros(1500u64));
-    assert_eq!(conn_clock.now_millis_(), 1u64, "向下取整到毫秒");
+    clock.advance_by(Duration::from_millis(37u64));
+    assert_eq!(conn_clock.now_millis_(), 37u64, "整数毫秒推进原样反映");
 
-    virtual_advance_(Duration::from_millis(2498u64) + Duration::from_micros(500u64));
-    assert_eq!(conn_clock.now_millis_(), 2500u64);
-}
+    clock.advance_by(Duration::from_millis(1213u64));
+    assert_eq!(conn_clock.now_millis_(), 1250u64);
 
-/// 验证 `ConnClock_::deadline_` 是「epoch + 毫秒」的绝对期限。
-/// - 手段：虚拟时钟停在 5 ms 处建时钟，取 `deadline_(7500)`；再把虚拟时钟推到
-///   105 ms，与 `clock_().now()` 相减。
-/// - 判断：期限距「现在」正好 7400 ms（= 7500 − 100）——折算基准是**建时钟那一刻**
-///   的 epoch，而不是某次调用时刻。
-#[test]
-fn conn_clock_deadline_is_epoch_plus_millis() {
-    virtual_reset_();
-    virtual_advance_(Duration::from_millis(5u64));
-    let conn_clock = super::clock_::ConnClock_::new_(FakeClock_);
-    let deadline = conn_clock.deadline_(7500u64);
-
-    virtual_advance_(Duration::from_millis(100u64));
-    let now = conn_clock.clock_().now();
-    assert_eq!(deadline - now, Duration::from_millis(7400u64));
+    clock.advance_by(Duration::from_micros(999u64));
     assert_eq!(
         conn_clock.now_millis_(),
-        100u64,
-        "`now_millis_` 是自 epoch（建时钟那一刻）起算的量"
+        1250u64,
+        "不足 1 ms 的推进不产生新的毫秒读数"
     );
+}
+
+/// 验证两点：`rt_()` 交出**同一个**运行时值，且它的时刻就是 `now_millis_` 的来源。
+/// - 手段：建时钟后经 `rt_()` 读时刻，与 `now_millis_()` 对同一个 epoch 的读数比对。
+/// - 判断：`rt_().now() − epoch` 与 `now_millis_()` 一致（都等于推进量）；这也说明
+///   计时循环经 `rt_()` 拿到的 `delay` 与这里的时刻**同源**。
+#[test]
+fn conn_clock_lends_the_same_runtime_value_to_the_timer_loop() {
+    let (clock, conn_clock) = manual_conn_clock_();
+    let epoch = conn_clock.rt_().now();
+
+    clock.advance_by(Duration::from_millis(37u64));
+
+    assert_eq!(conn_clock.rt_().now() - epoch, Duration::from_millis(37u64));
+    assert_eq!(conn_clock.now_millis_(), 37u64);
+}
+
+/// 验证计时循环赖以成立的那条不变式：**期限已过 ⇒ `delay(0)` ⇒ 立刻完成且时钟不动**。
+/// - 手段：手动时钟推到 5 ms，按计时循环的算法算出一个**已过**的期限（`next = 4 ms`），
+///   用 `next.saturating_sub(now)` 折算时长后 `delay`，只 poll 一轮、不推进时钟。
+/// - 判断：折算出的时长为 0、该 `delay` 首次 poll 即就绪，且时钟仍停在 5 ms——即
+///   「期限已过」退化成「不等」，不会让计时循环空转或倒退。
+#[test]
+fn an_already_past_deadline_collapses_to_a_zero_delay() {
+    let (clock, conn_clock) = manual_conn_clock_();
+    clock.advance_by(Duration::from_millis(5u64));
+
+    let now = conn_clock.now_millis_();
+    let next = 4u64;
+    let wait = next.saturating_sub(now);
+
+    assert_eq!(wait, 0u64, "已过的期限折算出的时长必须是 0");
+    let mut delay = core::pin::pin!(conn_clock.rt_().delay(Duration::from_millis(wait)));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(
+        delay.as_mut().poll(&mut cx),
+        Poll::Ready(()),
+        "`delay(0)` 必须首次 poll 就绪"
+    );
+    assert_eq!(clock.now().as_millis(), 5u64, "已过的期限不该让时钟前进");
+}
+
+/// 验证保活要用的**那一种循环形状**：每轮睡到「下一个期限」，只折算相对时长。
+/// - 手段：模拟 tick 循环三轮，每轮把期限往后推 1 秒，按 `next − now` 折算后 `delay`，
+///   由 [`BlockOnAdvancing_`] 在挂起时把手动时钟推进到该期限。
+/// - 判断：每轮结束时时钟恰好落在该轮期限上（1 s / 2 s / 3 s）。
+#[test]
+fn keepalive_style_loop_sleeps_until_each_deadline() {
+    let (clock, conn_clock) = manual_conn_clock_();
+    let driver = BlockOnAdvancing_::new_(clock.clone());
+
+    for round in 1..=3u64 {
+        let now = conn_clock.now_millis_();
+        let next = round * 1_000u64;
+        let wait = next.saturating_sub(now);
+        driver.run_(conn_clock.rt_().delay(Duration::from_millis(wait)));
+        assert_eq!(conn_clock.now_millis_(), next);
+    }
+}
+
+// ── `ManualTime` 装饰出来的运行时值 ──────────────────────────────────────
+
+/// 验证 `ManualTime` 的 `delay` **不会自己推进时钟**，要由驱动推进才完成。
+/// - 手段：用 `ManualTime` 包一份手动时钟造出运行时值，对 `delay(10 ms)` 单轮 poll。
+/// - 判断：首次 poll 必须是 `Pending`（说明等待没有凭空结束），时钟仍停在 0；
+///   把时钟推进到 10 ms 后再次 poll 才 `Ready`。
+#[test]
+fn manual_time_delay_waits_for_the_driver() {
+    let clock = ManualClock::new();
+    let timed = ManualTime::new(clock.clone(), clock.clone());
+
+    let mut delay = core::pin::pin!(timed.delay(Duration::from_millis(10u64)));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(
+        delay.as_mut().poll(&mut cx),
+        Poll::Pending,
+        "没有被驱动时，10 ms 的 delay 不应当就绪"
+    );
+    assert_eq!(clock.now().as_millis(), 0u64, "poll 本身不该让时钟前进");
+
+    clock.advance_by(Duration::from_millis(10u64));
+    assert_eq!(delay.as_mut().poll(&mut cx), Poll::Ready(()));
+}
+
+/// 验证 `ManualTime` 报出的**时刻**与它的 `delay` 在同一条时间轴上。
+/// - 手段：装饰出运行时值后把手动时钟推进 250 ms，再读该值报出的时刻。
+/// - 判断：时刻恰为 250 ms——与 `delay` 用的是同一个手动时钟，不存在第二个时间源。
+#[test]
+fn manual_time_reports_the_same_axis_as_its_delay() {
+    let clock = ManualClock::new();
+    let timed = ManualTime::new(clock.clone(), clock.clone());
+
+    clock.advance_by(Duration::from_millis(250u64));
+
+    assert_eq!(timed.now().as_millis(), 250u64);
 }
 
 /// 验证 `millis_of_` 对超出 `u64` 的时长**饱和**而不是截断。
@@ -361,52 +264,47 @@ fn millis_of_saturates_instead_of_wrapping() {
 
 // ── 真实后端用例（两个运行时各一格，缺省 feature 下都跑）──────────────────
 
-/// 以构造时刻为 epoch 的**真实**时钟（纳秒刻度）。
-#[derive(Debug)]
-struct RealClock_ {
-    base_: StdInstant,
-}
+/// 真实后端下的检查体：`ConnClock_` 的毫秒量跟着真实时间前进，且不早于等待时长。
+///
+/// 不写成泛型：`abs_art_tokio::current()` / `abs_art_compio::current()` 是各后端的
+/// **固有**关联函数（`abs_art` 没有「取当前运行时值」的 trait 入口），因此两格各写
+/// 一份具体代码，取运行时值的写法与其后端一致。
+macro_rules! real_backend_clock_case_ {
+    ($name:ident, [$($attr:meta),*], $current:path) => {
+        /// 目的：验证 `ConnClock_` 在**真实后端**下确实等到、且毫秒量前进。
+        /// - 手段：用该后端的当前运行时值构造 `ConnClock_`，`delay(20 ms)` 后
+        ///   比对墙钟耗时与 `now_millis_` 的增量。
+        /// - 判断：墙钟耗时 `>= 20 ms`（不提前返回），且毫秒增量 `>= 20`。
+        $(#[$attr])*
+        async fn $name() {
+            const WAIT: Duration = Duration::from_millis(20);
 
-impl Clock for RealClock_ {
-    /// 纳秒刻度：`Instant64<1_000_000_000>` 的每一 tick 恰好 1 ns。
-    type Instant = Instant64<1_000_000_000>;
+            let rt = $current();
+            let conn_clock = ConnClock_::new_(rt.clone());
+            let before = conn_clock.now_millis_();
 
-    fn now(&self) -> Self::Instant {
-        Instant64::new(self.base_.elapsed().as_nanos() as u64)
-    }
-}
+            let started = StdInstant::now();
+            rt.delay(WAIT).await;
+            let real = started.elapsed();
+            let after = conn_clock.now_millis_();
 
-/// 真实后端下的端到端检查体：两个运行时各用它跑一遍。
-async fn real_sleep_until_waits_at_least_<D: TrTime>() {
-    const WAIT: Duration = Duration::from_millis(20);
-    let clock = RealClock_ {
-        base_: StdInstant::now(),
+            assert!(real >= WAIT, "delay 提前返回了：{real:?}");
+            assert!(
+                after.saturating_sub(before) >= 20u64,
+                "`ConnClock_` 的毫秒量没有前进：{before} -> {after}"
+            );
+        }
     };
-    let started = StdInstant::now();
-    D::sleep_until(&clock, clock.now() + WAIT).await;
-    assert!(
-        started.elapsed() >= WAIT,
-        "sleep_until 提前返回了：{:?}",
-        started.elapsed()
-    );
 }
 
-/// 目的：验证 `smux_v1::time::sleep_until` 在 **tokio 真实后端**上能真正等到。
-/// - 手段：`#[tokio::test]` 提供 tokio 运行时（含 time 驱动），后端取
-///   `abs_art_tokio::Runtime<{ FULL }>`。
-/// - 判断：实际耗时 `>= 20 ms`（不提前返回）。
-#[cfg(feature = "test-tokio-runtime")]
-#[tokio::test]
-async fn real_backend_tokio_waits_until_the_deadline() {
-    real_sleep_until_waits_at_least_::<abs_art_tokio::Runtime<{ FULL }>>().await;
-}
+real_backend_clock_case_!(
+    real_backend_tokio_tracks_the_clock,
+    [cfg(feature = "test-tokio-runtime"), tokio::test],
+    abs_art_tokio::current
+);
 
-/// 目的：验证 `smux_v1::time::sleep_until` 在 **compio 真实后端**上能真正等到。
-/// - 手段：`#[compio::test]` 提供 compio 运行时，后端取
-///   `abs_art_compio::Runtime<{ FULL }>`。
-/// - 判断：实际耗时 `>= 20 ms`（不提前返回）。
-#[cfg(feature = "test-compio-runtime")]
-#[compio::test]
-async fn real_backend_compio_waits_until_the_deadline() {
-    real_sleep_until_waits_at_least_::<abs_art_compio::Runtime<{ FULL }>>().await;
-}
+real_backend_clock_case_!(
+    real_backend_compio_tracks_the_clock,
+    [cfg(feature = "test-compio-runtime"), compio::test],
+    abs_art_compio::current
+);

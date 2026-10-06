@@ -35,7 +35,12 @@ where
 ///
 /// 生产路径仍然按上游契约走 `accept_async(welcome, prepare)`；这里只是把闭包包进
 /// [`ClosurePrepare`] 后转发。
-pub trait AcceptAsyncClosureExt<C, S>: Sized
+///
+/// 第二个类型参数 `S` 是**运行时值**（`ChannelHandle<C, S>` 的第二个参数）：
+/// 时刻与「怎么等」由**连接配置**携带的运行时值提供
+/// （[`TrConnCfg::Rt`](smux_v1::connection::TrConnCfg::Rt)），因此这里不再需要
+/// 额外的运行时类型参数。
+pub trait AcceptAsyncClosureExt<C>: Sized
 where
     C: TrConnCfg,
 {
@@ -43,13 +48,13 @@ where
         &'f mut self,
         welcome: &'f mut W,
         prepare: F,
-    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>
+    ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
         W: 'f + TrBuffWrite<u8>,
         F: FnOnce() -> (C::Buff, C::Buff);
 }
 
-impl<C, S> AcceptAsyncClosureExt<C, S> for ChannelHandle<C, S>
+impl<C> AcceptAsyncClosureExt<C> for ChannelHandle<C>
 where
     C: TrConnCfg,
 {
@@ -57,7 +62,7 @@ where
         &'f mut self,
         welcome: &'f mut W,
         prepare: F,
-    ) -> Result<(ChannelTx<C, S>, ChannelRx<C, S>), HandleError>
+    ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
         W: 'f + TrBuffWrite<u8>,
         F: FnOnce() -> (C::Buff, C::Buff),

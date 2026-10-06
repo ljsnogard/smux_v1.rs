@@ -44,9 +44,10 @@
 //!
 //! ## F1 ✅ `MuxConnection` 可以跨函数传递，也可以多次克隆
 //!
-//! `MuxConnection<C, S, RE, WE>` 不带任何生命周期参数：`R` / `W`（收发半边）在
-//! `new` 里就被移进循环，只剩 `C`（策略）、`S`（作用域）与两个错误载荷类型。
-//! `Clone` 只是多一个强引用，因此连接可以被同时放进多个结构体、传给多个函数。
+//! `MuxConnection<C, R>` 不带任何生命周期参数：`C::ConnRx` / `C::ConnTx`（收发半边）
+//! 在 `new` 里就被移进循环，只剩 `C`（策略）与 `R`（运行时值）两个类型参数——本地
+//! 作用域只在 `new` 的方法级泛型上出现。`Clone` 只是多一个强引用，因此连接可以被
+//! 同时放进多个结构体、传给多个函数。
 //!
 //! ## F2 ✅ `DockBinding` 与连接可以同处一个结构体（旧模型下不行）
 //!
@@ -72,8 +73,9 @@
 //! ## F5 ✅ 已建立 channel 的具体类型可以命名
 //!
 //! 旧模型里 `Tx` / `Rx` 关联类型实例化后含未导出的环包装类型，下游写不出
-//! `ChannelTx<???>`。现在两个半部直接以 `<C, S, RE, WE>` 参数化，因此本文件的
-//! [`ChanTx`] / [`ChanRx`] 就是**可直接写出的具名别名**，也可以作为结构体字段类型。
+//! `ChannelTx<???>`。现在两个半部直接以 `<C, R>` 参数化（`R` 是运行时值），因此本
+//! 文件的 [`ChanTx`] / [`ChanRx`] 就是**可直接写出的具名别名**，也可以作为结构体
+//! 字段类型。
 //!
 //! ## F6 ⛔ `abs_smux` 的 channel trait 只承诺 **try** 语义
 //!
@@ -126,8 +128,10 @@
 //!
 //! # 运行方式
 //!
-//! 连接的读 / 写循环经 `abs_art` 的**本地作用域值**（`TrLocalScope`）投递，因此
-//! 场景函数把作用域作为第一个参数一路传下去，用例自己取得并驱动它。
+//! 连接的读 / 写循环经 `abs_art` 的**本地作用域值**（`TrLocalScope`）投递，而计时与
+//! 时刻来自**运行时值**（`TrTime`，进连接的类型参数）。因此场景函数把这一对值
+//! （`rt` 与 `scope`）作为最前面的两个参数一路传下去，用例自己取得并驱动它们：
+//! 作用域来自运行时值（`rt.local_scope()`），由 `scope.run_until(..)` 驱动。
 
 mod common;
 
@@ -135,7 +139,6 @@ use common::AcceptAsyncClosureExt;
 
 use core::mem::MaybeUninit;
 
-use abs_art::TrLocalScope;
 use smux_v1::single_runtime_test_;
 use abs_smux::{
     chan::TrChannelHalf,
@@ -185,22 +188,24 @@ type WireRx = smux_v1::connection::BufferedRx<WireBuff, CoreAlloc>;
 type WireTx = smux_v1::connection::BufferedTx<WireBuff, CoreAlloc>;
 
 /// L5 的连接对象。客户端与服务端同型，只是握手角色不同。
-type Mux<S> = common::SmokeConn<WireRx, WireTx, S>;
+///
+/// 本测试使用的具体配置类型（传输是 `WireTx` / `WireRx`，运行时值由第三个参数给出）。
+type SmokeCfg<RT> = common::SmokeMuxConfig<WireTx, WireRx, RT>;
 
-/// 本测试使用的具体配置类型（传输是 `WireTx` / `WireRx`）。
-type SmokeCfg = common::SmokeMuxConfig<WireTx, WireRx>;
+/// 运行时值由**配置**携带（`TrConnCfg::Rt`），因此连接的类型参数只有配置一个。
+type Mux<RT> = common::SmokeConn<WireRx, WireTx, RT>;
 
 /// 【F5 ✅】已建立 channel 的发送半边：**可以直接写出的具名类型**。
-type ChanTx<S> = ChannelTx<SmokeCfg, S>;
+type ChanTx<RT> = ChannelTx<SmokeCfg<RT>>;
 
 /// 同 [`ChanTx`]，接收半边。
-type ChanRx<S> = ChannelRx<SmokeCfg, S>;
+type ChanRx<RT> = ChannelRx<SmokeCfg<RT>>;
 
 /// 【F3 ✅】listener 也是具名类型，可以作为返回值与结构体字段。
-type Listener<S> = ChannelListener<SmokeCfg, S>;
+type Listener<RT> = ChannelListener<SmokeCfg<RT>>;
 
 /// 【F2 ✅】binding 同上。
-type Binding<S> = DockBinding<SmokeCfg, S>;
+type Binding<RT> = DockBinding<SmokeCfg<RT>>;
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // L4：传输层
@@ -243,9 +248,9 @@ fn loopback_wire_() -> (ClientWire_, ServerWire_) {
 /// # Panics
 ///
 /// 握手失败即 panic（测试专用）。
-async fn client_mux_connect_<S>(scope: &S, wire: ClientWire_) -> Mux<S>
+async fn client_mux_connect_<RT>(rt: &RT, wire: ClientWire_) -> Mux<RT>
 where
-    S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     let ClientWire_ { rx_, tx_ } = wire;
     let opts = BasicOpts::default();
@@ -255,9 +260,8 @@ where
         .expect("客户端握手应当成功");
     let (stage_r, stage_w) = common::make_stage_buffs_();
     MuxConnection::new(
-        scope,
-        delivery,
-        <SmokeCfg as Default>::default(),
+                delivery,
+        SmokeCfg::<RT>::new(rt.clone()),
         stage_r,
         stage_w,
     )
@@ -271,9 +275,9 @@ where
 /// # Panics
 ///
 /// 握手失败即 panic（测试专用）。
-async fn server_mux_accept_<S>(scope: &S, wire: ServerWire_) -> Mux<S>
+async fn server_mux_accept_<RT>(rt: &RT, wire: ServerWire_) -> Mux<RT>
 where
-    S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     let ServerWire_ { rx_, tx_ } = wire;
     let opts = BasicOpts::default();
@@ -283,9 +287,8 @@ where
         .expect("服务端握手应当成功");
     let (stage_r, stage_w) = common::make_stage_buffs_();
     MuxConnection::new(
-        scope,
-        delivery,
-        <SmokeCfg as Default>::default(),
+                delivery,
+        SmokeCfg::<RT>::new(rt.clone()),
         stage_r,
         stage_w,
     )
@@ -309,13 +312,13 @@ where
 /// # Panics
 ///
 /// 绑定或建流失败即 panic（测试专用）。
-async fn client_open_channel_<S>(
-    conn: &Mux<S>,
+async fn client_open_channel_<RT>(
+    conn: &Mux<RT>,
     local_dock: Dock,
     service_dock: Dock,
-) -> (ChanTx<S>, ChanRx<S>)
+) -> (ChanTx<RT>, ChanRx<RT>)
 where
-    S: Clone,
+    RT: common::TrSmokeRt,
 {
     let mut binding = conn
         .bind_async(local_dock)
@@ -343,21 +346,27 @@ where
 ///
 /// 【F2 ✅ / F3 ✅】这是旧模型下写不出来的形状：三者各自持有一份指向同一演员核心的
 /// 智能指针，因此不存在自引用，字段也不需要任何生命周期参数。
-struct RpcServer_<S> {
+struct RpcServer_<RT>
+where
+    RT: common::TrSmokeRt,
+{
     /// 连接：**刻意只持有不使用**——它在这里的作用是证明「连接与它的句柄可以同处
     /// 一个结构体」这条形状成立（旧模型下这是自引用结构体）。保活本身由
     /// `binding_` / `listener_` 各自持有的克隆承担。
     #[allow(dead_code)]
-    conn_: Mux<S>,
+    conn_: Mux<RT>,
 
     /// 本次监听绑定的 dock。
-    binding_: Binding<S>,
+    binding_: Binding<RT>,
 
     /// 在 `binding_` 的 dock 上建立的监听器。
-    listener_: Listener<S>,
+    listener_: Listener<RT>,
 }
 
-impl<S> RpcServer_<S> {
+impl<RT> RpcServer_<RT>
+where
+    RT: common::TrSmokeRt,
+{
     /// **L6（服务端）**：建 listener —— 与 accept 循环**分开**的第一步。
     ///
     /// 一次走完「握手 → 绑定 → 监听」，把三者一起交出去；accept 循环由调用方在
@@ -367,11 +376,10 @@ impl<S> RpcServer_<S> {
     /// # Panics
     ///
     /// 握手 / 绑定 / 监听任一步失败即 panic（测试专用）。
-    async fn bind_and_listen(scope: &S, wire: ServerWire_, dock: Dock) -> Self
+    async fn bind_and_listen(rt: &RT, wire: ServerWire_, dock: Dock) -> Self
     where
-        S: common::TrSmokeScope + Clone + 'static,
     {
-        let conn_ = server_mux_accept_(scope, wire).await;
+        let conn_ = server_mux_accept_(rt, wire).await;
         let mut binding_ = conn_
             .bind_async(dock)
             .await
@@ -565,9 +573,9 @@ where
 /// # Panics
 ///
 /// 任一层失败、或响应字节与预期不符即 panic。
-async fn layered_rpc_scenario_<S>(scope: &S)
+async fn layered_rpc_scenario_<RT>(rt: &RT)
 where
-    S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     // L4：一条已连接的字节流，两端分头进入各自的协议栈。
     let (client_wire, server_wire) = loopback_wire_();
@@ -575,8 +583,8 @@ where
     // L5 + L6：客户端 `invite`、服务端 `listen` 必须并发跑（互为对端）；
     // 服务端在同一个 future 里继续完成绑定与监听，交出一个 owned 的 `RpcServer_`。
     let (client_conn, mut server) = futures::join!(
-        client_mux_connect_::<S>(scope, client_wire),
-        RpcServer_::<S>::bind_and_listen(scope, server_wire, Dock::new(K_SERVICE_DOCK)),
+        client_mux_connect_::<RT>(rt, client_wire),
+        RpcServer_::<RT>::bind_and_listen(rt, server_wire, Dock::new(K_SERVICE_DOCK)),
     );
 
     // L6 + L7：服务端跑 accept 循环；客户端并发发起 K_CALL_COUNT 次调用。
@@ -589,7 +597,7 @@ where
         let calls = (0..K_CALL_COUNT).map(move |index| async move {
             // 每次调用一个互不相同的临时 local_dock（§4.1 的硬约束）。
             let local = Dock::new(K_CLIENT_DOCK_BASE + index as u32);
-            let (tx, rx) = client_open_channel_::<S>(conn, local, Dock::new(K_SERVICE_DOCK)).await;
+            let (tx, rx) = client_open_channel_::<RT>(conn, local, Dock::new(K_SERVICE_DOCK)).await;
             let reply = client_call_(tx, rx, &make_request_(index)).await;
             (index, reply)
         });
@@ -619,9 +627,9 @@ where
 /// **刻意不执行**：同时取出两条待决请求在协议上意味着该 dock 的两条请求被并发
 /// 处理，与本 crate「同一 dock 串行化」的约定不符，因此只做类型检查。
 #[allow(dead_code)]
-async fn probe_two_pending_handles_<S>(conn: &Mux<S>, service_dock: Dock)
+async fn probe_two_pending_handles_<RT>(conn: &Mux<RT>, service_dock: Dock)
 where
-    S: Clone,
+    RT: common::TrSmokeRt,
 {
     let mut binding = conn
         .bind_async(service_dock)
@@ -648,7 +656,10 @@ where
 /// 因为环包装类型没有导出。现在 [`ChanTx`] / [`ChanRx`] 就是可直接写出的类型。
 /// **刻意不执行**，只为把这条结论钉在编译期。
 #[allow(dead_code)]
-fn probe_named_half_types_<S>(tx: ChanTx<S>, rx: ChanRx<S>) -> HalfHolder_<S> {
+fn probe_named_half_types_<RT>(tx: ChanTx<RT>, rx: ChanRx<RT>) -> HalfHolder_<RT>
+where
+    RT: common::TrSmokeRt,
+{
     HalfHolder_ { tx_: tx, rx_: rx }
 }
 
@@ -669,7 +680,12 @@ fn probe_write_code_against_mux_error_(err: MuxError) -> ErrClass_ {
 
 /// 【F9 ✅ 探针】同一段代码也可以直接吃**连接的关联错误类型**。
 #[allow(dead_code)]
-fn probe_classify_connection_error_<S>(err: <Mux<S> as TrConnection<SmokeCfg>>::Err) -> ErrClass_ {
+fn probe_classify_connection_error_<RT>(
+    err: <Mux<RT> as TrConnection<SmokeCfg<RT>>>::Err,
+) -> ErrClass_
+where
+    RT: common::TrSmokeRt,
+{
     // 面自己的错误类型把连接级失败包在 `Mux(..)` 里，内层 `MuxError` 仍然是同一个类型，
     // 因此那段分类代码原样可用。
     match err {
@@ -702,9 +718,12 @@ enum ErrClass_ {
 
 /// 【F5 ✅ 探针】两个具名半部作为**结构体字段**。
 #[allow(dead_code)]
-struct HalfHolder_<S> {
-    tx_: ChanTx<S>,
-    rx_: ChanRx<S>,
+struct HalfHolder_<RT>
+where
+    RT: common::TrSmokeRt,
+{
+    tx_: ChanTx<RT>,
+    rx_: ChanRx<RT>,
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -721,20 +740,22 @@ struct HalfHolder_<S> {
 /// - 判断：4 次 RPC 的响应字节与业务层预期**逐字节相等**；任一步骤的 API 接线失败
 ///   （绑定、建流、接受、读写、半关闭）都会 panic。本条**不**判定协议行为，只判定
 ///   「当前 API 允许这样分层地用」。
-async fn layered_rpc_dual_<S>(scope: &S)
+async fn layered_rpc_dual_<RT>(rt: &RT)
 where
-    S: TrLocalScope + abs_art::TrTime + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
-    let scenario = layered_rpc_scenario_(scope);
-    scope.run_until(scenario).await;
+    // 连接自己取作用域并用它投递五个循环；场景里的驱动由后端自己的运行时负责
+    // （tokio 装配下由调用点的 `LocalSet` 驱动，见本文件顶部的装配说明）。
+    layered_rpc_scenario_::<RT>(rt).await;
 }
 
-/// 见 [`layered_rpc_dual_`] 说明：本函数只是给 tokio 作用域类型做一次实例化。
+/// 见 [`layered_rpc_dual_`] 说明：本函数只是给当前 feature 选中的运行时值 / 作用域
+/// 类型做一次实例化。
 async fn layered_rpc_body_tokio_() {
     #[cfg(feature = "test-tokio-runtime")]
-    let scope = abs_art_tokio::LocalScope::new();
+    let rt = abs_art_tokio::current();
     #[cfg(not(feature = "test-tokio-runtime"))]
-    let scope = abs_art_compio::LocalScope::new();
-    layered_rpc_dual_(&scope).await;
+    let rt = abs_art_compio::current();
+    layered_rpc_dual_(&rt).await;
 }
 single_runtime_test_!(layered_rpc_body_tokio_);

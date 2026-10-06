@@ -7,6 +7,7 @@ use smux_v1::connection::{BindError, Dock, HandleError};
 use crate::common::{
     AcceptAsyncClosureExt,
     SmokeMuxConfig,
+    TrSmokeRt,
     TrSmokeScope,
     connect_pair_,
     make_channel_buff_,
@@ -23,7 +24,8 @@ use crate::common::{
 /// 握手失败、绑定出现的错误类型不是 `DockInUse`、或解绑后重绑失败都会 panic。
 ///
 /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
-pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -35,17 +37,18 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     let (conn_a, conn_b) =
         connect_pair_::<
-            SmokeMuxConfig<WA, RA>,
-            SmokeMuxConfig<WB, RB>,
+            SmokeMuxConfig<WA, RA, RT>,
+            SmokeMuxConfig<WB, RB, RT>,
             RA,
             WA,
             RB,
             WB,
             S,
-        >(scope, tx_a, rx_a, tx_b, rx_b)
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
@@ -106,7 +109,8 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S>(
 /// # Panics
 ///
 /// 握手/绑定/监听失败，或上述两条判断不成立，都会 panic。
-pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
+pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -118,17 +122,18 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     let (conn_a, conn_b) =
         connect_pair_::<
-            SmokeMuxConfig<WA, RA>,
-            SmokeMuxConfig<WB, RB>,
+            SmokeMuxConfig<WA, RA, RT>,
+            SmokeMuxConfig<WB, RB, RT>,
             RA,
             WA,
             RB,
             WB,
             S,
-        >(scope, tx_a, rx_a, tx_b, rx_b)
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b)
         .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。

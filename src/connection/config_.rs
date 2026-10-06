@@ -3,7 +3,7 @@
 //! 上游 [`abs_smux::conf::TrMuxConfig`] 已收敛 `Data` / `Dock` / `Buff` 三个
 //! 类型；本 trait 只补上连接内部还需要、但上游不关心的两样东西：内部结构使用的
 //! 分配器，以及流控策略。两条传输半边的类型也放在这里，公开类型因此只需要
-//! `MuxConnection<C, S>` 两个参数。
+//! `MuxConnection<C, R>` 两个参数。
 //!
 //! # 子流环的存储
 //!
@@ -37,7 +37,7 @@ use crate::{
     connection::{Dock, MuxChanBuff},
     flow_ctrl::{DefaultPolicy, TrFlowCtrlPolicy},
     handshake::agent::HandshakeDelivery,
-    time::{Clock, SystemClock},
+    time::TrTime,
 };
 
 #[allow(unused)]
@@ -69,34 +69,35 @@ pub const K_STAGE_RING_CAPACITY: usize = 64usize * 1024usize;
 /// 连接的配置类型。
 ///
 /// 它是**使用环境**与连接之间的唯一约定：数据与 dock 类型由上游
-/// [`TrMuxConfig`] 给出；本 trait 再补上内部结构分配器、流控策略与两条传输半边。
-/// 所有公开类型都只带 `<C, S>` 两个参数（配置 + 本地作用域），因此加一个旋钮
-/// 只需要改一处。
+/// [`TrMuxConfig`] 给出；本 trait 再补上内部结构分配器、流控策略、两条传输半边，
+/// 以及**运行时值**（计时与时刻）。
+/// 所有公开类型都只带 `<C>` 一个参数（配置本身），因此加一个旋钮只需改一处。
+///
+/// # 运行时值为什么由配置提供
+///
+/// `MuxCore` 必须**无条件** `Send + Sync`（它是 `mm_ptr::Shared` 的被指对象，而
+/// `Shared<T, A>: Send + Sync` 要求 `T: Send + Sync`），因此核心**不能**自己持有
+/// 运行时值——compio 后端的 `Runtime` 是 `!Send + !Sync`（内含线程本地执行器）。
+/// 于是「现在几点」的来源改由配置回答：核心只留**建连 epoch**（一个纯数据），
+/// 需要时刻时调 [`TrConnCfg::runtime`] 取一个运行时值（克隆句柄，廉价）。
+///
+/// 这也让后端选择**留在配置侧**：`DefaultConnCfg` 用 `abs_art-bridge` 的裸名
+/// （即集成方在 `Cargo.toml` 里选定的后端），测试配置可以换成假运行时值。
 pub trait TrConnCfg
 where
     Self: TrMuxConfig<Data = u8, Dock = Dock> + 'static,
 {
+    /// **运行时值**：提供「现在几点」（[`TrClock`]）与「怎么等」（[`TrDelay`]）。
+    ///
+    /// 它必须是 `TrTime`（= `TrClock + TrDelay`）且可 `Clone`——核心与五个循环各自
+    /// 克隆一份，因此各处看到的时刻来自**同一个**时间轴。
+    ///
+    /// [`TrClock`]: abs_art::TrClock
+    /// [`TrDelay`]: abs_art::TrDelay
+    type Rt: TrTime + Clone + 'static;
+
     /// 连接内部结构（帧暂存、注册表等）的分配器。
     type Alloc: AllocatorClone + Send + Sync;
-
-    /// **时刻来源**：保活（`PULSE`）、空闲超时与拆流宽限期都以它为准。
-    ///
-    /// # 为什么是配置的一部分
-    ///
-    /// 与 [`Self::Alloc`] / [`Self::Policy`] 同一条理由：它是「使用环境注入的策略」，
-    /// 不是连接自己能决定的东西。连接内部的协议时间一律记成**自建连时刻（epoch）起
-    /// 算的毫秒数**，因此换一个时钟就能把「空闲超时到点」这类判定从「掐真实时间」
-    /// 变成**确定性验收**。
-    ///
-    /// # 约束
-    ///
-    /// - [`Clock`]：时刻类型与 `now()`；
-    /// - `Clone`：同一个时钟值要被核心与五个循环共享（各持一份克隆）；
-    /// - `'static`：五个循环都是 `spawn_local` 出来的 `'static` 任务。
-    ///
-    /// 缺省实现见 [`DefaultConnCfg`]（用 [`SystemClock`]）；测试用假时钟只需给出一个
-    /// 零大小、由外部原子量驱动的实现。
-    type Clock: Clock + Clone + 'static;
 
     /// 流控策略。
     type Policy: TrFlowCtrlPolicy;
@@ -116,11 +117,15 @@ where
     /// [`TrMuxConfig::Buff`] 的约束保持同一层级。
     type StageBuff: 'static + BorrowMut<[MaybeUninit<u8>]>;
 
+    /// 取一个**运行时值**（克隆句柄；各处共享同一个时间轴与计时器）。
+    ///
+    /// 调用点可能不在任何运行时上下文内（例如在别的线程上 `bind_async`），因此
+    /// 实现必须交出**建连时就已经抓住**的那个值，而不是临场重建——compio 的
+    /// `Runtime::current()` 要求调用点已在上下文内，做不到这一点。
+    fn runtime(&self) -> Self::Rt;
+
     /// 取连接内部结构用的分配器（按值，`buffex` 的构建器按值接收）。
     fn allocator(&self) -> Self::Alloc;
-
-    /// 取时刻来源（按值；连接内部各持有者各拿一份克隆）。
-    fn clock(&self) -> Self::Clock;
 
     /// 取流控策略。
     fn policy(&self) -> &Self::Policy;
@@ -171,6 +176,10 @@ pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 /// [`MuxChanBuff`]（`accept_async_managed` 那条路要求缓冲类型与调用方给出的分配器
 /// 无关）。
 ///
+/// 泛型参数 `Rt` 是**运行时值**，默认取 `abs_art-bridge` 的裸名
+/// [`Runtime`](abs_art_bridge::Runtime)——即集成方在 `Cargo.toml` 里选定的后端
+/// （本仓缺省是 compio）。要用另一个后端或假运行时值，显式写出 `Rt` 即可。
+///
 /// # 为什么两块缓冲用不同的类型
 ///
 /// [`MuxConnection::new`] 要求 `C::StageBuff: Send + Sync`（帧暂存环的存储会在建连时
@@ -179,18 +188,21 @@ pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 /// `unsafe impl`；子流环则需要「分配器擦除」这一点，那条路不要求 `Send + Sync`。
 ///
 /// [`MuxConnection::new`]: crate::connection::MuxConnection::new
-pub struct DefaultConnCfg<W, R, P = DefaultPolicy> {
+pub struct DefaultConnCfg<W, R, P = DefaultPolicy, Rt = crate::connection::DefaultRt_> {
+    /// 运行时值（计时与时刻的来源），建连时抓住、此后按需克隆。
+    rt_: Rt,
     policy_: P,
     /// 连接侧两条半边的类型占位（它们只以类型形式参与）。
     _use_w_: PhantomData<fn() -> W>,
     _use_r_: PhantomData<fn() -> R>,
 }
 
-// `Clone` / `Copy` / `Debug` **手写**：结构里只有 `PhantomData` 与策略值，不该给
-// `W` / `R` 加上这些约束（环半部既不 `Clone` 也不 `Debug`）。
-impl<W, R, P: Clone> Clone for DefaultConnCfg<W, R, P> {
+// `Clone` / `Copy` / `Debug` **手写**：结构里只有 `PhantomData`、策略值与运行时值，
+// 不该给 `W` / `R` 加上这些约束（环半部既不 `Clone` 也不 `Debug`）。
+impl<W, R, P: Clone, Rt: Clone> Clone for DefaultConnCfg<W, R, P, Rt> {
     fn clone(&self) -> Self {
         DefaultConnCfg {
+            rt_: self.rt_.clone(),
             policy_: self.policy_.clone(),
             _use_w_: PhantomData,
             _use_r_: PhantomData,
@@ -198,11 +210,14 @@ impl<W, R, P: Clone> Clone for DefaultConnCfg<W, R, P> {
     }
 }
 
-impl<W, R, P: Copy> Copy for DefaultConnCfg<W, R, P> {}
+impl<W, R, P: Copy, Rt: Copy> Copy for DefaultConnCfg<W, R, P, Rt> {}
 
-impl<W, R, P: core::fmt::Debug> core::fmt::Debug for DefaultConnCfg<W, R, P> {
+impl<W, R, P: core::fmt::Debug, Rt: core::fmt::Debug> core::fmt::Debug
+    for DefaultConnCfg<W, R, P, Rt>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DefaultConnCfg")
+            .field("rt_", &self.rt_)
             .field("policy_", &self.policy_)
             .finish_non_exhaustive()
     }
@@ -212,24 +227,42 @@ impl<W, R, P> DefaultConnCfg<W, R, P>
 where
     P: TrFlowCtrlPolicy,
 {
-    /// 由流控策略造出配置。
+    /// 用**默认后端**的运行时值（`abs_art_bridge::current()`）与策略造出配置。
     ///
     /// `delivery` 原样交回：握手交付物与配置总是成对出现，调用方一行就能拿到两者，
     /// 因此这里不去拆它。
-    pub const fn new(
+    ///
+    /// # Panics
+    ///
+    /// 调用点不在所选后端的运行时上下文内时 panic（文案由 `abs_art` 各后端给出；
+    /// tokio 为「no reactor running」、compio 为「not in a compio runtime」）。
+    /// 需要显式控制运行时值时用 [`DefaultConnCfg::new_with_rt`]。
+    pub fn new(
         delivery: HandshakeDelivery<W, R>,
         policy: P,
     ) -> (HandshakeDelivery<W, R>, Self) {
+        Self::new_with_rt(delivery, policy, crate::connection::default_rt_())
+    }
+
+    /// 用**调用者给定**的运行时值与策略造出配置。
+    ///
+    /// 这是「特别的需要」那条接口：想在无上下文处建连、想用虚拟时钟、或想固定某个
+    /// 具名后端时，用本入口把运行时值显式传进来（它会被抓住，此后只在配置内部克隆）。
+    pub fn new_with_rt(
+        delivery: HandshakeDelivery<W, R>,
+        policy: P,
+        rt: super::DefaultRt_,
+    ) -> (HandshakeDelivery<W, R>, Self) {
         let cfg = DefaultConnCfg {
+            rt_: rt,
             policy_: policy,
             _use_w_: PhantomData,
             _use_r_: PhantomData,
-        };
-        (delivery, cfg)
+        };        (delivery, cfg)
     }
 }
 
-impl<W, R, P> TrMuxConfig for DefaultConnCfg<W, R, P>
+impl<W, R, P, Rt> TrMuxConfig for DefaultConnCfg<W, R, P, Rt>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
@@ -240,25 +273,26 @@ where
     type Buff = MuxChanBuff;
 }
 
-impl<W, R, P> TrConnCfg for DefaultConnCfg<W, R, P>
+impl<W, R, P, Rt> TrConnCfg for DefaultConnCfg<W, R, P, Rt>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
     P: TrFlowCtrlPolicy + 'static,
+    Rt: TrTime + Clone + 'static,
 {
+    type Rt = Rt;
     type Alloc = CoreAlloc;
-    type Clock = SystemClock;
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
     type StageBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn runtime(&self) -> Self::Rt {
+        self.rt_.clone()
     }
 
-    fn clock(&self) -> Self::Clock {
-        SystemClock
+    fn allocator(&self) -> Self::Alloc {
+        CoreAlloc
     }
 
     fn policy(&self) -> &Self::Policy {

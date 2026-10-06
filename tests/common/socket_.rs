@@ -10,6 +10,7 @@ use crate::common::{
     K_NET_BUFFER_SIZE,
     SmokeBuff,
     TrLocalScope,
+    TrSmokeRt,
     TrSmokeScope,
     make_passive_ring_,
     run_small_mux_scenario_,
@@ -33,7 +34,8 @@ use super::pump_::{pump_input_, pump_output_};
 ///
 /// 四个泵与场景用 `select` 并发推进（同一任务内轮询，不要求任何类型 `Send`）；
 /// 场景完成即丢弃泵 future，从而结束对设备（及其借用的 socket 半边）的借用。
-pub async fn run_socket_scenario_<IA, OA, IB, OB, S>(
+pub async fn run_socket_scenario_<IA, OA, IB, OB, S, RT>(
+    rt: &RT,
     scope: &S,
     input_a: IA,
     output_a: OA,
@@ -45,9 +47,10 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB, S>(
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     run_socket_scenario_with_(input_a, output_a, input_b, output_b, |a_tx, a_rx, b_tx, b_rx| {
-        run_smoke_scenario_::<_, _, _, _, S>(scope, a_tx, a_rx, b_tx, b_rx)
+        run_smoke_scenario_::<_, _, _, _, S, RT>(rt, scope, a_tx, a_rx, b_tx, b_rx)
     })
     .await
 }
@@ -55,7 +58,8 @@ pub async fn run_socket_scenario_<IA, OA, IB, OB, S>(
 
 /// 与 [`run_socket_scenario_`] 相同的传输装配，但跑**本轮验收用的小场景**
 /// （2 dock × 各 2 条 channel，双向收发 + 半关闭），见 [`run_small_mux_scenario_`]。
-pub async fn run_small_socket_scenario_<IA, OA, IB, OB, S>(
+pub async fn run_small_socket_scenario_<IA, OA, IB, OB, S, RT>(
+    rt: &RT,
     scope: &S,
     input_a: IA,
     output_a: OA,
@@ -67,6 +71,7 @@ pub async fn run_small_socket_scenario_<IA, OA, IB, OB, S>(
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
     S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
 {
     run_socket_scenario_with_(
         input_a,
@@ -74,7 +79,7 @@ pub async fn run_small_socket_scenario_<IA, OA, IB, OB, S>(
         input_b,
         output_b,
         |a_tx, a_rx, b_tx, b_rx| {
-            run_small_mux_scenario_::<_, _, _, _, S>(scope, a_tx, a_rx, b_tx, b_rx)
+            run_small_mux_scenario_::<_, _, _, _, S, RT>(rt, scope, a_tx, a_rx, b_tx, b_rx)
         },
     )
     .await

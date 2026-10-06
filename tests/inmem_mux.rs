@@ -11,20 +11,21 @@
 //! 这样既保留了「两个真实端点、双向并发、真实运行时任务」的全部连接层行为，
 //! 又把传输层的未知问题隔离在外。
 //!
-//! # 运行方式：作用域由调用方取得并驱动
+//! # 运行方式：运行时值与作用域由调用方取得并驱动
 //!
-//! 连接的五个循环经 `abs_art` 的 [`TrLocalScope`] **值**投递（不再有运行时类型
-//! 参数），因此每个用例自己做两件事：取得作用域、驱动它。tokio 用
-//! `scope.run_until(..)`，compio 的运行时自己驱动线程本地队列。
+//! 连接的五个循环经 `abs_art` 的 [`TrLocalScope`] **值**投递（作用域不再是连接的
+//! 类型参数），因此每个用例自己做三件事：取得**运行时值**、由它交出**作用域**、
+//! 驱动作用域。tokio 用 `scope.run_until(..)`，compio 的运行时自己驱动线程本地队列。
 //!
 //! # 为什么用 `single_runtime_test_!` 而不是 `dual_runtime_test_!`
 //!
-//! 第五个循环（保活 / 空闲超时）要**真正等一段时间**，而等待能力挂在后端类型上：
-//! tokio 与 compio 的 `LocalScope` 是两个类型。本文件因此按当前 feature 选作用域
-//! （见下面的 `LocalScope` 选择），并让每个用例只生成**一个**变体——两个 feature
-//! 组合各跑一遍，覆盖面与「两个变体」相同，但不会在一个运行时里拿到另一个后端的
-//! 作用域（那样第五个循环会 panic「no reactor running」）。理由详见
-//! `single_runtime_test_!` 的文档。
+//! 第五个循环（保活 / 空闲超时）要**真正等一段时间**，而等待能力与时刻来源挂在
+//! **运行时值**上：tokio 的 `Runtime` 与 compio 的 `Runtime` 是两个类型（它们的
+//! `LocalScope` 亦然）。本文件因此按当前 feature 选这一对值
+//! （见下面的 `Runtime` / `LocalScope` 选择与 `current_rt_`），并让每个用例只生成
+//! **一个**变体——两个 feature 组合各跑一遍，覆盖面与「两个变体」相同，但不会在一个
+//! 运行时里拿到另一个后端的运行时值（那样第五个循环会 panic「no reactor running」）。
+//! 理由详见 `single_runtime_test_!` 的文档。
 
 mod common;
 
@@ -57,13 +58,14 @@ macro_rules! yield_once_ {
 use abs_art::TrLocalScope;
 use abs_smux::conf::TrMuxConfig;
 use abs_smux::conn::{TrChannelListener, TrDockBinding};
-// 作用域类型随 feature 选：这两个后端的 `LocalScope` 各自提供计时能力，而第五个
-// 循环（保活 / 空闲超时）**必须**跑在真正支持计时的后端上。详见
-// `single_runtime_test_!` 的文档。
+// 运行时值类型随 feature 选：等待能力与时刻来源挂在**运行时值**上，而第五个
+// 循环（保活 / 空闲超时）**必须**跑在真正支持计时的后端上。`LocalScope` 不再能凭空
+// 构造（`LocalScope::new()` 已删除），只能由运行时值经 `local_scope()` 交出——它的
+// 具体类型因此不必在本文件里写出。
 #[cfg(feature = "test-tokio-runtime")]
-use abs_art_tokio::LocalScope;
+use abs_art_tokio::Runtime;
 #[cfg(not(feature = "test-tokio-runtime"))]
-use abs_art_compio::LocalScope;
+use abs_art_compio::Runtime;
 use abs_smux::conn::TrConnection;
 use buffex::x_deps::abs_buff::{Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite};
 use buffex::x_deps::anylr::SomeOf;
@@ -77,11 +79,32 @@ use smux_v1::{
     },
 };
 
+/// 取当前运行时的**运行时值**（按 feature 选后端）。
+///
+/// tokio 与 compio 各有一个 crate 级 `current()` 自由函数，返回类型已经是具体的
+/// `Runtime<FULL>`；之所以不写 `Runtime::current()`，是因为 `CAPS` 的默认值不参与
+/// 函数调用返回位置的推断（见 `abs_art_compio::Runtime::current` 的文档）。
+///
+/// # Panics
+///
+/// 调用点不在对应运行时的上下文内时 panic——本文件的调用点都在 `#[tokio::test]` /
+/// `#[compio::test]` 里，满足前提。
+#[cfg(feature = "test-tokio-runtime")]
+fn current_rt_() -> Runtime {
+    abs_art_tokio::current()
+}
+
+/// 见 tokio 版说明。
+#[cfg(not(feature = "test-tokio-runtime"))]
+fn current_rt_() -> Runtime {
+    abs_art_compio::current()
+}
+
 /// 测试目标（**本轮验收点**）：两个端点之间 2 个 dock × 各 2 条 channel 并发通信。
 ///
 /// - 手段：用 `make_passive_ring_` 建两条容量 64 KiB 的内存环（一条 A→B、一条
-///   B→A），取得一个 tokio `LocalScope` 并把它与四个半部一起交给
-///   [`common::run_small_mux_scenario_`]；后者完成握手、建立两个 `MuxConnection`
+///   B→A），取得当前运行时的**运行时值**并由它交出**作用域**，把两者与四个半部一起
+///   交给 [`common::run_small_mux_scenario_`]；后者完成握手、建立两个 `MuxConnection`
 ///   （内部各自经作用域 `spawn_local` 读 / 写循环），并在 `1..=2` 两个 dock 上并发
 ///   跑 4 条 open + 4 条 accept（每条子流使用互不相同的临时 local_dock），双向收发
 ///   后丢弃发送半边、在对端等 EOF。整个场景由 `scope.run_until` 驱动。
@@ -94,8 +117,9 @@ async fn mux_small_inmem_dual_() {
 
     // tokio 的本地队列归作用域值所有，由 `run_until` 驱动；连接在核心留了一份克隆
     // 保活，因此队列不会先于连接消失。
-    let scope = LocalScope::new();
-    let scenario = common::run_small_mux_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_small_mux_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_small_inmem_dual_);
@@ -112,8 +136,9 @@ async fn mux_single_byte_transport_dual_() {
     let (a_tx, b_rx) = common::make_passive_ring_(1usize);
     let (b_tx, a_rx) = common::make_passive_ring_(1usize);
 
-    let scope = LocalScope::new();
-    let scenario = common::run_small_mux_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_small_mux_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_single_byte_transport_dual_);
@@ -135,8 +160,9 @@ async fn mux_idle_small_write_inmem_dual_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scope = LocalScope::new();
-    let scenario = common::run_idle_small_write_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_idle_small_write_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_idle_small_write_inmem_dual_);
@@ -156,8 +182,9 @@ async fn mux_unsettled_handle_dual_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scope = LocalScope::new();
-    let scenario = common::run_unsettled_handle_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_unsettled_handle_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_unsettled_handle_dual_);
@@ -177,8 +204,9 @@ async fn mux_bind_is_exclusive_dual_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scope = LocalScope::new();
-    let scenario = common::run_bind_exclusivity_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_bind_exclusivity_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_bind_is_exclusive_dual_);
@@ -199,8 +227,9 @@ async fn mux_per_channel_alloc_dual_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scope = LocalScope::new();
-    let scenario = common::run_per_channel_alloc_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_per_channel_alloc_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_per_channel_alloc_dual_);
@@ -220,8 +249,9 @@ async fn mux_recv_dropped_dual_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scope = LocalScope::new();
-    let scenario = common::run_recv_dropped_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_recv_dropped_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_recv_dropped_dual_);
@@ -419,9 +449,10 @@ impl<H> Drop for DropProbeTx_<H> {
 ///   每次检查四个标志。
 /// - 判断：限定轮数内四个探针标志**全部置位**（两个循环都退出、传输都释放）；
 ///   超时未置位说明循环没有响应「连接被丢弃」，判为失败。
-async fn dropping_connection_stops_both_loops_dual_<S>(scope: &S)
+async fn dropping_connection_stops_both_loops_dual_<S, RT>(rt: &RT, scope: &S)
 where
     S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     let dropped: [Rc<Cell<bool>>; 4] = core::array::from_fn(|_| Rc::new(Cell::new(false)));
 
@@ -446,17 +477,16 @@ where
 
         let (a_stage_r, a_stage_w) = common::make_stage_buffs_();
         let (b_stage_r, b_stage_w) = common::make_stage_buffs_();
+        // 配置由运行时值构造（运行时值进配置，`TrConnCfg::Rt`）。
         let conn_a = MuxConnection::new(
-            scope,
             invited.expect("发起方握手应当成功"),
-            common::SmokeMuxConfig::new(),
+            common::SmokeMuxConfig::<_, _, _>::new(rt.clone()),
             a_stage_r,
             a_stage_w,
         );
         let conn_b = MuxConnection::new(
-            scope,
             accepted.expect("等待方握手应当成功"),
-            common::SmokeMuxConfig::new(),
+            common::SmokeMuxConfig::<_, _, _>::new(rt.clone()),
             b_stage_r,
             b_stage_w,
         );
@@ -485,10 +515,12 @@ where
 
     scope.run_until(scenario).await;
 }
-/// 见 [`dropping_connection_stops_both_loops_dual_`] 说明：本函数只是给 tokio 作用域类型做一次实例化。
+/// 见 [`dropping_connection_stops_both_loops_dual_`] 说明：本函数只是给当前 feature
+/// 选中的运行时值 / 作用域类型做一次实例化。
 async fn dropping_connection_stops_both_loops_body_tokio_() {
-    let scope = LocalScope::new();
-    dropping_connection_stops_both_loops_dual_(&scope).await;
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    dropping_connection_stops_both_loops_dual_(&rt, &scope).await;
 }
 single_runtime_test_!(dropping_connection_stops_both_loops_body_tokio_);
 
@@ -506,9 +538,10 @@ single_runtime_test_!(dropping_connection_stops_both_loops_body_tokio_);
 /// - 手段：与上一个用例同样的探针接线，但只丢弃 `conn_a`（以及它的句柄），
 ///   `conn_b` 继续存活；随后循环 `yield_now()` 让本地队列推进。
 /// - 判断：限定轮数内 **A 侧**两个探针标志全部置位；超时未置位即失败。
-async fn dropping_one_side_stops_its_loops_dual_<S>(scope: &S)
+async fn dropping_one_side_stops_its_loops_dual_<S, RT>(rt: &RT, scope: &S)
 where
     S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     let dropped: [Rc<Cell<bool>>; 4] = core::array::from_fn(|_| Rc::new(Cell::new(false)));
 
@@ -533,17 +566,16 @@ where
 
         let (a_stage_r, a_stage_w) = common::make_stage_buffs_();
         let (b_stage_r, b_stage_w) = common::make_stage_buffs_();
+        // 配置由运行时值构造（运行时值进配置，`TrConnCfg::Rt`）。
         let conn_a = MuxConnection::new(
-            scope,
             invited.expect("发起方握手应当成功"),
-            common::SmokeMuxConfig::new(),
+            common::SmokeMuxConfig::<_, _, _>::new(rt.clone()),
             a_stage_r,
             a_stage_w,
         );
         let conn_b = MuxConnection::new(
-            scope,
             accepted.expect("等待方握手应当成功"),
-            common::SmokeMuxConfig::new(),
+            common::SmokeMuxConfig::<_, _, _>::new(rt.clone()),
             b_stage_r,
             b_stage_w,
         );
@@ -564,10 +596,12 @@ where
 
     scope.run_until(scenario).await;
 }
-/// 见 [`dropping_one_side_stops_its_loops_dual_`] 说明：本函数只是给 tokio 作用域类型做一次实例化。
+/// 见 [`dropping_one_side_stops_its_loops_dual_`] 说明：本函数只是给当前 feature
+/// 选中的运行时值 / 作用域类型做一次实例化。
 async fn dropping_one_side_stops_its_loops_body_tokio_() {
-    let scope = LocalScope::new();
-    dropping_one_side_stops_its_loops_dual_(&scope).await;
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    dropping_one_side_stops_its_loops_dual_(&rt, &scope).await;
 }
 single_runtime_test_!(dropping_one_side_stops_its_loops_body_tokio_);
 
@@ -584,8 +618,9 @@ async fn mux_ring_rejected_dual_() {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scope = LocalScope::new();
-    let scenario = common::run_ring_rejected_scenario_(&scope, a_tx, a_rx, b_tx, b_rx);
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_ring_rejected_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_ring_rejected_dual_);
@@ -611,27 +646,45 @@ const K_MIN_STAGE_CAPACITY_: usize = 1usize;
 ///
 /// `Clone` / `Copy` / `Default` **手写**：结构里只有 `PhantomData`，不该给 `W` / `R`
 /// 加上这些约束（环端既不 `Clone` 也不 `Default`）。
-struct MinStageConfig_<W, R> {
+struct MinStageConfig_<W, R, RT> {
     _mark_: PhantomData<fn() -> (W, R)>,
+    /// 运行时值（`TrConnCfg::runtime` 要交出建连时抓住的那一个）。
+    rt_: RT,
 }
 
-impl<W, R> Clone for MinStageConfig_<W, R> {
+impl<W, R, RT: Clone> Clone for MinStageConfig_<W, R, RT> {
     fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<W, R> Copy for MinStageConfig_<W, R> {}
-
-impl<W, R> Default for MinStageConfig_<W, R> {
-    fn default() -> Self {
         MinStageConfig_ {
             _mark_: PhantomData,
+            rt_: self.rt_.clone(),
         }
     }
 }
 
-impl<W, R> TrMuxConfig for MinStageConfig_<W, R>
+impl<W, R, RT: Copy> Copy for MinStageConfig_<W, R, RT> {}
+
+impl<W, R, RT> MinStageConfig_<W, R, RT> {
+    /// 由运行时值构造。
+    pub fn new_(rt: RT) -> Self {
+        MinStageConfig_ {
+            _mark_: PhantomData,
+            rt_: rt,
+        }
+    }
+}
+
+impl<W, R, RT> common::TestConnCfg for MinStageConfig_<W, R, RT>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+    RT: common::TrSmokeRt,
+{
+    fn new_(rt: Self::Rt) -> Self {
+        MinStageConfig_::new_(rt)
+    }
+}
+
+impl<W, R, RT> TrMuxConfig for MinStageConfig_<W, R, RT>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
@@ -645,24 +698,25 @@ where
 static TINY_POLICY_: smux_v1::flow_ctrl::DefaultPolicy =
     smux_v1::flow_ctrl::DefaultPolicy;
 
-impl<W, R> TrConnCfg for MinStageConfig_<W, R>
+impl<W, R, RT> TrConnCfg for MinStageConfig_<W, R, RT>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
+    RT: common::TrSmokeRt,
 {
+    type Rt = RT;
     type Alloc = mm_ptr::x_deps::abs_mm::CoreAlloc;
-    type Clock = smux_v1::time::SystemClock;
     type Policy = smux_v1::flow_ctrl::DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
     type StageBuff = common::SmokeBuff;
 
-    fn allocator(&self) -> Self::Alloc {
-        mm_ptr::x_deps::abs_mm::CoreAlloc
+    fn runtime(&self) -> Self::Rt {
+        self.rt_.clone()
     }
 
-    fn clock(&self) -> Self::Clock {
-        smux_v1::time::SystemClock
+    fn allocator(&self) -> Self::Alloc {
+        mm_ptr::x_deps::abs_mm::CoreAlloc
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -711,31 +765,35 @@ where
 /// - 判断：open / accept 均成功；两端收到的载荷与对端发出的**逐字节相等**；半关闭后
 ///   读到 `Closing`（EOF）。任一不满足即 panic；实现若要求「读环能装下整帧」，本用例
 ///   会在等第一帧时互等（超时）而不是通过。
-async fn mux_min_stage_inmem_dual_<S>(scope: &S)
+async fn mux_min_stage_inmem_dual_<S, RT>(rt: &RT, scope: &S)
 where
     S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
 
-    let scenario = drive_min_stage_(scope, a_tx, a_rx, b_tx, b_rx);
+    let scenario = drive_min_stage_(rt, scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 
-/// 见 [`mux_min_stage_inmem_dual_`] 说明：本函数只是给 tokio 作用域类型做一次实例化。
+/// 见 [`mux_min_stage_inmem_dual_`] 说明：本函数只是给当前 feature 选中的运行时值 /
+/// 作用域类型做一次实例化。
 ///
 /// **本用例曾经必须 `#[ignore]`**：载荷一次性读取（`Demand::exactly(payload_len)`）在
 /// 1 字节环上直接拿到终态的 `Unsatisfiable`，整条连接失败且等待建流的 future 不再返回
 /// ——表现为**无声挂死**。载荷改为按底层段长流式搬入之后（`ReadCursor::read_async_`），
 /// 它已如设计所愿地通过，因此去掉 ignore 并取环原语的最小容量。
 async fn mux_min_stage_inmem_body_tokio_() {
-    let scope = LocalScope::new();
-    mux_min_stage_inmem_dual_(&scope).await;
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    mux_min_stage_inmem_dual_(&rt, &scope).await;
 }
 single_runtime_test_!(mux_min_stage_inmem_body_tokio_);
 
 /// 最小帧暂存场景的执行体：建连 + 一对子流的双向收发与半关闭。
-async fn drive_min_stage_<RA, WA, RB, WB, S>(
+async fn drive_min_stage_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
     scope: &S,
     tx_a: WA,
     rx_a: RA,
@@ -747,16 +805,17 @@ async fn drive_min_stage_<RA, WA, RB, WB, S>(
     RB: TrBuffRead<u8> + 'static,
     WB: TrBuffWrite<u8> + 'static,
     S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
 {
     let (conn_a, conn_b) = common::connect_pair_::<
-        MinStageConfig_<WA, RA>,
-        MinStageConfig_<WB, RB>,
+        MinStageConfig_<WA, RA, RT>,
+        MinStageConfig_<WB, RB, RT>,
         RA,
         WA,
         RB,
         WB,
         S,
-    >(scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
     .await;
 
     let dock_b = Dock::new(1u32);

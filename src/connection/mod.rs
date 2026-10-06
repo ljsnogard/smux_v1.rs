@@ -36,15 +36,15 @@
 //!
 //! ### 2.1 两个对象
 //!
-//! - **`MuxCore<C, S>`**（crate 内部类型，不对外导出）：连接的**演员核心**，持有
+//! - **`MuxCore<C, R>`**（crate 内部类型，不对外导出）：连接的**演员核心**，持有
 //!   全部共享状态——资源策略 `C`、握手协商结果、两个循环的取消令牌与身份索引
 //!   （包在 `ChannelRegistry_` 里）、两条事件通道的发送端，以及作用域值的保活槽。
 //!   对它的每一次访问都经内部读写锁串行化：**不使用 actor 框架，也不使用消息通道**。
 //!   它不持有 `Rx` / `Tx`——那两个半边在 `MuxConnection::new` 里就被移进循环。
 //! - **[`MuxConnection`]**：**对一个 `MuxCore` 的智能指针的薄封装**
-//!   （`mm_ptr::Shared<MuxCore<C, S>, C::Alloc>`）。`Clone` 一份就是多一个强引用，
+//!   （`mm_ptr::Shared<MuxCore<C, R>, C::Alloc>`）。`Clone` 一份就是多一个强引用，
 //!   分配走调用方注入的分配器。于是它可以被任意分发：存进结构体、传进函数、跨层
-//!   持有。公开类型因此是 `MuxConnection<C, S>`——参数是策略与作用域类型；
+//!   持有。公开类型因此是 `MuxConnection<C, R>`——参数是策略与**运行时值**；
 //!   **两个传输类型**由 `C::ConnTx` / `C::ConnRx` 声明（收发半边本身不在了，但
 //!   「这条连接建在什么传输上」这个类型级事实留下）。
 //!
@@ -376,10 +376,13 @@
 //!
 //! ## 6. 线程模型与本地作用域
 //!
-//! 连接**不暴露运行时类型参数**：两个 `local spawn` 所需的「本地队列」被 `abs_art`
-//! **值化**为 [`TrLocalScope`](abs_art::TrLocalScope) 的实现值（各后端的
-//! `LocalScope`），由调用方在 [`MuxConnection::new`] 时注入了核心（同时保活）。
-//! 于是：
+//! 连接**只暴露一个运行时值参数**：`R`（[`abs_art::TrTime`] 的实现值，例如
+//! `abs_art_tokio::Runtime<{ FULL }>`）——它既回答「现在几点」（`TrClock`）又回答
+//! 「怎么等」（`TrDelay`），二者**同源**，因此虚拟时间验收只需换掉这一个值。
+//!
+//! 本地队列**不进类型参数**：它以 [`TrLocalScope`](abs_art::TrLocalScope) 的实现值
+//! 形式只出现在 [`MuxConnection::new`] 的方法级泛型上，投递完五个循环之后由循环
+//! 各自持有一份克隆来保活队列。于是：
 //!
 //! - **「运行时支持」与「此刻真有一条被驱动的队列」两件事都被表达出来**——后者
 //!   曾是纯类型参数表达不了的环境前提（tokio 的 `LocalSet` 必须在上下文内才
@@ -389,8 +392,7 @@
 //!   见 §2.4）；
 //! - **调用方负责驱动队列**：tokio 用 `scope.run_until(..)` 包住整段使用期，
 //!   compio 由运行时自己驱动，smol 由 `LocalExecutor` 驱动。忘记驱动不会有编译
-//!   错误，症状是循环从不推进（连接静默无响应）。计时能力同样来自后端类型，
-//!   因此作用域值上还要 `TrTime`（三个后端的 `LocalScope` 都实现了它）。
+//!   错误，症状是循环从不推进（连接静默无响应）。
 //!
 //! 注意收发半边类型（`C::ConnTx` / `C::ConnRx`）由 [`TrConnCfg`] 声明，而不是作为
 //! [`MuxConnection`] 的公开泛型参数；它们在 `new` 里被移进循环 future 并被
@@ -400,10 +402,11 @@
 //! 与循环里统一投影为 [`MuxError::Transport`]（只保留读写方向），因此同一份失败
 //! 原因可以存进共享注册表，也可以直接返回给 API 面。
 //!
-//! 连接与句柄是否 `Send` 取决于**作用域类型**：compio 的作用域是零大小类型，因此
-//! `MuxConnection` 与各会话句柄在 compio 下都是 `Send`（`tests/thread_safety.rs`
-//! 把这条边界钉成可运行的断言）；tokio 的作用域含 `Rc<LocalSet>`，同一套公开类型
-//! 在那套装配下仍是 `!Send`。由此得到两条实现纪律：
+//! 连接与句柄是否 `Send` 取决于**运行时值**：tokio 的 `Runtime` 抓着
+//! `Handle`（`Send + Sync`），因此 tokio 装配下 `MuxConnection` 与各会话句柄可以
+//! 跨线程；compio 的 `Runtime` 持有线程绑定的运行时实例（`!Send`），同一套公开类型
+//! 在那套装配下因此仍是 `!Send`（`tests/thread_safety.rs` 把这条边界钉成可运行的
+//! 断言）。由此得到两条实现纪律：
 //!
 //! - 共享状态的争用一律**零 CPU 忙等**：协作式锁只走 `try_*` 快路径，失败则 park
 //!   等待许可释放；`Drop` 既不取锁也不阻塞，只投一条释放消息；
@@ -440,7 +443,9 @@
 //! ### 7.1 保活：只用一种 `PULSE` 帧
 
 //! `max_channel_timeout` 的**空闲超时由连接内部的第五个循环（计时循环）用
-//! `abs_art` 的 `TrTime` + 注入式 `Clock` 维持**，不要求调用方代为计时。接近超时时
+//! `abs_art` 的 `TrTime` 维持**——时刻与计时器都来自**同一个运行时值**，
+//! 因此虚拟时间下不会出现「睡在虚拟时钟、读在墙上时钟」的错配；不要求调用方
+//! 代为计时。接近超时时
 //! 的保活**只用一个帧种类** [`FrameKind::Pulse`]
 //! （早期设计里的 `PING` / `PONG` 两种已经取消）：
 
@@ -516,6 +521,7 @@ mod frame_parser_;
 mod mux_connection;
 mod owner_;
 pub(crate) mod ring_;
+mod scope_host_;
 mod session_;
 pub(crate) mod session_pump_;
 mod signal_;
@@ -537,5 +543,6 @@ pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
 pub(crate) use mux_connection::ReserveErr_;
 pub use ring_::{BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff};
+pub use scope_host_::{DefaultRt_, ScopeHost, default_rt_};
 pub use telegraph::{Telegraph, TelegraphError};
 pub use types_::Dock;
