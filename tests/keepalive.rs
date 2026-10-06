@@ -89,3 +89,53 @@ fn keepalive_pulses_tokio_() {
         keepalive_common::keepalive_pulses_(&timed),
     );
 }
+
+/// 测试目标、手段、判断见 [`keepalive_common::establish_timeout_on_initiator_`]。
+///
+/// 手段补充：同 [`idle_channel_times_out_tokio_`]，仍走虚拟时间。
+#[test]
+fn establish_timeout_on_initiator_tokio_() {
+    let rt = tokio_rt_();
+    let value: abs_art_bridge::TokioRuntime =
+        abs_art_bridge::TokioRuntime::with_handle(rt.handle().clone());
+    common::assert_runtime_is_(&value, abs_art_bridge::RuntimeTag::Tokio);
+    let scope = value.local_scope();
+    let clock = ManualClock::new();
+    let timed = ManualTime::new(value, clock.clone());
+    scope.block_on_advancing(
+        &clock,
+        keepalive_common::establish_timeout_on_initiator_(&timed),
+    );
+}
+
+/// 测试目标、手段、判断见 [`keepalive_common::establish_timeout_on_responder_`]。
+#[test]
+fn establish_timeout_on_responder_tokio_() {
+    let rt = tokio_rt_();
+    let value: abs_art_bridge::TokioRuntime =
+        abs_art_bridge::TokioRuntime::with_handle(rt.handle().clone());
+    common::assert_runtime_is_(&value, abs_art_bridge::RuntimeTag::Tokio);
+    let scope = value.local_scope();
+    let clock = ManualClock::new();
+    let timed = ManualTime::new(value, clock.clone());
+    scope.block_on_advancing(
+        &clock,
+        keepalive_common::establish_timeout_on_responder_(&timed),
+    );
+}
+
+/// 测试目标、手段、判断见 [`keepalive_common::cancel_accept_notifies_peer_`]。
+#[test]
+fn cancel_accept_notifies_peer_tokio_() {
+    let rt = tokio_rt_();
+    let value: abs_art_bridge::TokioRuntime =
+        abs_art_bridge::TokioRuntime::with_handle(rt.handle().clone());
+    common::assert_runtime_is_(&value, abs_art_bridge::RuntimeTag::Tokio);
+    let scope = value.local_scope();
+    let clock = ManualClock::new();
+    let timed = ManualTime::new(value, clock.clone());
+    scope.block_on_advancing(
+        &clock,
+        keepalive_common::cancel_accept_notifies_peer_(&timed),
+    );
+}

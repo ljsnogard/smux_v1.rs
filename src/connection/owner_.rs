@@ -121,6 +121,13 @@ const RX_CONSUMED: usize = 1usize << 10usize;
 const ESTABLISH_OUTCOME_SHIFT: usize = 11usize;
 const ESTABLISH_OUTCOME_MASK: usize = 0b11usize << ESTABLISH_OUTCOME_SHIFT;
 
+/// 建流是否已**裁决完毕**（本端 `accept` / `reject` 收尾）。
+///
+/// 计时循环据此区分同一根存活时钟上的两类到点（见 `TimerAction_`）：
+/// - **未裁决** ⇒ 建流超时：向对端发 `REJECT`、释放身份、把原因留在 `abort_` 上；
+/// - **已裁决** ⇒ 活跃子流空闲超时：`CLOSE(FIN)` + `CLOSE(RESET)` 拆流。
+const ESTABLISH_SETTLED: usize = 1usize << 13usize;
+
 /// 测试某个位。
 fn has_flag_(value: usize, flag: usize) -> bool {
     value & flag != 0usize
@@ -380,6 +387,18 @@ impl ChannelState_ {
     /// 「先查状态、再 poll」即可，不会丢唤醒。
     pub(crate) fn establish_poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.establish_.poll_wait_(cx)
+    }
+
+    /// 记下「本端已完成建流裁决」（`accept` / `reject` 收尾时置位）。幂等。
+    pub(crate) fn set_establish_settled_(&self) {
+        let _ = self
+            .flags_
+            .try_spin_compare_exchange_weak(|_| true, |value| value | ESTABLISH_SETTLED);
+    }
+
+    /// 建流是否已裁决完毕（见 [`ESTABLISH_SETTLED`]）。
+    pub(crate) fn establish_settled_(&self) -> bool {
+        has_flag_(self.flags_.value(), ESTABLISH_SETTLED)
     }
 
     /// 记录「已收到对端 `OPEN`」。
@@ -859,6 +878,11 @@ where
     loop {
         if cancel.is_cancelled() {
             return Result::Err(MuxError::Cancelled);
+        }
+        // 0. 建流阶段超时：计时循环已经认领（`claim_abort_`）并把原因记在共享状态上，
+        //    等待方据此**立刻**退出，而不是无限等到对端回帧。
+        if owner.is_aborted_() {
+            return Result::Err(MuxError::IdleTimeout);
         }
         // 1. 连接级失败优先（取注册表锁，可取消）。
         if let Result::Ok(Option::Some(err)) = reg.failure_(cancel.child_token()).await {

@@ -71,3 +71,48 @@ fn keepalive_pulses_compio_() {
         keepalive_common::keepalive_pulses_(&timed),
     );
 }
+
+/// 测试目标、手段、判断见 [`keepalive_common::establish_timeout_on_initiator_`]。
+#[test]
+fn establish_timeout_on_initiator_compio_() {
+    let rt = compio::runtime::Runtime::new().expect("建 compio 运行时应当成功");
+    let value: abs_art_bridge::CompioRuntime = abs_art_bridge::CompioRuntime::with_runtime(rt);
+    common::assert_runtime_is_(&value, abs_art_bridge::RuntimeTag::Compio);
+    let scope = value.local_scope();
+    let clock = ManualClock::new();
+    let timed = ManualTime::new(value, clock.clone());
+    scope.block_on_advancing(
+        &clock,
+        keepalive_common::establish_timeout_on_initiator_(&timed),
+    );
+}
+
+/// 测试目标、手段、判断见 [`keepalive_common::establish_timeout_on_responder_`]。
+#[test]
+fn establish_timeout_on_responder_compio_() {
+    let rt = compio::runtime::Runtime::new().expect("建 compio 运行时应当成功");
+    let value: abs_art_bridge::CompioRuntime = abs_art_bridge::CompioRuntime::with_runtime(rt);
+    common::assert_runtime_is_(&value, abs_art_bridge::RuntimeTag::Compio);
+    let scope = value.local_scope();
+    let clock = ManualClock::new();
+    let timed = ManualTime::new(value, clock.clone());
+    scope.block_on_advancing(
+        &clock,
+        keepalive_common::establish_timeout_on_responder_(&timed),
+    );
+}
+
+/// 测试目标、手段、判断见 [`keepalive_common::cancel_accept_notifies_peer_`]。
+#[test]
+fn cancel_accept_notifies_peer_compio_() {
+    let rt = compio::runtime::Runtime::new().expect("建 compio 运行时应当成功");
+    let value: abs_art_bridge::CompioRuntime = abs_art_bridge::CompioRuntime::with_runtime(rt);
+    common::assert_runtime_is_(&value, abs_art_bridge::RuntimeTag::Compio);
+    let scope = value.local_scope();
+    let clock = ManualClock::new();
+    let timed = ManualTime::new(value, clock.clone());
+    scope.block_on_advancing(
+        &clock,
+        keepalive_common::cancel_accept_notifies_peer_(&timed),
+    );
+}

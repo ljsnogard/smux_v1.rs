@@ -93,6 +93,12 @@
   `wait_establish_`（`channel_handle/handle_.rs:421`）。空闲超时只管**已登记**的子流。
 - **处置方向**：按本端策略加一个建流超时（与 `timer-mock-clock-and-generic-drop-…`
   §10.5 的裁决一致：本端自行决定，不进协议）。
+- **进展（2026-10-06）**：**子流建流**这一段已落地——超时沿用
+  `max_channel_timeout`（本端策略、不进协议），到点由连接代替调用方向对端回
+  `REJECT`，并把 `IdleTimeout` 直接交给调用方（`accept` / `reject` 返回它，或经
+  `ChannelHandle::abort_reason()` 查询）；裁决被取消时同样会向对端回 `REJECT`。
+  因果与实测见 `establish-timeout-20261006-2231.md`。**本条前半句仍未解决**：
+  连接级握手（`HandshakeAgent` 的 invite / listen）依旧没有超时。
 
 ### 2.7 默认参数的保守面
 

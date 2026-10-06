@@ -49,6 +49,10 @@ pub enum HandleError {
     FlowCtrl(FlowCtrlError),
 
     /// 本次操作被取消。
+    ///
+    /// 在建流裁决（`accept` / `reject`）上，取消**不是「什么都不做」**：只要本端已经
+    /// 参与过这条子流的建流（发出过 `OPEN`，或收到过对端的 `OPEN`），连接就已经向对端
+    /// 宣告了 `REJECT` 并释放身份——否则对端会永久悬在等裁决上。
     #[error("本次操作被取消")]
     Cancelled,
 
@@ -292,6 +296,24 @@ where
         let mut empty: &mut [u8] = &mut [];
         self.accept_async_managed(&mut empty, ring_cap).await
     }
+
+    /// 本条子流被**连接内部**主动中止的原因（若发生过）。
+    ///
+    /// # 什么时候会有值
+    ///
+    /// 目前只有一种原因：[`MuxError::IdleTimeout`]（`max_channel_timeout` 到点）。
+    /// 它覆盖两个阶段：
+    ///
+    /// - **建流尚未裁决**（本句柄还没走过 `accept_async` / `reject_async`）：计时循环
+    ///   已经向对端回过 `REJECT` 并释放了身份，同时把原因留在这里；之后调用方无论是
+    ///   走 [`Self::accept_async_managed`] / [`Self::accept_async_default`] 还是
+    ///   `reject_async`，都会**直接拿到这个超时错误**，而不是一个语义含糊的
+    ///   `Closed`（或一次注定失败的成功）。
+    /// - **已裁决之后**：与 [`ChannelTx::abort_reason`](super::ChannelTx::abort_reason)
+    ///   同源——两者读的是同一份共享状态，因此两条路得到的结论一致。
+    pub fn abort_reason(&self) -> Option<MuxError> {
+        self.accepted_owner_.abort_reason_()
+    }
 }
 
 impl<C> TrChannelHandle<C> for ChannelHandle<C>
@@ -388,6 +410,22 @@ where
     // 共享状态在登记身份时就建立了，句柄一直在本对象手里；不再有「挂 owner」这一步。
     let owner = handle.accepted_owner_.clone();
 
+    // 0. 建流阶段已经超时：计时循环早已向对端回过 `REJECT` 并释放了身份，这里只需把
+    //    超时结果告诉调用方——不再建流、也不再发 `OPEN` / `ACCEPT`。
+    if owner.is_aborted_() {
+        handle.settled_ = true;
+        return Result::Err(HandleError::Mux(MuxError::IdleTimeout));
+    }
+
+    // 0.1 取消已经到达：本端此刻还没发出任何建流帧，按角色收尾——发起方撤销本地预留
+    //    （对端不知道这条子流），响应方回 `REJECT`（对端的 `OPEN` 在登记时已经到达，
+    //    它正等裁决）。
+    if cancel.is_cancelled() {
+        abort_pending_(&conn, local, remote, handle.is_initiator_);
+        handle.settled_ = true;
+        return Result::Err(HandleError::Cancelled);
+    }
+
     // 1. 对端窗口通告：响应方在登记入向请求时已由读循环存下。
     if !handle.is_initiator_ {
         let report = match conn
@@ -397,6 +435,10 @@ where
         {
             Result::Ok(Option::Some(report)) => report,
             Result::Err(ReserveErr_::Cancelled) => {
+                // 对端已经在等裁决（它的 `OPEN` 正是登记入向请求的前提）：本端放弃时
+                // 必须回 `REJECT`，否则它会一直悬在 `wait_establish_` 上。
+                abort_pending_(&conn, local, remote, handle.is_initiator_);
+                handle.settled_ = true;
                 return Result::Err(HandleError::Cancelled);
             }
             _ => return Result::Err(HandleError::Mux(MuxError::Closed)),
@@ -418,9 +460,27 @@ where
         send_open_(&conn, local, remote, initial, message);
         // 对端的 `OPEN` 到达时，读循环会把它的接收窗口写进发送窗口；`ACCEPT` /
         // `REJECT` 到达时唤醒这里。
-        match wait_establish_(conn.core_().reg_(), &owner, cancel.child_token()).await? {
+        let outcome = match wait_establish_(conn.core_().reg_(), &owner, cancel.child_token()).await
+        {
+            Result::Ok(outcome) => outcome,
+            // 取消：本端已经发出 `OPEN`，对端可能已经回过 `OPEN` 甚至 `ACCEPT`，
+            // 因此必须主动宣告拒绝，否则两端对这条子流的认知会不一致。
+            Result::Err(MuxError::Cancelled) => {
+                reject_after_open_(&conn, local, remote);
+                handle.settled_ = true;
+                return Result::Err(HandleError::Cancelled);
+            }
+            // 建流阶段超时（`IdleTimeout`）或连接级失败：对端通知与身份释放都已经由
+            // 计时循环 / 连接收尾完成，这里只把结果交给调用方。
+            Result::Err(err) => {
+                handle.settled_ = true;
+                return Result::Err(HandleError::Mux(err));
+            }
+        };
+        match outcome {
             EstablishOutcome_::Accepted => {
                 handle.settled_ = true;
+                owner.set_establish_settled_();
                 Result::Ok((tx, rx))
             }
             EstablishOutcome_::Refused => {
@@ -429,16 +489,25 @@ where
                     .release_channel_(local, remote, cancel.child_token())
                     .await;
                 handle.settled_ = true;
+                owner.set_establish_settled_();
                 Result::Err(HandleError::Refused)
             }
         }
     } else {
+        // 取消已经到达：绝不能「已经取消却照发 `ACCEPT`」——那会让对端以为建流成功，
+        // 而调用方拿到的却是 `Cancelled`。此刻对端仍停在等裁决上，必须回 `REJECT`。
+        if cancel.is_cancelled() {
+            abort_pending_(&conn, local, remote, false);
+            handle.settled_ = true;
+            return Result::Err(HandleError::Cancelled);
+        }
         // 响应方：对端 `OPEN` 的窗口通告已在登记时存下（读循环存的）。
         let initial = handle.accepted_initial_window_;
         // 先回自己的 `OPEN`，再发 `ACCEPT`。
         send_open_(&conn, local, remote, initial, Vec::new());
         // `welcome` 的契约本轮按空载荷发出，记为遗留。
         let _ = welcome;
+        owner.set_establish_settled_();
         let _ = conn
             .core_()
             .w_events_()
@@ -581,6 +650,17 @@ where
     let conn = handle.conn_.clone();
     let local = handle.local_dock_;
     let remote = handle.remote_dock_;
+
+    // 建流阶段已经超时：超时结果优先——此刻「拒绝」已经没有可拒的对象，超时才是
+    // 调用方需要知道的结论。
+    if handle.accepted_owner_.is_aborted_() {
+        handle.settled_ = true;
+        return Result::Err(HandleError::Mux(MuxError::IdleTimeout));
+    }
+
+    // 取消只能截断「理由载荷」，**不能**让拒绝本身消失：先记下取消，照常把 `REJECT`
+    // 发出去，最后再把 `Cancelled` 交给调用方。
+    let cancelled = cancel.is_cancelled();
     let payload = read_available_into_vec_(
         reason,
         conn.core_().opts_().basic_opts.max_packet_size,
@@ -589,11 +669,15 @@ where
     .await;
     let written = payload.len();
     if handle.is_initiator_ {
+        // 发起方此刻还没发过 `OPEN`（`OPEN` 由 `accept_async` 发出）：撤销本地预留即可，
+        // 对端并不知道这条子流存在。
         let _ = conn
             .core_()
             .unreserve_channel_(local, remote, cancel.child_token())
             .await;
     } else {
+        // 响应方：对端正在等裁决，`REJECT` 必须发出去，否则它会一直悬在
+        // `wait_establish_` 上。
         let _ = conn
             .core_()
             .w_events_()
@@ -613,7 +697,40 @@ where
             .await;
     }
     handle.settled_ = true;
+    handle.accepted_owner_.set_establish_settled_();
+    if cancelled {
+        return Result::Err(HandleError::Cancelled);
+    }
     Result::Ok(written)
+}
+
+/// 建流**已经发出 `OPEN` 之后**本端放弃裁决（取消）：向对端宣告 `REJECT` 并释放身份。
+///
+/// 与 [`abort_pending_`] 只差一处前提：那个函数假设发起方**还没发过** `OPEN`（因此只需
+/// 撤销本地预留、不必回帧）；走到这里的发起方已经发过 `OPEN`，对端可能已经回过 `OPEN`
+/// 甚至已经 `accept` 完成——不回帧就会让对端永久悬在 `wait_establish_` 上。
+fn reject_after_open_<C>(conn: &MuxConnection<C>, local: Dock, remote: Dock)
+where
+    C: TrConnCfg,
+{
+    let core = conn.core_();
+    let _ = core.w_events_().try_send_event_(WriteEvent_::Control {
+        frame_: ControlFrame_::with_window_(
+            FrameKind::Reject,
+            0u8,
+            local,
+            remote,
+            Option::None,
+            Vec::new(),
+        ),
+    });
+    // 进拆流宽限期：对端可能已经在途的帧会被静默丢弃。
+    let _ = core
+        .reg_()
+        .post_session_event_(SessionEvent_::ReleaseChannel {
+            local_dock: local,
+            remote_dock: remote,
+        });
 }
 
 #[cfg(test)]

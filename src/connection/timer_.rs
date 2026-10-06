@@ -117,6 +117,18 @@ pub(crate) enum TimerAction_ {
         /// 对端 dock。
         remote_dock: Dock,
     },
+
+    /// 某条**建流尚未裁决**的子流超时：向对端回 `REJECT` 把它放走、释放本端身份，
+    /// 并把原因留在共享状态上供应用随后读取（见 `ChannelHandle::abort_reason`）。
+    ///
+    /// 它与 [`TimerAction_::Abort`] 共用同一根存活时钟与同一个 `max_channel_timeout`，
+    /// 差别只在「对端是不是还在等裁决」：还在等 ⇒ 必须回帧；已经建好 ⇒ 只关本端。
+    RejectEstablish {
+        /// 本端 dock。
+        local_dock: Dock,
+        /// 对端 dock。
+        remote_dock: Dock,
+    },
 }
 
 /// 计时循环本体。
@@ -325,6 +337,52 @@ where
                 local_dock: local,
                 remote_dock: remote,
             });
+            true
+        }
+
+        TimerAction_::RejectEstablish {
+            local_dock,
+            remote_dock,
+        } => {
+            let (local, remote) = (*local_dock, *remote_dock);
+
+            // 1. 先取状态句柄：身份一旦释放就取不到了，而下面还要用它唤醒建流等待方。
+            let owner = match shared
+                .reg_()
+                .channel_owner_(local, remote, cancel.child_token())
+                .await
+            {
+                Result::Ok(owner) => owner,
+                Result::Err(_) => return false,
+            };
+
+            // 2. 对端此刻一定在等裁决（发起方已发出 `OPEN`、响应方的 `OPEN` 已到达），
+            //    因此必须明确回一条 `REJECT` 把它放走——这正是本条与 `Abort` 的分界：
+            //    后者关掉的是一条对端早已在传数据的子流，对端不在等建流结果。
+            let reject = ControlFrame_::plain_(FrameKind::Reject, 0u8, local, remote);
+            if !w_events.try_send_event_(WriteEvent_::Control { frame_: reject }) {
+                return false;
+            }
+
+            // 3. 释放身份（进拆流宽限，让在途帧被静默丢弃）。此刻还没有环、也没有
+            //    数据流，因此不像 `Abort` 那样再投两条本地关闭事件。
+            let _ = shared
+                .reg_()
+                .release_channel_(
+                    local,
+                    remote,
+                    shared.conn_clock_().now_millis_(),
+                    cancel.child_token(),
+                )
+                .await;
+
+            // 4. 唤醒建流等待方：原因位已在扫描时经 `claim_abort_` 写下，它会读到
+            //    `IdleTimeout`。同一时刻把「已裁决」置上，免得同一根时钟在下一轮扫描
+            //    里再把它当成活跃子流拆一次。
+            if let Option::Some(owner) = owner {
+                owner.set_establish_settled_();
+                owner.notify_establish_();
+            }
             true
         }
     }

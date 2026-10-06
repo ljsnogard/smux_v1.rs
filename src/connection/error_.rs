@@ -51,8 +51,17 @@ pub enum MuxError {
     #[error("子流已关闭")]
     Closed,
 
-    /// 子流空闲超时：`max_channel_timeout` 内既无数据往来、也无保活应答。
-    #[error("子流空闲超时：保活无应答")]
+    /// 子流超时：`max_channel_timeout` 内既无数据往来、也无保活应答。
+    ///
+    /// 它覆盖**两个阶段**，判据都是同一根存活时钟（连接内毫秒）：
+    ///
+    /// - **建流尚未裁决**：对端还没回 `ACCEPT` / `REJECT`（本端是发起方），或本端还没
+    ///   裁决对端已经发出的 `OPEN`（本端是响应方）。此时连接会代替调用方**向对端回
+    ///   `REJECT`** 并把原因留下：正在等待的 `accept_async` 直接得到本错误，而已经拿到
+    ///   句柄、还没裁决的一侧之后调 `accept_async` / `reject_async` 也同样得到它；
+    /// - **已建立子流**：空闲超时拆流（`CLOSE(FIN)` + `CLOSE(RESET)`），应用侧两个半部
+    ///   经 `abort_reason()` 读到本错误。
+    #[error("子流超时：保活无应答或建流未裁决")]
     IdleTimeout,
 
     /// 该 dock 是保留取值，不能作为子流 dock。

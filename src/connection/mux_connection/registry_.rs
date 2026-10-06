@@ -1242,6 +1242,20 @@ where
                     full = true;
                     break;
                 }
+                // 建流**尚未裁决**：这是「建流超时」。它与活跃子流的空闲超时共用
+                // 同一根存活时钟与同一个 `max_channel_timeout`，但处置完全不同——
+                // 对端此刻正等裁决，必须回 `REJECT` 把它放走，而不是给一条还没有
+                // 数据的子流发 `FIN` / `RESET`。
+                if !owner.establish_settled_() {
+                    if owner.claim_abort_(AbortCode_::IdleTimeout) {
+                        actions[count] = TimerAction_::RejectEstablish {
+                            local_dock: key.0,
+                            remote_dock: key.1,
+                        };
+                        count += 1;
+                    }
+                    continue;
+                }
                 if owner.claim_abort_(AbortCode_::IdleTimeout) {
                     actions[count] = TimerAction_::Abort {
                         local_dock: key.0,
@@ -2001,9 +2015,12 @@ mod tests_ {
 
     /// 测试计时扫描按「保活阈值 → 存活到顶」两级推进，且每级只产出一次动作。
     ///
-    /// - 手段：登记一条子流（登记即打点 0 ms），以 `pulse = 500`、`timeout = 1000`
-    ///   依次在 `now = 0 / 499 / 500 / 999 / 1000 / 5000` 扫描，每次记录动作条数与
-    ///   下一次期限。
+    /// 本条验的是**已经裁决完毕**的子流：到点走「拆流」（`Abort`）。未裁决的建流到点
+    /// 走的是另一条路（`RejectEstablish`），由下一个用例单独钉住。
+    ///
+    /// - 手段：登记一条子流（登记即打点 0 ms）并把它标成「建流已裁决」，以
+    ///   `pulse = 500`、`timeout = 1000` 依次在 `now = 0 / 499 / 500 / 999 / 1000 /
+    ///   5000` 扫描，每次记录动作条数与下一次期限。
     /// - 判断：`0` 与 `499` 无动作、期限指向 500；`500` 恰好一条 `Pulse`、期限落到
     ///   1000；`999` 无动作；`1000` 恰好一条 `Abort`；已中止之后不再参与扫描
     ///   （无动作、期限为 `u64::MAX`）。
@@ -2015,6 +2032,13 @@ mod tests_ {
             registry.reserve_channel_t_(dock_a, dock_b).await.is_ok(),
             "登记子流应当成功"
         );
+        // 标记「建流已裁决」：否则到点会走建流超时那条路（对端还在等裁决 ⇒ 回 REJECT）。
+        let owner = registry
+            .channel_owner_(dock_a, dock_b, NonCancellableToken::new())
+            .await
+            .expect("取状态句柄应当成功")
+            .expect("刚登记的活跃子流应当有状态句柄");
+        owner.set_establish_settled_();
 
         let (count, next, full, _) = scan_(&registry, 0u64, 500u64, 1000u64).await;
         assert_eq!(count, 0usize, "刚登记不该有动作");
@@ -2055,6 +2079,39 @@ mod tests_ {
         assert_eq!(next, u64::MAX, "没有其它子流时没有需要等待的期限");
     }
     dual_runtime_test_!(timer_scan_walks_pulse_then_abort);
+
+    /// 测试**建流尚未裁决**的子流到点走「拒绝建流」而不是「拆流」。
+    ///
+    /// 对端此刻正等裁决（发起方等 `ACCEPT` / `REJECT`，响应方的 `OPEN` 已到本端），
+    /// 因此处置必须是「回 `REJECT` + 释放身份 + 留下原因」，而不是给一条还没有数据的
+    /// 子流发 `FIN` / `RESET`。
+    ///
+    /// - 手段：登记一条子流后**不**置「建流已裁决」，在 `now = 1000`（`timeout = 1000`）
+    ///   扫一次，再在 `now = 5000` 扫一次。
+    /// - 判断：第一次恰好一条 `RejectEstablish`（指向该 dock 对）；第二次无动作——
+    ///   `claim_abort_` 已经认领过，不重复投递。
+    async fn timer_scan_rejects_unsettled_establish_on_timeout() {
+        let registry = make_scan_registry_();
+        let dock_a = Dock::new(1u32);
+        let dock_b = Dock::new(9u32);
+        assert!(
+            registry.reserve_channel_t_(dock_a, dock_b).await.is_ok(),
+            "登记子流应当成功"
+        );
+
+        let (count, _, _, actions) = scan_(&registry, 1000u64, 500u64, 1000u64).await;
+        assert_eq!(count, 1usize, "未裁决的建流到点应当产出一条动作");
+        assert!(matches!(
+            actions[0],
+            TimerAction_::RejectEstablish { local_dock, remote_dock }
+                if local_dock == dock_a && remote_dock == dock_b
+        ));
+
+        let (count, next, _, _) = scan_(&registry, 5000u64, 500u64, 1000u64).await;
+        assert_eq!(count, 0usize, "已经认领过的建流超时不应重复投递");
+        assert_eq!(next, u64::MAX, "它已经退出扫描");
+    }
+    dual_runtime_test_!(timer_scan_rejects_unsettled_establish_on_timeout);
 
     /// 测试**收到对端 `PULSE` 不会让本端少发一条**——保活能收敛的关键。
     ///

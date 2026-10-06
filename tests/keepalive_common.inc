@@ -36,16 +36,19 @@
 //! | --- | --- |
 //! | [`idle_channel_times_out_`] | **对端静默**时本端在 `max_channel_timeout` 后拆掉该子流并报 `IdleTimeout`；**连接本身不死**（同连接上还能再建流收发）；对端只看到一次正常关闭 |
 //! | [`keepalive_pulses_`] | **两端都活着**时，`timeout/2` 的 `PULSE` 往返足以让完全空闲的子流无限期活下去 |
+//! | [`establish_timeout_on_initiator_`] | **建流未裁决**的发起方：对端迟迟不裁决时在 `max_channel_timeout` 后拿到 `IdleTimeout`，不再无限等 |
+//! | [`establish_timeout_on_responder_`] | **建流未裁决**的响应方：超时后连接代它向对端回 `REJECT`（对端拿到 `Refused`），它自己之后调 `accept_async` 直接拿到 `IdleTimeout` |
+//! | [`cancel_accept_notifies_peer_`] | 带取消令牌的 `accept_async` 在裁决完成前被取消：调用方拿到 `Cancelled`，**同时**对端收到 `REJECT`（拿到 `Refused`），不会悬着 |
 
-use core::time::Duration;
+use core::{future::IntoFuture, time::Duration};
 
 use abs_smux::{
-    chan::TrChannelHalf,
+    chan::{TrChannelHalf, TrChannelHandle},
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use futures::join;
-use mm_ptr::x_deps::abs_mm::CoreAlloc;
+use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
 use smux_v1::{
     connection::{
         BufferedRx, BufferedTx, ChannelRx, ChannelTx, Dock, MuxConnection, MuxError, TrConnCfg,
@@ -57,9 +60,12 @@ use smux_v1::{
     time::TrClock,
 };
 
+use buffex::x_deps::abs_cancel::{CancelledToken, TrMayCancel};
+use smux_v1::connection::HandleError;
+
 use crate::common::{
-    K_CHANNEL_CAPACITY, K_NET_BUFFER_SIZE, SmokeBuff, SmokeConn, SmokeMuxConfig, TrSmokeRt,
-    make_passive_ring_, read_channel_exact_, write_channel_all_,
+    ClosurePrepare, K_CHANNEL_CAPACITY, K_NET_BUFFER_SIZE, SmokeBuff, SmokeConn, SmokeMuxConfig,
+    TrSmokeRt, make_passive_ring_, read_channel_exact_, write_channel_all_,
 };
 
 // ── 具体类型：两条环由同一个构造器造出，因此两端传输类型相同 ────────────────
@@ -415,4 +421,262 @@ where
     // 「一直空闲」的子流仍然可用。
     round_trip_(&mut tx_a, &mut rx_b, b"still-alive-a-to-b").await;
     round_trip_(&mut tx_b, &mut rx_a, b"still-alive-b-to-a").await;
+}
+
+
+// ── 用例三：建流未裁决 —— 发起方一侧超时 ────────────────────────────────────
+
+/// 测试目标：**发起方**发出 `OPEN` 之后对端迟迟不裁决（listener 不 accept）时，
+/// `max_channel_timeout` 到点必须让它拿到明确的超时错误，而不是永久悬在等裁决上。
+///
+/// - 手段：A 侧超时 1 秒、B 侧 1 小时；B 只建 listener **不** accept；A 的
+///   `accept_async_managed`（它内部才发 `OPEN` 并等裁决）与 `virtual_sleep_(1.6s)`
+///   竞速推进。
+/// - 判断：竞速必须由「建流 future 完成」取胜，且错误是
+///   `HandleError::Mux(MuxError::IdleTimeout)`；句柄上的 `abort_reason()` 同样是它。
+pub async fn establish_timeout_on_initiator_<RT>(rt: &RT)
+where
+    RT: TrSmokeRt + smux_v1::connection::ScopeHost,
+{
+    let (a_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    let (conn_a, conn_b) =
+        connect_asymmetric_(rt, a_tx, a_rx, b_tx, b_rx, K_TIMEOUT, K_SILENT_TIMEOUT).await;
+
+    // B 只监听、不 accept：因此它不会回 `OPEN`，也不会回 `ACCEPT` / `REJECT`。
+    let dock_b = Dock::new(2u32);
+    let _listener_b = conn_b
+        .bind_async(dock_b)
+        .await
+        .expect("B 侧绑定监听 dock 应当成功")
+        .listen_async()
+        .await
+        .expect("B 侧建立 listener 应当成功");
+
+    let dock_a = Dock::new(0x2100u32);
+    let mut handle_a = conn_a
+        .bind_async(dock_a)
+        .await
+        .expect("A 侧绑定发起 dock 应当成功");
+    let mut message: &[u8] = &[];
+    let mut handle_a = handle_a
+        .open_channel_async(dock_b, &mut message)
+        .await
+        .expect("A 侧本地登记应当成功");
+
+    let mut welcome_a_buf: [u8; 0] = [];
+    let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+    {
+        let accept_fut = handle_a.accept_async_managed(&mut welcome_a, K_CHANNEL_CAPACITY);
+        futures::pin_mut!(accept_fut);
+        // 先推几轮让 `OPEN` 发出去并进入等待。
+        for _ in 0..8 {
+            yield_once_().await;
+        }
+        let sleep_fut = virtual_sleep_(rt, Duration::from_millis(1600u64));
+        futures::pin_mut!(sleep_fut);
+        match futures::future::select(accept_fut.as_mut(), sleep_fut).await {
+            futures::future::Either::Left((outcome, _)) => match outcome {
+                Result::Err(HandleError::Mux(MuxError::IdleTimeout)) => {}
+                Result::Err(err) => {
+                    panic!("发起方建流超时应得到 IdleTimeout，实际错误：{err:?}")
+                }
+                Result::Ok(_) => panic!("建流超时时不应成功拿到两个半部"),
+            },
+            futures::future::Either::Right(((), _)) => panic!(
+                "建流超时未生效：虚拟时间已过 1.6s，发起方仍停在等裁决上"
+            ),
+        }
+    }
+    assert_eq!(
+        handle_a.abort_reason(),
+        Option::Some(MuxError::IdleTimeout),
+        "建流超时的原因应当留在句柄上，供调用方随时查"
+    );
+}
+
+// ── 用例四：建流未裁决 —— 响应方一侧超时（并代它通知对端） ──────────────────
+
+/// 测试目标：**响应方**收到对端 `OPEN` 之后迟迟不裁决时：
+/// (1) 本端超时会**代它向对端回 `REJECT`**，对端因此拿到 `Refused`（不悬着）；
+/// (2) 它自己之后调 `accept_async` 直接拿到 `IdleTimeout`，而不是 `Closed`
+///     或一次注定无效的成功。
+///
+/// - 手段：A 侧超时 1 小时、B 侧超时 1 秒；A 发 `OPEN` 并等裁决，B 取到入向句柄后
+///   **不裁决**；推进虚拟时间越过 B 侧超时，再让 B 调 `accept_async_managed`。
+/// - 判断：A 侧先得到 `HandleError::Refused`；B 侧随后得到
+///   `HandleError::Mux(MuxError::IdleTimeout)`，且 `abort_reason()` 与之相同。
+pub async fn establish_timeout_on_responder_<RT>(rt: &RT)
+where
+    RT: TrSmokeRt + smux_v1::connection::ScopeHost,
+{
+    let (a_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    // A 侧超时 1 小时（不主动拆），B 侧超时 1 秒（要它超时）。
+    let (conn_a, conn_b) =
+        connect_asymmetric_(rt, a_tx, a_rx, b_tx, b_rx, K_SILENT_TIMEOUT, K_TIMEOUT).await;
+
+    let dock_b = Dock::new(2u32);
+    let mut listener_b = conn_b
+        .bind_async(dock_b)
+        .await
+        .expect("B 侧绑定监听 dock 应当成功")
+        .listen_async()
+        .await
+        .expect("B 侧建立 listener 应当成功");
+
+    let dock_a = Dock::new(0x2200u32);
+    let mut handle_a = conn_a
+        .bind_async(dock_a)
+        .await
+        .expect("A 侧绑定发起 dock 应当成功");
+    let mut message: &[u8] = &[];
+    let mut handle_a = handle_a
+        .open_channel_async(dock_b, &mut message)
+        .await
+        .expect("A 侧本地登记应当成功");
+
+    let mut welcome_a_buf: [u8; 0] = [];
+    let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+    let accept_a = handle_a.accept_async_managed(&mut welcome_a, K_CHANNEL_CAPACITY);
+    futures::pin_mut!(accept_a);
+
+    // ① A 发 `OPEN`、B 取到入向句柄：两者竞速，B 一侧先完成。
+    let mut handle_b = {
+        let income_b = listener_b.income_async().into_future();
+        futures::pin_mut!(income_b);
+        match futures::future::select(accept_a.as_mut(), income_b).await {
+            futures::future::Either::Left((_outcome, _)) => {
+                panic!("B 侧还没取到入向请求，A 侧不应先完成")
+            }
+            futures::future::Either::Right((handle, _)) => {
+                handle.expect("B 侧应当取到入向建流请求")
+            }
+        }
+    };
+
+    // ② B 不裁决：推进虚拟时间越过它那 1 秒超时（同时推进 A 的等待）。
+    {
+        let sleep_fut = virtual_sleep_(rt, Duration::from_millis(1600u64));
+        futures::pin_mut!(sleep_fut);
+        match futures::future::select(accept_a.as_mut(), sleep_fut).await {
+            futures::future::Either::Left((outcome, _)) => match outcome {
+                Result::Err(HandleError::Refused) => {}
+                Result::Err(err) => panic!("A 侧应当收到 B 超时代发的 REJECT（Refused），实际：{err:?}"),
+                Result::Ok(_) => panic!("A 侧不应在建流超时后拿到两个半部"),
+            },
+            futures::future::Either::Right(((), _)) => {
+                panic!("B 侧建流超时之后没有把 REJECT 发给对端：A 侧仍在等")
+            }
+        }
+    }
+
+    // ③ B 之后才裁决：超时结果直接交给调用方。
+    let mut welcome_b_buf: [u8; 0] = [];
+    let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
+    match handle_b
+        .accept_async_managed(&mut welcome_b, K_CHANNEL_CAPACITY)
+        .await
+    {
+        Result::Err(HandleError::Mux(MuxError::IdleTimeout)) => {}
+        Result::Err(err) => panic!("建流已超时的响应方 accept 应得 IdleTimeout，实际：{err:?}"),
+        Result::Ok(_) => panic!("建流已超时的响应方 accept 不应成功"),
+    }
+    assert_eq!(
+        handle_b.abort_reason(),
+        Option::Some(MuxError::IdleTimeout),
+        "响应方句柄上也应当读得到超时原因"
+    );
+}
+
+// ── 用例五：带取消令牌的 accept 被取消 ⇒ 调用者 Cancelled、对端收到 REJECT ──
+
+/// 测试目标：`accept_async` 带取消令牌、且在裁决真正完成之前收到取消信号时：
+/// (1) 调用方得到 `HandleError::Cancelled`；
+/// (2) 连接**同时**向对端宣告了 `REJECT`——对端拿到 `Refused`，不会悬在等裁决上。
+///
+/// - 手段：两侧超时都取 1 小时（本用例的时间尺度内不允许超时插手）；A 发 `OPEN` 并
+///   等裁决，B 取到入向句柄后用**已经处于取消态**的令牌（[`CancelledToken`]）做
+///   `accept_async`，两支并发推进（`join!`）。
+/// - 判断：B 侧得到 `Cancelled`；A 侧得到 `Refused`。
+pub async fn cancel_accept_notifies_peer_<RT>(rt: &RT)
+where
+    RT: TrSmokeRt + smux_v1::connection::ScopeHost,
+{
+    let (a_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
+    let (conn_a, conn_b) = connect_asymmetric_(
+        rt,
+        a_tx,
+        a_rx,
+        b_tx,
+        b_rx,
+        K_SILENT_TIMEOUT,
+        K_SILENT_TIMEOUT,
+    )
+    .await;
+
+    let dock_b = Dock::new(2u32);
+    let mut listener_b = conn_b
+        .bind_async(dock_b)
+        .await
+        .expect("B 侧绑定监听 dock 应当成功")
+        .listen_async()
+        .await
+        .expect("B 侧建立 listener 应当成功");
+
+    let dock_a = Dock::new(0x2300u32);
+    let mut handle_a = conn_a
+        .bind_async(dock_a)
+        .await
+        .expect("A 侧绑定发起 dock 应当成功");
+    let mut message: &[u8] = &[];
+    let mut handle_a = handle_a
+        .open_channel_async(dock_b, &mut message)
+        .await
+        .expect("A 侧本地登记应当成功");
+
+    let mut welcome_a_buf: [u8; 0] = [];
+    let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+    let (outcome_a, outcome_b) = join!(
+        async {
+            // A：发 `OPEN` 并等裁决（B 取消后回 `REJECT` ⇒ 这里得到 `Refused`）。
+            handle_a
+                .accept_async_managed(&mut welcome_a, K_CHANNEL_CAPACITY)
+                .await
+        },
+        async {
+            // B：取到入向句柄，然后带**已经取消**的令牌做最终裁决。
+            let mut handle_b = listener_b
+                .income_async()
+                .await
+                .expect("B 侧应当取到入向建流请求");
+            let mut welcome_b_buf: [u8; 0] = [];
+            let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
+            let tx_buff: SmokeBuff = Owned::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc);
+            let rx_buff: SmokeBuff = Owned::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc);
+            let prep = ClosurePrepare::new(move || (tx_buff, rx_buff));
+            let outcome = handle_b
+                .accept_async(&mut welcome_b, prep)
+                .may_cancel_with(CancelledToken)
+                .await;
+            assert_eq!(
+                handle_b.abort_reason(),
+                Option::None,
+                "本用例靠取消收尾，不该出现超时原因"
+            );
+            outcome
+        },
+    );
+
+    match outcome_b {
+        Result::Err(HandleError::Cancelled) => {}
+        Result::Err(err) => panic!("取消的 accept 应得 Cancelled，实际：{err:?}"),
+        Result::Ok(_) => panic!("取消的 accept 不应成功"),
+    }
+    match outcome_a {
+        Result::Err(HandleError::Refused) => {}
+        Result::Err(err) => panic!("对端应当收到 REJECT（Refused），实际：{err:?}"),
+        Result::Ok(_) => panic!("对端不应在取消场景下拿到两个半部"),
+    }
 }
