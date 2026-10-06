@@ -2029,7 +2029,19 @@ where
     if available == 0 {
         return Result::Ok(false);
     }
-    let want = core::cmp::min(available as usize, K_MAX_DATA_CHUNK);
+    // **每轮最多搬「一个帧装得下的量」**：帧总长必须 ≤ 协商的 `max_packet_size`，而帧头
+    // 最长 `K_MAX_FRAME_HEADER`。这一收敛是必须的，不是优化：应用完全可能一口气把发送环
+    // 写满（一次积压远超一个帧），下面的帧总长检查只是**兜底**，不该成为「应用一次写多了」
+    // 的出口——少了这一收敛，一次正常的大写入会被判 `FrameTooLarge`、整条连接失败，而
+    // 连接级失败不会唤醒在册子流，应用侧看到的是**挂死**（0 CPU）。
+    // 回归用例：`tests/inmem_mux.rs` 的 `mux_frame_cap_burst_dual_`；
+    // 因果与真机现场见 `dev-notes/frame-cap-20261007-0540.md`。
+    let payload_cap = shared.max_packet_size_.saturating_sub(K_MAX_FRAME_HEADER);
+    if payload_cap == 0usize {
+        // 协商出的帧总长连一个帧头都装不下：这是真正的非法协商，按协议错误处理。
+        return Result::Err(MuxError::FrameTooLarge);
+    }
+    let want = core::cmp::min(available as usize, K_MAX_DATA_CHUNK.min(payload_cap));
 
     // 借一段数据。**必须用非阻塞的 `try_read`**：`read_async` 在空环上会 park，
     // 而这里一旦 park 就再也看不到事件通道里的事件（多子流下直接死锁）。等待新数据

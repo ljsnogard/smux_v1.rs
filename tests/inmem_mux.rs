@@ -168,6 +168,30 @@ async fn mux_idle_small_write_inmem_dual_() {
 }
 single_runtime_test_!(mux_idle_small_write_inmem_dual_);
 
+/// 测试目标（**帧上限回归**）：发送环里**一次积压超过一个帧装得下的量**时，写路径必须
+/// 把它拆成多个 `DATA` 帧送出，而不是判 `FrameTooLarge` 让连接失败。
+///
+/// - 背景：写循环每次只搬一个逻辑读段（上界 16 KiB），却在搬之前检查
+///   `段长 + 帧头 > max_packet_size`；缺省 `max_packet_size = 4096`、帧头上界 64，
+///   因此「一次积压 > 4032 字节」就会被判非法帧。连接级失败又不唤醒在册子流，
+///   应用侧表现为 0 CPU 挂死（跨进程真机上搬 8 MiB 必然踩到）。
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_frame_cap_scenario_`]：子流环容量 8 KiB，A **一次**写入 6 KiB
+///   （> 4032），B 在「让出 4096 轮仍无进展即 panic」的看门狗里读满并逐字节比对，
+///   随后双向半关闭等 EOF。场景由 `scope.run_until` 驱动。
+/// - 判断：B 读到完整且逐字节相等的载荷、双向读到 EOF。修复前本用例以看门狗 panic
+///   失败（挂死），修复后应当通过。
+async fn mux_frame_cap_burst_dual_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_frame_cap_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+single_runtime_test_!(mux_frame_cap_burst_dual_);
+
 /// 测试目标（**本轮验收点**）：**最终裁决**（`accept_async`）成为建流的唯一提交点
 /// ——在它之前丢弃半建立句柄，两个角色都不留垃圾、不悬着对端。
 ///
