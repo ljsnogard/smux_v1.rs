@@ -56,6 +56,7 @@ use crate::{
     },
     flow_ctrl::WindowReport,
     handshake::opts::HandshakeOpts,
+    metrics::{ConnCloseReason, TrMetricsSink},
 };
 
 /// 复用连接的**演员核心**：连接的全部共享状态与全部资源句柄。
@@ -326,6 +327,23 @@ where
     /// 是跨线程收尾的前提：最后一个句柄可能在任意线程上被丢弃。计时循环也在这份
     /// 令牌上竞争，因此它不会在连接析构后继续持有状态。
     fn drop(&mut self) {
+        // 上报连接关闭。**它必须在本函数里完成**，因此 sink 的方法必须同步、非阻塞、
+        // 不 panic、不隐式分配——`Drop` 的硬纪律见本类型文档与 [`crate::metrics`]
+        // 模块文档的「硬契约」。
+        //
+        // 关闭原因来自注册表的**锁外**快照（`fail_kind_`）：本函数不能取锁。
+        // 时刻取自配置的运行时值——`TrConnCfg::runtime` 的契约保证交出的正是建连时
+        // 抓住的那一个，读时刻不需要重新进入运行时上下文。
+        //
+        // 注意这里是**无条件**取一次时刻：没有 `Option` 短路之后，即使 sink 是静默的
+        // `NoMetrics`，这次时钟读也会发生。它落在收尾路径上、每条连接只发生一次，
+        // 因此可以接受；换成「按需才读」反而要把判空重新引回调用点。
+        self.config_.metrics().on_conn_closed(
+            self.reg_
+                .fail_kind_()
+                .unwrap_or(ConnCloseReason::Local),
+            self.now_millis_(),
+        );
         for token in &self.loops_ {
             token.cancel_();
         }

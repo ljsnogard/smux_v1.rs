@@ -77,6 +77,7 @@ use smux_v1::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
     },
+    metrics::NoMetrics,
 };
 
 /// 取当前运行时的**运行时值**（按 feature 选后端）。
@@ -710,6 +711,7 @@ where
     type ConnTx = W;
     type ConnRx = R;
     type StageBuff = common::SmokeBuff;
+    type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
         self.rt_.clone()
@@ -721,6 +723,11 @@ where
 
     fn policy(&self) -> &Self::Policy {
         &TINY_POLICY_
+    }
+
+    /// 本配置不上报；带 sink 的端到端用例见 `tests/metrics_e2e.rs`。
+    fn metrics(&self) -> &Self::Metrics {
+        &NoMetrics
     }
 
     fn make_ring_buffs(

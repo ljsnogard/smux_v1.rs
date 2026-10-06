@@ -27,6 +27,7 @@ use crate::{
     },
     flow_ctrl::DefaultPolicy,
     handshake::opts::{BasicOpts, HandshakeOpts},
+    metrics::NoMetrics,
 };
 
 /// 测试用的**假运行时值**：时刻恒为 0，`delay` 永不就绪。
@@ -127,6 +128,7 @@ impl TrConnCfg for TestMuxConfig_ {
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
     type StageBuff = TestBuff;
+    type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
         NullRt_
@@ -138,6 +140,11 @@ impl TrConnCfg for TestMuxConfig_ {
 
     fn policy(&self) -> &Self::Policy {
         &TEST_POLICY_
+    }
+
+    /// 测试配置不上报；`metrics` feature 与集成测试另有专用的带 sink 配置。
+    fn metrics(&self) -> &Self::Metrics {
+        &NoMetrics
     }
 
     fn make_ring_buffs(
@@ -180,6 +187,7 @@ impl TrConnCfg for ErasedTestMuxConfig_ {
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
     type StageBuff = MuxChanBuff;
+    type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
         NullRt_
@@ -191,6 +199,11 @@ impl TrConnCfg for ErasedTestMuxConfig_ {
 
     fn policy(&self) -> &Self::Policy {
         &TEST_POLICY_
+    }
+
+    /// 测试配置不上报；`metrics` feature 与集成测试另有专用的带 sink 配置。
+    fn metrics(&self) -> &Self::Metrics {
+        &NoMetrics
     }
 
     fn make_ring_buffs(

@@ -57,6 +57,7 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         session_::{ByteLoopShared_, Took_, race_cancel_, took_},
     },
+    metrics::{FrameDir, TrMetricsSink},
 };
 
 
@@ -88,9 +89,10 @@ where
 }
 
 /// 泵循环的连接级失败处理：**取消导致的收尾不算失败**（与内侧两个循环同义）。
-pub(crate) async fn fail_pump_<A, K>(shared: &ByteLoopShared_<A>, cancel: &K, err: &MuxError)
+pub(crate) async fn fail_pump_<A, M, K>(shared: &ByteLoopShared_<A, M>, cancel: &K, err: &MuxError)
 where
     A: AllocatorClone + Send + Sync,
+    M: TrMetricsSink,
     K: TrCancellationToken,
 {
     if !cancel.is_cancelled() {
@@ -103,7 +105,7 @@ where
 /// `shared` 只用于在连接级失败时打标记；本循环不认识任何子流。
 pub(crate) async fn rx_pump_loop_async_<C, K>(
     mut rx: C::ConnRx,
-    _shared: ByteLoopShared_<C::Alloc>,
+    shared: ByteLoopShared_<C::Alloc, C::Metrics>,
     mut stage: BufferedTx<C::StageBuff, C::Alloc>,
     cancel: K,
 ) where
@@ -170,13 +172,16 @@ pub(crate) async fn rx_pump_loop_async_<C, K>(
             // 回到顶部重新轮询空间。
             continue;
         }
+        // 上报**连接级原始字节**（读方向）：口径是字节流上真实搬运的字节，不分帧，
+        // 因此它包含尚未成帧的零头与被丢弃的帧（见 trait 文档）。
+        shared.metrics_().on_transport_bytes(FrameDir::Recv, moved as u64);
     }
 }
 
 /// 写泵：`连接写环 → transport Tx`。
 pub(crate) async fn tx_pump_loop_async_<C, K>(
     mut tx: C::ConnTx,
-    shared: ByteLoopShared_<C::Alloc>,
+    shared: ByteLoopShared_<C::Alloc, C::Metrics>,
     mut stage: BufferedRx<C::StageBuff, C::Alloc>,
     cancel: K,
 ) where
@@ -246,5 +251,7 @@ pub(crate) async fn tx_pump_loop_async_<C, K>(
             fail_pump_(&shared, &cancel, &MuxError::Transport { write: true }).await;
             return;
         }
+        // 上报**连接级原始字节**（写方向）；口径同读泵。
+        shared.metrics_().on_transport_bytes(FrameDir::Send, moved as u64);
     }
 }

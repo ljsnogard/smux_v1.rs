@@ -128,6 +128,7 @@ use crate::{
         },
     },
     flow_ctrl::{Credit, WindowReport},
+    metrics::{ChannelCloseReason, FrameDir, TrMetricsSink},
     time::{ConnClock_, TrTime},
     wire_io_::{CursorError, ReadCursor},
 };
@@ -163,10 +164,11 @@ const K_MAX_DATA_CHUNK: usize = 16usize * 1024usize;
 /// 核心已经因为「必须无条件 `Send + Sync`」而不持有运行时值，共享量只在**本地**
 /// 循环里活着，因此可以自由持有它。
 #[derive(Clone)]
-pub(crate) struct MuxLoopShared_<A, R>
+pub(crate) struct MuxLoopShared_<A, R, M>
 where
     A: AllocatorClone + Send + Sync,
     R: TrTime,
+    M: TrMetricsSink,
 {
     /// 注册表（dock / 子流索引与配额、失败标志、取消令牌、计时唤醒槽）。
     reg_: ChannelRegistry_<A>,
@@ -179,6 +181,16 @@ where
 
     /// 协商出的**活跃子流空闲超时**（毫秒）；计时循环的判据。
     channel_timeout_millis_: u64,
+
+    /// 本次连接的**指标接收方**（建连时从配置克隆的一份）。
+    ///
+    /// 五个循环不持有核心（见模块文档 §2.2），拿不到 `MuxCore`，只能像运行时值那样
+    /// 自持一份。克隆的代价由需求方选的 sink 类型决定（见 `crate::metrics` 模块文档 §3）。
+    ///
+    /// **它不是 `Option`**：「有没有 sink」是编译期由 `C::Metrics` 决定的**类型事实**，
+    /// 做成运行期状态只会让每个上报点多一次判空分支。不上报的装配里它是零大小的
+    /// `NoMetrics`，上报调用点随即被单态化消除。
+    metrics_: M,
 }
 
 /// [`MuxLoopShared_`] 在具体连接策略上的简写：分配器与运行时值都取自 `C`。
@@ -186,13 +198,17 @@ where
 /// 循环与事件处理的签名里满是这个类型，用别名把两个关联类型摊平；而只依赖
 /// 「注册表 + 分配器」的辅助函数（例如 [`fail_mux_loop_`]）仍写成泛型于
 /// `A` / `R` 的形状，不必被绑到某个 `C` 上。
-pub(crate) type MuxShared_<C> =
-    MuxLoopShared_<<C as TrConnCfg>::Alloc, <C as TrConnCfg>::Rt>;
+pub(crate) type MuxShared_<C> = MuxLoopShared_<
+    <C as TrConnCfg>::Alloc,
+    <C as TrConnCfg>::Rt,
+    <C as TrConnCfg>::Metrics,
+>;
 
-impl<A, R> MuxLoopShared_<A, R>
+impl<A, R, M> MuxLoopShared_<A, R, M>
 where
     A: AllocatorClone + Send + Sync,
     R: TrTime,
+    M: TrMetricsSink,
 {
     /// 由建连路径展开后的量构造（成员私有，构造只能走这里）。
     pub(crate) fn new_(
@@ -200,20 +216,23 @@ where
         max_packet_size: usize,
         conn_clock: ConnClock_<R>,
         channel_timeout_millis: u64,
+        metrics: M,
     ) -> Self {
         MuxLoopShared_ {
             reg_: reg,
             max_packet_size_: max_packet_size,
             conn_clock_: conn_clock,
             channel_timeout_millis_: channel_timeout_millis,
+            metrics_: metrics,
         }
     }
 }
 
-impl<A, R> MuxLoopShared_<A, R>
+impl<A, R, M> MuxLoopShared_<A, R, M>
 where
     A: AllocatorClone + Send + Sync,
     R: TrTime,
+    M: TrMetricsSink,
 {
     /// 注册表句柄。
     pub(crate) fn reg_(&self) -> &ChannelRegistry_<A> {
@@ -229,25 +248,48 @@ where
     pub(crate) fn channel_timeout_millis_(&self) -> u64 {
         self.channel_timeout_millis_
     }
+
+    /// 本次连接携带的**指标接收方**（总有值，见字段文档）。
+    ///
+    /// 循环侧的上报直接写成 `shared.metrics_().on_frame(..)`：**没有判空分支**；
+    /// 缺省 sink（`NoMetrics`）下整句在单态化后消失（见 `crate::metrics` 模块文档 §4）。
+    #[inline]
+    pub(crate) fn metrics_(&self) -> &M {
+        &self.metrics_
+    }
 }
 
 /// 两个**外侧**泵循环共享的量（与 [`MuxLoopShared_`] 同源，少一个单帧上限）。
 #[derive(Clone)]
-pub(crate) struct ByteLoopShared_<A>
+pub(crate) struct ByteLoopShared_<A, M>
 where
     A: AllocatorClone + Send + Sync,
+    M: TrMetricsSink,
 {
     /// 注册表（失败标志与取消令牌）。
     pub(crate) reg_: ChannelRegistry_<A>,
+
+    /// 本次连接的**指标接收方**（建连时从配置克隆的一份；见 [`MuxLoopShared_::metrics_`]）。
+    metrics_: M,
 }
 
-impl<A> ByteLoopShared_<A>
+impl<A, M> ByteLoopShared_<A, M>
 where
     A: AllocatorClone + Send + Sync,
+    M: TrMetricsSink,
 {
-    /// 由注册表构造（成员私有，构造只能走这里）。
-    pub(crate) fn new_(reg: ChannelRegistry_<A>) -> Self {
-        ByteLoopShared_ { reg_: reg }
+    /// 由注册表与指标接收方构造（成员私有，构造只能走这里）。
+    pub(crate) fn new_(reg: ChannelRegistry_<A>, metrics: M) -> Self {
+        ByteLoopShared_ {
+            reg_: reg,
+            metrics_: metrics,
+        }
+    }
+
+    /// 本次连接携带的**指标接收方**（没有判空分支，理由见 [`MuxLoopShared_::metrics_`]）。
+    #[inline]
+    pub(crate) fn metrics_(&self) -> &M {
+        &self.metrics_
     }
 }
 
@@ -364,6 +406,7 @@ where
     // 3. 环已排空：此刻才可以发 `CLOSE(FIN)`。
     control_close_via_::<C, _>(
         tx_stage,
+        shared,
         shared.max_packet_size_,
         pair.0,
         pair.1,
@@ -441,16 +484,22 @@ where
 /// 连接被丢弃时 [`MuxCore::drop`](super::mux_connection::core_::MuxCore) 触发取消
 /// 令牌，循环在 await 点上以「取消错误」的形式收到通知并退出——那是正常关闭，
 /// 不应在注册表上留下失败标志（否则收尾路径会伪造出一个假的连接级失败）。
-pub(crate) async fn fail_mux_loop_<A, R, K>(
-    shared: &MuxLoopShared_<A, R>,
+pub(crate) async fn fail_mux_loop_<A, R, M, K>(
+    shared: &MuxLoopShared_<A, R, M>,
     cancel: &K,
+    kind: Option<FrameKind>,
     err: &MuxError,
 ) where
     A: AllocatorClone + Send + Sync,
     R: TrTime,
+    M: TrMetricsSink,
     K: TrCancellationToken,
 {
     if !cancel.is_cancelled() {
+        // 上报帧 / 协议错误：**只有真的失败才报**——取消导致的收尾不是帧错误（见上方
+        // 文档）。`kind` 给出「已经解析出帧种类」时的种类，帧头都没解析出来时为
+        // `None`（见 [`crate::metrics::TrMetricsSink::on_frame_error`]）。
+        shared.metrics_().on_frame_error(kind, *err);
         let _ = shared.reg_.mark_failed_(err, cancel.child_token()).await;
     }
 }
@@ -708,7 +757,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
             )
             .await
         {
-            fail_mux_loop_(&shared, &cancel, &err).await;
+            fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
             return;
         }
 
@@ -742,7 +791,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     )
                     .await
                     {
-                        fail_mux_loop_(&shared, &cancel, &err).await;
+                        fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                         return;
                     }
                 }
@@ -757,16 +806,16 @@ pub(crate) async fn demux_loop_async_<C, K>(
         //    `Unsatisfiable` 而整条连接失败的路径**从构造上消失**。
         //    帧头可能消耗环读指针，因此必须与第 2 步合起来看：环里此刻至少有一帧的
         //    **前若干字节**，帧头解析不会因为「环空」而永久 park——外侧读泵会继续填充。
-        let header = match race_cancel_(
+        let (header, head_len) = match race_cancel_(
             &cancel,
             frame_parser_::read_header_async_::<_, _>(&mut rx_stage, cancel.child_token()),
         )
         .await
         {
             Option::None => return,
-            Option::Some(Result::Ok(header)) => header,
+            Option::Some(Result::Ok(parsed)) => parsed,
             Option::Some(Result::Err(err)) => {
-                fail_mux_loop_(&shared, &cancel, &err).await;
+                fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                 return;
             }
         };
@@ -774,7 +823,13 @@ pub(crate) async fn demux_loop_async_<C, K>(
         // 4. 载荷长度校验（与写侧同一条上限：帧总长 ≤ `max_packet_size`）。
         let len = header.payload_len();
         if len + K_MAX_FRAME_HEADER > shared.max_packet_size_ || len > payload.len() {
-            fail_mux_loop_(&shared, &cancel, &MuxError::FrameTooLarge).await;
+            fail_mux_loop_(
+                &shared,
+                &cancel,
+                Option::Some(header.kind()),
+                &MuxError::FrameTooLarge,
+            )
+            .await;
             return;
         }
         if len > 0 {
@@ -788,12 +843,21 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 Option::None => return,
                 Option::Some(Result::Ok(())) => {}
                 Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, &map_read_cursor_err_::<_>(err)).await;
+                    fail_mux_loop_(
+                        &shared,
+                        &cancel,
+                        Option::Some(header.kind()),
+                        &map_read_cursor_err_::<_>(err),
+                    )
+                    .await;
                     return;
                 }
             }
         }
         let bytes = &payload[..len];
+
+        // 帧种类在这里取一次：下面的上报与派发都用它。
+        let kind = header.kind();
 
         // 5. 派发。帧头里的 `LocalDock` 是发送方的本端 dock，因此**本端的
         //    local_dock 是帧头的 `RemoteDock`**（镜像语义，见模块文档 §4.2）。
@@ -801,10 +865,24 @@ pub(crate) async fn demux_loop_async_<C, K>(
         let remote = header.local_dock();
         let pair = (local, remote);
 
+        // 帧已经完整到手（帧头解析 + 载荷读取 + 长度校验都过了），上报「收到一个帧」。
+        //
+        // **口径与写侧逐字一致**：`head_len` 是逐字节状态机自己数出的**帧头长度**
+        // （[`frame_parser_::FrameHeaderParser::consumed_len_`]），加上载荷长度就是该帧的
+        // **线上总长**。因此两侧的 `on_frame` 字节数可以直接相加比对——端到端用例正是
+        // 用「发送帧字节之和 == 接收帧字节之和」把这条口径钉住的。
+        shared.metrics_().on_frame(
+            FrameDir::Recv,
+            local,
+            remote,
+            kind,
+            u32::try_from(head_len + len).unwrap_or(u32::MAX),
+        );
+
         // 每次活动就地读一次连接级时钟（vDSO 读，相对本帧的解析 / 环操作可忽略）：
         // 两个时钟必须记下**活动发生的时刻**，而不是计时循环扫描的时刻。
         let now_millis = shared.conn_clock_().now_millis_();
-        match header.kind() {
+        match kind {
             FrameKind::Data => {
                 let amount = Credit::try_from(len).unwrap_or(Credit::MAX);
                 let Some(entry) = table.get_mut(&pair) else {
@@ -822,7 +900,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     )) {
                         continue;
                     }
-                    fail_mux_loop_(&shared, &cancel, &MuxError::MalformedFrame).await;
+                    fail_mux_loop_(&shared, &cancel, Option::Some(kind), &MuxError::MalformedFrame).await;
                     return;
                 };
                 if entry.owner_.is_app_rx_closed_() {
@@ -842,7 +920,8 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 entry.owner_.mark_data_(now_millis);
                 let counted = entry.owner_.recv_on_data_(amount);
                 if let Result::Err(err) = counted {
-                    fail_mux_loop_(&shared, &cancel, &MuxError::FlowCtrl(err)).await;
+                    fail_mux_loop_(&shared, &cancel, Option::Some(kind), &MuxError::FlowCtrl(err))
+                        .await;
                     return;
                 }
                 // **数据到达本身就是一次水位变化**（尤其是「刚好归零」），必须在这次
@@ -874,15 +953,20 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     Option::Some(Result::Err(err))
                         if err.err_tag() == WriteErrTag::Closing => {}
                     Option::Some(Result::Err(_err)) => {
-                        fail_mux_loop_(&shared, &cancel, &MuxError::Transport { write: true })
-                            .await;
+                        fail_mux_loop_(
+                            &shared,
+                            &cancel,
+                            Option::Some(kind),
+                            &MuxError::Transport { write: true },
+                        )
+                        .await;
                         return;
                     }
                 }
             }
             FrameKind::Open => {
                 let Some(report) = window_report_of_(&header) else {
-                    fail_mux_loop_(&shared, &cancel, &MuxError::MalformedFrame).await;
+                    fail_mux_loop_(&shared, &cancel, Option::Some(kind), &MuxError::MalformedFrame).await;
                     return;
                 };
                 if let Option::Some(entry) = table.get(&pair) {
@@ -951,6 +1035,8 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         // 且已经写进本端接收环的数据一起丢掉（旧实现正是如此，实测
                         // 少一个窗口，见 `dev-notes/flow-ctrl…` §3.3）。
                         entry.owner_.set_peer_reset_();
+                        // 上报「对端发来 RESET」。
+                        shared.metrics_().on_reset(local, remote, true);
                     } else {
                         // 对端宣告**不再发送**：关掉接收环写端，应用读完已缓存数据
                         // 之后读到 EOF。
@@ -1392,7 +1478,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 Option::None => return,
                 Option::Some(Result::Ok(())) => {}
                 Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, &err).await;
+                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                     return;
                 }
             }
@@ -1416,7 +1502,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 Option::Some(Result::Ok(true)) => continue,
                 Option::Some(Result::Ok(false)) => break,
                 Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, &err).await;
+                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                     return;
                 }
             }
@@ -1448,7 +1534,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 Option::Some(Result::Ok(true)) => continue,
                 Option::Some(Result::Ok(false)) => break,
                 Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, &err).await;
+                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                     return;
                 }
             }
@@ -1538,7 +1624,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 Option::None => return,
                 Option::Some(Result::Ok(())) => {}
                 Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, &err).await;
+                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                     return;
                 }
             }
@@ -1591,6 +1677,7 @@ where
             // 控制帧也必须整帧进入写环；装不下时先 park 在写环上，再重试同一帧。
             write_control_blocking_::<C, _>(
                 tx_stage,
+                shared,
                 shared.max_packet_size_,
                 &frame_,
                 cancel,
@@ -1654,6 +1741,7 @@ where
                 if owner.claim_local_reset_() {
                     control_close_via_::<C, _>(
                         tx_stage,
+                        shared,
                         shared.max_packet_size_,
                         local_dock,
                         remote_dock,
@@ -1661,6 +1749,8 @@ where
                         cancel.child_token(),
                     )
                     .await?;
+                    // 本端发出的 `RESET` 到此才真正上线，因此上报点放在发送成功之后。
+                    shared.metrics_().on_reset(local_dock, remote_dock, false);
                 }
             }
             // **绝不在这里摘写侧表项、也不在这里丢掉读侧表项**：
@@ -1750,19 +1840,23 @@ where
         return Result::Ok(());
     };
     if owner.claim_release_() {
+        let now_millis = shared.conn_clock_().now_millis_();
         let _ = shared
             .reg_
-            .release_channel_(
-                pair.0,
-                pair.1,
-                shared.conn_clock_().now_millis_(),
-                cancel.child_token(),
-            )
+            .release_channel_(pair.0, pair.1, now_millis, cancel.child_token())
             .await;
         let _ = read_events.try_send_event_(ReadEvent_::Release {
             local_dock: pair.0,
             remote_dock: pair.1,
         });
+        // 上报子流关闭（正常协议收尾）。`claim_release_` 是一次性的 CAS，因此这里
+        // **恰好上报一次**；超时与建流超时两条路径不经过本函数，各自在 `timer_` 里上报。
+        shared.metrics_().on_channel_closed(
+            pair.0,
+            pair.1,
+            ChannelCloseReason::Fin,
+            now_millis.saturating_sub(owner.created_millis_()),
+        );
     }
     Result::Ok(())
 }
@@ -1770,6 +1864,7 @@ where
 /// 发一条 `CLOSE`。用独立的 helper 以便在事件处理里直接 await。
 async fn control_close_via_<C, K>(
     tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
+    shared: &MuxShared_<C>,
     max_packet_size: usize,
     local_dock: Dock,
     remote_dock: Dock,
@@ -1786,12 +1881,13 @@ where
         local_dock,
         remote_dock,
     );
-    write_control_blocking_::<C, _>( tx_stage, max_packet_size, &frame, &cancel).await
+    write_control_blocking_::<C, _>(tx_stage, shared, max_packet_size, &frame, &cancel).await
 }
 
 /// 把控制帧写进写环（分块；空间不足时由写泵持续搬运腾出空间）。
 async fn write_control_blocking_<C, K>(
     tx_stage: &mut BufferedTx<C::StageBuff, C::Alloc>,
+    shared: &MuxShared_<C>,
     max_packet_size: usize,
     frame: &ControlFrame_,
     cancel: &K,
@@ -1814,7 +1910,17 @@ where
     if head_len + payload.len() > max_packet_size {
         return Result::Err(MuxError::FrameTooLarge);
     }
-    enqueue_frame_parts_::<C, _>(tx_stage, &head[..head_len], payload, cancel.child_token()).await
+    enqueue_frame_parts_::<C, _>(tx_stage, &head[..head_len], payload, cancel.child_token()).await?;
+    // 上报「写出一个帧」：控制帧在这里才真正**整帧**进了写环（`enqueue_frame_parts_`
+    // 把头与载荷分两次入环，因此计数点必须在它之后）。
+    shared.metrics_().on_frame(
+        FrameDir::Send,
+        frame.local_dock_(),
+        frame.remote_dock_(),
+        frame.kind_(),
+        u32::try_from(head_len + payload.len()).unwrap_or(u32::MAX),
+    );
+    Result::Ok(())
 }
 
 /// 把某条子流发送环里已提交的数据全部写出（直到取空）。
@@ -2022,5 +2128,15 @@ where
         return Result::Err(err);
     }
     owner.mark_data_(shared.conn_clock_().now_millis_());
+    // 上报「写出一个数据帧」：帧总长 = 帧头的**实际**长度 + 载荷长度。计数点必须在
+    // `enqueue_frame_parts_` **之后**——它把头与载荷分两次入环，在那之前计数会把一个
+    // 帧算成半个（见该函数的说明）。
+    shared.metrics_().on_frame(
+        FrameDir::Send,
+        pair.0,
+        pair.1,
+        FrameKind::Data,
+        u32::try_from(head_len + moved).unwrap_or(u32::MAX),
+    );
     Result::Ok(true)
 }

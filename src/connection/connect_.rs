@@ -22,9 +22,10 @@ use crate::{
     connection::{BuffAllocError, DefaultConnCfg, DefaultRt_, MuxConnection, TrConnCfg},
     flow_ctrl::DefaultPolicy,
     handshake::agent::HandshakeDelivery,
+    metrics::NoMetrics,
 };
 
-impl<Tx, Rx> MuxConnection<DefaultConnCfg<Tx, Rx, DefaultPolicy, DefaultRt_>>
+impl<Tx, Rx> MuxConnection<DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, DefaultRt_>>
 where
     Tx: TrBuffWrite<u8> + 'static,
     Rx: TrBuffRead<u8> + 'static,

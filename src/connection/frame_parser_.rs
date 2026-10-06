@@ -360,6 +360,30 @@ pub struct FrameHeaderParser {
     state_: State_,
     /// 已归位的字段槽位；只在头结束时使用。
     slots_: Option<Slots_>,
+
+    /// **本轮解析**已消费的字节数：自这一轮的**帧首字节**起算（它计为 `1`）。
+    ///
+    /// # 生命周期：一轮解析一个值
+    ///
+    /// - 解析出结论（[`Consume_::Done`] / [`Consume_::Failed`]）时，它就是这一帧的
+    ///   **帧头长度**；出结论后重复喂入不改变它（幂等，见
+    ///   [`FrameHeaderParser::consume_byte_`] 的「消费不变量」）；
+    /// - **回到解析开头即重新起算**：状态机重新进入 [`State_::Start`] 时本字段被重置，
+    ///   因此它**不是**跨解析、更不是跨实例的累计量。
+    ///
+    /// 后一条是硬约束而不是风格：把「累计已消费」当帧头长度用，一旦解析器被复用，
+    /// 第一帧之后的每一帧都会得到一个偏大的长度（它包含了此前所有帧的字节）。
+    ///
+    /// # 为什么由状态机自己数
+    ///
+    /// 帧头长度曾经「拿不到」，理由是解析入口逐字节推进、并不回报吃了多少。但换一个
+    /// 角度就有一个零歧义的来源：**状态机本来就逐个吃掉这些字节**，它自己数最准。
+    ///
+    /// 不能改从环状态推：解析在环空时会 park，而外侧读泵会在那一刻往**同一个**环里
+    /// 填新字节，因此「前后 `data_size()` 之差」量的是「期间消费 − 期间写入」；而且
+    /// `buffex` 的环状态只有物理读写指针（`IoPos { rp, wp }`，都在 `[0, capacity)` 内
+    /// 环绕），**没有单调累计量**可用。
+    consumed_: usize,
 }
 
 impl Default for FrameHeaderParser {
@@ -384,6 +408,7 @@ impl FrameHeaderParser {
             buffer_: [0u8; K_HEADER_BUFFER_LEN],
             state_: State_::Start,
             slots_: Option::None,
+            consumed_: 0usize,
         }
     }
 
@@ -436,6 +461,24 @@ impl FrameHeaderParser {
     /// assert!(parser.is_done_());
     /// ```
     pub fn consume_byte_(&mut self, byte: u8) -> Consume_ {
+        // 已出结论：重复喂入不消费字节（幂等），因此也**不**计入 `consumed_`。
+        if self.is_done_() || self.is_failed_() {
+            match self.state_ {
+                State_::Done(header) => return Consume_::Done(header),
+                State_::Failed(err) => return Consume_::Failed(err),
+                // 上面的判定已排除其余状态。
+                _ => {}
+            }
+        }
+        // 计数**只覆盖本轮解析**：`Start` 是新一轮解析的开头，从它重新起算（本字节算
+        // 第 1 个，因此回到 `Start` 就等于把计数 reset）；其余状态在本轮内累加。
+        // 终态在上面已经短路，所以出结论之后不会再进来。
+        if matches!(self.state_, State_::Start) {
+            self.consumed_ = 1usize;
+        } else {
+            self.consumed_ = self.consumed_.saturating_add(1usize);
+        }
+
         match self.state_ {
             // 已出结论：重复喂入不消费字节（幂等）。
             State_::Done(header) => Consume_::Done(header),
@@ -546,6 +589,27 @@ impl FrameHeaderParser {
         }
     }
 
+    /// **本轮解析**已消费的字节数；解析完成时它**就是帧头长度**（含帧首字节与全部
+    /// 头字段）。
+    ///
+    /// 契约只覆盖**单轮**：状态机回到 [`State_::Start`] 时本计数重新起算，因此它**不是**
+    /// 累计量——把累计量当帧头长度用，一旦解析器被复用就会给出偏大的长度（理由见字段
+    /// 文档）。失败路径上它同样是「这一轮已经吃掉多少字节」，但那条路径的调用方只需要
+    /// 错误本身。
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use smux_v1::connection::{Consume_, FrameHeaderParser};
+    ///
+    /// let mut parser = FrameHeaderParser::new();
+    /// // ……逐字节喂入，直到 `Consume_::Done`……
+    /// let head_len = parser.consumed_len_();
+    /// ```
+    pub const fn consumed_len_(&self) -> usize {
+        self.consumed_
+    }
+
     /// 记下失败结论并终止解析。
     ///
     /// 失败结论与完成结论一样**只算一次**：此后 [`FrameHeaderParser::consume_byte_`]
@@ -579,7 +643,7 @@ impl FrameHeaderParser {
 pub(crate) async fn read_header_async_<R, K>(
     rx: &mut R,
     cancel: K,
-) -> Result<FrameHeader, MuxError>
+) -> Result<(FrameHeader, usize), MuxError>
 where
     R: TrBuffRead<u8>,
     K: TrCancellationToken,
@@ -597,7 +661,9 @@ where
 
         match parser.consume_byte_(byte) {
             Consume_::Pending => continue,
-            Consume_::Done(header) => return Result::Ok(header),
+            // 第二个分量是**帧头长度**（逐字节状态机自己数的已消费字节数）：
+            // 调用方把它与 `payload_len` 相加，就得到该帧的**线上总字节数**。
+            Consume_::Done(header) => return Result::Ok((header, parser.consumed_len_())),
             Consume_::Failed(err) => return Result::Err(err),
         }
     }
@@ -1122,6 +1188,8 @@ mod tests_ {
                 read_header_async_::<_, _>(&mut rx, abs_cancel::NonCancellableToken::new())
                     .await
                     .expect("容量 1 的环应当能解析出帧头")
+                    // 第二个分量是帧头长度，本用例只需帧头本身。
+                    .0
             };
 
             let ((), parsed) = futures::join!(writer, reader);
@@ -1160,4 +1228,59 @@ mod tests_ {
         assert_eq!(err_kind_(err), ErrKind::UnsupportedField);
     }
     dual_runtime_test_!(protocol_errors_survive_async_entry_);
+
+    /// 测试解析器如实累计**帧头长度**（metrics 读侧「帧总字节」口径的来源）。
+    ///
+    /// - 手段：把最小 `DATA` 帧头的 7 个字节逐字节喂进 `consume_byte_`，直到拿到
+    ///   `Consume_::Done`；随后再喂一个字节走幂等路径；最后用一个**新解析器**只喂
+    ///   帧首字节，观察计数起点。
+    /// - 判断：`consumed_len_()` 恰好等于实际喂入的字节数——多算会让读侧的帧总长偏大、
+    ///   少算会偏小——且出结论后的重复喂入**不再增长**。后者正是 `consume_byte_` 文档里
+    ///   那条「消费不变量」的直接体现（出结论之后的重复喂入不消费字节）；计数起点那一
+    ///   组则钉住「回到解析开头即重新起算」，即它**不是**跨轮累计量。
+    #[test]
+    fn consumed_len_counts_exactly_the_header_bytes_() {
+        // 帧首 + LocalDock=1 + RemoteDock=2 + PayloadLen=0（见 `consume_byte_` 的示例）。
+        let bytes = [0x05u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x00];
+        let mut parser = FrameHeaderParser::new();
+        assert_eq!(
+            parser.consumed_len_(),
+            0usize,
+            "还没喂入任何字节时，本轮已消费为 0"
+        );
+        let mut fed = 0usize;
+        for byte in bytes {
+            fed += 1usize;
+            match parser.consume_byte_(byte) {
+                Consume_::Pending => {}
+                Consume_::Done(header) => {
+                    assert_eq!(header.kind(), FrameKind::Data);
+                    break;
+                }
+                Consume_::Failed(err) => panic!("合法的最小帧头不应失败：{err:?}"),
+            }
+        }
+        assert_eq!(fed, bytes.len(), "7 个字节应当刚好喂完整个帧头");
+        assert_eq!(
+            parser.consumed_len_(),
+            bytes.len(),
+            "本轮已消费字节数就是帧头长度"
+        );
+
+        // 幂等：出结论之后重复喂入不消费字节，计数因此不变。
+        assert!(matches!(parser.consume_byte_(0xFFu8), Consume_::Done(_)));
+        assert_eq!(parser.consumed_len_(), bytes.len());
+
+        // **计数只覆盖本轮**：解析器回到解析开头（`Start`）时重新起算，帧首字节计为 1。
+        // 若这里继承了上一轮的 7，就说明实现退回了「自建立以来累计」——那正是被否掉的
+        // 设计（解析器一旦复用，每帧长度都会偏大）。
+        let mut next_round = FrameHeaderParser::new();
+        assert_eq!(next_round.consumed_len_(), 0usize);
+        assert!(matches!(next_round.consume_byte_(0x05u8), Consume_::Pending));
+        assert_eq!(
+            next_round.consumed_len_(),
+            1usize,
+            "新一轮解析从帧首字节重新起算"
+        );
+    }
 }

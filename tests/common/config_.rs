@@ -11,6 +11,7 @@ use abs_smux::conf::TrMuxConfig;
 use smux_v1::{
     connection::{BuffAllocError, Dock, K_STAGE_RING_CAPACITY, MuxConnection, TrConnCfg},
     flow_ctrl::DefaultPolicy,
+    metrics::NoMetrics,
 };
 
 use crate::common::{SmokeBuff, make_stage_buffs_with_};
@@ -158,6 +159,7 @@ where
     type ConnTx = W;
     type ConnRx = R;
     type StageBuff = SmokeBuff;
+    type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
         self.rt_.clone()
@@ -169,6 +171,11 @@ where
 
     fn policy(&self) -> &Self::Policy {
         &SMOKE_POLICY
+    }
+
+    /// 本配置不上报；带 sink 的端到端用例见 `tests/metrics_e2e.rs`。
+    fn metrics(&self) -> &Self::Metrics {
+        &NoMetrics
     }
 
     fn make_ring_buffs(
@@ -264,6 +271,7 @@ where
     type ConnTx = W;
     type ConnRx = R;
     type StageBuff = SmokeBuff;
+    type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
         self.rt_.clone()
@@ -275,6 +283,11 @@ where
 
     fn policy(&self) -> &Self::Policy {
         &SMOKE_POLICY
+    }
+
+    /// 本配置不上报；带 sink 的端到端用例见 `tests/metrics_e2e.rs`。
+    fn metrics(&self) -> &Self::Metrics {
+        &NoMetrics
     }
 
     fn make_ring_buffs(

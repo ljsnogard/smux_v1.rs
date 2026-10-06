@@ -45,9 +45,22 @@ default:
 # **两种装配各自跑一遍，而不是靠 cfg 把跑不了的格子跳过去**：同一个 cargo 进程里
 # 「谁是默认后端」只能有一个答案（bridge 的裸名 `Runtime` 必须唯一），所以
 # 全部测试的完整验收：两种装配各自跑一遍。
-test: test-doc
+test: test-metrics
     @echo
     @echo "== 全部装配下的测试通过 =="
+
+# metrics 特性的**端到端**验收（需要 `metrics` feature）：两种装配各跑一遍。
+#
+# 它**不并进**上面两条 `--all-targets`：那两条跑的是缺省 feature 集，而内置采集器
+# （`DebugCounters`）只在 `metrics` 打开时才进编译单元。因此这里显式加上 feature。
+test-metrics: test-doc
+    @echo "== 测试：文档（含 metrics 示例）=="
+    cargo test --manifest-path {{manifest}} --doc --features metrics
+    @echo "== 测试：metrics 端到端（compio 装配）=="
+    cargo test --manifest-path {{manifest}} --test metrics_e2e --features metrics
+    @echo "== 测试：metrics 端到端（tokio 装配）=="
+    cargo test --manifest-path {{manifest}} --test metrics_e2e \
+        --no-default-features --features metrics,test-tokio-runtime
 
 # 文档测试（不需要运行时 feature）
 test-doc: test-compio
@@ -98,6 +111,10 @@ check-all-features: clippy
     cargo check --manifest-path {{manifest}} --all-targets --no-default-features --features test-compio-runtime
     @echo "== 编译：只开 smol feature（冒烟 target）=="
     cargo check --manifest-path {{manifest}} --test smoke_smol --no-default-features --features test-smol-runtime
+    @echo "== 编译：开 metrics feature（缺省 compio 装配，全部 target）=="
+    cargo check --manifest-path {{manifest}} --all-targets --features metrics
+    @echo "== 编译：开 metrics feature（tokio 装配）=="
+    cargo check --manifest-path {{manifest}} --all-targets --no-default-features --features metrics,test-tokio-runtime
 
 # 静态检查：库 + 所有测试目标（警告即失败）
 #
@@ -110,6 +127,8 @@ clippy:
     cargo clippy --manifest-path {{manifest}} --no-default-features --features test-tokio-runtime \
         --lib --test smoke_tokio --test keepalive --test inmem_mux --test layered_rpc \
         --test alloc_count --test thread_safety -- -D warnings
+    @echo "== 静态检查：clippy -D warnings（metrics，缺省 compio 装配）=="
+    cargo clippy --manifest-path {{manifest}} --all-targets --features metrics -- -D warnings
 
 #-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 # 局部自查用（不参与 `just test`）

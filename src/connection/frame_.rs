@@ -694,6 +694,9 @@ mod tests_ {
             NonCancellableToken::new(),
         )
         .await
+        // 第二个分量是帧头长度（`frame_parser_` 自己数的已消费字节数）；本辅助函数
+        // 只关心帧头本身。
+        .map(|(header, _head_len)| header)
         .map_err(err_kind_)
     }
 

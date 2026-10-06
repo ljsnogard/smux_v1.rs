@@ -100,10 +100,12 @@ rx.read_exact(&mut buf).await?; // 对端 drop(tx) 之后就到这里
 ```rust,ignore
 use smux_v1::connection::{DefaultConnCfg, MuxConnection, TrConnCfg};
 use smux_v1::flow_ctrl::DefaultPolicy;
+use smux_v1::metrics::NoMetrics;
 
 // 用自己的运行时值类型（这里用 bridge 的具名别名指到 tokio）。
 type Rt = smux_v1::x_deps::abs_art_bridge::TokioRuntime;
-type Cfg = DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>;
+// 泛型参数顺序是 <W, R, M, P, Rt>：M 是 metrics 接收方，不上报就填 NoMetrics。
+type Cfg = DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>;
 
 let rt = <Rt>::current();                   // 在 tokio 上下文内取
 let (delivery, cfg) = <Cfg>::new_with_rt(delivery, DefaultPolicy, rt);
@@ -152,7 +154,7 @@ just test                                    # 全量：两套冒烟 + 文档测
 
 单条用例 `just test-one <名字片段>`；单个目标 `just test-target inmem_mux`。
 
-## 5. 五条使用须知
+## 5. 六条使用须知
 
 1. **dock 对即身份**：同一 `(local_dock, remote_dock)` 对同一时刻至多一条活动子流。
    发起侧要为每条并发子流分配**互不相同**的临时 `local_dock`（类比 TCP 临时端口），
@@ -171,6 +173,15 @@ just test                                    # 全量：两套冒烟 + 文档测
    `--no-default-features --features test-tokio-runtime` 换 tokio。连接是
    `Send + Sync` **当且仅当**配置里的运行时值是——compio 的运行时值
    （线程本地的执行器）不是，tokio 的 `Handle` 把手是。
+6. **指标上报是可选特性**：`--features metrics` 才启用（**零依赖**）。它只在
+   `TrConnCfg::Metrics` 上做**静态分派**：缺省是零大小的 `NoMetrics`，`metrics()` 返回
+   的是**确定的引用**（不是 `Option`，因此热路径上没有判空分支），上报调用点随之被
+   优化掉（实测无 `callq`）——不开 feature 不付代价。要接自己的采集器，实现
+   `type Metrics` 与 `metrics()` 两处即可（不上报的写法是一行 `NoMetrics::silent()`）；
+   mux **不**替你做 `Arc` / `dyn` 的适配，sink 存在哪、怎么共享全由你决定
+   （`tests/metrics_e2e.rs` 演示了「放 `static`」这一种）。指标清单的裁剪（重传与心跳
+   RTT 在本协议下不成立，水位不报）与全部插入点见
+   [`dev-notes/metrics-20261006-2253.md`](dev-notes/metrics-20261006-2253.md)。
 
 ## 6. 延伸阅读
 

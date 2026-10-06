@@ -83,6 +83,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use core::{
     alloc::AllocatorClone,
     ops::Bound,
+    sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll},
 };
 
@@ -104,8 +105,34 @@ use crate::{
     },
     flow_ctrl::WindowReport,
     handshake::opts::BasicOpts,
+    metrics::ConnCloseReason,
     time::millis_of_,
 };
+
+/// [`ChannelRegistry_::fail_kind_`] 的取值；`0` = 从未发生连接级失败（正常收尾）。
+const K_FAIL_NONE: u8 = 0u8;
+
+/// 对端主动关闭。
+const K_FAIL_PEER_CLOSED: u8 = 1u8;
+
+/// 传输层读 / 写错误。
+const K_FAIL_TRANSPORT: u8 = 2u8;
+
+/// 协议错误（非法帧、状态机错误、流控违例等）。
+const K_FAIL_PROTOCOL: u8 = 3u8;
+
+/// 把连接级错误投影成**锁外的关闭原因类别**。
+///
+/// 之所以要这个投影：[`RegistryInner_::fail_`] 在锁内，而 `MuxCore::drop` 的硬纪律是
+/// **不取锁、不阻塞**，因此「连接为什么结束」必须在锁外也读得到（见
+/// [`ChannelRegistry_::fail_kind_`]）。
+fn fail_kind_of_(err: &MuxError) -> u8 {
+    match err {
+        MuxError::PeerClosed => K_FAIL_PEER_CLOSED,
+        MuxError::Transport { .. } => K_FAIL_TRANSPORT,
+        _ => K_FAIL_PROTOCOL,
+    }
+}
 
 /// 注册表在「预留 / 绑定一个身份」时能给出的失败。
 ///
@@ -483,6 +510,14 @@ where
     /// **同一个**槽；`NotifySlot_` 本身只有一个 waker 位与一个原子位，零堆分配，
     /// `Shared` 这一次分配是**每连接一次**。
     timer_wake_: Shared<NotifySlot_, A>,
+
+    /// **连接级失败的种类**（锁外的原子快照）。
+    ///
+    /// 存在理由见 [`fail_kind_of_`]：`MuxCore::drop` 不能取锁，却要报出「连接为什么
+    /// 结束」。用 `Shared` 包一层是为了让注册表的**各个克隆**（核心、五个循环各持一份）
+    /// 指向同一份值——失败由循环侧写入、由核心侧在收尾时读出。
+    /// 每连接一次分配，与 [`ChannelRegistry_::timer_wake_`] 同源。
+    fail_kind_: Shared<AtomicU8, A>,
 }
 
 impl<A> Clone for ChannelRegistry_<A>
@@ -496,6 +531,7 @@ where
             // 邮箱按值克隆：生产端共享同一条队列，消费端因此有**多个** drain 者。
             mailbox_: self.mailbox_.clone(),
             timer_wake_: self.timer_wake_.clone(),
+            fail_kind_: self.fail_kind_.clone(),
         }
     }
 }
@@ -536,6 +572,8 @@ where
         let docks_ = BTreeMap::new_in(alloc.clone());
         // 计时唤醒槽的节点：与注册表根部同源分配器，**每连接一次**。
         let timer_wake_ = Shared::new(NotifySlot_::new_(), alloc.clone());
+        // 连接级失败种类的共享快照：同样**每连接一次**，让所有克隆看得同一份。
+        let fail_kind_ = Shared::new(AtomicU8::new(K_FAIL_NONE), alloc.clone());
         let bindings_ = BTreeMap::new_in(alloc.clone());
         let remote_index_ = BTreeSet::new_in(alloc.clone());
         let wait_close_expiry_ = BTreeSet::new_in(alloc.clone());
@@ -556,6 +594,7 @@ where
             loops_: loops,
             mailbox_: SessionMailbox_::new_(),
             timer_wake_,
+            fail_kind_,
         }
     }
 
@@ -730,6 +769,9 @@ where
             // 两个时钟立刻用「现在」打点：连接的 epoch 可能远早于本条子流的诞生，
             // 从 0 起算会让它第一条扫描就被判空闲超时。
             state.mark_data_(now_millis);
+            // 创建时刻只写这一次：子流关闭时用它结算寿命（`metrics` 的
+            // `on_channel_closed`），而 `data_millis_` 会被后续活动不断刷新。
+            state.set_created_millis_(now_millis);
             let dock = inner
                 .docks_
                 .entry(local_dock)
@@ -1141,6 +1183,8 @@ where
             let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
             if guard.fail_.is_none() {
                 guard.fail_ = Option::Some(*err);
+                // 锁外的关闭原因快照：与 `fail_` 同一判据，只记**首个**失败。
+                self.fail_kind_.store(fail_kind_of_(err), Ordering::Release);
             }
             for binding in guard.bindings_.values() {
                 match binding {
@@ -1157,6 +1201,20 @@ where
         }
         self.cancel_loops_();
         Result::Ok(())
+    }
+
+    /// 连接级失败的种类（**锁外**同步读）。
+    ///
+    /// `None` 表示从未发生连接级失败，即「正常收尾」。唯一的调用方是
+    /// [`MuxCore::drop`](super::core_::MuxCore)：那条路径不能取锁，因此这份快照必须在
+    /// 锁外可读（见 [`fail_kind_of_`] 与 [`ChannelRegistry_::fail_kind_`]）。
+    pub(crate) fn fail_kind_(&self) -> Option<ConnCloseReason> {
+        match self.fail_kind_.load(Ordering::Acquire) {
+            K_FAIL_PEER_CLOSED => Option::Some(ConnCloseReason::PeerClosed),
+            K_FAIL_TRANSPORT => Option::Some(ConnCloseReason::Transport),
+            K_FAIL_PROTOCOL => Option::Some(ConnCloseReason::ProtocolError),
+            _ => Option::None,
+        }
     }
 
     /// 连接级失败的原因（若有）。

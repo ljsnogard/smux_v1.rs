@@ -232,6 +232,12 @@ pub(crate) struct ChannelState_ {
     /// 建流等待者的**零分配**内联通知槽（协议见 [`NotifySlot_`]）。
     establish_: NotifySlot_,
 
+    /// **创建时刻**：该子流登记身份时的连接内毫秒。
+    ///
+    /// 与下面两个「活动时钟」不同：它们会被每次活动刷新，本字段**只写一次**，唯一的
+    /// 读者是子流关闭时的寿命结算（[`crate::metrics::TrMetricsSink::on_channel_closed`]）。
+    created_millis_: AtomicU64,
+
     /// **存活时钟**：最近一次收到任何一帧（**含**对端 `PULSE`）或本端写出一段
     /// 数据的连接内毫秒。`max_channel_timeout` 的判据是它。
     active_millis_: AtomicU64,
@@ -262,6 +268,7 @@ impl ChannelState_ {
             flags_: AtomicFlags::new(core::sync::atomic::AtomicUsize::new(0usize)),
             flow_: FlowCtrl::new_empty_(),
             establish_: NotifySlot_::new_(),
+            created_millis_: AtomicU64::new(0u64),
             active_millis_: AtomicU64::new(0u64),
             data_millis_: AtomicU64::new(0u64),
             abort_: AtomicU8::new(AbortCode_::NONE),
@@ -335,6 +342,19 @@ impl ChannelState_ {
     /// 最近一次活动的连接内毫秒（存活时钟）。
     pub(crate) fn active_millis_(&self) -> u64 {
         self.active_millis_.load(Ordering::Acquire)
+    }
+
+    /// 记下**创建时刻**：登记身份时调用一次（与 [`ChannelState_::mark_data_`] 同处）。
+    ///
+    /// 单独一个字段、而不复用 `data_millis_`：后者会被后续每一次活动刷新，而寿命结算
+    /// 要的是「最初那一笔」。
+    pub(crate) fn set_created_millis_(&self, now_millis: u64) {
+        self.created_millis_.store(now_millis, Ordering::Release);
+    }
+
+    /// 创建时刻（连接内毫秒）。
+    pub(crate) fn created_millis_(&self) -> u64 {
+        self.created_millis_.load(Ordering::Acquire)
     }
 
     /// 最近一次非保活活动的连接内毫秒（保活职责时钟）。

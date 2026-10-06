@@ -78,6 +78,7 @@ use smux_v1::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
     },
+    metrics::NoMetrics,
 };
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -248,6 +249,7 @@ where
     type ConnTx = W;
     type ConnRx = R;
     type StageBuff = CountBuff;
+    type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
         self.rt_.clone()
@@ -259,6 +261,12 @@ where
 
     fn policy(&self) -> &Self::Policy {
         &COUNT_POLICY
+    }
+
+    /// 本配置不上报：分配基线用例要的正是「**静默** sink」这一形态（它零大小、
+    /// 调用点被消除，因此不会给分配面添任何东西）。
+    fn metrics(&self) -> &Self::Metrics {
+        &NoMetrics
     }
 
     fn make_ring_buffs(
@@ -362,6 +370,7 @@ where
 
     /// 连接级帧暂存仍用 `Owned`（与基准场景一致），把差异**隔离在子流环存储**上。
     type StageBuff = CountBuff;
+    type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
         self.rt_.clone()
@@ -373,6 +382,12 @@ where
 
     fn policy(&self) -> &Self::Policy {
         &COUNT_POLICY
+    }
+
+    /// 本配置不上报：分配基线用例要的正是「**静默** sink」这一形态（它零大小、
+    /// 调用点被消除，因此不会给分配面添任何东西）。
+    fn metrics(&self) -> &Self::Metrics {
+        &NoMetrics
     }
 
     fn make_ring_buffs(

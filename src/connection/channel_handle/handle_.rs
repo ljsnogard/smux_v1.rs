@@ -26,6 +26,7 @@ use crate::{
     flow_ctrl::{
         Credit, FlowCtrlError, RecvTotal, TrFlowCtrlPolicy,
     },
+    metrics::TrMetricsSink,
 };
 
 /// [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) 的错误类型
@@ -601,6 +602,14 @@ where
         owner: owner.clone(),
         writer_: rx_w,
     });
+
+    // 子流到这里才算**建成**：两条环已建好、两侧半部已交给循环。上报点必须在这里，
+    // 而不是登记身份时——登记时既没有环，也还没有任何线上痕迹（见 [`crate::connection`]
+    // 模块文档 §4.2「最终裁决是唯一的提交点」）。
+    conn.core_()
+        .config_()
+        .metrics()
+        .on_channel_opened(local, remote);
 
     Result::Ok((
         ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote, backlog),

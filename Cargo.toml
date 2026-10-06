@@ -73,6 +73,12 @@ test-mock-clock = ["dep:abs_art-mock_clock"]
 # 循环活动探针（诊断挂起类问题）：给连接加一个只增的「解复用循环跑了几轮」计数，
 # 集成测试经 `MuxConnection::demux_ticks_()` 采样它。不在生产 feature 集里。
 test-loop-probe = []
+# **指标上报**（见 `src/metrics/` 与 `dev-notes/metrics-20261006-2253.md`）：
+# 打开后内置的 bench / debug 采集器（`DebugCounters` / `DebugMetrics`）可用，且上报
+# 调用点按具体 sink 类型单态化。**关掉**时内置采集器整个不进编译单元，热路径上的
+# 上报调用点被消除为零指令——缺省 sink 是零大小的 `NoMetrics`，每个方法都是
+# `#[inline(always)]` 空实现。本 feature **不引入任何依赖**。
+metrics = []
 default = ["test-compio-runtime"]
 
 [dev-dependencies]
@@ -151,3 +157,11 @@ required-features = ["test-tokio-runtime"]
 name = "keepalive_compio"
 path = "tests/keepalive_compio.rs"
 required-features = ["test-compio-runtime"]
+
+# metrics 特性的**端到端**验收：一条子流的完整生命周期之后，连接数 / 子流数 / 帧数 /
+# 字节数都必须真的被上报（内置采集器 `DebugCounters` 只在 `metrics` feature 下存在，
+# 因此这个 target 也挂在它上面）。它只跑一个用例——计数是进程级累计量。
+[[test]]
+name = "metrics_e2e"
+path = "tests/metrics_e2e.rs"
+required-features = ["metrics"]

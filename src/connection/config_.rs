@@ -37,6 +37,7 @@ use crate::{
     connection::{Dock, MuxChanBuff},
     flow_ctrl::{DefaultPolicy, TrFlowCtrlPolicy},
     handshake::agent::HandshakeDelivery,
+    metrics::{NoMetrics, TrMetricsSink},
     time::TrTime,
 };
 
@@ -102,6 +103,18 @@ where
     /// 流控策略。
     type Policy: TrFlowCtrlPolicy;
 
+    /// **指标上报的接收方**（见 [`crate::metrics`]）。
+    ///
+    /// **每个实现都要写它**（没有默认值）：不上报就写 [`NoMetrics`]——零大小、每个方法
+    /// 都是 `#[inline(always)]` 空实现；配合 [`TrConnCfg::metrics`] 返回的引用，该装配下
+    /// 的上报调用点会被单态化消除。
+    ///
+    /// 要求 `Clone`：五个循环**不持有核心**（见 [`crate::connection`] 模块文档 §2.2），
+    /// 建连时必须把 sink 克隆一份进内部共享量。因此这里适合放**廉价可克隆的句柄**
+    /// （例如 `&'static T`，或需求方自己的共享句柄）；`crate::metrics` 的模块文档
+    /// §3 说明了为什么 mux 不替需求方做 `Arc` / `dyn` 的适配。
+    type Metrics: TrMetricsSink + Clone;
+
     /// 连接侧的写 / 读半边（即两条传输的缓冲类型）。
     type ConnTx: TrBuffWrite<u8>;
     type ConnRx: TrBuffRead<u8>;
@@ -129,6 +142,45 @@ where
 
     /// 取流控策略。
     fn policy(&self) -> &Self::Policy;
+
+    /// 取本配置携带的**指标接收方**。
+    ///
+    /// # 为什么它返回引用而不是 `Option<&…>`
+    ///
+    /// 「有没有 sink」是**编译期**由 [`TrConnCfg::Metrics`] 决定的类型事实，不是运行期
+    /// 状态。用 `Option` 会让**每一个**上报调用点都多一次判空分支，而那个分支在
+    /// 「不上报」的装配下本可以彻底消失。返回确定的引用之后，调用点写成
+    ///
+    /// ```ignore
+    /// shared.metrics_().on_frame(dir, local, remote, kind, bytes);
+    /// ```
+    ///
+    /// ——缺省时 `NoMetrics` 的空实现让整句被消除，配了 sink 时它是一次直接调用。
+    ///
+    /// # 为什么它是必需方法（没有默认实现）
+    ///
+    /// Rust 不允许默认方法体假定 `Self::Metrics == NoMetrics`，因此没有默认实现可写。
+    /// 「不上报」的实现照下面一行即可（零大小类型的常量引用被提升为 `'static`，
+    /// 不涉及分配）：
+    ///
+    /// ```ignore
+    /// type Metrics = NoMetrics;
+    ///
+    /// fn metrics(&self) -> &Self::Metrics {
+    ///     &NoMetrics
+    /// }
+    /// ```
+    ///
+    /// 要上报的实现返回自己的 sink（通常是配置里的一个廉价可克隆句柄字段）：
+    ///
+    /// ```ignore
+    /// type Metrics = MySink;
+    ///
+    /// fn metrics(&self) -> &Self::Metrics {
+    ///     &self.sink_
+    /// }
+    /// ```
+    fn metrics(&self) -> &Self::Metrics;
 
     /// 用自身分配器造出一对该 channel 使用的环缓冲（Tx、Rx）。
     ///
@@ -180,6 +232,16 @@ pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 /// [`Runtime`](abs_art_bridge::Runtime)——即集成方在 `Cargo.toml` 里选定的后端
 /// （本仓缺省是 compio）。要用另一个后端或假运行时值，显式写出 `Rt` 即可。
 ///
+/// # 泛型参数顺序：`<W, R, M, P, Rt>`
+///
+/// 第三个参数 `M` 是**指标接收方**（见 [`crate::metrics`]），排在策略 `P` **之前**。
+/// 因此写 `DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>` 是错的——`DefaultPolicy` 会落到
+/// `M` 位上、`Rt` 落到 `P` 位上。不上报时要显式写全：
+///
+/// ```ignore
+/// type Cfg = DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>;
+/// ```
+///
 /// # 为什么两块缓冲用不同的类型
 ///
 /// [`MuxConnection::new`] 要求 `C::StageBuff: Send + Sync`（帧暂存环的存储会在建连时
@@ -188,10 +250,16 @@ pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 /// `unsafe impl`；子流环则需要「分配器擦除」这一点，那条路不要求 `Send + Sync`。
 ///
 /// [`MuxConnection::new`]: crate::connection::MuxConnection::new
-pub struct DefaultConnCfg<W, R, P = DefaultPolicy, Rt = crate::connection::DefaultRt_> {
+pub struct DefaultConnCfg<
+    W, R,
+    M = NoMetrics,
+    P = DefaultPolicy,
+    Rt = crate::connection::DefaultRt_>
+{
     /// 运行时值（计时与时刻的来源），建连时抓住、此后按需克隆。
     rt_: Rt,
     policy_: P,
+    metrics_: M,
     /// 连接侧两条半边的类型占位（它们只以类型形式参与）。
     _use_w_: PhantomData<fn() -> W>,
     _use_r_: PhantomData<fn() -> R>,
@@ -199,32 +267,45 @@ pub struct DefaultConnCfg<W, R, P = DefaultPolicy, Rt = crate::connection::Defau
 
 // `Clone` / `Copy` / `Debug` **手写**：结构里只有 `PhantomData`、策略值与运行时值，
 // 不该给 `W` / `R` 加上这些约束（环半部既不 `Clone` 也不 `Debug`）。
-impl<W, R, P: Clone, Rt: Clone> Clone for DefaultConnCfg<W, R, P, Rt> {
+impl<W, R, M, P, Rt> Clone for DefaultConnCfg<W, R, M, P, Rt>
+where
+    M: Clone,
+    P: Clone,
+    Rt: Clone,
+{
     fn clone(&self) -> Self {
         DefaultConnCfg {
             rt_: self.rt_.clone(),
             policy_: self.policy_.clone(),
+            metrics_: self.metrics_.clone(),
             _use_w_: PhantomData,
             _use_r_: PhantomData,
         }
     }
 }
 
-impl<W, R, P: Copy, Rt: Copy> Copy for DefaultConnCfg<W, R, P, Rt> {}
+impl<W, R, M, P, Rt> Copy for DefaultConnCfg<W, R, M, P, Rt>
+where
+    M: Copy,
+    P: Copy,
+    Rt: Copy,
+{}
 
-impl<W, R, P: core::fmt::Debug, Rt: core::fmt::Debug> core::fmt::Debug
-    for DefaultConnCfg<W, R, P, Rt>
+impl<W, R, M: core::fmt::Debug, P: core::fmt::Debug, Rt: core::fmt::Debug> core::fmt::Debug
+    for DefaultConnCfg<W, R, M, P, Rt>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DefaultConnCfg")
             .field("rt_", &self.rt_)
             .field("policy_", &self.policy_)
+            .field("metrics_", &self.metrics_)
             .finish_non_exhaustive()
     }
 }
 
-impl<W, R, P> DefaultConnCfg<W, R, P, super::DefaultRt_>
+impl<W, R, M, P> DefaultConnCfg<W, R, M, P, super::DefaultRt_>
 where
+    M: TrMetricsSink + Clone + Default,
     P: TrFlowCtrlPolicy,
 {
     /// 用**默认后端**的运行时值与策略造出配置。
@@ -244,6 +325,7 @@ where
         let cfg = DefaultConnCfg {
             rt_: super::default_rt_(),
             policy_: policy,
+            metrics_: M::default(),
             _use_w_: PhantomData,
             _use_r_: PhantomData,
         };
@@ -251,8 +333,9 @@ where
     }
 }
 
-impl<W, R, P, Rt> DefaultConnCfg<W, R, P, Rt>
+impl<W, R, M, P, Rt> DefaultConnCfg<W, R, M, P, Rt>
 where
+    M: TrMetricsSink + Clone + Default,
     P: TrFlowCtrlPolicy,
 {
     /// 用**调用者给定**的运行时值与策略造出配置。
@@ -267,13 +350,14 @@ where
         let cfg = DefaultConnCfg {
             rt_: rt,
             policy_: policy,
+            metrics_: M::default(),
             _use_w_: PhantomData,
             _use_r_: PhantomData,
         };        (delivery, cfg)
     }
 }
 
-impl<W, R, P, Rt> TrMuxConfig for DefaultConnCfg<W, R, P, Rt>
+impl<W, R, M, P, Rt> TrMuxConfig for DefaultConnCfg<W, R, M, P, Rt>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
@@ -284,10 +368,11 @@ where
     type Buff = MuxChanBuff;
 }
 
-impl<W, R, P, Rt> TrConnCfg for DefaultConnCfg<W, R, P, Rt>
+impl<W, R, M, P, Rt> TrConnCfg for DefaultConnCfg<W, R, M, P, Rt>
 where
     W: TrBuffWrite<u8> + 'static,
     R: TrBuffRead<u8> + 'static,
+    M: TrMetricsSink + Clone,
     P: TrFlowCtrlPolicy + 'static,
     Rt: TrTime + Clone + 'static,
 {
@@ -296,6 +381,7 @@ where
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
+    type Metrics = M;
     type StageBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
 
     fn runtime(&self) -> Self::Rt {
@@ -308,6 +394,17 @@ where
 
     fn policy(&self) -> &Self::Policy {
         &self.policy_
+    }
+
+    /// 取本配置**自己携带**的那一份 sink（类型由泛型参数 `M` 决定）。
+    ///
+    /// `metrics_` 由 [`DefaultConnCfg::new`] / [`DefaultConnCfg::new_with_rt`] 经
+    /// `M::default()` 造出，因此 `M` 只支持**实现了 `Default`** 的 sink（典型是零大小的
+    /// [`NoMetrics`]）。这不是缺口而是分工：要挂一个有状态、能被自己读到的采集器，
+    /// **请自定义配置类型**并把 sink 句柄放进字段（见 `tests/metrics_e2e.rs` 的
+    /// `MetricsCfg`）——sink 存哪、怎么共享属于需求方。
+    fn metrics(&self) -> &Self::Metrics {
+        &self.metrics_
     }
 
     fn make_ring_buffs(

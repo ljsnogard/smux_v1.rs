@@ -34,6 +34,7 @@ use smux_v1::handshake::{
     agent::{AcceptAllEntries, HandshakeAgent},
     opts::BasicOpts,
 };
+use smux_v1::metrics::NoMetrics;
 use compio::net::UnixStream;
 
 /// 本示例用的**运行时值**类型：计时与时刻的来源。
@@ -43,8 +44,11 @@ use compio::net::UnixStream;
 /// 连接建连时要经 [`smux_v1::connection::ScopeHost`] 自己取作用域，那条实现只挂在
 /// bridge 的别名上（见 `src/connection/scope_host_.rs`）。
 type Rt = abs_art_bridge::Runtime;
-/// 本示例的连接配置：默认资源策略 + **显式传入的 tokio 运行时值**。
-type Cfg = DefaultConnCfg<Tx, Rx, smux_v1::flow_ctrl::DefaultPolicy, Rt>;
+/// 本示例的连接配置：默认资源策略 + **显式传入的 tokio 运行时值** + 静默 sink。
+///
+/// 泛型参数顺序是 `<W, R, M, P, Rt>`：`M`（metrics 接收方）排在策略之前，本示例
+/// 不需要上报，因此填 [`NoMetrics`]。
+type Cfg = DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>;
 /// 本示例用的**本地作用域**类型：五个循环的投递点，由运行时值交出。
 ///
 /// 与 [`Rt`] 一样取 bridge 的**裸名**——这样示例与库用的就是同一个后端解析结果，
@@ -142,7 +146,7 @@ async fn active(
     // 那个，本仓缺省 compio）的运行时值。本示例跑在 tokio 上，属于「特别的需要」，
     // 因此显式把运行时值传进配置——这正是 `DefaultConnCfg::new_with_rt` 的用途。
     let (delivery, cfg) =
-        <DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>>::new_with_rt(
+        <DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>>::new_with_rt(
             delivery,
             DefaultPolicy,
             rt.clone(),
@@ -181,7 +185,7 @@ async fn passive(
     // 那个，本仓缺省 compio）的运行时值。本示例跑在 tokio 上，属于「特别的需要」，
     // 因此显式把运行时值传进配置——这正是 `DefaultConnCfg::new_with_rt` 的用途。
     let (delivery, cfg) =
-        <DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>>::new_with_rt(
+        <DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>>::new_with_rt(
             delivery,
             DefaultPolicy,
             rt.clone(),

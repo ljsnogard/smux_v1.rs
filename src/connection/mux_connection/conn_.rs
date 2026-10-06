@@ -16,6 +16,7 @@ use crate::{
         timer_::timer_loop_async_,
     },
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
+    metrics::TrMetricsSink,
     time::{ConnClock_, millis_of_},
 };
 
@@ -281,6 +282,10 @@ where
         );
         scope.spawn_local(timer_fut).detach();
 
+        // 连接到此才算**建立成功**：五个循环都已经投递。上报点放在这里而不是 `new`
+        // 的开头——「建立成功」的语义正是「循环已经开始跑」（见 `crate::metrics`）。
+        core_.config_().metrics().on_conn_opened();
+
         MuxConnection { core_ }
     }
 }
@@ -343,7 +348,7 @@ where
 {
     core_: Shared<MuxCore<C>, C::Alloc>,
     shared_: MuxShared_<C>,
-    byte_shared_: ByteLoopShared_<C::Alloc>,
+    byte_shared_: ByteLoopShared_<C::Alloc, C::Metrics>,
     w_receiver_: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
     r_receiver_: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
 }
@@ -365,13 +370,23 @@ where
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
 
+        // 指标接收方在**建连这一刻**从配置克隆一份：五个循环不持有核心，拿不到
+        // `MuxCore`，只能像运行时值那样自持一份（见 `core_` 模块文档「队列保活」）。
+        // 缺省配置交出的是零大小的 `NoMetrics`，于是整段上报在单态化后消失
+        // （见 `crate::metrics` 模块文档 §4）。
+        //
+        // `C::Metrics::clone(..)` 显式写成关联函数调用：`config.metrics().clone()` 会
+        // 解析到 `<&C::Metrics as Clone>::clone`（克隆**引用**），不是我们要的那一份值。
+        let metrics = <C as TrConnCfg>::Metrics::clone(config.metrics());
+
         let shared = MuxShared_::<C>::new_(
             reg.clone(),
             max_packet_size,
             conn_clock.clone(),
             channel_timeout_millis,
+            metrics.clone(),
         );
-        let byte_shared = ByteLoopShared_::new_(reg.clone());
+        let byte_shared = ByteLoopShared_::new_(reg.clone(), metrics);
 
         // 核心自持一份五个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
         // （那会阻塞，而 `Drop` 可能在任意线程上发生）。

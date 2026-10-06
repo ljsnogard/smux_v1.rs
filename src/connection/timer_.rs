@@ -81,6 +81,7 @@ use crate::{
         signal_::{ControlFrame_, EventSender_, ReadEvent_, TrEventSender_, WriteEvent_},
     },
     flow_ctrl::WindowReport,
+    metrics::{ChannelCloseReason, TrMetricsSink},
 };
 
 /// 每轮最多认领 / 投递多少条保活动作。
@@ -311,6 +312,16 @@ where
             if let Option::Some(owner) = owner {
                 owner.set_local_fin_sent_();
                 let _ = owner.claim_local_reset_();
+                // 上报子流关闭（空闲超时）。这条路径**不经过** `maybe_release_`——它
+                // 直接释放身份，因此关闭回调只能在这里发（见 [`crate::metrics`] 模块
+                // 文档的插入点说明）。
+                let now_millis = shared.conn_clock_().now_millis_();
+                shared.metrics_().on_channel_closed(
+                    local,
+                    remote,
+                    ChannelCloseReason::IdleTimeout,
+                    now_millis.saturating_sub(owner.created_millis_()),
+                );
             }
 
             // 4. 尽力告诉对端：两个方向都收尾。`FIN` 关掉对端的接收方向、`RESET` 关掉
@@ -382,6 +393,15 @@ where
             if let Option::Some(owner) = owner {
                 owner.set_establish_settled_();
                 owner.notify_establish_();
+                // 上报子流关闭（**建流未裁决**即超时）：与 `Abort` 同理，这条路径不经过
+                // `maybe_release_`。
+                let now_millis = shared.conn_clock_().now_millis_();
+                shared.metrics_().on_channel_closed(
+                    local,
+                    remote,
+                    ChannelCloseReason::EstablishTimeout,
+                    now_millis.saturating_sub(owner.created_millis_()),
+                );
             }
             true
         }
