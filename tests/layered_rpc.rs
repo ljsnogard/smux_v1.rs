@@ -139,6 +139,7 @@ use common::AcceptAsyncClosureExt;
 
 use core::mem::MaybeUninit;
 
+use abs_art::TrLocalScope;
 use smux_v1::single_runtime_test_;
 use abs_smux::{
     chan::TrChannelHalf,
@@ -759,6 +760,13 @@ async fn layered_rpc_body_() {
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     #[cfg(not(feature = "test-tokio-runtime"))]
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
-    layered_rpc_dual_(&rt).await;
+
+    // **本地队列必须由持有者驱动**：tokio 的 `spawn_local` 把任务投进本线程的
+    // `LocalSet`，只有 `run_until` 会驱动它；compio 的运行时自己驱动线程本地队列，
+    // 但 `run_until` 对它同样可用。少了这一步，连接的五个循环一个都不会跑，用例会
+    // **静默挂起**（user 时间≈0、无任何输出）——这正是本用例此前只在 tokio 装配下
+    // 挂住的原因。
+    let scope = rt.local_scope();
+    scope.run_until(layered_rpc_dual_(&rt)).await;
 }
 single_runtime_test_!(layered_rpc_body_);

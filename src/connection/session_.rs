@@ -998,9 +998,14 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     remote,
                     cancel.child_token()
                 )) {
-                    // 【实验】建流窗口：身份已在册（`reserve_inbound_`），而应用还没
-                    // 走到最终裁决，读侧表项尚未安装。此刻到达的 `PULSE` /
-                    // `WINDOW_UPDATE` 不能白白丢掉——它承载的正是对端的存活信号。
+                    // 建流窗口：身份已在册（`reserve_inbound_`），而应用还没走到最终
+                    // 裁决，读侧表项尚未安装。此刻到达的 `PULSE` / `WINDOW_UPDATE`
+                    // 承载的正是对端的活动信号，不能因为「本地表还没这一项」就吞掉——
+                    // 否则本端会在对端明明活着的时候判自己空闲超时。
+                    //
+                    // 这与「建流尚未完成的子流也要被超时控制」不冲突：超时判据仍是
+                    // **本端自己的**（自身份登记起算，不进协议），这里只是把对端的
+                    // 活动如实记账。
                     if header.kind() == FrameKind::Pulse {
                         owner.touch_(now_millis);
                     } else {

@@ -505,417 +505,62 @@ loop {
 建议保留。`assert_runtime_is_`（§8.2）同样保留。
 
 
----
-
-## 10. 定论：`idle_channel_times_out_tokio_` 的病因是**虚拟时钟在 reserve 与 attach 之间推进了整整一个 `timeout`**
-
-本轮用帧 / 事件级临时探针（跑完即撤，工作区已还原）把「第二条子流建不起来」拆到了
-**单条事件的时间戳**上。§9.4 列出的三个待查点全部被排除：帧没有丢、
-`read_header_async_` 也没有「每轮从头开始」，问题出在**计时循环把一条尚未建成的子流判成了空闲超时**。
-
-### 10.1 决定性日志（逐条为真实探针输出）
-
-```text
-[idle: slept; asserting]
-T69  REG:reserve local=Dock(4097) remote=Dock(1) now=2500      ← 第二条子流登记身份，活跃时钟打点 = 2500
-T70  TMR:scan now=3500 timeout=1000 pulse=500
-T71  TMR:abort local=Dock(4097) remote=Dock(1)                 ← 3500 − 2500 = 1000 ≥ timeout ⇒ 认领空闲超时
-T72  TMR:sleep wait=1000 next=4500 now=3500
-T73  W:attach local=Dock(4097) remote=Dock(1)                  ← 会话侧半部上线（Attach）此时才发生
-T74  W:control kind=Open flags=0 local=Dock(4097) remote=Dock(1)
-T76  W:control kind=Close flags=1 local=Dock(4097) remote=Dock(1)   ← 计时循环的 FIN
-T78  W:control kind=Close flags=2 local=Dock(4097) remote=Dock(1)   ← 计时循环的 RESET
-T80  W:local-abort local=Dock(4097) remote=Dock(1)             ← 复用循环放弃该子流
-T81  D:ev-attach  local=Dock(4097) remote=Dock(1)              ← 解复用循环收到 Attach（太晚了）
-T82  D:ev-release local=Dock(4097) remote=Dock(1)              ← 紧接着收到 Release，表项被摘掉
-T85  D:frame kind=Open flags=0 local=Dock(1) remote=Dock(4097) ← B 侧正常收到 A 的 OPEN、登记入向
-T99  D:frame kind=Open flags=0 local=Dock(4097) remote=Dock(1) ← A 侧收到 B 回的 OPEN
-T100 D:open-miss-inbound local=Dock(4097) remote=Dock(1)       ← 但本地表里已没有它 ⇒ 当成「入向请求」
-T102 W:control kind=Reject flags=0 local=Dock(4097) remote=Dock(1)
-```
-
-即：**A 的 `accept_async` 并不是等不到帧，而是帧到得太晚——子流在 `reserve` 之后、
-`attach` 之前就被自己的计时循环拆掉了**。B 回的 `OPEN` 因此落入「入向请求」分支，
-`reserve_inbound_` 返回 `WaitClose`（身份刚进宽限态），于是回 `REJECT`；
-`wait_establish_` 永远等不到结论 ⇒ 测试挂起。
-
-### 10.2 为什么推进量恰好等于 `timeout`
-
-`timer_loop_async_` 每轮睡到「下一次期限」，而这个期限是：
-
-- 有在册子流时：`next = active + timeout`（`registry_::timer_scan_` 的第 3 步）；
-- **没有任何在册子流时**：兜底为 `next = now + timeout`（`timer_loop_async_` 第 3 步的
-  `.min(now.saturating_add(timeout_millis))`）。
-
-`Supervisor` 在 `body` 每次都 `Pending` 时调用 `try_advance_to_next()`，它会**一步跳到**
-那个期限。于是「一次调度 ⇒ 时钟前进一个 `timeout`」。而
-`timer_scan_` 的判据是 `now − active >= timeout`，**恰好命中**。
-
-建流要跨过若干次 `await`（`open_channel_async` 取锁 / `join!` 的两支 / `accept_async_managed`），
-每一次 `await` 都给 `Supervisor` 一次推进机会。于是：
-**在虚拟时间下，只要「登记身份」与「会话侧半部上线 / 对端回帧」之间跨过一次调度，
-这条子流就必然在建成前被判空闲超时。**
-
-这同时解释了 §9.1 的两组对照为什么都仍挂（睡眠缩到 0 / 两端对称超时），
-以及 `keepalive_pulses_compio_` 的 `B 侧被判 IdleTimeout`（同一条因果链的另一端）。
-
-### 10.3 为什么第一条子流没事
-
-第一条的 `reserve → attach → 对端 OPEN/ACCEPT` 全部落在虚拟时钟 0→1000 ms 的**同一格**里
-（那时兜底期限还远），握手一次调度就走完。第二条的 `reserve` 落在 `now = 2500`，
-而下一格就是 `3500`——整整一个 `timeout`。
-
-### 10.4 反向验证：把 `timeout` 放大十倍，**仍然挂**
-
-把 `K_TIMEOUT` 从 1 s 临时改成 10 s（并临时块注释掉 1、2 组断言）后重跑：
-
-```text
-T51  REG:reserve local=Dock(4097) remote=Dock(1) now=10000
-T56  W:attach local=Dock(4097) remote=Dock(1)            ← 这次 attach 抢在超时之前
-T71  D:open-miss-inbound local=Dock(1) remote=Dock(4097) ← B 收到 OPEN 并登记入向
-T88  TMR:abort local=Dock(4097) remote=Dock(1)           ← 20000 − 10000 = 10000 = 新的 timeout
-T100 D:open-miss-inbound local=Dock(4097) remote=Dock(1) ← A 收到 B 回的 OPEN 时已在宽限态
-T102 D:inbound-reserve-failed err=WaitClose
-```
-
-超时点只是**后移了一个 `timeout`**，挂起照旧。这排除了「阈值设得太小」这一解释。
-
-### 10.5 两个层面的问题（供裁决）
-
-| 层面 | 事实 | 影响 |
-| --- | --- | --- |
-| **驱动层（第一性原因，见 §11）** | `Supervisor` 的推进只受 `is_frozen` 控制：`tick()` 的返回值**不参与**是否推进的决策，只参与 `stalled_` 计数；三端实测（tokio `LocalSet` / compio `Runtime` / smol `LocalExecutor`）行为**完全一致** | 与后端无关的语义缺陷。tokio 的 `\|\|false` 只是让「停滞保护」失效（`ran` 恒 false 时只能靠 `advanced` 归零）；「compio 的 idle 通过」是推进时机与本地任务驱动顺序把同一缺陷放大到不同轮次，不是语义正确 |
-| **产品语义** | 空闲超时的活跃时钟从 `reserve_channel_` 起算，覆盖「建流尚未完成」的窗口 | 真实时间下该窗口是微秒级、不显现；虚拟时间把它放大成「任何跨调度握手都必然超时」。是否把活跃时钟起点改到 `OPEN`/`ACCEPT` 完成，或给建流中的子流单独一个期限，需要人类裁决 |
-
-修法候选（按代价从低到高）：
-
-1. **测试驱动**：让 tokio 后端的「推进」发生在「本地队列确实没活可干」之后（需要给
-   `Supervisor` 一个能同步跑一轮本地任务的钩子，或改由 `LocalSet` 侧驱动）；
-2. **测试场景**：建流期间冻结虚拟时钟（`set_frozen(true)`，建完再解冻）——能让用例变绿，
-   但没有回答「建流中的子流该不该被空闲超时拆」；
-3. **产品**：把空闲超时的计时起点从 `reserve` 后移到建流完成（或在建流中挂一个单独的
-   建流期限）。
-
-### 10.6 复现手段（探针已撤除）
-
-- 直接跑：`cargo test --no-default-features --features test-tokio-runtime --test keepalive
-  idle_channel_times_out_tokio_ -- --nocapture --test-threads=1`（会挂，需外部超时）；
-- 挂起性质：在同一命令里对测试进程采样 `/proc/<tid>/stat` 与 `/proc/<tid>/syscall`，
-  可见测试线程 `R / running`、`utime` 稳定增长（100% 单核），tokio worker 在 epoll；
-- 需要再次做帧级追踪时，按 §10.1 的落点插 `eprintln` 即可——五个落点分别是
-  `reserve_channel_`、`timer_scan_` 与 `deliver_action_`、`handle_write_event_`、
-  `demux_loop_async_` 的派发点、两条泵的 `moved > 0` 处。
-
 
 ---
 
-## 11. 追认：病因在 `abs_art-mock_clock` 的**推进判据**，不是 tokio 后端
+## 10. `idle` 挂起的真因：mock 时钟的推进判据（外加一处产品缺口）
 
-问题被提出为：「这是不是 `abs_art-mock_clock` 的 bug？需要确定性证据——比如在 **smol** 下
-表现一样，就说明它对 `LocalSet` / `LocalExecutor` 的理解不正确。」
+### 10.1 病因
 
-本轮用一个**与 smux 无关的最小场景**取到了这份证据。
-
-### 11.1 取证方式
-
-新增 `tests/supervisor_semantics.rs`（临时文件，未跟踪；同时临时加了 `abs_art-smol`
-的 dev-dependency）：在一条 **500 ms 周期定时器**存活的线程上，主体什么都不做、
-只反复「让出」（自唤醒后返回 `Pending`），报告让出前后的虚拟时刻。三端各跑一遍，
-用各自 `LocalScope::block_on_advancing` 的原生驱动入口。
-
-### 11.2 三端结果**完全一致**
+`Supervisor`（`abs_art-mock_clock`）原本**每被 poll 就推进到下一个到期时刻**（只受
+`is_frozen` 约束），`tick` 钩子的返回值只参与停滞计数。建流要跨若干次 `await`，
+每一次都给它一次推进机会，而推进量恰好是「下一个期限 − 现在」。于是「身份登记
+（`reserve_channel_`）」与「接收侧表项安装」之间被推进整整一个 `max_channel_timeout`，
+计时循环把一条**尚未建成**的子流判成空闲超时拆掉：
 
 ```text
-[tokio]  纯让出 6 轮的虚拟时钟： 500 → 3500 ms（推进 3000 ms）
-[compio] 纯让出 6 轮的虚拟时钟：1000 → 4000 ms（推进 3000 ms）
-[smol]   纯让出 6 轮的虚拟时钟：1000 → 4000 ms（推进 3000 ms）
+REG:reserve 4097 now=2500        ← 第二条子流登记
+TMR:scan    now=3500
+TMR:abort   4097                 ← 3500 − 2500 = 1000 ≥ timeout
+W:attach    4097                 ← 会话侧半部这时才上线
 ```
 
-推进量 = 6 轮 × 500 ms（正好是那个定时器的周期）。**`LocalSet`、compio `Runtime`、
-`LocalExecutor` 三者行为相同**——所以这不是 tokio 适配的偶发问题。
+对端回的 `OPEN` 到达时本地身份已进宽限态 ⇒ 落进「未知子流」⇒ 回 `REJECT` ⇒
+`accept_async` 永远等不到结论。挂起时测试线程 100% CPU，来自 `Supervisor` 的
+无条件自唤醒——**不是**解复用循环空转，§9.3 的旧结论据此修订。
 
-（起始值 500 / 1000 的差异来自「tick 是否在推进之前驱动执行器」：compio/smol 的 tick
-会先跑一轮执行器，于是周期任务登记定时器发生在第一次推进之前；tokio 的 tick 是空操作。
-这只影响**从哪个时刻起算**，不影响「每轮必推进」这一结论。）
+### 10.2 与后端无关
 
-### 11.3 判据本身：tick 返回什么都照样推
+三端最小复现（500 ms 周期定时器 + 主体只让出 6 轮）：tokio / compio / smol 都推进了
+3000 ms。这是 mock 时钟的判据问题，不是 tokio 适配问题。
 
-再把 `Supervisor` 单独拉出来，主体自旋 4 轮、每轮登记一个 `now + 500 ms` 的定时器，
-**只改 tick 钩子的返回值**：
+### 10.3 修法
 
-```text
-[tick 取值对照] 同为「自旋 4 轮 × 每轮登记 500ms 定时器」：
-                tick=true → 2000 ms；tick=false → 2000 ms
-```
+- `Supervisor`：**连续两轮报「执行器没活」且时钟未冻结**才推进一格；`tick` 的返回值
+  从此真正参与决策。「连续两轮」把「唤醒链真的走完了」与「刚跑完一环、下一环还没被
+  驱动」分开，后端只需回答「有没有活」。
+- 「有活」的来源：smol 用 `LocalExecutor::try_tick()`、compio 用 `Runtime::run()`，
+  两者都是原生同步 tick，**无需包装**；tokio 的 `LocalSet::tick` 是 `pub(crate)`，
+  只能由该后端用**唤醒登记**折算（`mock-clock` 下 `spawn_local` 的任务被包一层，
+  任务 waker 被调用即置位）。包装只在 `mock-clock` 构建里存在，且零堆分配
+  （稳态分配与未改动基线同为 1504）。
+- 契约用例：`abs_art-mock_clock/tests/supervisor_contract.rs` 两条（有活不推 / 连续
+  没活照推），三端各自的 `busy_executor_does_not_advance_virtual_time`。
 
-两种取值给出**同一个**虚拟时刻。即 `Supervisor::poll` 中 `tick()` 的返回值**不参与**
-「是否推进」的决策，只参与 `stalled_` 计数。模块文档标题写的是「空闲即推进」，
-实现却是**每次被 poll 就推进**（除非 `is_frozen`）；`tick` 唯一的作用是让停滞断言
-不至于误报。
+### 10.4 顺带逼出的产品缺口
 
-### 11.4 结论
+建流窗口内到达的 `PULSE` / `WINDOW_UPDATE` 会因为本地读表项尚未安装而被
+`FrameKind::WindowUpdate | Pulse` 分支整个忽略（该分支没有 `else`），对端的活动信号
+丢失，本端随后判自己空闲超时。处置：在同一分支用注册表兜底取 owner 并记账。
 
-1. **是 `abs_art-mock_clock` 的缺陷**，且与后端无关：`Supervisor` 把「虚拟时间推进」
-   与「执行器是否还有就绪工作」解耦，只剩一个全局冻结开关；
-2. tokio 的 `|| false` 的作用只是让停滞保护失效：`ran` 恒 false 时只能靠 `advanced`
-   归零。这解释了两件事——smux 挂起时为什么**没有** panic（timer 每轮都算出兜底期限，
-   `advanced` 恒 true），以及 §11.3 里 tick 恒 true 时**也没有** panic（`ran` 恒 true）；
-3. 「compio 的 `idle` 通过、tokio 挂」**不是语义差异**：同一缺陷在不同后端被放大到
-   不同轮次上（谁在推进之前驱动执行器），不能作为「tokio 适配错了、其余是对的」的证据；
-4. smux 的 `idle_channel_times_out_tokio_` 是该缺陷的一个**具体后果**：建流跨了一次
-   `await`，就被推进了整整一个 `max_channel_timeout`。
+### 10.5 决策（人类裁决）
 
-### 11.5 修法方向（供裁决）
+**建流尚未完成的子流同样受本端空闲超时控制**；这个超时是本端自行决定的策略，不需要
+与对端协商、也不进协议。`10.4` 的兜底只是如实记账对端活动，不改变这一点。
 
-| # | 方向 | 代价 |
-| --- | --- | --- |
-| 1 | 推进与「执行器是否空闲」绑定：`ran == true`（本轮确实跑到了任务）时**不推进**，只有 tick 报「什么都没跑」才推进 | 改 `Supervisor` 的一行判据 + 三端 tick 语义需重新对齐；要防止「执行器永远有活 ⇒ 时钟永不推进」的新死结 |
-| 2 | 让抽象能表达 tokio 的**异步** tick：`LocalSet::tick()` 是 `async fn`，现有 `Fn() -> bool` 表达不了；可改成 `FnMut() -> impl Future<Output = bool>`，或把「先跑一轮执行器」挪到推进之前由驱动方 await | 改 `Supervisor` 的泛型契约（跨仓公开 API 变更），但这是 tokio 与另两端语义对齐的唯一路径 |
-| 3 | 顺带处理停滞保护：`tick=true` 时 `stalled_` 永远归零，时钟推不动也不会报错（静默自旋） | 属 #1 的配套 |
+### 10.6 遗留：tokio 壳必须自己驱动本地队列
 
-### 11.6 复现
-
-三端最小复现脚本（临时文件）已撤除，数据存档在 §11.2 / §11.3。要重跑同样的判据，
-用已经沉淀到 `abs_art` 里的**契约用例**：
-
-```bash
-# 判据本身（与后端无关）
-cargo test -p abs_art-mock_clock --test supervisor_contract -- --ignored --nocapture
-# 三端各自的「纯调度不该消耗虚拟时间」
-cargo test -p abs_art-tokio  --features mock-clock --lib -- --ignored --nocapture
-cargo test -p abs_art-compio --features mock-clock --lib -- --ignored --nocapture
-cargo test -p abs_art-smol   --features mock-clock --lib -- --ignored --nocapture
-```
-
-这些用例在 §13 的彻底修法落地后**已经转绿**（转成了常规用例，不再需要 `--ignored`）。
-注意它们钉住的语义是「**执行器有活**时不得推进」；「纯让出 + 周期定时器」那类场景在
-「空闲即推进」下本就该推进，那不是契约——见 §13.1 的纠正。
-
-
----
-
-## 12. 修法验证：让「推进」排在「执行器跑一轮」之后，四格立刻全绿
-
-§11 把病因定到 `Supervisor` 的推进判据上。本节按「先验证因果、再谈最终形态」做了一次
-**最小修法实验**（改动在 `abs_art-mock_clock/src/driver.rs`，属临时实验，尚未定稿）。
-
-### 12.1 改了什么
-
-只加一件事：**主体 `Pending` 时，先「让出」一轮再推进**——即每两轮 poll 才推进一次，
-而那一轮 `Pending` 正好让外层驱动（`LocalSet::run_until` / compio `block_on` /
-`smol::block_on`）去 tick 执行器。于是「执行器跑一轮」被排到了「时钟推进」**之前**，
-与 compio / smol 的 tick 钩子本来就保证的顺序一致。
-
-```rust
-if let Poll::Ready(value) = this.body_.as_mut().poll(cx) { return Poll::Ready(value); }
-if !this.yielded_ {            // 【实验】推进前先让出一轮
-    this.yielded_ = true;
-    cx.waker().wake_by_ref();
-    return Poll::Pending;
-}
-this.yielded_ = false;
-// …… 原来的 tick / advance / stalled 逻辑不变
-```
-
-### 12.2 效果一：最小场景的推进量减半，且三端**起点也一致了**
-
-```text
-改前：[tokio]  500 → 3500（推进 3000）；[compio]/[smol] 1000 → 4000（推进 3000）
-改后：[tokio]/[compio]/[smol] 一律 500 → 2000（推进 1500）
-```
-
-`tick=true / false` 仍是同一个结果（1000 ms）——推进判据本身还没动，本实验只改顺序。
-
-### 12.3 效果二：smux 的 keepalive **四格全部变绿**
-
-```text
-== tokio 装配 ==
-test idle_channel_times_out_tokio_ ... ok      （改前：挂起）
-test keepalive_pulses_tokio_ ... ok
-== compio 装配 ==
-test idle_channel_times_out_compio_ ... ok
-test keepalive_pulses_compio_ ... ok           （改前：B 侧被判 IdleTimeout）
-```
-
-这完成了「病因 → 后果」的闭环：**挂起与 compio 的 `pulses` 失败，确实是同一个
-`Supervisor` 推进时机问题**，产品侧的计时逻辑（`reserve` 起算的空闲时钟）并没有算错。
-
-### 12.4 无回归
-
-`abs_art` 侧：
-
-| 目标 | 结果 |
-| --- | --- |
-| `cargo test -p abs_art-mock_clock` | 26 passed（+ 3 doctest） |
-| `cargo test -p abs_art-tokio --features mock-clock` | 25 + 9 + 2 passed |
-| `cargo test -p abs_art-compio --features mock-clock` | 31 + 16 + 10 passed |
-| `cargo test -p abs_art-smol --features mock-clock` | 36 + 9 + 2 passed |
-
-（含各自的 `Supervisor` 停滞断言、`virtual_hour_passes_instantly` 等虚拟时间用例。）
-
-`smux_v1` 侧：
-
-| 装配 | 结果 |
-| --- | --- |
-| tokio：`--lib --test smoke_tokio --test keepalive --test inmem_mux --test alloc_count --test thread_safety` | 199 + 4 + 2 + 11 + 1 + 2 passed，0 failed |
-| compio：`cargo test --all-targets`（缺省装配全量，含 example） | 全绿（含 `layered_rpc` 1 passed） |
-
-**顺带发现的既有问题（与本轮改动无关）**：`layered_rpc` 的 **tokio** 用例会挂起——
-`user` 时间 0.25 s、无输出、5 分钟不返回。把 `abs_art-mock_clock` 还原成基线后
-**同样挂起**（2 分钟不返回），因此不是本轮回归；缺省（compio）装配下它正常通过。
-记为遗留，需要另立一项排查。
-
-### 12.5 这不是最终形态
-
-本实验只把推进**推迟一轮**，推进判据仍是「每两轮一次」：§12.2 里「纯让出 6 轮 ⇒
-推进 1500 ms」说明它依旧会在纯调度等待中消耗虚拟时间，只是粒度减半、顺序正确。
-彻底的修法仍是 §11.5：
-
-1. `ran == true` 时不推进（需要各后端 tick 的语义对齐，且要防「永远有活 ⇒ 永不推进」）；
-2. 让抽象能表达 tokio 的异步 tick（`LocalSet::tick()` 是 `pub(crate)` 私有方法，
-   公开 API 里取不到；`Fn() -> bool` 也表达不了 async）；
-3. 配套处理 `tick=true` 时停滞保护失效。
-
-也就是说：**顺序修法解决了 smux 当前的挂起，但没有解决「虚拟时间被调度消耗」这一
-根本语义**；§11.5 的 1+2 仍应做，只是可以与本实验分开落地。
-
-### 12.6 契约用例已沉淀进 `abs_art`
-
-`smux_v1` 里的临时诊断文件已撤除，判据改以四处 `#[ignore]` 用例存档：
-
-| 位置 | 钉住什么 |
-| --- | --- |
-| `abs_art-mock_clock/tests/supervisor_contract.rs` | ①「执行器有活 ⇒ 不得推进」（期望语义，红灯）；②「tick 取值不改变推进量」（修法前行为存档） |
-| `abs_art-tokio/src/local_scope.rs`（`mock_clock_tests_`） | 纯调度让出不该消耗虚拟时间 |
-| `abs_art-compio/src/local_scope.rs`（同） | 同上 |
-| `abs_art-smol/src/local_scope.rs`（同） | 同上 |
-
-它们当时以 `#[ignore]` 落在常规 CI 之外，把「期望语义」立成了可执行的契约；
-§13 的彻底修法落地后已全部去掉 `#[ignore]`，成为常规用例。
-
-
----
-
-## 13. 彻底修法落地：判据 + 三端「有活」信号；以及它逼出来的产品缺陷
-
-§12 的顺序修法只是权宜。本节按 §11.5 的 1+2 做了彻底修法，并把上一轮误设的契约
-场景一并纠正。
-
-### 13.1 先行纠正：契约场景必须是「执行器有活」
-
-§11 的三端最小复现（纯让出 + 一条周期定时器）在「空闲即推进」的语义下**本来就该
-推进**——那时执行器确实没活。它不是契约。真正的契约是：
-
-> **执行器还有就绪工作（有任务被唤醒 / 还有任务要跑）时，虚拟时间不得前进。**
-
-因此三端契约用例的场景已改为「spawn 一个每轮自唤醒的任务」+ 断言 6 轮让出推进 `0 ms`。
-
-### 13.2 改了什么
-
-| 位置 | 改动 |
-| --- | --- |
-| `abs_art-mock_clock/src/driver.rs` | 推进判据由「只看 `is_frozen`」改为 **连续两轮 `ran == false` 且未冻结时才推进**；`tick` 的返回值从此真正参与决策（此前只喂停滞计数）。「连续两轮」是为了把「唤醒链真的走完了」与「刚跑完一环、下一环还没被驱动」分开——后端只需回答「有没有活」 |
-| `abs_art-tokio/src/local_scope.rs` | `LocalSet::tick` 是 crate 私有的，拿不到「有没有活」。改为**唤醒登记**：`mock-clock` 下 `spawn_local` 的任务被 `Tracked_` 包一层，任务注册出去的 waker 被调用即置位 `WOKE_`；`block_on_advancing` 的 tick = 读取并清除它 |
-| `abs_art-compio/src/local_scope.rs` | **不需要任何包装**：`Runtime::run()`（「队列里还有任务吗」）配合上一条的「连续两轮」判据就够了——单轮 `false` 只是「刚跑完一环」，下一轮 `run()` 会跑到它唤醒的下一环并返回 `true`。实测：去包装后契约与 keepalive 四格全绿 |
-| `abs_art-smol/src/local_scope.rs` | `LocalExecutor::try_tick()` 返回「是否跑到了任务」，语义本就正确，未改 |
-
-### 13.3 契约转绿
-
-四个原先 `#[ignore]` 的用例现在都是常规用例：
-
-- `abs_art-mock_clock/tests/supervisor_contract.rs`：`advance_must_wait_until_executor_is_idle_`（有活不推，`0 ms`）与 `advance_happens_when_executor_is_idle_`（连续没活时照推：tick=false、4 轮让出 ⇒ 2 格 = `1000 ms`）成对；
-- 三端各自的 `busy_executor_does_not_advance_virtual_time`：均 `0 ms` 通过。
-
-### 13.4 逼出来的产品缺陷：建流窗口内收到的 `PULSE` 被丢弃
-
-彻底修法后 `idle` 四格与 tokio 的 `pulses` 通过，但 `keepalive_pulses_compio_` **失败**。
-帧级探针（临时插入、已撤除）给出的序列：
-
-```text
-T8  TMR:scan now=500            ← A 侧扫描（身份已在册，虽然子流还没完成 accept）
-T9  TMR:pulse 8192 → 2          ← A 发出 PULSE
-T11 TMR:pulse 2 → 8192          ← B 也发 PULSE
-T18 D:frame kind=Pulse … now=500   ← B **收到了** A 的 PULSE
-T20 W:control kind=Open  2 → 8192  ← B 这时才发出自己的 OPEN（最终裁决）
-T21 W:control kind=Accept 2 → 8192
-T28 TMR:scan now=1000
-T29 TMR:abort 2 → 8192          ← B 把自己拆了
-```
-
-**根因**：`reserve_inbound_` 已经登记身份、计时循环也已经按这个身份发 `PULSE`，但
-**接收侧读表项**要等应用调用 `accept_async`（`install_channel_` 投
-`ReadEvent_::Attach`）才安装。这段窗口里到达的 `PULSE` 在
-`FrameKind::WindowUpdate | Pulse` 分支里 `table.get(&pair)` 落空，而该分支**没有
-else**，于是什么也不做——对端的存活信号被吞掉。等本端扫描时
-`now - active >= timeout` 成立，就把一条**双方都在正常保活**的子流拆了。
-
-这个窗口在真实时间里是微秒级，所以只在虚拟时间下暴露；但它不是 mock-clock 的错，
-是 demux 的健壮性缺口。
-
-### 13.5 实验性修复（未定稿，待裁决）
-
-在 `table.get(&pair)` 落空时，用注册表兜底取 owner 并刷新时钟（`session_.rs`，+13 行）：
-
-```rust
-} else if let Option::Some(owner) = lock_or_exit_!(shared.reg_.channel_owner_(
-    local, remote, cancel.child_token()
-)) {
-    if header.kind() == FrameKind::Pulse { owner.touch_(now_millis); }
-    else { owner.mark_data_(now_millis); }
-}
-```
-
-加上之后 `keepalive_pulses_compio_` 通过。需要裁决的两点：
-
-1. 这条兜底是否采纳（它把「身份已在册、表项未安装」的窗口纳入了活动记账）；
-2. **同一窗口内到达的 `DATA` 帧**目前会走「未知子流」分支（可能把整条连接判成协议
-   违例）——本轮没有触发，但按同一条因果链它值得单独确认。
-
-### 13.6 验证矩阵
-
-| 目标 | 结果 |
-| --- | --- |
-| `abs_art`：mock_clock / tokio / compio / smol（含 mock-clock） | 26 + 2、23 + 9 + 2、32 + 16 + 10、37 + 9 + 2，全绿 |
-| `abs_art` 四 crate `clippy -D warnings` | 通过 |
-| `smux_v1` tokio 装配（lib / smoke / keepalive / inmem / alloc / thread_safety） | 199 + 4 + 2 + 11 + 1 + 2，0 failed |
-| `smux_v1` compio 全量 `--all-targets` | 全绿（含 `layered_rpc` 1 passed 与 example） |
-
-`layered_rpc` 的 **tokio** 用例仍是既有挂起（§12.4 已记，基线可复现），与本轮改动无关。
-
-### 13.7 修法的副作用与处置
-
-`Tracked_` 起初每次 **poll** 都 `Arc::new` 一次记录 waker。`alloc_count_baseline_tokio_`
-的「稳态搬运」全局分配实测三组：
-
-| 版本 | 稳态分配 | 结果 |
-| --- | --- | --- |
-| 未改动基线（`abs_art` 全还原） | **1504** | 通过 |
-| 每次 poll 一次 `Arc::new` | **1984** | 失败（上限 1600） |
-| 最终实现（构造时一次 `Arc<RecState_>`，poll 只 `Arc::clone` + 更新 `Mutex` 里的 waker） | **1504** | 通过 |
-
-即最终实现的额外堆分配为 **0**，多出的 480 次正是「搬运期间任务被 poll 的次数」。
-这也是「mock-clock 的包装不得进入热路径分配」这条纪律的第一次实测约束。
-
-顺带记一条**测试装配**的问题：`test-tokio-runtime` 里塞了 `test-mock-clock`，于是
-`alloc_count` 这类与虚拟时钟无关的基线用例也在「包装版」构建下跑，其预算里混进了
-mock-clock 的构造期分配。本轮数值恰好没有差异，但这个耦合值得单独拆开。
-
-### 13.8 代价边界：谁必须包装
-
-「给每个 `spawn_local` 任务套一层记录 waker」是 **tokio 后端**为取得「有活」信号
-付出的代价，不是 `abs_art-mock_clock` 的必然逻辑。三种后端实测：
-
-| 后端 | 可用的「有活」信息 | 是否包装 |
-| --- | --- | --- |
-| smol | `LocalExecutor::try_tick()`（同步、公开） | 否 |
-| compio | `Runtime::run()` + 「连续两轮」判据 | 否（本轮已去包装） |
-| tokio | `LocalSet::tick` 是 `pub(crate)`；公开 API 里没有同步/异步 tick | **是**（唯一可行） |
-
-tokio 去包装的对照实验：契约用例 `busy_executor_does_not_advance_virtual_time`
-立刻失败（`left: 1500`，即每两轮推进一格）——因为没有信号时 `tick` 恒 `false`。
-若要彻底去掉这份代价，只有换掉本地队列（例如改用带有同步 tick 的执行器），
-那会改变 `spawn_local` 的语义，属于另一个量级的决定。
-
-包装本身的代价（仅 `mock-clock` 构建、生产构建里整块 `#[cfg]` 掉）：
-每个被投递的任务一次 `Box::pin` + 一次 `Arc<RecState_>`（**构造期**），
-每次 poll 一次 `Arc::clone` 与一次 `Mutex` 加解锁（**无堆分配**）。
+`layered_rpc` 的 tokio 用例此前**静默挂起**（user 时间≈0、无输出）：它没有像
+`inmem_mux` 那样用 `scope.run_until(..)` 驱动本地队列，于是 tokio 下连接的五个
+`spawn_local` 循环一个也不会跑。已按同一模式修复（compio 侧本来就由运行时驱动）。
+**tokio 装配下 `#[tokio::test]` 不替你驱动 `LocalSet`**，这条要写进测试装配的常识。
