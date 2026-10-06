@@ -40,25 +40,39 @@ manifest := justfile_directory() / "Cargo.toml"
 default:
     @{{just_executable()}} --list
 
-# 全部 feature 组合的完整验收（串行）：clippy → 编译矩阵 → tokio 侧 → compio 侧 → 文档
+# 全部测试的完整验收（串行）：clippy → 编译矩阵 → tokio 装配全量 → compio 装配全量 → 文档
+#
+# **两种装配各自跑一遍，而不是靠 cfg 把跑不了的格子跳过去**：同一个 cargo 进程里
+# 「谁是默认后端」只能有一个答案（bridge 的裸名 `Runtime` 必须唯一），所以
+# 全部测试的完整验收：两种装配各自跑一遍。
 test: test-doc
     @echo
-    @echo "== 全部 feature 组合通过 =="
+    @echo "== 全部装配下的测试通过 =="
 
 # 文档测试（不需要运行时 feature）
 test-doc: test-compio
     @echo "== 测试：文档 =="
     cargo test --manifest-path {{manifest}} --doc
 
-# 默认装配的全量（缺省 feature = compio）
+# compio 装配的全量（缺省 feature；示例也在这个装配下跑）
 test-compio: test-tokio
-    @echo "== 测试：默认装配（缺省 feature = compio，--all-targets）=="
+    @echo "== 测试：compio 装配（缺省 feature，--all-targets）=="
     cargo test --manifest-path {{manifest}} --all-targets
 
 # tokio 装配的全量（显式 opt-in）
+#
+# 刻意**不带 `--all-targets`**：example 是 compio 传输，在 tokio 后端下编得过也
+# 没有意义（它是「默认后端」的演示，归 compio 那一趟）。测试目标逐个列出，一个不少。
 test-tokio: check-all-features
     @echo "== 测试：tokio 装配（--no-default-features --features test-tokio-runtime）=="
-    cargo test --manifest-path {{manifest}} --all-targets --no-default-features --features test-tokio-runtime
+    cargo test --manifest-path {{manifest}} --no-default-features --features test-tokio-runtime \
+        --lib --test smoke_tokio --test keepalive --test inmem_mux --test layered_rpc --test alloc_count --test thread_safety
+    @echo "注：thread_safety / alloc_count / keepalive 都是 tokio 专属（它们要一个"
+    @echo "    `Send + Sync` 的运行时值或 tokio 的 socket），只在本次运行里有意义。"
+
+# 示例：默认后端（compio）的端到端演示，也是 README §2 的落地版本
+demo:
+    cargo run --manifest-path {{manifest}} --example active_passive
 
 # 编译矩阵：三种非缺省 feature 组合都要能编过
 check-all-features: clippy
@@ -66,17 +80,22 @@ check-all-features: clippy
     @echo "    运行覆盖由 test-tokio / test-compio 两步负责。"
     @echo "== 编译：缺省（compio）=="
     cargo check --manifest-path {{manifest}} --all-targets
-    @echo "== 编译：一个后端 feature 都不开 =="
-    cargo check --manifest-path {{manifest}} --all-targets --no-default-features
     @echo "== 编译：只开 tokio feature =="
     cargo check --manifest-path {{manifest}} --all-targets --no-default-features --features test-tokio-runtime
     @echo "== 编译：只开 compio feature =="
     cargo check --manifest-path {{manifest}} --all-targets --no-default-features --features test-compio-runtime
 
 # 静态检查：库 + 所有测试目标（警告即失败）
+#
+# **两个装配都查**：tokio 专属的测试文件在缺省（compio）装配下被 cfg 掉，
+# 只查缺省会漏掉它们的 lint。
 clippy:
-    @echo "== 静态检查：clippy --all-targets -D warnings =="
+    @echo "== 静态检查：clippy -D warnings（缺省 compio 装配）=="
     cargo clippy --manifest-path {{manifest}} --all-targets -- -D warnings
+    @echo "== 静态检查：clippy -D warnings（tokio 装配）=="
+    cargo clippy --manifest-path {{manifest}} --no-default-features --features test-tokio-runtime \
+        --lib --test smoke_tokio --test keepalive --test inmem_mux --test layered_rpc \
+        --test alloc_count --test thread_safety -- -D warnings
 
 #-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 # 局部自查用（不参与 `just test`）

@@ -897,6 +897,7 @@ async fn alloc_count_baseline_tokio_() {
     // 默认后端（`test-mock-clock`/`test-tokio-runtime` 下即 tokio）的运行时值：
     // 连接要自己取作用域，因此必须用 bridge 的具名别名（`ScopeHost` 只对它们实现）。
     let rt = common::default_rt_();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     let (build_global, build_injected) = scope.run_until(run_baseline_(&rt, &scope)).await;
 

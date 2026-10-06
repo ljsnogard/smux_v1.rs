@@ -335,3 +335,43 @@ pub const K_FLOW_CTRL_SMALL_LEN: usize = 256;
 pub fn default_rt_() -> DefaultRt {
     smux_v1::connection::default_rt_()
 }
+
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 运行时装配断言：让测试自己声明「我跑在哪个后端上」
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 断言 `rt` 确实来自**期待的后端**。
+///
+/// # 为什么每个「依赖某个运行时」的测试都该先调它
+///
+/// 同一个 `smux_v1` 可以在多个 feature 装配下编译，而**装配错了的失败模式很差**：
+/// 轻则在别的上下文里 panic 出一句与病因无关的文案（compio 的
+/// 「not in a compio runtime」、tokio 的「no reactor running」），重则**静默挂住**
+/// （本地队列没人驱动，或 `block_on_advancing` 的驱动与连接用的计时器不是同一条时间
+/// 轴）。无论哪一种，都要从现象反推配置，而配置本来是可以写在测试第一句里的。
+///
+/// 因此在**取得运行时值之后立刻**断言一次：装配不对时第一句就响亮失败，病因是
+/// 「我期待 X，实际是 Y」。
+///
+/// # Panics
+///
+/// `rt` 报告的身份不是 `expected` 时 panic，文案里带上实际身份。
+///
+/// # Examples
+///
+/// ```ignore
+/// let rt = common::default_rt_();
+/// common::assert_runtime_is_(&rt, RuntimeTag::Tokio);
+/// ```
+pub fn assert_runtime_is_<R>(rt: &R, expected: smux_v1::x_deps::RuntimeTag)
+where
+    R: abs_art::TrAsyncRuntime,
+{
+    let actual = rt.about();
+    assert_eq!(
+        actual, expected,
+        "本用例要求跑在 {expected:?} 后端上，但当前运行时值报告的身份是 {actual:?}；\
+         请检查 Cargo feature（`test-tokio-runtime` / `test-compio-runtime`）"
+    );
+}

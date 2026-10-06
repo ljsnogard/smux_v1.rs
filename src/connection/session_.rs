@@ -689,6 +689,8 @@ pub(crate) async fn demux_loop_async_<C, K>(
         if cancel.is_cancelled() {
             return;
         }
+        #[cfg(feature = "test-loop-probe")]
+        crate::connection::loop_probe_::demux_tick_();
         // 0. 先落实**会话释放**消息：`Drop` 只投消息、不碰身份表，因此处理「未知
         // 子流」之前必须先让「刚被丢弃的句柄」的释放生效——否则在途帧会被误判成
         // 协议违例，而不是宽限期（`WAIT_CLOSE`）内的静默丢弃。
@@ -991,6 +993,19 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         local_dock: local,
                         remote_dock: remote,
                     });
+                } else if let Option::Some(owner) = lock_or_exit_!(shared.reg_.channel_owner_(
+                    local,
+                    remote,
+                    cancel.child_token()
+                )) {
+                    // 【实验】建流窗口：身份已在册（`reserve_inbound_`），而应用还没
+                    // 走到最终裁决，读侧表项尚未安装。此刻到达的 `PULSE` /
+                    // `WINDOW_UPDATE` 不能白白丢掉——它承载的正是对端的存活信号。
+                    if header.kind() == FrameKind::Pulse {
+                        owner.touch_(now_millis);
+                    } else {
+                        owner.mark_data_(now_millis);
+                    }
                 }
             }
             FrameKind::Datagram => {

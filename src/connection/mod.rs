@@ -531,6 +531,11 @@ mod telegraph;
 mod timer_;
 #[cfg(test)]
 mod test_support_;
+
+/// 循环活动探针（`test-loop-probe` feature）：诊断挂起类问题用，见模块文档。
+#[cfg(feature = "test-loop-probe")]
+pub mod loop_probe_;
+
 mod types_;
 mod util_;
 

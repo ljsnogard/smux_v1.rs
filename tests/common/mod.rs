@@ -53,7 +53,7 @@ pub use channel_io_::{expect_eof_, read_channel_exact_, write_channel_all_};
 pub use scenarios_::{TestConnCfg, connect_pair_};
 pub use closure_::{AcceptAsyncClosureExt, ClosurePrepare};
 pub use config_::{
-    DefaultRt, default_rt_,
+    DefaultRt, assert_runtime_is_, default_rt_,
     FlowCtrlConfig,
     K_CHANNELS_PER_DOCK,
     K_CHANNEL_CAPACITY,

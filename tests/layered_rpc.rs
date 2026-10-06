@@ -751,11 +751,14 @@ where
 
 /// 见 [`layered_rpc_dual_`] 说明：本函数只是给当前 feature 选中的运行时值 / 作用域
 /// 类型做一次实例化。
-async fn layered_rpc_body_tokio_() {
+async fn layered_rpc_body_() {
+    let rt = abs_art_bridge::current();
+    // 与 [`single_runtime_test_!`] 选出的壳一致：tokio feature 下是 tokio，
+    // 否则是默认后端 compio。第一句就断言，配错了不会拖到最后才以怪文案失败。
     #[cfg(feature = "test-tokio-runtime")]
-    let rt = abs_art_tokio::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     #[cfg(not(feature = "test-tokio-runtime"))]
-    let rt = abs_art_compio::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     layered_rpc_dual_(&rt).await;
 }
-single_runtime_test_!(layered_rpc_body_tokio_);
+single_runtime_test_!(layered_rpc_body_);

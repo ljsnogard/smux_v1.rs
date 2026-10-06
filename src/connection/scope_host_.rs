@@ -56,48 +56,30 @@ pub trait ScopeHost {
 }
 
 
-/// **默认后端 compio** 的实现（本仓缺省；打开 `test-tokio-runtime` 时改用 tokio）。
+/// **默认后端**的实现：`abs_art_bridge::Runtime` / `LocalScope` 是本 crate 的
+/// 唯一后端入口。
 ///
-/// 实现写在**后端 crate 自己的类型**上（而不是 bridge 的具名别名）：两者是同一个
-/// 类型，但后者的存在与否取决于 bridge 的 feature，而本 crate 无条件依赖两个后端，
-/// 因此对调用方来说「`abs_art_tokio::Runtime` 就是能用的时间源」这件事与 feature 无关。
-/// 示例 [`examples/active_passive.rs`] 正需要这一点：它跑在 tokio 上，而缺省后端是
-/// compio，于是显式挑 tokio。
-///
-/// [`examples/active_passive.rs`]: ../examples/active_passive.rs
-/// 见上：tokio 后端类型自己的实现。
-impl ScopeHost for abs_art_tokio::Runtime<{ abs_art_tokio::FULL }> {
-    type Scope = abs_art_tokio::LocalScope;
+/// 裸名由 bridge 按 **feature** 解析（本仓缺省 compio；打开 `test-tokio-runtime`
+/// 时是 tokio），而 smux 自己的 feature 就是按同一条规则在 `Cargo.toml` 里转发给
+/// bridge 的（`test-compio-runtime` → `backend-compio` + `default-backend-compio`），
+/// 因此这里**只有一条**条件实现，不需要为每个后端各写一份、也不需要 smux 直接依赖
+/// 任何后端 crate。
+impl ScopeHost for abs_art_bridge::Runtime {
+    type Scope = abs_art_bridge::LocalScope;
 
     fn local_scope(&self) -> Self::Scope {
-        abs_art_tokio::Runtime::<{ abs_art_tokio::FULL }>::local_scope(self)
+        abs_art_bridge::Runtime::local_scope(self)
     }
 }
 
-/// 见上：compio 后端类型自己的实现。
-impl ScopeHost for abs_art_compio::Runtime<{ abs_art_compio::FULL }> {
-    type Scope = abs_art_compio::LocalScope;
-
-    fn local_scope(&self) -> Self::Scope {
-        abs_art_compio::Runtime::<{ abs_art_compio::FULL }>::local_scope(self)
-    }
-}
-
-/// **本 crate 的默认运行时值类型**：由 smux 自己的测试 feature 二选一，缺省 compio。
+/// **本 crate 的默认运行时值类型**：就是 bridge 的裸名。
 ///
 /// 它是 [`TrConnCfg::Rt`](super::TrConnCfg::Rt) 的缺省值，也是
 /// [`DefaultConnCfg`](super::DefaultConnCfg) 的默认运行时值类型。
 ///
-/// 为什么不直接用 `abs_art_bridge::Runtime`（bridge 的裸名）：bridge 的守卫要求
-/// 「同时启用多个 backend 时必须显式声明 `default-backend-*`」，而 `cargo test` 的
-/// feature 并集里两个后端会同时出现；那时候裸名根本不存在。用**具名别名**配 smux
-/// 自己的 feature 二选一，规则就只有一条、且与 bridge 的默认后端无关。
-#[cfg(not(feature = "test-tokio-runtime"))]
-pub type DefaultRt_ = abs_art_compio::Runtime<{ abs_art_compio::FULL }>;
-
-/// 见上：`test-tokio-runtime` 下换成 tokio。
-#[cfg(feature = "test-tokio-runtime")]
-pub type DefaultRt_ = abs_art_tokio::Runtime<{ abs_art_tokio::FULL }>;
+/// 「哪个后端」这件事因此**只有一个来源**：bridge 的 feature 解析。smux 的
+/// `test-tokio-runtime` / `test-compio-runtime` 只是转发者，不再自己维护第二套规则。
+pub type DefaultRt_ = abs_art_bridge::Runtime;
 
 /// 编译期断言：默认运行时值必须满足 [`TrConnCfg::Rt`](super::TrConnCfg::Rt) 的约束。
 const _: fn() = || {
@@ -105,7 +87,7 @@ const _: fn() = || {
     assert_rt_::<DefaultRt_>();
 };
 
-/// 构造**默认运行时值**：等价于各后端的 `current()`。
+/// 构造**默认运行时值**：等价于当前默认后端的 `current()`。
 ///
 /// # Panics
 ///
@@ -114,15 +96,8 @@ const _: fn() = || {
 /// [`DefaultConnCfg::new`](super::DefaultConnCfg::new) 的既定契约：自动取运行时值
 /// 那条路要求调用点已经在运行时里；不在时请走
 /// [`DefaultConnCfg::new_with_rt`](super::DefaultConnCfg::new_with_rt) 显式传入。
-#[cfg(not(feature = "test-tokio-runtime"))]
 pub fn default_rt_() -> DefaultRt_ {
-    abs_art_compio::current()
-}
-
-/// 见上：`test-tokio-runtime` 下换成 tokio。
-#[cfg(feature = "test-tokio-runtime")]
-pub fn default_rt_() -> DefaultRt_ {
-    abs_art_tokio::current()
+    abs_art_bridge::current()
 }
 
 /// **虚拟时间**的运行时值：把作用域请求委托给被装饰的运行时值。

@@ -49,6 +49,9 @@ pub mod x_deps {
     /// 从这里转出口，是为了让下游**只依赖 smux** 也能取到运行时值——否则调用方要
     /// 自己再加一条 `abs_art-bridge` 依赖、并保证与 smux 用的是同一个后端 feature。
     pub use abs_art_bridge;
+    /// 运行时身份标签（[`RuntimeTag`](abs_art::RuntimeTag)）：测试用它断言
+    /// 「当前值确实来自我期待的那个后端」，而不是靠 panic 文案反推。
+    pub use abs_art::RuntimeTag;
     pub use abs_async_iter;
     pub use abs_smux;
     pub use buffex;

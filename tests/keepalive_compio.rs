@@ -42,6 +42,8 @@ fn idle_channel_times_out_compio_() {
     let rt = compio::runtime::Runtime::new().expect("建 compio 运行时应当成功");
     let value: abs_art_bridge::CompioRuntime =
         abs_art_bridge::CompioRuntime::with_runtime(rt);
+    // 第一句就说清本用例的前提：驱动虚拟时间的那套 API 属于 compio。
+    common::assert_runtime_is_(&value, abs_art_bridge::RuntimeTag::Compio);
     let scope = value.local_scope();
     let clock = ManualClock::new();
     let timed = ManualTime::new(value, clock.clone());
@@ -59,6 +61,8 @@ fn keepalive_pulses_compio_() {
     let rt = compio::runtime::Runtime::new().expect("建 compio 运行时应当成功");
     let value: abs_art_bridge::CompioRuntime =
         abs_art_bridge::CompioRuntime::with_runtime(rt);
+    // 第一句就说清本用例的前提：驱动虚拟时间的那套 API 属于 compio。
+    common::assert_runtime_is_(&value, abs_art_bridge::RuntimeTag::Compio);
     let scope = value.local_scope();
     let clock = ManualClock::new();
     let timed = ManualTime::new(value, clock.clone());

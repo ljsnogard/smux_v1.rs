@@ -15,7 +15,7 @@
 //! # 两个值从哪里来
 //!
 //! 与 tokio 壳同理：`LocalScope::new()` 已不存在，作用域只能经
-//! `abs_art_compio::current().local_scope()` 取得（`current()` 要求调用点已在 compio
+//! `abs_art_bridge::current().local_scope()` 取得（`current()` 要求调用点已在 compio
 //! 运行时上下文内——`#[compio::test]` 满足）。
 
 #![cfg(not(feature = "test-tokio-runtime"))]
@@ -29,7 +29,8 @@ mod smoke_common;
 /// 测试目标、手段、判断见 [`smoke_common::smoke_socket_body_`]。
 #[compio::test]
 async fn smoke_socket_compio_() {
-    let rt = abs_art_compio::current();
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::smoke_socket_body_(&rt, &scope).await;
 }
@@ -37,7 +38,8 @@ async fn smoke_socket_compio_() {
 /// 测试目标、手段、判断见 [`smoke_common::small_socket_body_`]。
 #[compio::test]
 async fn small_socket_compio_() {
-    let rt = abs_art_compio::current();
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::small_socket_body_(&rt, &scope).await;
 }
@@ -50,7 +52,8 @@ async fn small_socket_compio_() {
 /// `dev-notes/flow-ctrl-20261005-0115.md` §2、§3。
 #[compio::test]
 async fn flow_ctrl_socket_compio_() {
-    let rt = abs_art_compio::current();
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_socket_body_(&rt, &scope).await;
 }
@@ -58,7 +61,8 @@ async fn flow_ctrl_socket_compio_() {
 /// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_isolation_socket_body_`]。
 #[compio::test]
 async fn flow_ctrl_isolation_socket_compio_() {
-    let rt = abs_art_compio::current();
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope).await;
 }

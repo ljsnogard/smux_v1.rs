@@ -321,6 +321,15 @@ impl<C> MuxConnection<C>
 where
     C: TrConnCfg,
 {
+    /// **诊断专用**：解复用循环的活动计数（只增不减）。
+    ///
+    /// 用来回答「循环到底还在不在跑」——挂起类问题的第一分岔点。只在 `cfg(test)`
+    /// 下存在，不在生产 API 上。
+    #[cfg(feature = "test-loop-probe")]
+    pub fn demux_ticks_(&self) -> u64 {
+        crate::connection::loop_probe_::demux_ticks_()
+    }
+
     /// 演员核心（crate 内部句柄与两个循环都经它访问共享状态）。
     pub(crate) fn core_(&self) -> &MuxCore<C> {
         &self.core_

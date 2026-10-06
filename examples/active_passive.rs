@@ -17,7 +17,6 @@
 use core::mem::MaybeUninit;
 
 use abs_art::TrLocalScope;
-use abs_art_tokio::LocalScope;
 use abs_smux::conn::{TrChannelListener, TrConnection, TrDockBinding};
 use buffex::{
     ring::{Ring, RingReader, RingWriter},
@@ -27,7 +26,7 @@ use buffex::{
         io::{TrInput, TrOutput},
     },
 };
-use buffex_tokio_adapt::x_deps::abs_buff_tokio_adapt::{ReadAsInput, WriteAsOutput};
+use buffex_compio_adapt::{ReadAsInput, WriteAsOutput};
 use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
 use smux_v1::connection::{DefaultConnCfg, Dock, MuxConnection, TrConnCfg};
 use smux_v1::flow_ctrl::DefaultPolicy;
@@ -35,7 +34,7 @@ use smux_v1::handshake::{
     agent::{AcceptAllEntries, HandshakeAgent},
     opts::BasicOpts,
 };
-use tokio::net::UnixStream;
+use compio::net::UnixStream;
 
 /// 本示例用的**运行时值**类型：计时与时刻的来源。
 ///
@@ -43,11 +42,14 @@ use tokio::net::UnixStream;
 /// 因此下面用 `abs_art_bridge` 的具名别名，而不是 `abs_art_tokio::Runtime`：
 /// 连接建连时要经 [`smux_v1::connection::ScopeHost`] 自己取作用域，那条实现只挂在
 /// bridge 的别名上（见 `src/connection/scope_host_.rs`）。
-type Rt = abs_art_tokio::Runtime;
+type Rt = abs_art_bridge::Runtime;
 /// 本示例的连接配置：默认资源策略 + **显式传入的 tokio 运行时值**。
 type Cfg = DefaultConnCfg<Tx, Rx, smux_v1::flow_ctrl::DefaultPolicy, Rt>;
 /// 本示例用的**本地作用域**类型：五个循环的投递点，由运行时值交出。
-type Scope = LocalScope;
+///
+/// 与 [`Rt`] 一样取 bridge 的**裸名**——这样示例与库用的就是同一个后端解析结果，
+/// smux 侧也因此**不需要**直接依赖任何后端 crate。
+type Scope = abs_art_bridge::LocalScope;
 /// 全被动环的存储类型（连接级帧暂存也用它）。
 type Buf = Owned<[MaybeUninit<u8>], CoreAlloc>;
 /// 交给 smux 当 `Tx` 的写半边。
@@ -60,12 +62,18 @@ const K_RING_CAP: usize = 64usize * 1024usize;
 /// 单次从 socket 搬进环的分块上限。
 const K_PUMP_CHUNK: usize = 4096usize;
 
-#[tokio::main]
+/// 缺省后端即 **compio**（bridge 的 `default-backend-compio`），因此本示例直接用
+/// compio 的运行时与 socket：`cargo run --example active_passive` 不需要任何 feature。
+#[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (socket_a, socket_b) = UnixStream::pair()?;
-    // 运行时值只能从「当前运行时上下文」取得（`#[tokio::main]` 满足）；作用域不再能
+    // compio 0.19 的 `UnixStream` 没有 `pair()`：先建 `std` socket 对，再逐个注册进
+    // 当前运行时（与 `tests/common/socket_.rs` 的 compio 版同款）。
+    let (std_a, std_b) = std::os::unix::net::UnixStream::pair()?;
+    let socket_a = UnixStream::from_std(std_a)?;
+    let socket_b = UnixStream::from_std(std_b)?;
+    // 运行时值只能从「当前运行时上下文」取得（`#[compio::main]` 满足）；作用域不再能
     // 凭空构造，只能由运行时值交出。
-    let rt = abs_art_tokio::current();
+    let rt = abs_art_bridge::current();
     let scope = rt.local_scope();
 
     // -- 传输装配：每端两个全被动环，四个半部按「谁贴 socket、谁贴 smux」分派。

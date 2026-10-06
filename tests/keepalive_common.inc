@@ -184,7 +184,8 @@ where
     let mut handle_a = conn_a
         .bind_async(dock_a)
         .await
-        .expect("A 侧绑定发起 dock 应当成功")
+        .expect("A 侧绑定发起 dock 应当成功");
+    let mut handle_a = handle_a
         .open_channel_async(dock_b, &mut message)
         .await
         .expect("A 侧发起子流应当成功");
@@ -271,7 +272,7 @@ where
     let mut rounds = 0u32;
     while rt.now() - start < duration {
         rounds += 1;
-        if rounds % 200 == 0 {
+        if rounds.is_multiple_of(200) {
             std::eprintln!(
                 "[probe] virtual_sleep rounds={rounds} elapsed_ms={}",
                 (rt.now() - start).as_millis()

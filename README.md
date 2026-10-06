@@ -101,17 +101,20 @@ rx.read_exact(&mut buf).await?; // 对端 drop(tx) 之后就到这里
 use smux_v1::connection::{DefaultConnCfg, MuxConnection, TrConnCfg};
 use smux_v1::flow_ctrl::DefaultPolicy;
 
-// 本连接固定跑 tokio（默认后端仍是 compio）。
-type Rt = abs_art_tokio::Runtime;
+// 用自己的运行时值类型（这里用 bridge 的具名别名指到 tokio）。
+type Rt = smux_v1::x_deps::abs_art_bridge::TokioRuntime;
 type Cfg = DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>;
 
-let rt = abs_art_tokio::current();          // 在 tokio 上下文内取
+let rt = <Rt>::current();                   // 在 tokio 上下文内取
 let (delivery, cfg) = <Cfg>::new_with_rt(delivery, DefaultPolicy, rt);
 let (stage_r, stage_w) = cfg.make_stage_buffs(cfg.allocator())?;
 let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
 ```
 
-`examples/active_passive.rs` 走的就是这条路（它跑在 tokio 上，而缺省后端是 compio）。
+**smux 本身不直接依赖任何后端 crate**：`Runtime` / `LocalScope` / `current` 都从
+`abs_art-bridge` 取，后端由 feature 选定（缺省 compio）。因此下游要么直接用 bridge 的
+裸名（与缺省后端一致），要么像上面这样用具名别名挑一个别的后端。
+
 连接内部**读取「现在」的时刻来源**就是配置里的这个值，因此「时刻」与「计时器」必然
 同源——换成 `abs_art_mock_clock::ManualTime` 就能把整条连接跑在虚拟时间上。
 
@@ -127,7 +130,9 @@ socket 读半边 --(入向泵)--> 全被动环 ──> Rx 交给 smux
 ```
 
 照抄 [`examples/active_passive.rs`](examples/active_passive.rs) 里的
-`passive_ring_` / `pump_input_` / `pump_output_` 三个函数即可（约 80 行）。
+`passive_ring_` / `pump_input_` / `pump_output_` 三个函数即可（约 80 行；那个示例用
+**缺省后端 compio** 的 socket 与适配，因此 `cargo run --example active_passive`
+不需要任何 feature）。
 **为什么必须自己驱动泵**（三处实测阻塞点：compio 半边 `!Send`、`TrBuffWrite` 没有
 flush 钩子、`buffex` 主动泵只做单次 poll）写在
 [`tests/common/mod.rs`](tests/common/mod.rs) 模块文档里。
@@ -139,7 +144,7 @@ cd smux_v1
 cargo run --example active_passive           # 本文 §2 的两段代码，可运行版本
 
 cargo test --test inmem_mux                  # 内存环直连：握手 → 建流 → 收发 → 半关闭
-cargo test --test smoke_compio small_socket  # 真实 UNIX socket，2 dock × 2 子流，秒级
+cargo test --test smoke_compio small_socket  # 真实 UNIX socket，2 dock × 2 子流，秒级（缺省装配）
 cargo test --test smoke_compio smoke_socket  # 真实 UNIX socket，16 个 dock 共 1024 条子流
 cargo test --test inmem_mux mux_single_byte_transport   # 传输环只给 1 字节也照样跑通
 just test                                    # 全量：两套冒烟 + 文档测试 + feature 组合

@@ -10,7 +10,7 @@
 //! # 两个值从哪里来
 //!
 //! `LocalScope::new()` 已不存在：作用域只能从**运行时值**取得（`rt.local_scope()`）。
-//! 因此每个用例先取当前运行时值（`abs_art_tokio::current()`，要求调用点已在 tokio
+//! 因此每个用例先取当前运行时值（`abs_art_bridge::current()`，要求调用点已在 tokio
 //! 运行时上下文内——`#[tokio::test]` 满足），再向它要作用域；两个值分别作为
 //! `MuxConnection<C>` 的类型参数与 `MuxConnection::new` 的方法级泛型。
 
@@ -25,7 +25,8 @@ mod smoke_common;
 /// 测试目标、手段、判断见 [`smoke_common::smoke_socket_body_`]。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_socket_tokio_() {
-    let rt = abs_art_tokio::current();
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     smoke_common::smoke_socket_body_(&rt, &scope).await;
 }
@@ -33,7 +34,8 @@ async fn smoke_socket_tokio_() {
 /// 测试目标、手段、判断见 [`smoke_common::small_socket_body_`]。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn small_socket_tokio_() {
-    let rt = abs_art_tokio::current();
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     smoke_common::small_socket_body_(&rt, &scope).await;
 }
@@ -53,7 +55,8 @@ async fn small_socket_tokio_() {
 /// 不触发归零后的回补，是本条之外的独立对照。）
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flow_ctrl_socket_tokio_() {
-    let rt = abs_art_tokio::current();
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_socket_body_(&rt, &scope).await;
 }
@@ -61,7 +64,8 @@ async fn flow_ctrl_socket_tokio_() {
 /// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_isolation_socket_body_`]。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flow_ctrl_isolation_socket_tokio_() {
-    let rt = abs_art_tokio::current();
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope).await;
 }

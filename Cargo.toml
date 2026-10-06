@@ -9,22 +9,22 @@ description = "流复用协议第一版"
 # 【本地 spike，未提交】`abs_art` 家族改用**本地路径**依赖，以便试用
 # `feat/time` 分支新增的计时能力（`TrTime`）。正式落地时应当改回 git tag/branch。
 abs_art = { path = "../abs_art/abs_art" }
-# 示例与下游可能直接用**后端 crate 自己的**运行时类型（`abs_art_tokio::Runtime` 等），
-# 而不是 bridge 的具名别名——两者是同一个类型，但只有当对应 feature 打开时别名才存在。
-# 因此这里无条件依赖两个后端，供「显式挑后端」的用例使用（bridge 已把它们作为
-# 传递依赖拉进来，这里只是把类型路径变短）。
-abs_art-tokio = { path = "../abs_art/abs_art-tokio" }
-abs_art-compio = { path = "../abs_art/abs_art-compio" }
 # **桥接 crate**：业务库只依赖它就能拿到运行时值（`Runtime` / `current`）与本地
 # 作用域（`LocalScope`），而不直接按后端写代码——后端由 `Cargo.toml` 的 feature
 # 选定（见下方 `[features]` 的说明）。
 #
 # 缺省后端 = **compio**（bridge 的 `default = ["default-backend-compio"]`）。
-# 注意 bridge 的守卫：**同时启用多个 backend** 时必须显式声明 `default-backend-*`，
-# 否则裸名 `Runtime` 没有唯一解，直接编译失败——因此本仓不启用 bridge 的裸名，
-# 而是在 `connection/scope_host_.rs` 里用**具名别名**（`CompioRuntime` /
-# `TokioRuntime`）配合自己的 feature 二选一。
-abs_art-bridge = { path = "../abs_art/abs_art-bridge" }
+#
+# 本 crate **不直接依赖任何后端 crate**：运行时值（`Runtime` / `current`）与本地
+# 作用域（`LocalScope`）都经 bridge 的**裸名**取用，后端由 smux 自己的 feature
+# 转发给 bridge 的 `backend-*` + `default-backend-*`（见 `[features]`）。
+# 因此「哪个后端」只有一个来源，换后端只改 feature。
+#
+# **关掉 bridge 自己的默认 feature**：它的 `default` 会把 `backend-compio` 与
+# `default-backend-compio` 一起打开，于是 `--features test-tokio-runtime` 下会出现
+# 「两个 backend + 两个默认后端」而撞上 bridge 的守护。关掉之后，后端选择**完全**
+# 由 smux 自己的 feature 决定（各自只开一个 `backend-*`，此时裸名即它）。
+abs_art-bridge = { path = "../abs_art/abs_art-bridge", default-features = false }
 # 虚拟时间（仅测试装配需要）：连接的建连路径要自己取作用域（`ScopeHost`），而
 # `ManualTime` 是外部类型，它的 `ScopeHost` 实现只能写在**拥有该 trait 的本 crate**
 # 里（孤儿规则）。因此这里开一个可选依赖 + 测试 feature，生产依赖图里不出现它。
@@ -47,20 +47,25 @@ thiserror = { version = "2.0.*", default-features = false }
 # **后端选择**（经 `abs_art-bridge`）：缺省 = compio；`test-tokio-runtime` 把它换成
 # tokio（用于在 tokio 装配下再跑一遍同一批场景）。
 #
-# 为什么不用 bridge 的裸名 `Runtime`：bridge 的守卫要求「同时启用多个 backend 时
-# 必须显式声明 default-backend-*」，而这里两个后端会同时出现在 `cargo test` 的
-# feature 并集里；用了裸名就会踩那条守卫（或更糟：按优先级悄悄选中一个）。
-# 因此 smux 侧用**具名别名**（`CompioRuntime` / `TokioRuntime`）二选一，
-# 见 `src/connection/scope_host_.rs`。
-test-tokio-runtime = ["abs_art-bridge/backend-tokio", "test-mock-clock"]
+# 每个 feature 只开 bridge 的**一个** `backend-*`：照 bridge 的规则，「只启用一个
+# backend 时它就是默认」，裸名 `Runtime` / `current` 因此有唯一解，不需要（也不能）
+# 再写 `default-backend-*`——那一位**两个 feature 同时生效时**会撞 bridge 的
+# 「只能声明一个默认后端」守护（`--all-features` 正是这种情形，dev-dependencies
+# 里的后端 crate 也会把第二个 backend 拉进并集）。
+#
+# 换言之：「谁是默认」的**唯一**声明点始终只有一个——当前编译里那个唯一的 backend。
+test-tokio-runtime = ["abs_art-bridge/backend-tokio", "test-mock-clock", "test-loop-probe"]
 # compio 侧：与 tokio feature 构成**互斥二选一**（共享文件按「compio feature 是否
 # 打开」分派设备类型）。两个都在缺省集里：这样 `cargo test --all-targets` 不带任何
 # 参数就能把两个冒烟 target 各按自己的运行时编译一遍，与改动前 `smoke_tokio.rs` +
 # `smoke_compio.rs` 两个文件各自运行的效果一致；单独跑某一个 target 时用
 # `--no-default-features --features <该侧>` 即可。
-test-compio-runtime = ["abs_art-bridge/backend-compio", "test-mock-clock"]
+test-compio-runtime = ["abs_art-bridge/backend-compio", "test-mock-clock", "test-loop-probe"]
 # 虚拟时钟（`abs_art_mock_clock`）只在这两个测试 feature 下被拉进来。
 test-mock-clock = ["dep:abs_art-mock_clock"]
+# 循环活动探针（诊断挂起类问题）：给连接加一个只增的「解复用循环跑了几轮」计数，
+# 集成测试经 `MuxConnection::demux_ticks_()` 采样它。不在生产 feature 集里。
+test-loop-probe = []
 default = ["test-compio-runtime"]
 
 [dev-dependencies]
