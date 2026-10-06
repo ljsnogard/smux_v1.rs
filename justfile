@@ -63,7 +63,19 @@ test-compio: test-tokio
 #
 # 刻意**不带 `--all-targets`**：example 是 compio 传输，在 tokio 后端下编得过也
 # 没有意义（它是「默认后端」的演示，归 compio 那一趟）。测试目标逐个列出，一个不少。
-test-tokio: check-all-features
+# smol 装配的冒烟（显式 opt-in）
+#
+# 与 tokio 同样**不带 `--all-targets`**：本 crate 的其它测试目标都以「默认后端」
+# （缺省 compio，或 tokio 装配）为前提，smol 这一趟只覆盖对接冒烟 target。
+#
+# 它验的是「`buffex_smol_adapt` 的设备适配 + 调用方驱动的泵 + 全被动 `buffex::ring`
+# 环」这条链在真实 UNIX socket 上跑得通，因此 `smoke_smol` 里的四条用例都要跑。
+test-smol: check-all-features
+    @echo "== 测试：smol 装配（--no-default-features --features test-smol-runtime）=="
+    cargo test --manifest-path {{manifest}} --no-default-features --features test-smol-runtime \
+        --test smoke_smol
+
+test-tokio: test-smol
     @echo "== 测试：tokio 装配（--no-default-features --features test-tokio-runtime）=="
     cargo test --manifest-path {{manifest}} --no-default-features --features test-tokio-runtime \
         --lib --test smoke_tokio --test keepalive --test inmem_mux --test layered_rpc --test alloc_count --test thread_safety
@@ -84,6 +96,8 @@ check-all-features: clippy
     cargo check --manifest-path {{manifest}} --all-targets --no-default-features --features test-tokio-runtime
     @echo "== 编译：只开 compio feature =="
     cargo check --manifest-path {{manifest}} --all-targets --no-default-features --features test-compio-runtime
+    @echo "== 编译：只开 smol feature（冒烟 target）=="
+    cargo check --manifest-path {{manifest}} --test smoke_smol --no-default-features --features test-smol-runtime
 
 # 静态检查：库 + 所有测试目标（警告即失败）
 #

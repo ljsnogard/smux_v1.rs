@@ -372,6 +372,7 @@ where
     assert_eq!(
         actual, expected,
         "本用例要求跑在 {expected:?} 后端上，但当前运行时值报告的身份是 {actual:?}；\
-         请检查 Cargo feature（`test-tokio-runtime` / `test-compio-runtime`）"
+         请检查 Cargo feature（`test-tokio-runtime` / `test-compio-runtime` / \
+         `test-smol-runtime`）"
     );
 }

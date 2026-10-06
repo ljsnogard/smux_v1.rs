@@ -1,8 +1,9 @@
 #![warn(unused)]
 
-//! 冒烟测试的**共用餐**:同一份场景与断言，两个运行时各跑一遍。
+//! 冒烟测试的**共用餐**:同一份场景与断言，三个运行时各跑一遍。
 //!
-//! 本文件由两个薄壳（`tests/smoke_tokio.rs` / `tests/smoke_compio.rs`）各自
+//! 本文件由三个薄壳（`tests/smoke_tokio.rs` / `tests/smoke_compio.rs` /
+//! `tests/smoke_smol.rs`）各自
 //! `mod smoke_common;` 引入——测试 target 是独立 crate，无法共享同一个模块定义，
 //! 但被引入的是**同一份文件**。壳里只做「建立作用域 + 选运行时」。
 //!
@@ -36,7 +37,10 @@ pub async fn smoke_socket_body_(rt: &abs_art_tokio::Runtime, scope: &abs_art_tok
 }
 
 /// 见 tokio 版说明。
-#[cfg(not(feature = "test-tokio-runtime"))]
+#[cfg(all(
+    not(feature = "test-tokio-runtime"),
+    not(feature = "test-smol-runtime")
+))]
 pub async fn smoke_socket_body_(rt: &abs_art_compio::Runtime, scope: &abs_art_compio::LocalScope) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
         common::run_smoke_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
@@ -59,7 +63,10 @@ pub async fn small_socket_body_(rt: &abs_art_tokio::Runtime, scope: &abs_art_tok
 }
 
 /// 见 tokio 版说明。
-#[cfg(not(feature = "test-tokio-runtime"))]
+#[cfg(all(
+    not(feature = "test-tokio-runtime"),
+    not(feature = "test-smol-runtime")
+))]
 pub async fn small_socket_body_(rt: &abs_art_compio::Runtime, scope: &abs_art_compio::LocalScope) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
         common::run_small_mux_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
@@ -81,10 +88,12 @@ pub async fn small_socket_body_(rt: &abs_art_compio::Runtime, scope: &abs_art_co
 ///   误判为过期（本仓库修掉的那个缺陷），这条用例会死锁而不是失败，超时是它唯一的
 ///   可观测征兆。
 #[cfg(feature = "test-tokio-runtime")]
-pub async fn flow_ctrl_socket_body_(rt: &abs_art_tokio::Runtime, scope: &abs_art_tokio::LocalScope) {
+pub async fn flow_ctrl_socket_body_(
+    rt: &abs_art_tokio::Runtime,
+    scope: &abs_art_tokio::LocalScope,
+) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
-        let scenario =
-            common::run_flow_ctrl_socket_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
+        let scenario = common::run_flow_ctrl_socket_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
         match tokio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
             Result::Ok(()) => {}
             Result::Err(_) => panic!(
@@ -97,11 +106,16 @@ pub async fn flow_ctrl_socket_body_(rt: &abs_art_tokio::Runtime, scope: &abs_art
 }
 
 /// 见 tokio 版说明。
-#[cfg(not(feature = "test-tokio-runtime"))]
-pub async fn flow_ctrl_socket_body_(rt: &abs_art_compio::Runtime, scope: &abs_art_compio::LocalScope) {
+#[cfg(all(
+    not(feature = "test-tokio-runtime"),
+    not(feature = "test-smol-runtime")
+))]
+pub async fn flow_ctrl_socket_body_(
+    rt: &abs_art_compio::Runtime,
+    scope: &abs_art_compio::LocalScope,
+) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
-        let scenario =
-            common::run_flow_ctrl_socket_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
+        let scenario = common::run_flow_ctrl_socket_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
         match compio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
             Result::Ok(()) => {}
             Result::Err(_) => panic!(
@@ -126,8 +140,7 @@ pub async fn flow_ctrl_isolation_socket_body_(
     scope: &abs_art_tokio::LocalScope,
 ) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
-        let scenario =
-            common::run_flow_ctrl_isolation_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
+        let scenario = common::run_flow_ctrl_isolation_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
         match tokio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
             Result::Ok(()) => {}
             Result::Err(_) => panic!(
@@ -140,14 +153,16 @@ pub async fn flow_ctrl_isolation_socket_body_(
 }
 
 /// 见 tokio 版说明。
-#[cfg(not(feature = "test-tokio-runtime"))]
+#[cfg(all(
+    not(feature = "test-tokio-runtime"),
+    not(feature = "test-smol-runtime")
+))]
 pub async fn flow_ctrl_isolation_socket_body_(
     rt: &abs_art_compio::Runtime,
     scope: &abs_art_compio::LocalScope,
 ) {
     common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
-        let scenario =
-            common::run_flow_ctrl_isolation_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
+        let scenario = common::run_flow_ctrl_isolation_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
         match compio::time::timeout(common::K_FLOW_CTRL_WATCHDOG_, scenario).await {
             Result::Ok(()) => {}
             Result::Err(_) => panic!(
@@ -184,7 +199,10 @@ fn assert_tokio_adapters_fit_() {
 /// 编译期断言（compio）：两类适配都成立——(1) socket 半边经**缓冲级**适配后直接就是
 /// `TrBuffRead` / `TrBuffWrite`（不需要中间环即可充当 `Rx` / `Tx`）；(2) 经**设备级**
 /// 适配后满足 `common` 的 `TrInput<u8>` / `TrOutput<u8>` 契约（本测试实际使用的形态）。
-#[cfg(not(feature = "test-tokio-runtime"))]
+#[cfg(all(
+    not(feature = "test-tokio-runtime"),
+    not(feature = "test-smol-runtime")
+))]
 #[allow(dead_code)]
 fn assert_compio_adapters_fit_() {
     use buffex::x_deps::abs_buff::{
@@ -207,4 +225,105 @@ fn assert_compio_adapters_fit_() {
     let mut stream = UnixStream::from_std(std_a).expect("应能注册到 compio 运行时");
     assert_input_(ReadAsInput::new(&mut stream));
     assert_output_(WriteAsOutput::new(&mut stream));
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// smol 版（与上面两版逐字同构，只有「设备类型 + 适配 crate + 驱动方式」不同）
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 测试目标、手段、判断见 tokio 版同名函数。
+///
+/// smol 侧多一处**驱动方式**的差别：本地队列是本线程 `thread_local!` 里的
+/// `Rc<LocalExecutor<'static>>`，因此壳里用 `smol::block_on(scope.run_until(..))`
+/// 把它驱动起来（见 `tests/smoke_smol.rs`）；场景体本身逐字共用。
+#[cfg(feature = "test-smol-runtime")]
+pub async fn smoke_socket_body_(rt: &abs_art_smol::Runtime, scope: &abs_art_smol::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_smoke_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
+    })
+    .await;
+}
+
+/// 见 tokio 版说明。
+#[cfg(feature = "test-smol-runtime")]
+pub async fn small_socket_body_(rt: &abs_art_smol::Runtime, scope: &abs_art_smol::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_small_mux_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
+    })
+    .await;
+}
+
+/// 见 tokio 版说明。
+///
+/// 看门狗换成 `smol::Timer`：`futures::future::select` 让「场景跑完」与「计时到点」
+/// 二者竞速，后者先到即判为挂死。超时的判据与另两版完全一致。
+#[cfg(feature = "test-smol-runtime")]
+pub async fn flow_ctrl_socket_body_(rt: &abs_art_smol::Runtime, scope: &abs_art_smol::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        let scenario = common::run_flow_ctrl_socket_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
+        let watchdog = async {
+            smol::Timer::after(common::K_FLOW_CTRL_WATCHDOG_).await;
+        };
+        futures::pin_mut!(scenario);
+        futures::pin_mut!(watchdog);
+        match futures::future::select(scenario, watchdog).await {
+            futures::future::Either::Left(((), _)) => {}
+            futures::future::Either::Right(((), _)) => panic!(
+                "流控场景超时（{:?}）：疑似窗口回补之后发送方永久拿不到额度而卡死",
+                common::K_FLOW_CTRL_WATCHDOG_
+            ),
+        }
+    })
+    .await;
+}
+
+/// 见 tokio 版说明。
+#[cfg(feature = "test-smol-runtime")]
+pub async fn flow_ctrl_isolation_socket_body_(
+    rt: &abs_art_smol::Runtime,
+    scope: &abs_art_smol::LocalScope,
+) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        let scenario = common::run_flow_ctrl_isolation_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx);
+        let watchdog = async {
+            smol::Timer::after(common::K_FLOW_CTRL_WATCHDOG_).await;
+        };
+        futures::pin_mut!(scenario);
+        futures::pin_mut!(watchdog);
+        match futures::future::select(scenario, watchdog).await {
+            futures::future::Either::Left(((), _)) => {}
+            futures::future::Either::Right(((), _)) => panic!(
+                "流控隔离场景超时（{:?}）：一条子流的额度耗尽拖死了其它子流",
+                common::K_FLOW_CTRL_WATCHDOG_
+            ),
+        }
+    })
+    .await;
+}
+
+/// 编译期断言（smol）：三层适配都成立——(1) 设备级适配后的 socket 半边满足 `common`
+/// 对输入 / 输出设备的契约（本测试实际使用的形态）；(2) 环层 `BuffRead` / `BuffWrite`
+/// 直接就是 `TrBuffRead` / `TrBuffWrite`（不需要中间环即可充当 `Rx` / `Tx`）；
+/// (3) 两层的设备都是 `smol` 生态的原生流类型（`smol::net::unix::UnixStream`）。
+#[cfg(feature = "test-smol-runtime")]
+#[allow(dead_code)]
+fn assert_smol_adapters_fit_() {
+    use buffex::x_deps::abs_buff::{
+        TrBuffRead, TrBuffWrite,
+        io::{TrInput, TrOutput},
+    };
+    use buffex_smol_adapt::{BuffRead, BuffWrite, ReadAsInput, WriteAsOutput};
+    use smol::net::unix::UnixStream;
+
+    fn assert_buff_read_<R: TrBuffRead<u8>>() {}
+    fn assert_buff_write_<W: TrBuffWrite<u8>>() {}
+    fn assert_input_<I: TrInput<u8>>(_: I) {}
+    fn assert_output_<O: TrOutput<u8>>(_: O) {}
+
+    assert_buff_read_::<BuffRead<UnixStream>>();
+    assert_buff_write_::<BuffWrite<UnixStream>>();
+
+    let (mut stream_a, _) = UnixStream::pair().expect("建立 smol UNIX socket 对应当成功");
+    assert_input_(ReadAsInput::new(&mut stream_a));
+    assert_output_(WriteAsOutput::new(&mut stream_a));
 }

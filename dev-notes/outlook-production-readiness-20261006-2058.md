@@ -56,6 +56,10 @@
 - **处置方向**：加 feature（转发 bridge 的 `backend-smol`）+ 一个 smol 的 UDS 薄适配
   （`async-net::UnixStream` 包成 `TrInput` / `TrOutput`）+ 一个冒烟 target；
   驱动方式照 `tests/inmem_mux.rs`（`scope.run_until(scenario)`）。
+- **进展（2026-10-06）**：本条处置方向的三件（Bridge feature / UDS 适配 / 冒烟
+  target）已落地，四个冒烟用例在三个装配下全绿；因果与实测见
+  `smoke-smol-20261006-2152.md`。本节其余判断（§2.1 的骨架提炼、§3 的跨进程编排）
+  仍然成立。
 
 ### 2.3 没有优雅关闭
 

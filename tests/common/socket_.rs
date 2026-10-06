@@ -141,9 +141,9 @@ async fn run_socket_scenario_with_<IA, OA, IB, OB, F, Fut>(
 /// **tokio** 版：建立一条已注册进运行时的 UNIX socket 对、装配好四条调用方驱动的
 /// 泵，然后在给定作用域上跑 `scenario`。
 ///
-/// 与下面的 compio 版**逐字同构**，只有「设备类型 + 适配 crate」不同；两个运行时
-/// 因此共用同一份场景（[`run_smoke_scenario_`] / [`run_small_mux_scenario_`]），
-/// 不再各写一个测试文件。
+/// 与下面的 compio / smol 版**逐字同构**，只有「设备类型 + 适配 crate + 怎么拆读写
+/// 半边」不同；三个运行时因此共用同一份场景（[`run_smoke_scenario_`] /
+/// [`run_small_mux_scenario_`]），不再各写一个测试文件。
 #[cfg(feature = "test-tokio-runtime")]
 pub async fn run_socket_scenario_on_runtime_<F, Fut>(
     scope: &abs_art_tokio::LocalScope,
@@ -177,7 +177,10 @@ pub async fn run_socket_scenario_on_runtime_<F, Fut>(
 
 /// **compio** 版：0.19 的 `UnixStream` 没有 `pair()`，因此先建 `std` socket 对再
 /// 逐个 `from_std` 注册进当前运行时。其余与 tokio 版逐字同构。
-#[cfg(not(feature = "test-tokio-runtime"))]
+#[cfg(all(
+    not(feature = "test-tokio-runtime"),
+    not(feature = "test-smol-runtime")
+))]
 pub async fn run_socket_scenario_on_runtime_<F, Fut>(
     scope: &abs_art_compio::LocalScope,
     scenario: F,
@@ -200,6 +203,42 @@ pub async fn run_socket_scenario_on_runtime_<F, Fut>(
         compio::net::UnixStream::from_std(std_b).expect("b 端应能注册到 compio 运行时");
     let (mut a_read, mut a_write) = stream_a.into_split();
     let (mut b_read, mut b_write) = stream_b.into_split();
+
+    let fut = run_socket_scenario_with_(
+        ReadAsInput::new(&mut a_read),
+        WriteAsOutput::new(&mut a_write),
+        ReadAsInput::new(&mut b_read),
+        WriteAsOutput::new(&mut b_write),
+        scenario,
+    );
+    scope.run_until(fut).await;
+}
+
+
+/// **smol** 版：`async-net` 的 `UnixStream` 没有 `into_split`，因此用
+/// [`smol::io::split`]（即 `futures_lite::io::split`）把整条流拆成读写半边——它内部
+/// 用一把**短临界区**的互斥锁共享同一条流（`poll_read` / `poll_write` 期间才持锁），
+/// 与 tokio / compio 的 `into_split` 在语义上等价：两个半边仍然指向同一条全双工连接。
+/// 其余与 tokio 版逐字同构。
+#[cfg(feature = "test-smol-runtime")]
+pub async fn run_socket_scenario_on_runtime_<F, Fut>(
+    scope: &abs_art_smol::LocalScope,
+    scenario: F,
+) where
+    F: FnOnce(
+        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+    ) -> Fut,
+    Fut: core::future::Future<Output = ()>,
+{
+    use buffex_smol_adapt::{ReadAsInput, WriteAsOutput};
+    use smol::net::unix::UnixStream;
+
+    let (stream_a, stream_b) = UnixStream::pair().expect("建立 smol UNIX socket 对应当成功");
+    let (mut a_read, mut a_write) = smol::io::split(stream_a);
+    let (mut b_read, mut b_write) = smol::io::split(stream_b);
 
     let fut = run_socket_scenario_with_(
         ReadAsInput::new(&mut a_read),
