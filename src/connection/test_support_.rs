@@ -13,15 +13,13 @@
 //! （环的关闭态、dock 上报、非阻塞转发）。端到端行为一律由 `tests/` 下的集成
 //! 测试覆盖。
 
-use mm_ptr::Owned;
-
 use abs_smux::conf::TrMuxConfig;
 use abs_art::{TrClock, TrDelay, TrInterval, TrTime};
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, BuffAllocError, K_STAGE_RING_CAPACITY, MuxChanBuff,
+        BufferedRx, BufferedTx, BuffAllocError, K_STAGE_RING_CAPACITY,
         MuxConnection, TrConnCfg,
         ring_::test_support_::TestBuff,
     },
@@ -152,74 +150,14 @@ impl TrConnCfg for TestMuxConfig_ {
         alloc: Self::Alloc,
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(capacity, alloc),
-            Owned::new_uninit_slice(capacity, alloc),
-        ))
+        TestBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
     }
 
     fn make_stage_buffs(
         &self,
         alloc: Self::Alloc,
     ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-        ))
-    }
-}
-
-/// 与 [`TestMuxConfig_`] 同构，但 `Buff` 使用擦除分配器的 [`MuxChanBuff`]。
-///
-/// 用于在同一个二进制内对比「零 dyn 的具体缓冲」与「擦除载具」。
-pub(crate) struct ErasedTestMuxConfig_;
-
-impl TrMuxConfig for ErasedTestMuxConfig_ {
-    type Data = u8;
-    type Dock = crate::connection::Dock;
-    type Buff = MuxChanBuff;
-}
-
-impl TrConnCfg for ErasedTestMuxConfig_ {
-    type Rt = NullRt_;
-    type Alloc = CoreAlloc;
-    type Policy = DefaultPolicy;
-    type ConnTx = TestWireTx_;
-    type ConnRx = TestWireRx_;
-    type StageBuff = MuxChanBuff;
-    type Metrics = NoMetrics;
-
-    fn runtime(&self) -> Self::Rt {
-        NullRt_
-    }
-
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
-    }
-
-    fn policy(&self) -> &Self::Policy {
-        &TEST_POLICY_
-    }
-
-    /// 测试配置不上报；`metrics` feature 与集成测试另有专用的带 sink 配置。
-    fn metrics(&self) -> &Self::Metrics {
-        &NoMetrics
-    }
-
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        MuxChanBuff::pair_from_alloc_(alloc, capacity).map_err(|_| BuffAllocError)
-    }
-
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        MuxChanBuff::pair_from_alloc_(alloc, K_STAGE_RING_CAPACITY)
-            .map_err(|_| BuffAllocError)
+        TestBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
     }
 }
 

@@ -17,7 +17,7 @@ use buffex::{
         },
     },
 };
-use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
+use mm_ptr::{Shared, x_deps::abs_mm::CoreAlloc};
 
 use crate::common::SmokeBuff;
 
@@ -32,7 +32,8 @@ pub fn make_passive_ring_(
     smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
     smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
 ) {
-    let buffer: SmokeBuff = Owned::new_uninit_slice(capacity, CoreAlloc);
+    let buffer = SmokeBuff::try_new(CoreAlloc, capacity)
+        .expect("测试的传输环内存应当分配成功");
     let ring = Ring::try_new(buffer).expect("环容量应当落在 buffex 允许的区间内");
     let shared = Shared::new(ring, CoreAlloc);
     // SAFETY: 这条环只被刚建出的 `Shared` 独占，且没有对应的 `Weak`（不存在升级

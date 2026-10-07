@@ -27,14 +27,16 @@ use buffex::{
     },
 };
 use buffex_compio_adapt::{ReadAsInput, WriteAsOutput};
-use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
-use smux_v1::connection::{DefaultConnCfg, Dock, MuxConnection, TrConnCfg};
-use smux_v1::flow_ctrl::DefaultPolicy;
-use smux_v1::handshake::{
-    agent::{AcceptAllEntries, HandshakeAgent},
-    opts::BasicOpts,
+use mm_ptr::{Shared, x_deps::abs_mm::CoreAlloc};
+use smux_v1::{
+    connection::{DefaultConnCfg, Dock, MuxChanBuffOwnedBy, MuxConnection, TrConnCfg},
+    flow_ctrl::DefaultPolicy,
+    handshake::{
+        agent::{AcceptAllEntries, HandshakeAgent},
+        opts::BasicOpts,
+    },
+    metrics::NoMetrics,
 };
-use smux_v1::metrics::NoMetrics;
 use compio::net::UnixStream;
 
 /// 本示例用的**运行时值**类型：计时与时刻的来源。
@@ -55,7 +57,9 @@ type Cfg = DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>;
 /// smux 侧也因此**不需要**直接依赖任何后端 crate。
 type Scope = abs_art_bridge::LocalScope;
 /// 全被动环的存储类型（连接级帧暂存也用它）。
-type Buf = Owned<[MaybeUninit<u8>], CoreAlloc>;
+///
+/// 用与生产默认装配同一个智能指针：一块内存与释放它的分配器打包在一起。
+type Buf = MuxChanBuffOwnedBy<CoreAlloc>;
 /// 交给 smux 当 `Tx` 的写半边。
 type Tx = RingWriter<Shared<Ring<Buf, u8>, CoreAlloc>, Buf, u8>;
 /// 交给 smux 当 `Rx` 的读半边。
@@ -214,7 +218,7 @@ async fn passive(
 
 /// 造一条全被动环，切成 `(写端, 读端)`。
 fn passive_ring_() -> (Tx, Rx) {
-    let buffer: Buf = Owned::new_uninit_slice(K_RING_CAP, CoreAlloc);
+    let buffer = Buf::try_new(CoreAlloc, K_RING_CAP).expect("容量合法");
     let ring = Ring::try_new(buffer).expect("容量合法");
     let shared = Shared::new(ring, CoreAlloc);
     // SAFETY: 这条环由刚建出的 `Shared` 独占，且不存在对应的 `Weak`，

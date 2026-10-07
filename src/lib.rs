@@ -3,6 +3,11 @@
 // 索引表都要用它指定分配器，因此与 `allocator_api` 一并打开。
 #![feature(btreemap_alloc)]
 #![feature(impl_trait_in_assoc_type)]
+// 上游 `abs_mm::res_man::TrBoxed` 把「取回自己那块内存的分配器」写成一个返回
+// `impl Try<Output = &Self::Alloc>` 的方法（分配器可能存在于 `Rc` 这类共享所有权里），
+// 因此**实现**该 trait 就必须能引用 `core::ops::Try`。本地不解析它的残差类型，只把
+// 结果当「一定成功」使用（见 `connection::ring_::MuxChanBuffAlloc`）。
+#![feature(try_trait_v2)]
 
 extern crate alloc;
 

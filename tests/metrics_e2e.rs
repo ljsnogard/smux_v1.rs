@@ -24,6 +24,7 @@
 //! ```
 
 #![cfg(feature = "metrics")]
+#![feature(allocator_ext)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -36,7 +37,7 @@ use abs_smux::{
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
+use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{BuffAllocError, Dock, K_STAGE_RING_CAPACITY, ScopeHost, TrConnCfg},
     flow_ctrl::DefaultPolicy,
@@ -160,20 +161,14 @@ where
         alloc: Self::Alloc,
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(capacity, alloc),
-            Owned::new_uninit_slice(capacity, alloc),
-        ))
+        SmokeBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
     }
 
     fn make_stage_buffs(
         &self,
         alloc: Self::Alloc,
     ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-        ))
+        SmokeBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
     }
 }
 
@@ -259,7 +254,7 @@ async fn metrics_reports_lifecycle_() {
                 .await
                 .expect("B 侧绑定监听 dock 应当成功");
             let mut listener = binding
-                .listen_async()
+                .listen_async_default()
                 .await
                 .expect("B 侧建立 listener 应当成功");
             let mut handle = listener

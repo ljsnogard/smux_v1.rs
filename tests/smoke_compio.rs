@@ -19,6 +19,7 @@
 //! 运行时上下文内——`#[compio::test]` 满足）。
 
 #![cfg(not(feature = "test-tokio-runtime"))]
+#![feature(allocator_ext)]
 
 #[path = "common/mod.rs"]
 mod common;

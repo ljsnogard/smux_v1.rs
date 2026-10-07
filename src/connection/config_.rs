@@ -31,10 +31,11 @@ use core::{
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use abs_smux::conf::TrMuxConfig;
-use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
+use abs_mm::{CoreAlloc, res_man::TrBoxed};
+use mm_ptr::x_deps::abs_mm;
 
 use crate::{
-    connection::{Dock, MuxChanBuff},
+    connection::{Dock, MuxChanBuffOwnedBy},
     flow_ctrl::{DefaultPolicy, TrFlowCtrlPolicy},
     handshake::agent::HandshakeDelivery,
     metrics::{NoMetrics, TrMetricsSink},
@@ -86,7 +87,18 @@ pub const K_STAGE_RING_CAPACITY: usize = 64usize * 1024usize;
 /// （即集成方在 `Cargo.toml` 里选定的后端），测试配置可以换成假运行时值。
 pub trait TrConnCfg
 where
-    Self: TrMuxConfig<Data = u8, Dock = Dock> + 'static,
+    Self: TrMuxConfig<
+        Data = u8,
+        Dock = Dock,
+        // 上游只用 `TrBoxed` 描述 `Buff`——能 `Deref` 到切片、并能报出自己那块内存的
+        // 分配器。连接侧还要把它当 `buffex::ring` 的环存储用，而那要求**可变**借用
+        // （`BorrowMut`），上游不保证这一条，因此在这里补上。
+        //
+        // 它必须挂在 **supertrait 的关联类型绑定**上（而不是写成 trait 的普通
+        // `where Self::Buff: …`）：绑定会随 `C: TrConnCfg` 一起进入使用环境，而普通
+        // where 子句不会——后者会逼着每一个用到 `C::Buff` 的签名自己再抄一遍约束。
+        Buff: BorrowMut<[MaybeUninit<u8>]>,
+    > + 'static,
 {
     /// **运行时值**：提供「现在几点」（[`TrClock`]）与「怎么等」（[`TrDelay`]）。
     ///
@@ -121,14 +133,17 @@ where
 
     /// **连接级**两条帧暂存环的存储类型（读环一块、写环一块）。
     ///
-    /// 与 [`TrMuxConfig::Buff`] 解耦：子流环容量由调用方在 `accept_async` 逐条
+    /// 与 [`TrMuxConfig::Buff`] **同形**：两者都是「由外部交出、供环使用」的智能指针
+    /// （[`TrBoxed`]），只是容量来源不同——子流环容量由调用方在 `accept_async` 逐条
     /// 决定，帧暂存容量是**连接级**策略，两者不该互相绑架。容量下限由实现者保证
     /// （至少能整块驻留一个满帧，见 `session_` 模块文档），连接不再二次校验。
     ///
     /// 这里刻意**不**要求 `Send + Sync`：是否需要跨线程搬运由具体装配决定
     /// （`MuxConnection::new` 才要求 `C::StageBuff: Send + Sync`），与
     /// [`TrMuxConfig::Buff`] 的约束保持同一层级。
-    type StageBuff: 'static + BorrowMut<[MaybeUninit<u8>]>;
+    type StageBuff: 'static
+        + BorrowMut<[MaybeUninit<u8>]>
+        + TrBoxed<Item = [MaybeUninit<u8>]>;
 
     /// 取一个**运行时值**（克隆句柄；各处共享同一个时间轴与计时器）。
     ///
@@ -224,9 +239,9 @@ where
 pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 
 /// 默认配置：`u8` 数据、[`Dock`] dock、[`CoreAlloc`] 分配、[`DefaultPolicy`]
-/// 流控；**帧暂存**用不经类型擦除的 [`Owned`]，**子流环**用把分配器擦除掉的
-/// [`MuxChanBuff`]（`accept_async_managed` 那条路要求缓冲类型与调用方给出的分配器
-/// 无关）。
+/// 流控；**帧暂存与子流环都用** [`MuxChanBuffAlloc`]——一种把「环内存 + 释放它的
+/// 分配器」打包在一起的智能指针，分配器内联在值里，因此每次建缓冲都不必再为保存
+/// 分配器做一次额外堆分配。
 ///
 /// 泛型参数 `Rt` 是**运行时值**，默认取 `abs_art-bridge` 的裸名
 /// [`Runtime`](abs_art_bridge::Runtime)——即集成方在 `Cargo.toml` 里选定的后端
@@ -242,12 +257,17 @@ pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 /// type Cfg = DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>;
 /// ```
 ///
-/// # 为什么两块缓冲用不同的类型
+/// # 两块缓冲为什么是同一种类型
 ///
-/// [`MuxConnection::new`] 要求 `C::StageBuff: Send + Sync`（帧暂存环的存储会在建连时
-/// 被搬进循环），而 [`MuxChanBuff`] 内部持有裸指针、没有这两个 impl。帧暂存的分配器
-/// 本就是配置自己定的（[`CoreAlloc`]），用 [`Owned`] 既满足约束又不必引入新的
-/// `unsafe impl`；子流环则需要「分配器擦除」这一点，那条路不要求 `Send + Sync`。
+/// 连接级帧暂存与子流环都是「由外部交出、供环使用的一块内存」，因此上游
+/// [`TrMuxConfig::Buff`] 与本 trait 的 [`TrConnCfg::StageBuff`] 用同一个契约
+/// （[`TrBoxed`]）描述它们，默认实现也就用同一个 [`MuxChanBuffAlloc`]。两种用途的差别
+/// 只在**容量从哪来**：帧暂存由 [`TrConnCfg::make_stage_buffs`] 定死，子流环由调用方
+/// 在最终裁决时逐条给出。
+///
+/// 帧暂存这一路额外要求 `Send + Sync`（[`MuxConnection::new`] 会把缓冲搬进循环），
+/// 而 [`MuxChanBuffAlloc`] 内部是裸指针，因此那两条 `unsafe impl` 写在 `ring_` 模块里
+/// （附安全论证）。子流环那条路不要求这两个 auto trait。
 ///
 /// [`MuxConnection::new`]: crate::connection::MuxConnection::new
 pub struct DefaultConnCfg<
@@ -365,7 +385,7 @@ where
 {
     type Data = u8;
     type Dock = Dock;
-    type Buff = MuxChanBuff;
+    type Buff = MuxChanBuffOwnedBy<CoreAlloc>;
 }
 
 impl<W, R, M, P, Rt> TrConnCfg for DefaultConnCfg<W, R, M, P, Rt>
@@ -382,7 +402,7 @@ where
     type ConnTx = W;
     type ConnRx = R;
     type Metrics = M;
-    type StageBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
+    type StageBuff = MuxChanBuffOwnedBy<CoreAlloc>;
 
     fn runtime(&self) -> Self::Rt {
         self.rt_.clone()
@@ -412,16 +432,14 @@ where
         alloc: Self::Alloc,
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        MuxChanBuff::pair_from_alloc_(alloc, capacity).map_err(|_| BuffAllocError)
+        MuxChanBuffOwnedBy::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
     }
 
     fn make_stage_buffs(
         &self,
         alloc: Self::Alloc,
     ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        let cap = K_STAGE_RING_CAPACITY;
-        let read = Owned::try_new_uninit_slice(cap, alloc).map_err(|_| BuffAllocError)?;
-        let write = Owned::try_new_uninit_slice(cap, alloc).map_err(|_| BuffAllocError)?;
-        Result::Ok((read, write))
+        MuxChanBuffOwnedBy::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY)
+            .map_err(|_| BuffAllocError)
     }
 }

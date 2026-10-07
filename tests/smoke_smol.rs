@@ -27,6 +27,7 @@
 //! 裸名 `Runtime` 要求「当前编译里只有一个后端」。
 
 #![cfg(feature = "test-smol-runtime")]
+#![feature(allocator_ext)]
 
 use abs_art::TrLocalScope;
 

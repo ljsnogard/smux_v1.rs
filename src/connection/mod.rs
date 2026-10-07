@@ -548,7 +548,7 @@ pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
 pub(crate) use mux_connection::ReserveErr_;
-pub use ring_::{BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff};
+pub use ring_::{BufferedChannel, BufferedRx, BufferedTx, MuxChanBuffOwnedBy};
 pub use scope_host_::{DefaultRt_, ScopeHost, default_rt_};
 pub use telegraph::{Telegraph, TelegraphError};
 pub use types_::Dock;

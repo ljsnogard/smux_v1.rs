@@ -1,9 +1,10 @@
 //! `TrPrepareChannelRing` 的测试侧适配：把「闭包里塞两块缓冲」这个常见写法包成
 //! [`ClosurePrepare`]，并给出 `accept` / `accept_async_closure` 的扩展 trait。
 
-use core::{borrow::BorrowMut, mem::MaybeUninit};
+use core::{alloc::AllocatorClone, mem::MaybeUninit};
 use buffex::x_deps::abs_buff::TrBuffWrite;
 use abs_smux::chan::{ChannelBuffAlloc, TrChannelHandle, TrPrepareChannelRing};
+use mm_ptr::x_deps::abs_mm::res_man::TrBoxed;
 use smux_v1::connection::{ChannelHandle, ChannelRx, ChannelTx, HandleError, TrConnCfg};
 
 /// 测试侧对「闭包造两块缓冲」这一常见写法的适配器。
@@ -22,7 +23,8 @@ impl<F> ClosurePrepare<F> {
 impl<F, B> TrPrepareChannelRing<B, u8> for ClosurePrepare<F>
 where
     F: FnOnce() -> (B, B),
-    B: 'static + BorrowMut<[MaybeUninit<u8>]>,
+    B: 'static + TrBoxed<Item = [MaybeUninit<u8>]>,
+    B::Alloc: AllocatorClone,
 {
     fn prepare(self) -> ChannelBuffAlloc<B, u8> {
         let (tx_buff, rx_buff) = (self.0)();

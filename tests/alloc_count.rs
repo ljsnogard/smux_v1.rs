@@ -54,7 +54,6 @@ mod common;
 use core::{
     alloc::{AllocError, Allocator, AllocatorClone, Layout},
     marker::PhantomData,
-    mem::MaybeUninit,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
@@ -67,11 +66,11 @@ use abs_smux::{
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use futures::join;
-use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
+use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{
         BuffAllocError, BufferedRx, BufferedTx, ChannelListener, ChannelRx, ChannelTx, Dock,
-        K_STAGE_RING_CAPACITY, MuxChanBuff, MuxConnection, TrConnCfg,
+        K_STAGE_RING_CAPACITY, MuxChanBuffOwnedBy, MuxConnection, TrConnCfg,
     },
     flow_ctrl::DefaultPolicy,
     handshake::{
@@ -175,7 +174,11 @@ unsafe impl Allocator for CountingAlloc {
 unsafe impl AllocatorClone for CountingAlloc {}
 
 /// 子流环存储的类型（与冒烟配置同构，只换分配器）。
-type CountBuff = Owned<[MaybeUninit<u8>], CountingAlloc>;
+///
+/// 它与生产默认装配是同一种智能指针：内存与分配器内联在一起，因此「造一块环内存」
+/// 只向注入分配器记一次账，不会额外经全局分配器（旧版把分配器擦除成
+/// `Arc<dyn Allocator>`，每块缓冲都要多一次 `Arc::new`）。
+type CountBuff = MuxChanBuffAlloc<CountingAlloc>;
 
 /// 用[注入分配器](CountingAlloc)记账的连接配置。
 #[derive(Debug)]
@@ -274,138 +277,14 @@ where
         alloc: Self::Alloc,
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(capacity, alloc),
-            Owned::new_uninit_slice(capacity, alloc),
-        ))
+        CountBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
     }
 
     fn make_stage_buffs(
         &self,
         alloc: Self::Alloc,
     ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-        ))
-    }
-}
-
-/// 与 [`CountMuxConfig`] 同构，但**子流环存储**换成擦除分配器的 [`MuxChanBuff`]
-/// （`DefaultConnCfg` 那条路径）。
-///
-/// 唯一的差别就是这一处：`MuxChanBuff::pair_from_alloc_` 每次调用都要
-/// `Arc::new(alloc)` 把分配器擦除成一个 trait object——**每侧一次全局分配**
-/// （audit-heap-alloc §3.1 #5 / §5.5-A）。本配置存在的意义就是量出这笔开销，
-/// 为「#5 怎么改（公开 API 加性新增还是改签名）」提供数字。
-#[derive(Debug)]
-struct ErasedMuxConfig<W, R, RT> {
-    /// 传输写半边的类型占位。
-    _use_w_: PhantomData<fn() -> W>,
-
-    /// 传输读半边的类型占位。
-    _use_r_: PhantomData<fn() -> R>,
-
-    /// 运行时值（`TrConnCfg::runtime` 要交出建连时抓住的那一个）。
-    rt_: RT,
-}
-
-impl<W, R, RT: Copy> Copy for ErasedMuxConfig<W, R, RT> {}
-
-impl<W, R, RT: Clone> Clone for ErasedMuxConfig<W, R, RT> {
-    fn clone(&self) -> Self {
-        ErasedMuxConfig {
-            _use_w_: PhantomData,
-            _use_r_: PhantomData,
-            rt_: self.rt_.clone(),
-        }
-    }
-}
-
-impl<W, R, RT> ErasedMuxConfig<W, R, RT> {
-    /// 由运行时值构造。
-    fn new_(rt: RT) -> Self {
-        ErasedMuxConfig {
-            _use_w_: PhantomData,
-            _use_r_: PhantomData,
-            rt_: rt,
-        }
-    }
-}
-
-impl<W, R, RT> common::TestConnCfg for ErasedMuxConfig<W, R, RT>
-where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
-    RT: common::TrSmokeRt,
-{
-    fn new_(rt: Self::Rt) -> Self {
-        ErasedMuxConfig::new_(rt)
-    }
-}
-
-impl<W, R, RT> TrMuxConfig for ErasedMuxConfig<W, R, RT>
-where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
-{
-    type Data = u8;
-    type Dock = Dock;
-
-    /// 与 [`CountMuxConfig`] 的 `CountBuff` 的**唯一**差别。
-    type Buff = MuxChanBuff;
-}
-
-impl<W, R, RT> TrConnCfg for ErasedMuxConfig<W, R, RT>
-where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
-    RT: common::TrSmokeRt,
-{
-    type Rt = RT;
-    type Alloc = CountingAlloc;
-    type Policy = DefaultPolicy;
-    type ConnTx = W;
-    type ConnRx = R;
-
-    /// 连接级帧暂存仍用 `Owned`（与基准场景一致），把差异**隔离在子流环存储**上。
-    type StageBuff = CountBuff;
-    type Metrics = NoMetrics;
-
-    fn runtime(&self) -> Self::Rt {
-        self.rt_.clone()
-    }
-
-    fn allocator(&self) -> Self::Alloc {
-        CountingAlloc
-    }
-
-    fn policy(&self) -> &Self::Policy {
-        &COUNT_POLICY
-    }
-
-    /// 本配置不上报：分配基线用例要的正是「**静默** sink」这一形态（它零大小、
-    /// 调用点被消除，因此不会给分配面添任何东西）。
-    fn metrics(&self) -> &Self::Metrics {
-        &NoMetrics
-    }
-
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        MuxChanBuff::pair_from_alloc_(alloc, capacity).map_err(|_| BuffAllocError)
-    }
-
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-        ))
+        CountBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
     }
 }
 
@@ -619,7 +498,7 @@ where
             .await
             .expect("B 侧绑定应当成功");
         let listener = binding
-            .listen_async()
+            .listen_async_default()
             .await
             .expect("B 侧监听应当成功");
         dock_bs.push(dock_b);
@@ -797,102 +676,29 @@ where
     (build_global, build_injected)
 }
 
-/// 擦除缓冲（`MuxChanBuff`）场景：只测**建流**，用来量出 audit #5 的「每侧一次
-/// `Arc::new(alloc)`」。
+/// **直接量一次环内存的分配足迹**：造一对缓冲、再释放掉。
 ///
-/// 与 [`run_baseline_`] 的建流阶段逐语句同构，只有子流环存储的类型不同。
-async fn run_erased_buffers_<S, RT>(rt: &RT, scope: &S) -> (Usage_, Usage_)
-where
-    S: common::TrSmokeScope + Clone + 'static,
-    RT: common::TrSmokeRt,
-{
-    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
-    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
-    let (conn_a, conn_b) =
-        connect_with_::<ErasedMuxConfig<RingTx, RingRx, RT>, S>(rt, scope, a_tx, a_rx, b_tx, b_rx)
-            .await;
-
-    let dock_a = Dock::new(0x6001u32);
-    let mut listeners_b: Vec<ChannelListener<ErasedMuxConfig<RingTx, RingRx, RT>>> =
-        Vec::with_capacity(K_CHANNELS);
-    let mut dock_bs: Vec<Dock> = Vec::with_capacity(K_CHANNELS);
-    let mut binding_a = conn_a
-        .bind_async(dock_a)
-        .await
-        .expect("A 侧绑定应当成功");
-    for index in 0..K_CHANNELS {
-        let dock_b = Dock::new(0x6100u32 + index as u32);
-        let listener = conn_b
-            .bind_async(dock_b)
-            .await
-            .expect("B 侧绑定应当成功")
-            .listen_async()
-            .await
-            .expect("B 侧监听应当成功");
-        dock_bs.push(dock_b);
-        listeners_b.push(listener);
-    }
-
-    // 四个半边**全部留着**（与基准场景一致）：一旦在这里丢掉 B 侧半边，上一条子流的
-    // 拆流（`TxClosed` / `RxClosed` → FIN/RESET → 释放）就会被算进**下一条**的窗口，
-    // 数字立刻不可比（第一版就是这么错的）。
-    let mut txs_a: Vec<ChannelTx<ErasedMuxConfig<RingTx, RingRx, RT>>> =
-        Vec::with_capacity(K_CHANNELS);
-    let mut rxs_a: Vec<ChannelRx<ErasedMuxConfig<RingTx, RingRx, RT>>> =
-        Vec::with_capacity(K_CHANNELS);
-    let mut txs_b: Vec<ChannelTx<ErasedMuxConfig<RingTx, RingRx, RT>>> =
-        Vec::with_capacity(K_CHANNELS);
-    let mut rxs_b: Vec<ChannelRx<ErasedMuxConfig<RingTx, RingRx, RT>>> =
-        Vec::with_capacity(K_CHANNELS);
+/// 这是本轮重构要钉住的**核心事实的直测**——建流阶段的全局分配里混着事件通道等固有
+/// 成本（实测每子流约 32 次，见 `run_baseline_` 的逐条打印），单独量一对缓冲才看得清
+/// 「分配器是不是内联在缓冲里」。
+///
+/// 返回 `(全局用量, 注入用量)`：期望分别是 **0 次**与 **2 次**（Tx / Rx 各一块）。
+fn measure_pair_from_alloc_() -> (Usage_, Usage_) {
+    /// 探针缓冲的容量（与子流环的常见容量一致）。
+    const K_PROBE_CAP: usize = 4096usize;
 
     let g0 = global_usage_();
     let i0 = injected_usage_();
-    for index in 0..K_CHANNELS {
-        arm_();
-        let mut message: &[u8] = &[];
-        let mut handle = binding_a
-            .open_channel_async(dock_bs[index], &mut message)
-            .await
-            .expect("A 侧发起子流应当成功");
-        let listener = &mut listeners_b[index];
-        let (opened, accepted) = join!(
-            async {
-                let mut welcome: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome[..];
-                handle
-                    .accept_async_managed(&mut welcome, common::K_CHANNEL_CAPACITY)
-                    .await
-            },
-            async {
-                let mut incoming = listener
-                    .income_async()
-                    .await
-                    .expect("B 侧应当取到入向请求");
-                let mut welcome: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome[..];
-                incoming
-                    .accept_async_managed(&mut welcome, common::K_CHANNEL_CAPACITY)
-                    .await
-            },
-        );
-        let (tx_a, rx_a) = opened.expect("A 侧最终裁决应当成功");
-        let (tx_b, rx_b) = accepted.expect("B 侧最终裁决应当成功");
-        txs_a.push(tx_a);
-        rxs_a.push(rx_a);
-        txs_b.push(tx_b);
-        rxs_b.push(rx_b);
-        disarm_();
-    }
-    let erased_global = Usage_::since_(global_usage_(), g0);
-    let erased_injected = Usage_::since_(injected_usage_(), i0);
-    report_(&format!("擦除缓冲 建流 ×{K_CHANNELS}"), erased_global, erased_injected);
-    // 收尾在武装之外：这一步会触发拆流（FIN/RESET），不属本场景要量的「建流」。
-    drop(txs_a);
-    drop(rxs_a);
-    drop(txs_b);
-    drop(rxs_b);
-    drop(listeners_b);
-    (erased_global, erased_injected)
+    arm_();
+    let pair = CountBuff::pair_from_alloc(CountingAlloc, K_PROBE_CAP)
+        .expect("探针缓冲应当分配成功");
+    // 释放也在这段区间里：`Drop` 只把内存交还分配器，本身不应触发任何分配。
+    drop(pair);
+    disarm_();
+    (
+        Usage_::since_(global_usage_(), g0),
+        Usage_::since_(injected_usage_(), i0),
+    )
 }
 
 /// 分配计数基线（tokio 单运行时，理由见文件头）。
@@ -903,12 +709,30 @@ where
 ///   **全局**分配不超过回归上限（#1 之后每帧不再有那个 `Vec`）；建每条子流的注入分配
 ///   不少于 5 次（两块环存储 + 两个环节点 + 一个状态节点）；绑定 + 监听阶段全局分配
 ///   不超过 2 次（listener 通知已内联，audit #6）。
-/// - 判断（#5 的量）：擦除缓冲路径的**全局**分配恰好比 `Owned` 路径多
-///   `2 × K_CHANNELS` 次（每侧一次 `Arc::new(alloc)`），**注入**侧完全相同——这就是
-///   「`MuxChanBuff::pair_from_alloc_` 每次调用擦除一个分配器」的价格。C4 的 A/B 任一
-///   方案落地后，右边应当变成「基线 + 1」（每连接一份），本断言随之收紧。
+/// - 判断（环存储不再有「擦除分配」）：环存储统一为 [`MuxChanBuffAlloc`]，分配器**内联**
+///   在缓冲里，因此 `pair_from_alloc` 只向注入分配器要两块内存、**一次都不碰全局分配器**
+///   ——这一条由 [`measure_pair_from_alloc_`] 直接断言。旧版把分配器擦除成
+///   `Arc<dyn Allocator>`（每块缓冲多一次全局分配），与之配套的「擦除 vs 不擦除」A/B
+///   场景随实现一起删除；建流阶段的全局分配另有一个宽松上限兜底（它的实际构成是事件
+///   通道，见 `run_baseline_` 的打印）。
+///
+/// [`MuxChanBuffAlloc`]: smux_v1::connection::MuxChanBuffAlloc
 #[tokio::test]
 async fn alloc_count_baseline_tokio_() {
+    // 先直测缓冲本身：注入 +2（两块内存），全局 +0（分配器内联，没有擦除分配）。
+    let (probe_global, probe_injected) = measure_pair_from_alloc_();
+    assert_eq!(
+        probe_injected.allocs_, 2usize,
+        "造一对环缓冲应当只向注入分配器要两次内存（Tx / Rx 各一块），实际 {} 次",
+        probe_injected.allocs_
+    );
+    assert_eq!(
+        probe_global.allocs_, 0usize,
+        "造一对环缓冲不应当碰全局分配器（分配器内联在缓冲里），实际 {} 次——\
+         是不是又为保存分配器做了一次额外分配？",
+        probe_global.allocs_
+    );
+
     // 默认后端（`test-mock-clock`/`test-tokio-runtime` 下即 tokio）的运行时值：
     // 连接要自己取作用域，因此必须用 bridge 的具名别名（`ScopeHost` 只对它们实现）。
     let rt = common::default_rt_();
@@ -916,18 +740,25 @@ async fn alloc_count_baseline_tokio_() {
     let scope = rt.local_scope();
     let (build_global, build_injected) = scope.run_until(run_baseline_(&rt, &scope)).await;
 
-    // 第二个场景（擦除缓冲）另起一个作用域：两个连接的循环互不干扰。
-    let scope = rt.local_scope();
-    let (erased_global, erased_injected) = scope.run_until(run_erased_buffers_(&rt, &scope)).await;
-
-    assert_eq!(
-        erased_injected.allocs_, build_injected.allocs_,
-        "两条路径的**注入**分配应当完全一致（只有擦除那一步不同）"
+    // 注入侧确实发生了建流该有的分配——否则「全局侧安静」可能只是因为什么都没建。
+    assert!(
+        build_injected.allocs_ >= 5usize * K_CHANNELS,
+        "建 {K_CHANNELS} 条子流的注入分配只有 {} 次，少于「每条 2 块环存储 + 2 个环节点 \
+         + 1 个状态节点」的下界",
+        build_injected.allocs_
     );
-    assert_eq!(
-        erased_global.allocs_,
-        build_global.allocs_ + 2usize * K_CHANNELS,
-        "擦除缓冲路径应当恰好每侧多一次 `Arc::new(alloc)`（audit #5）；若这里变了，\
-         说明 `MuxChanBuff` 的擦除次数或 `pair_from_alloc_` 的实现变了"
+    // 全局侧的兜底上限：建流阶段的全局分配来自事件通道（`flume`）等固有成本，实测约
+    // 32 次/子流；环存储本身的贡献已经在 `measure_pair_from_alloc_` 里钉成 0。这里只防
+    // 「每次建缓冲/每帧又冒出一笔全局分配」这类量级失控。
+    const K_BUILD_GLOBAL_PER_CHANNEL_CEILING: usize = 48usize;
+    assert!(
+        build_global.allocs_ <= K_BUILD_GLOBAL_PER_CHANNEL_CEILING * K_CHANNELS,
+        "建 {K_CHANNELS} 条子流的全局分配有 {} 次，超过每子流 {K_BUILD_GLOBAL_PER_CHANNEL_CEILING} \
+         次的上限——环存储或事件通道可能又多了全局分配",
+        build_global.allocs_
+    );
+    println!(
+        "[alloc] 建流合计          全局 {:>6} 次 / {:>9} B    注入 {:>6} 次 / {:>9} B",
+        build_global.allocs_, build_global.bytes_, build_injected.allocs_, build_injected.bytes_
     );
 }

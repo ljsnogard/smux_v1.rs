@@ -133,11 +133,11 @@
 //! （`rt` 与 `scope`）作为最前面的两个参数一路传下去，用例自己取得并驱动它们：
 //! 作用域来自运行时值（`rt.local_scope()`），由 `scope.run_until(..)` 驱动。
 
+
+#![feature(allocator_ext)]
 mod common;
 
 use common::AcceptAsyncClosureExt;
-
-use core::mem::MaybeUninit;
 
 use abs_art::TrLocalScope;
 use smux_v1::single_runtime_test_;
@@ -147,7 +147,7 @@ use abs_smux::{
     dock::TrDock,
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
+use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{
         BindError, ChannelListener, ChannelRx, ChannelTx, Dock, DockBinding, MuxConnection,
@@ -180,7 +180,7 @@ const K_CLIENT_DOCK_BASE: u32 = 0x1000u32;
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 /// 内存环的存储类型（与 `common::make_passive_ring_` 的返回类型一致）。
-type WireBuff = Owned<[MaybeUninit<u8>], CoreAlloc>;
+type WireBuff = common::SmokeBuff;
 
 /// L4 的读半边。
 type WireRx = smux_v1::connection::BufferedRx<WireBuff, CoreAlloc>;

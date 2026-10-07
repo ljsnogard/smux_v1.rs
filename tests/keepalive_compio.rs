@@ -24,6 +24,7 @@
 //! compio 执行器的 `run()` 当作 tick 钩子）。
 
 #![cfg(not(feature = "test-tokio-runtime"))]
+#![feature(allocator_ext)]
 
 #[path = "common/mod.rs"]
 mod common;

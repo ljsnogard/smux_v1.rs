@@ -47,7 +47,7 @@
 //! 允许保留它。
 
 #![cfg(feature = "test-tokio-runtime")]
-
+#![feature(allocator_ext)]
 mod common;
 
 /// 本文件用到的连接配置别名：两侧同构的冒烟策略（传输类型由 [`common::connect_pair_`]

@@ -33,6 +33,7 @@
 //! `keepalive_compio.rs`。
 
 #![cfg(feature = "test-tokio-runtime")]
+#![feature(allocator_ext)]
 
 #[path = "common/mod.rs"]
 mod common;

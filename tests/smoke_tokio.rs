@@ -15,6 +15,7 @@
 //! `MuxConnection<C>` 的类型参数与 `MuxConnection::new` 的方法级泛型。
 
 #![cfg(feature = "test-tokio-runtime")]
+#![feature(allocator_ext)]
 
 #[path = "common/mod.rs"]
 mod common;

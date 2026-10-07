@@ -27,6 +27,8 @@
 //! 运行时里拿到另一个后端的运行时值（那样第五个循环会 panic「no reactor running」）。
 //! 理由详见 `single_runtime_test_!` 的文档。
 
+
+#![feature(allocator_ext)]
 mod common;
 
 use core::cell::Cell;
@@ -818,10 +820,8 @@ where
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), smux_v1::connection::BuffAllocError> {
         // 与冒烟配置一致：子流环仍是 `SmokeBuff`，这里**只**改帧暂存容量。
-        Ok((
-            mm_ptr::Owned::new_uninit_slice(capacity, alloc),
-            mm_ptr::Owned::new_uninit_slice(capacity, alloc),
-        ))
+        common::SmokeBuff::pair_from_alloc(alloc, capacity)
+            .map_err(|_| smux_v1::connection::BuffAllocError)
     }
 
     /// **极小容量**帧暂存：连接读环与连接写环各只有

@@ -6,7 +6,7 @@
 
 use core::marker::PhantomData;
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
+use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use abs_smux::conf::TrMuxConfig;
 use smux_v1::{
     connection::{BuffAllocError, Dock, K_STAGE_RING_CAPACITY, MuxConnection, TrConnCfg},
@@ -14,7 +14,7 @@ use smux_v1::{
     metrics::NoMetrics,
 };
 
-use crate::common::{SmokeBuff, make_stage_buffs_with_};
+use crate::common::SmokeBuff;
 
 /// 连接层对**作用域值**的要求：值化的本地队列（`abs_art::TrLocalScope`）。
 ///
@@ -183,20 +183,14 @@ where
         alloc: Self::Alloc,
         capacity: usize,
     ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(capacity, alloc),
-            Owned::new_uninit_slice(capacity, alloc),
-        ))
+        SmokeBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
     }
 
     fn make_stage_buffs(
         &self,
         alloc: Self::Alloc,
     ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        Result::Ok((
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-            Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, alloc),
-        ))
+        SmokeBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
     }
 }
 
@@ -299,19 +293,15 @@ where
         // 一定被用尽（取 `min` 而不是直接替换，是为了让「调用方请求 0」这类边界
         // 仍然按原语义走）。
         let capacity = capacity.min(K_FLOW_CTRL_RING_CAPACITY);
-        Result::Ok((
-            Owned::new_uninit_slice(capacity, alloc),
-            Owned::new_uninit_slice(capacity, alloc),
-        ))
+        SmokeBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
     }
 
     fn make_stage_buffs(
         &self,
         alloc: Self::Alloc,
     ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        // 分配器参数用不上（缓冲由 helper 直接给），显式消费掉以免告警。
-        let _ = alloc;
-        Result::Ok(make_stage_buffs_with_(K_STAGE_RING_CAPACITY))
+        // 连接级帧暂存仍走 64 KiB，避免把「帧暂存」这一无关变量带进对照。
+        SmokeBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
     }
 }
 

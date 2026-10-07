@@ -193,6 +193,10 @@ where
 
     K: TrCancellationToken,
 {
+    // `reserve` 是上游新加的「入向邀请最多同时挂起多少条」的上限。当前实现还没有按它
+    // 预分配的队列（入向通知是身份节点里的**内联**槽），因此这里先显式消费掉参数；
+    // 等定容队列落地后再按它预分配（见 `crate::connection` 模块文档 §2.3 的遗留项）。
+    let _ = reserve;
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
     // 先清空释放邮箱：上一位持有者可能刚丢弃它的 listener（Drop 只投消息），

@@ -48,7 +48,7 @@ use abs_smux::{
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use futures::join;
-use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
+use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{
         BufferedRx, BufferedTx, ChannelRx, ChannelTx, Dock, MuxConnection, MuxError, TrConnCfg,
@@ -182,7 +182,7 @@ where
         .bind_async(dock_b)
         .await
         .expect("B 侧绑定监听 dock 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧建立 listener 应当成功");
 
@@ -449,7 +449,7 @@ where
         .bind_async(dock_b)
         .await
         .expect("B 侧绑定监听 dock 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧建立 listener 应当成功");
 
@@ -521,7 +521,7 @@ where
         .bind_async(dock_b)
         .await
         .expect("B 侧绑定监听 dock 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧建立 listener 应当成功");
 
@@ -621,7 +621,7 @@ where
         .bind_async(dock_b)
         .await
         .expect("B 侧绑定监听 dock 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧建立 listener 应当成功");
 
@@ -653,8 +653,10 @@ where
                 .expect("B 侧应当取到入向建流请求");
             let mut welcome_b_buf: [u8; 0] = [];
             let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
-            let tx_buff: SmokeBuff = Owned::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc);
-            let rx_buff: SmokeBuff = Owned::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc);
+            let tx_buff = SmokeBuff::try_new(CoreAlloc, K_CHANNEL_CAPACITY)
+                .expect("测试的子流环内存应当分配成功");
+            let rx_buff = SmokeBuff::try_new(CoreAlloc, K_CHANNEL_CAPACITY)
+                .expect("测试的子流环内存应当分配成功");
             let prep = ClosurePrepare::new(move || (tx_buff, rx_buff));
             let outcome = handle_b
                 .accept_async(&mut welcome_b, prep)
