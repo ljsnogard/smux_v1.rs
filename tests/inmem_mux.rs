@@ -222,6 +222,34 @@ async fn mux_closed_ring_spin_dual_() {
 }
 single_runtime_test_!(mux_closed_ring_spin_dual_);
 
+/// 测试目标（**连接级失败唤醒回归**）：判定不可恢复的连接级失败必须唤醒**所有**在册
+/// 子流，并让它们读到连接级原因（而不是无期限挂起、也不是笼统的半关闭）。
+///
+/// - 背景：连接级失败此前不唤醒在册子流上的读写等待者，应用只能靠子流空闲超时兜底
+///   （见 `smux_v1_sock_demo/dev-notes/known-stall-20261007-0130.md` §3.2）。
+///   而 `buffex` 的环半部 **drop 不置关闭位、也不唤醒对端**，所以「循环退出把表丢掉」
+///   本身不产生任何唤醒——必须有执行者显式 `close()` 它。
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_conn_failed_wakes_scenario_`]：A 侧的传输写半部包着一个**可置位
+///   故障**的替身，A 侧每条子流先双双阻塞（读等 B 的数据；写因 B 不读、窗口用尽而停在
+///   环满），随后用例置位故障并丢掉一条子流的发送半边——那条 `CLOSE(FIN)` 让写泵去碰
+///   传输、拿到写失败，连接于是判死（`mark_failed_(Transport { write: true })`）。
+///   整段等待包在「让出 40 万轮仍无进展即失败」的看门狗里。
+/// - 判断：A 侧每条子流的读与写都在看门狗内返回错误，且两个半部的
+///   `abort_reason()` 都是 `ConnFailed(Transport)`。把两个循环的收尾守卫改成透明包装
+///   （不关半部、不排空队列）时本用例会失败——诊断输出显示原因已经发布、半部却没被
+///   关闭，证明「原因」与「唤醒」是两件事，缺一不可。
+async fn mux_conn_failed_wakes_dual_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_conn_failed_wakes_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+single_runtime_test_!(mux_conn_failed_wakes_dual_);
+
 /// 测试目标（**本轮验收点**）：**最终裁决**（`accept_async`）成为建流的唯一提交点
 /// ——在它之前丢弃半建立句柄，两个角色都不留垃圾、不悬着对端。
 ///

@@ -97,12 +97,20 @@
 //! [`TrMetricsSink::on_channel_opened`] 等事件自行累加即可——这也正是「sink 的问题
 //! 交给 metrics 实现方」的一条推论。
 //!
-//! ## 6. 已知缺口
+//! ## 6. 连接级失败时的逐子流回调
 //!
-//! **连接级失败时，在册子流不会有各自的关闭回调**：`ChannelRegistry_::mark_failed_`
-//! 只置失败位、唤醒等待者、取消五个循环，**不逐条释放身份**。因此
-//! [`ChannelCloseReason::ConnFailed`] 目前只在文档层面表达，需求方要从
-//! [`TrMetricsSink::on_conn_closed`] 推断所有在册子流一并终结。
+//! 连接级失败（`ChannelRegistry_::mark_failed_`）**逐条**做了两件事：把失败类别写进
+//! 每条在册子流的通知槽（应用随后经 `abort_reason()` 读到
+//! [`MuxError::ConnFailed`](crate::connection::MuxError::ConnFailed)），以及取消五个
+//! 循环。循环退出时由各自的收尾守卫显式 `close()` 手里的环半部——**这一步才真正唤醒
+//! 在册子流上的读写等待者**。
+//!
+//! [`ChannelCloseReason::ConnFailed`] 的逐子流回调就在这两个守卫里上报，判据是
+//! 「本次收尾伴随连接级失败」+ [`ChannelOwner_::claim_release_`] 的一次性 CAS；
+//! 后者与正常收尾路径（`maybe_release_`）共用同一把闸门，因此**每条子流恰好上报
+//! 一次**：正常收尾的那条报 `Fin`，被连接级失败牵连的那条报 `ConnFailed`，不会重复。
+//!
+//! [`ChannelOwner_::claim_release_`]: crate::connection::owner_::ChannelOwner_::claim_release_
 //!
 //! ## 7. Examples
 //!

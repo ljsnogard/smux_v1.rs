@@ -62,7 +62,7 @@
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
-    sync::atomic::{AtomicU64, AtomicU8, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
     task::{Context, Poll},
 };
 
@@ -78,6 +78,7 @@ use crate::{
         sync_::NotifySlot_,
     },
     flow_ctrl::{Credit, FlowCtrl, FlowCtrlError, WindowReport},
+    metrics::ConnCloseReason,
 };
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -174,11 +175,16 @@ pub(crate) enum EstablishOutcome_ {
 // 共享状态节点
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-/// 一条子流的中止原因（保活判定用）。
+/// 一条子流的**中止动作认领码**（保活判定用）。
 ///
-/// 目前只有一种：空闲超时。它由**计时循环**认领（[`ChannelState_::claim_abort_`]）
-/// 并通过 [`ChannelState_::abort_reason_`] 回传给应用侧的两个半部
-/// （[`ChannelTx::abort_reason`](super::ChannelTx::abort_reason)）。
+/// 它只回答「谁负责执行中止这条子流的动作」（[`ChannelState_::claim_abort_`] 的 CAS
+/// 首个生效），**不是**应用读到的原因——原因是 [`ChannelNotice`]，由认领成功的一方
+/// 顺带发布。两者分开的理由（尤其是「连接级失败必须压过子流级原因」这条）见
+/// [`ChannelNotice`]。
+///
+/// 目前只有一种：空闲超时。它由**计时循环**认领
+/// （[`ChannelState_::claim_abort_`]）并通过 [`ChannelState_::abort_reason_`] 回传给
+/// 应用侧的两个半部（[`ChannelTx::abort_reason`](super::ChannelTx::abort_reason)）。
 ///
 /// 存成 `AtomicU8` 而不是把 `MuxError` 塞进原子：`MuxError` 是普通的 `Copy` 枚举，
 /// 没有稳定的整数表示，直接把它的位模式存下来会随编译选项变化。这里只存一个
@@ -202,20 +208,121 @@ impl AbortCode_ {
             AbortCode_::IdleTimeout => AbortCode_::IDLE_TIMEOUT,
         }
     }
+}
 
-    /// 从原子字解码；`NONE` 与未知值都解码成 `None`。
-    fn from_u8_(value: u8) -> Option<Self> {
-        match value {
-            AbortCode_::IDLE_TIMEOUT => Option::Some(AbortCode_::IdleTimeout),
-            _ => Option::None,
+/// 一条子流的**不可忽略通知**：应用被唤醒之后第一件要查的东西。
+///
+/// # 它与 [`AbortCode_`] 为什么是两个原子字
+///
+/// `AbortCode_` 是**动作认领**：CAS 成功的那一方负责执行中止动作（回 `CLOSE`、投
+/// `LocalAbort` / `Release`），因此必须「首个生效、永不改写」。
+/// 而通知是**应用要读的结论**，它的规则不同——见 [`ChannelNotice::priority_`]：
+/// 连接级失败必须**压过**此前记下的子流级原因（连接正式判死之前，往往已经发生过
+/// 大面积子流级错误；应用需要的结论是「连接没了」，而不是某一条子流为什么先停）。
+/// 把两件事挤进一个字，就会让「已认领的动作」被后到的通知改写；拆开之后各守一条规则。
+///
+/// # 只有「不可忽略」的事实才进这里
+///
+/// 对端 `FIN` / `RESET` 这类**协议上正常**的半关闭不进这个槽：它们由环的关闭态与帧面
+/// 状态表达（`TrChannelHalf::is_tx_closed` / `is_rx_closed`）。进槽位的只有「应用从
+/// 环的 `Closing` 里读不出区别、但必须知道」的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelNotice {
+    /// **连接级失败牵连**：连接已经不可用，在册子流一同终结。
+    ///
+    /// 只带**类别**；具体原因（首个 `MuxError`）留在连接级，由子流经它持有的
+    /// `MuxConnection` 读取（见 [`MuxConnection::failure`]）。
+    ConnFailed(ConnCloseReason),
+
+    /// 空闲超时：`max_channel_timeout` 内既无数据往来、也无保活应答。
+    ///
+    /// 与 [`MuxError::IdleTimeout`] 同义，**建流未裁决**那一档也走它（两者共用同一根
+    /// 存活时钟与同一个错误值，处置不同而已）。
+    IdleTimeout,
+}
+
+impl ChannelNotice {
+    /// 优先级：数值大的压过数值小的，槽位只允许**升级**。
+    ///
+    /// 顺序即裁决：连接级失败 > 空闲超时。加新变体时在这里给出它的档位。
+    const fn priority_(self) -> u8 {
+        match self {
+            ChannelNotice::ConnFailed(_) => 2u8,
+            ChannelNotice::IdleTimeout => 1u8,
         }
     }
 
-    /// 投影成连接级错误（应用侧看到的那一个）。
+    /// 投影成应用侧看到的那一个 [`MuxError`]。
     fn as_error_(self) -> MuxError {
         match self {
-            AbortCode_::IdleTimeout => MuxError::IdleTimeout,
+            ChannelNotice::ConnFailed(kind) => MuxError::ConnFailed(kind),
+            ChannelNotice::IdleTimeout => MuxError::IdleTimeout,
         }
+    }
+}
+
+/// 「没有通知」的哨兵值（整个槽位字为 `0`）。
+const K_NOTICE_NONE: u32 = 0u32;
+
+/// 通知槽里优先级字段的位移（低位留给「种类 + 载荷」）。
+const K_NOTICE_PRIO_SHIFT: u32 = 8u32;
+
+/// 空闲超时的种类码。
+const K_NOTICE_IDLE_TIMEOUT: u32 = 1u32;
+
+/// 连接级失败的种类码（低 4 位放 [`ConnCloseReason`] 的编码）。
+const K_NOTICE_CONN_FAILED: u32 = 0x10u32;
+
+/// 把一条通知编码进槽位字：高 8 位优先级、低位种类与载荷。
+///
+/// `ConnCloseReason` 只有 4 个无字段变体，因此低 4 位就装得下——这也是 [`AtomicU32`]
+/// 足够的原因（没有分配、没有锁、任何线程都能读）。
+const fn encode_notice_(notice: ChannelNotice) -> u32 {
+    let prio = (notice.priority_() as u32) << K_NOTICE_PRIO_SHIFT;
+    match notice {
+        ChannelNotice::IdleTimeout => prio | K_NOTICE_IDLE_TIMEOUT,
+        ChannelNotice::ConnFailed(kind) => prio | K_NOTICE_CONN_FAILED | encode_conn_reason_(kind),
+    }
+}
+
+/// 槽位字的优先级。
+const fn notice_prio_of_(raw: u32) -> u8 {
+    (raw >> K_NOTICE_PRIO_SHIFT) as u8
+}
+
+/// 从槽位字解码；`0` 与未知组合都解码成 `None`。
+const fn decode_notice_(raw: u32) -> Option<ChannelNotice> {
+    if raw == K_NOTICE_NONE {
+        return Option::None;
+    }
+    if raw & K_NOTICE_CONN_FAILED != 0u32 {
+        return Option::Some(ChannelNotice::ConnFailed(decode_conn_reason_(
+            raw & 0x0fu32,
+        )));
+    }
+    if raw & K_NOTICE_IDLE_TIMEOUT != 0u32 {
+        return Option::Some(ChannelNotice::IdleTimeout);
+    }
+    Option::None
+}
+
+/// [`ConnCloseReason`] 的锁外编码（只用于通知槽的低 4 位）。
+const fn encode_conn_reason_(kind: ConnCloseReason) -> u32 {
+    match kind {
+        ConnCloseReason::Local => 1u32,
+        ConnCloseReason::PeerClosed => 2u32,
+        ConnCloseReason::Transport => 3u32,
+        ConnCloseReason::ProtocolError => 4u32,
+    }
+}
+
+/// [`encode_conn_reason_`] 的逆；未知值按「协议错误」处理（防御，正常不会出现）。
+const fn decode_conn_reason_(code: u32) -> ConnCloseReason {
+    match code {
+        1u32 => ConnCloseReason::Local,
+        2u32 => ConnCloseReason::PeerClosed,
+        3u32 => ConnCloseReason::Transport,
+        _ => ConnCloseReason::ProtocolError,
     }
 }
 
@@ -255,6 +362,17 @@ pub(crate) struct ChannelState_ {
 
     /// 中止代码：[`AbortCode_::NONE`] 表示未中止（见 [`AbortCode_`]）。
     abort_: AtomicU8,
+
+    /// **不可忽略通知**槽：`0` = 无，否则是 [`ChannelNotice`] 的编码。
+    ///
+    /// 与 [`ChannelState_::abort_`] 分开的理由见 [`ChannelNotice`]；这里只补两条实现
+    /// 上的理由：
+    ///
+    /// - **无锁、零分配**：应用可能在任意线程、甚至在非异步上下文里读它（`Closing`
+    ///   也能从非阻塞接口拿到），而连接级失败路径可能在 `Drop` 的调用栈里写它；
+    /// - **任何线程都写得进**：连接级失败由循环侧发布，不经过注册表锁（`mark_failed_`
+    ///   虽然持锁，但发布本身只是原子 CAS）。
+    notice_: AtomicU32,
 }
 
 impl ChannelState_ {
@@ -272,6 +390,7 @@ impl ChannelState_ {
             active_millis_: AtomicU64::new(0u64),
             data_millis_: AtomicU64::new(0u64),
             abort_: AtomicU8::new(AbortCode_::NONE),
+            notice_: AtomicU32::new(K_NOTICE_NONE),
         }
     }
 
@@ -371,15 +490,27 @@ impl ChannelState_ {
     }
 
     /// 认领「中止这条子流」：第一次调用返回 `true`（此后 `is_aborted_` 恒为真）。
+    ///
+    /// 认领成功时**顺带发布**对应的不可忽略通知（[`ChannelNotice::IdleTimeout`]）：
+    /// 「谁负责执行中止动作」与「应用读到什么原因」是两件事（见 [`ChannelNotice`]），
+    /// 但**原因必须在动作之前就位**——应用可能在任何一次唤醒之后立刻读它。
     pub(crate) fn claim_abort_(&self, code: AbortCode_) -> bool {
-        self.abort_
+        let claimed = self
+            .abort_
             .compare_exchange(
                 AbortCode_::NONE,
                 code.as_u8_(),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        if claimed {
+            let notice = match code {
+                AbortCode_::IdleTimeout => ChannelNotice::IdleTimeout,
+            };
+            self.publish_notice_(notice);
+        }
+        claimed
     }
 
     /// 本子流是否已被中止（计时循环判定空闲超时后为真）。
@@ -387,9 +518,52 @@ impl ChannelState_ {
         self.abort_.load(Ordering::Acquire) != AbortCode_::NONE
     }
 
-    /// 中止原因（若有）；应用侧的两个半部经它区分「空闲超时」与「对端正常关闭」。
+    /// 发布一条**不可忽略通知**；规则是「只升级、不降级」，同优先级首个生效。
+    ///
+    /// 返回 `true` 表示本次调用改写了槽位。用优先级 CAS 表达两条判据（见
+    /// [`ChannelNotice`]）：
+    ///
+    /// - **连接级失败压过子流级原因**：连接正式判死之前往往已经发生过大面积子流级
+    ///   错误，应用需要知道的结论是「连接没了」，因此后到的 `ConnFailed` 会覆盖
+    ///   先到的 `IdleTimeout`；
+    /// - **反向永远不成立**：已经写进去的连接级结论不会被后来的子流级原因改写，
+    ///   于是任何时刻读一次都拿到「至今为止最重的那个结论」。
+    ///
+    /// 本方法是**同步、无锁、零分配**的，任何线程、任何上下文（包括 `Drop`）都能调。
+    pub(crate) fn publish_notice_(&self, notice: ChannelNotice) -> bool {
+        let desire = encode_notice_(notice);
+        let prio = notice_prio_of_(desire);
+        let mut current = self.notice_.load(Ordering::Acquire);
+        loop {
+            // 槽位里已经是同级或更重的结论：不改写（同优先级首个生效）。
+            if notice_prio_of_(current) >= prio {
+                return false;
+            }
+            match self.notice_.compare_exchange_weak(
+                current,
+                desire,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Result::Ok(_) => return true,
+                Result::Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// 当前的不可忽略通知（诊断 / 用例用）。
+    #[cfg(test)]
+    pub(crate) fn notice_(&self) -> Option<ChannelNotice> {
+        decode_notice_(self.notice_.load(Ordering::Acquire))
+    }
+
+    /// 中止 / 终结原因（若有）：应用侧的两个半部经它区分「空闲超时」「连接级失败牵连」
+    /// 与「对端正常关闭」。
+    ///
+    /// 投影自**通知槽**（而不是认领位）：连接级失败不认领中止动作（连接已经死了，
+    /// 逐条回 `CLOSE` 没有意义），但它必须能被应用读到。
     pub(crate) fn abort_reason_(&self) -> Option<MuxError> {
-        AbortCode_::from_u8_(self.abort_.load(Ordering::Acquire)).map(AbortCode_::as_error_)
+        decode_notice_(self.notice_.load(Ordering::Acquire)).map(ChannelNotice::as_error_)
     }
 
     //-- ---- 建流位 ----
@@ -1129,6 +1303,83 @@ mod tests_ {
         assert!(!owner.claim_abort_(AbortCode_::IdleTimeout), "只允许认领一次");
         assert!(owner.is_aborted_());
         assert_eq!(owner.abort_reason_(), Option::Some(MuxError::IdleTimeout));
+    }
+
+    /// 测试连接级失败牵连的通知**压过**此前记下的子流级原因，且反向永远不成立。
+    ///
+    /// - 背景：连接正式判死之前往往已经发生过大面积子流级错误（空闲超时、建流超时），
+    ///   应用需要知道的结论是「连接没了」；反过来，后到的子流级原因不能把已经写下的
+    ///   连接级结论改回去——否则应用读到的原因取决于「谁最后写」，不可推理。
+    /// - 手段：在同一个 owner 上按两种顺序各发布一次（`IdleTimeout` 与
+    ///   `ConnFailed(Transport)`），每一步读一次 `notice_()` 与 `abort_reason_()`。
+    /// - 判断：先 `IdleTimeout` 后 `ConnFailed` ⇒ 槽位变成 `ConnFailed`；先
+    ///   `ConnFailed` 后 `IdleTimeout` ⇒ 槽位**不变**。
+    #[test]
+    fn conn_failed_notice_overrides_channel_level_reason() {
+        // 顺序一：子流级 → 连接级（升级）。
+        let owner = make_owner_();
+        assert!(owner.publish_notice_(ChannelNotice::IdleTimeout));
+        assert_eq!(owner.notice_(), Option::Some(ChannelNotice::IdleTimeout));
+        assert!(
+            owner.publish_notice_(ChannelNotice::ConnFailed(ConnCloseReason::Transport)),
+            "连接级失败必须压过已经记下的子流级原因"
+        );
+        assert_eq!(
+            owner.notice_(),
+            Option::Some(ChannelNotice::ConnFailed(ConnCloseReason::Transport))
+        );
+        assert_eq!(
+            owner.abort_reason_(),
+            Option::Some(MuxError::ConnFailed(ConnCloseReason::Transport))
+        );
+
+        // 顺序二：连接级 → 子流级（不得降级，也不得改写载荷）。
+        let owner = make_owner_();
+        assert!(owner.publish_notice_(ChannelNotice::ConnFailed(ConnCloseReason::ProtocolError)));
+        assert!(
+            !owner.publish_notice_(ChannelNotice::IdleTimeout),
+            "子流级原因不得覆盖连接级结论"
+        );
+        assert_eq!(
+            owner.notice_(),
+            Option::Some(ChannelNotice::ConnFailed(ConnCloseReason::ProtocolError))
+        );
+
+        // 同优先级：首个生效（类别不同也不改写）。
+        let owner = make_owner_();
+        assert!(owner.publish_notice_(ChannelNotice::ConnFailed(ConnCloseReason::Transport)));
+        assert!(!owner.publish_notice_(ChannelNotice::ConnFailed(ConnCloseReason::PeerClosed)));
+        assert_eq!(
+            owner.notice_(),
+            Option::Some(ChannelNotice::ConnFailed(ConnCloseReason::Transport))
+        );
+    }
+
+    /// 测试「中止动作认领」与「应用读到的通知」是两件事：认领会发布通知，但连接级
+    /// 通知**不需要**先认领中止动作（连接已死，逐条回 `CLOSE` 没有意义）。
+    ///
+    /// - 手段：只发布 `ConnFailed`（不认领），检查 `is_aborted_` 与 `abort_reason_`；
+    ///   再认领 `IdleTimeout`，检查认领位与槽位的关系。
+    /// - 判断：只发布连接级通知时 `is_aborted_` 仍为假、但 `abort_reason_` 已经给出
+    ///   连接级失败；认领空闲超时不会把连接级结论改回去（上一个用例已覆盖，这里只钉
+    ///   「认领会顺带发布通知」这一条）。
+    #[test]
+    fn notice_and_abort_claim_are_independent() {
+        let owner = make_owner_();
+        assert!(owner.publish_notice_(ChannelNotice::ConnFailed(ConnCloseReason::PeerClosed)));
+        assert!(!owner.is_aborted_(), "连接级牵连不认领中止动作");
+        assert_eq!(
+            owner.abort_reason_(),
+            Option::Some(MuxError::ConnFailed(ConnCloseReason::PeerClosed))
+        );
+
+        assert!(owner.claim_abort_(AbortCode_::IdleTimeout));
+        assert!(owner.is_aborted_());
+        assert_eq!(
+            owner.abort_reason_(),
+            Option::Some(MuxError::ConnFailed(ConnCloseReason::PeerClosed)),
+            "认领空闲超时不得覆盖已经写下的连接级结论"
+        );
     }
 
     /// 测试「两个方向都在协议层收尾」才认领释放，且只认领一次。

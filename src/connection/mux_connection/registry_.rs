@@ -96,8 +96,8 @@ use crate::{
     connection::{
         Dock, MuxError,
         owner_::{
-            AbortCode_, ChannelOwner_, LsnOwner_, TgOwner_, new_listener_owner_, new_owner_,
-            new_telegraph_owner_,
+            AbortCode_, ChannelNotice, ChannelOwner_, LsnOwner_, TgOwner_, new_listener_owner_,
+            new_owner_, new_telegraph_owner_,
         },
         signal_::{SessionEvent_, SessionMailbox_},
         sync_::{CancelToken_, LockCancelled_, NotifySlot_, acquire_read_, acquire_write_},
@@ -131,6 +131,17 @@ fn fail_kind_of_(err: &MuxError) -> u8 {
         MuxError::PeerClosed => K_FAIL_PEER_CLOSED,
         MuxError::Transport { .. } => K_FAIL_TRANSPORT,
         _ => K_FAIL_PROTOCOL,
+    }
+}
+
+/// [`fail_kind_of_`] 的逆：把锁外快照解码成连接级失败类别；`0`（从未失败）与未知值
+/// 都给出 `None`。
+fn decode_fail_kind_(raw: u8) -> Option<ConnCloseReason> {
+    match raw {
+        K_FAIL_PEER_CLOSED => Option::Some(ConnCloseReason::PeerClosed),
+        K_FAIL_TRANSPORT => Option::Some(ConnCloseReason::Transport),
+        K_FAIL_PROTOCOL => Option::Some(ConnCloseReason::ProtocolError),
+        _ => Option::None,
     }
 }
 
@@ -1186,6 +1197,9 @@ where
                 // 锁外的关闭原因快照：与 `fail_` 同一判据，只记**首个**失败。
                 self.fail_kind_.store(fail_kind_of_(err), Ordering::Release);
             }
+            // 逐条发布通知时用的**类别**：读锁外快照而不是当前这次调用的 `err`——
+            // 第二次调用 `mark_failed_` 时，保留的仍然是**第一个**失败（与 `fail_` 一致）。
+            let fail_kind = decode_fail_kind_(self.fail_kind_.load(Ordering::Acquire));
             for binding in guard.bindings_.values() {
                 match binding {
                     BindingSlot_::Listener(rec) => {
@@ -1193,6 +1207,16 @@ where
                         rec.notify_();
                     }
                     BindingSlot_::Channel(ctx) => {
+                        // 1. **先**发布「连接级失败牵连」这条不可忽略通知，再唤醒等待者。
+                        //    顺序不可反：应用被唤醒后的第一件事就是读原因（`abort_reason()`
+                        //    与 `wait_establish_` 都直接读它），先唤醒会让它读到「还没有
+                        //    通知」而把连接级失败误判成普通半关闭。
+                        //    这里是**逐条遍历写 N 个槽位**，代价与上面那次逐条叫醒同阶：
+                        //    连接级失败是终结事件，一次 O(N) 完全可以接受；子流级原因
+                        //    （空闲超时）本来就只写一条，没有遍历。
+                        if let Option::Some(kind) = fail_kind {
+                            ctx.rec_.publish_notice_(ChannelNotice::ConnFailed(kind));
+                        }
                         ctx.rec_.notify_establish_();
                     }
                     _ => {}
@@ -1205,16 +1229,13 @@ where
 
     /// 连接级失败的种类（**锁外**同步读）。
     ///
-    /// `None` 表示从未发生连接级失败，即「正常收尾」。唯一的调用方是
-    /// [`MuxCore::drop`](super::core_::MuxCore)：那条路径不能取锁，因此这份快照必须在
-    /// 锁外可读（见 [`fail_kind_of_`] 与 [`ChannelRegistry_::fail_kind_`]）。
+    /// `None` 表示从未发生连接级失败，即「正常收尾」。两个调用方都要求它在锁外可读：
+    /// [`MuxCore::drop`](super::core_::MuxCore)（那条路径按设计不取锁）与
+    /// [`ChannelRegistry_::mark_failed_`] 的通知发布（它虽然持写锁，但读的是**首个**
+    /// 失败的快照，而不是本次调用的参数）。见 [`fail_kind_of_`] 与
+    /// [`ChannelRegistry_::fail_kind_`]。
     pub(crate) fn fail_kind_(&self) -> Option<ConnCloseReason> {
-        match self.fail_kind_.load(Ordering::Acquire) {
-            K_FAIL_PEER_CLOSED => Option::Some(ConnCloseReason::PeerClosed),
-            K_FAIL_TRANSPORT => Option::Some(ConnCloseReason::Transport),
-            K_FAIL_PROTOCOL => Option::Some(ConnCloseReason::ProtocolError),
-            _ => Option::None,
-        }
+        decode_fail_kind_(self.fail_kind_.load(Ordering::Acquire))
     }
 
     /// 连接级失败的原因（若有）。

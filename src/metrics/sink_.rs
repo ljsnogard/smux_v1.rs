@@ -147,10 +147,10 @@ pub enum ChannelCloseReason {
 
     /// 连接级失败牵连：连接已经不可用，在册子流一同终结。
     ///
-    /// 注意当前实现**只在文档层面**表达这一原因：连接级失败时
-    /// `ChannelRegistry_::mark_failed_` 不逐条释放身份（见 [`crate::metrics`] 模块
-    /// 文档 §6 的「已知缺口」），因此这些子流不会有各自的关闭回调，需求方只能从
-    /// [`TrMetricsSink::on_conn_closed`] 推断它们一并结束。
+    /// 上报点是两个内侧循环的**收尾守卫**：连接级失败时它们逐条 `close()` 自己持有的
+    /// 环半部（唤醒应用侧的等待者），顺带按「恰好一次」的闸门上报道这一条（见
+    /// [`crate::metrics`] 模块文档 §6）。因此它与 [`ChannelCloseReason::Fin`] 互斥：
+    /// 同一条子流只会因为其中一个原因被上报一次。
     ConnFailed,
 }
 

@@ -761,11 +761,119 @@ fn map_read_cursor_err_<E>(err: CursorError<E, ()>) -> MuxError {
 // 解复用循环
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
+/// 解复用循环**本地状态**的收尾守卫（规则与理由见 [`MuxLocalGuard_`]）。
+///
+/// 与复用侧对称、但**关的是另一半**：本循环持有每条子流**接收环的写端**，因此退出时
+/// 要 `close()` 它——把「接收环为空而 park 的读者」唤醒（拿到 EOF 语义的 `Closing`）。
+struct DemuxLocalGuard_<'a, C>
+where
+    C: TrConnCfg,
+{
+    /// 本地读表：dock 对 → 该子流接收环的**写端**（本循环持有）。
+    table: ReadTable_<C::Buff, C::Alloc>,
+
+    /// 连接共享面（上报关闭与读时钟用）。
+    shared: &'a MuxShared_<C>,
+}
+
+impl<C> core::ops::Deref for DemuxLocalGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    type Target = ReadTable_<C::Buff, C::Alloc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl<C> core::ops::DerefMut for DemuxLocalGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.table
+    }
+}
+
+impl<C> Drop for DemuxLocalGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn drop(&mut self) {
+        let failed = self.shared.reg_.fail_kind_();
+        let now_millis = self.shared.conn_clock_().now_millis_();
+        for (pair, entry) in self.table.iter_mut() {
+            // 显式关掉生产端：把「接收环为空而 park 的读者」唤醒（拿到 `Closing`）。
+            entry.writer_.close();
+            if failed.is_some() {
+                report_conn_failed_::<C>(self.shared, &entry.owner_, pair.0, pair.1, now_millis);
+            }
+        }
+    }
+}
+
+/// 解复用循环**读事件队列**的收尾守卫（规则与理由见 [`MuxLocalGuard_`]）。
+struct DemuxEventsGuard_<'a, C>
+where
+    C: TrConnCfg,
+{
+    /// 尚未处理的事件（里面可能还压着没进表的 `Attach` 半部）。
+    events: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
+
+    /// 连接共享面（上报关闭与读时钟用）。
+    shared: &'a MuxShared_<C>,
+}
+
+impl<C> core::ops::Deref for DemuxEventsGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    type Target = EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+impl<C> core::ops::DerefMut for DemuxEventsGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.events
+    }
+}
+
+impl<C> Drop for DemuxEventsGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn drop(&mut self) {
+        let failed = self.shared.reg_.fail_kind_();
+        let now_millis = self.shared.conn_clock_().now_millis_();
+        while let Option::Some(event) = self.events.try_take_event_() {
+            if let ReadEvent_::Attach {
+                local_dock,
+                remote_dock,
+                owner,
+                mut writer_,
+            } = event
+            {
+                writer_.close();
+                if failed.is_some() {
+                    report_conn_failed_::<C>(self.shared, &owner, local_dock, remote_dock, now_millis);
+                }
+            }
+        }
+    }
+}
+
 /// 解复用循环：从连接读环解析帧、投递载荷、推进建流状态机。
 pub(crate) async fn demux_loop_async_<C, K>(
     mut rx_stage: BufferedRx<C::StageBuff, C::Alloc>,
     shared: MuxShared_<C>,
-    mut events: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
+    events: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
     events_tx: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
     cancel: K,
 ) where
@@ -773,8 +881,15 @@ pub(crate) async fn demux_loop_async_<C, K>(
     C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
-    let mut table: ReadTable_<C::Buff, C::Alloc> =
-        BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())));
+    // 表与事件队列都包进收尾守卫（与复用侧对称；理由见 `MuxLocalGuard_`）。
+    let mut table: DemuxLocalGuard_<'_, C> = DemuxLocalGuard_ {
+        table: BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token()))),
+        shared: &shared,
+    };
+    let mut events: DemuxEventsGuard_<'_, C> = DemuxEventsGuard_ {
+        events,
+        shared: &shared,
+    };
 
     // 控制帧的暂存：只用于「帧头解析完成、载荷已经整块在环上」之后的取载荷。
     // 连接级环本身已经是暂存，因此这里只需要容纳**一帧**的最大载荷。
@@ -801,8 +916,8 @@ pub(crate) async fn demux_loop_async_<C, K>(
         // 1. 先把挂起的 `Attach` / `Release` / `RxConsumed` 成批排空。
         if let Result::Err(err) =
             drain_read_events_::<C, _>(
-                &mut events,
-                &mut table,
+                &mut *events,
+                &mut *table,
                 shared.conn_clock_().now_millis_(),
                 &events_tx,
                 &cancel,
@@ -827,7 +942,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
             // 唯一触发点，而它到来时连接读环完全可能长期为空（对端正等额度、没有新帧）。
             // 只 park 在环上会让这条通知一直排在一条睡着的循环后面——应用读空了环却
             // 没人补发额度，两端互等（本仓库流控验收用例的死锁形态）。
-            match park_read_wake_::<C, _>(&cancel, &mut rx_stage, &mut events).await {
+            match park_read_wake_::<C, _>(&cancel, &mut rx_stage, &mut *events).await {
                 // 环里有字节：回顶部交给正式的帧头解析。
                 ReadWake_::Bytes => {}
                 // 事件已由 park **取出**（`flume` 的 `recv_async` 是消费语义，丢掉它就
@@ -836,7 +951,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 ReadWake_::Event(event) => {
                     if let Result::Err(err) = handle_read_event_::<C, _>(
                         event,
-                        &mut table,
+                        &mut *table,
                         shared.conn_clock_().now_millis_(),
                         &events_tx,
                         &cancel,
@@ -1450,13 +1565,162 @@ where
 // 复用循环
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
+/// 连接级失败牵连的**逐子流关闭上报**（恰好一次）。
+///
+/// 「恰好一次」由 [`ChannelOwner_::claim_release_`] 的一次性 CAS 保证：它与
+/// [`maybe_release_`] 的正常收尾路径共用同一把闸门，因此同一条子流不会被报两次。
+fn report_conn_failed_<C>(
+    shared: &MuxShared_<C>,
+    owner: &ChannelOwner_<C::Alloc>,
+    local: Dock,
+    remote: Dock,
+    now_millis: u64,
+) where
+    C: TrConnCfg,
+{
+    if !owner.claim_release_() {
+        return;
+    }
+    shared.metrics_().on_channel_closed(
+        local,
+        remote,
+        ChannelCloseReason::ConnFailed,
+        now_millis.saturating_sub(owner.created_millis_()),
+    );
+}
+
+/// 复用循环**本地状态**的收尾守卫（表 + 事件队列各一个）。
+///
+/// # 为什么必须显式 `close()`
+///
+/// 应用侧的写者可能正 park 在「发送环满」上、读者正 park 在「接收环为空」上；而
+/// `buffex` 的环半部 **drop 不置关闭位、也不唤醒对端**，事件通道的消费者又正是这个
+/// 正在退出的循环。于是「循环退出 ⇒ 表被丢掉」**不产生任何唤醒**：应用那半部永远
+/// 睡下去——这就是「连接级失败之后应用无期限挂起」的机制。`close()` 是唯一既置关闭位
+/// 又唤醒对端的方式，而这一半的持有者只有本循环。
+///
+/// # 为什么分成「表」与「事件队列」两个守卫
+///
+/// 半部有两拨：一拨已经进了本地表，另一拨（`Attach`）还**躺在事件队列里**——连接完全
+/// 可能在子流刚建好、循环还没取走那条事件时就结束，此时应用已经拿着另一半。两拨都要
+/// 收尾，漏掉后者同样是永久挂起。
+///
+/// # 为什么用 `Deref` 转发而不是把守卫穿进主体
+///
+/// 主体逐字不动（`table.get_mut(..)` / `events.try_take_event_()` 经自动解引用照常
+/// 工作），收尾因此与「表 / 队列的生命周期」绑定：**任何**退出路径（正常返回、取消、
+/// 连接级失败，乃至 panic 展开）都会跑到，不必在每个 `return` 前手写一遍。
+struct MuxLocalGuard_<'a, C>
+where
+    C: TrConnCfg,
+{
+    /// 本地写表：dock 对 → 该子流发送环的**读端**（本循环持有）。
+    table: WriteTable_<C::Buff, C::Alloc>,
+
+    /// 连接共享面（上报关闭与读时钟用）。
+    shared: &'a MuxShared_<C>,
+}
+
+impl<C> core::ops::Deref for MuxLocalGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    type Target = WriteTable_<C::Buff, C::Alloc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl<C> core::ops::DerefMut for MuxLocalGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.table
+    }
+}
+
+impl<C> Drop for MuxLocalGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn drop(&mut self) {
+        let failed = self.shared.reg_.fail_kind_();
+        let now_millis = self.shared.conn_clock_().now_millis_();
+        for (pair, entry) in self.table.iter_mut() {
+            // 显式关掉消费端：把「发送环已满而 park 的写者」唤醒（拿到 `Closing`）。
+            entry.reader_.close();
+            if failed.is_some() {
+                report_conn_failed_::<C>(self.shared, &entry.owner_, pair.0, pair.1, now_millis);
+            }
+        }
+    }
+}
+
+/// 复用循环**写事件队列**的收尾守卫（规则与理由见 [`MuxLocalGuard_`]）。
+struct MuxEventsGuard_<'a, C>
+where
+    C: TrConnCfg,
+{
+    /// 尚未处理的事件（里面可能还压着没进表的 `Attach` 半部）。
+    events: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
+
+    /// 连接共享面（上报关闭与读时钟用）。
+    shared: &'a MuxShared_<C>,
+}
+
+impl<C> core::ops::Deref for MuxEventsGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    type Target = EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+impl<C> core::ops::DerefMut for MuxEventsGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.events
+    }
+}
+
+impl<C> Drop for MuxEventsGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn drop(&mut self) {
+        let failed = self.shared.reg_.fail_kind_();
+        let now_millis = self.shared.conn_clock_().now_millis_();
+        while let Option::Some(event) = self.events.try_take_event_() {
+            if let WriteEvent_::Attach {
+                local_dock,
+                remote_dock,
+                owner,
+                mut reader_,
+            } = event
+            {
+                reader_.close();
+                if failed.is_some() {
+                    report_conn_failed_::<C>(self.shared, &owner, local_dock, remote_dock, now_millis);
+                }
+            }
+        }
+    }
+}
+
 /// 复用循环：按对端发送窗口调度各子流的发送环，把成帧写进**连接写环**。
 ///
 /// 字节到网络的搬运由外侧写泵负责（见 `session_pump_`）。
 pub(crate) async fn mux_loop_async_<C, K>(
     mut tx_stage: BufferedTx<C::StageBuff, C::Alloc>,
     shared: MuxShared_<C>,
-    mut events: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
+    events: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
     read_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
     cancel: K,
 ) where
@@ -1464,8 +1728,16 @@ pub(crate) async fn mux_loop_async_<C, K>(
     C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
-    let mut table: WriteTable_<C::Buff, C::Alloc> =
-        BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())));
+    // 表与事件队列都包进收尾守卫：**退出时显式关闭本循环持有的那些半部**。
+    // 为什么必须这样做、以及为什么分成两个守卫，见 `MuxLocalGuard_` 的类型文档。
+    let mut table: MuxLocalGuard_<'_, C> = MuxLocalGuard_ {
+        table: BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token()))),
+        shared: &shared,
+    };
+    let mut events: MuxEventsGuard_<'_, C> = MuxEventsGuard_ {
+        events,
+        shared: &shared,
+    };
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
     // 「发送方向已丢弃、但发送环还没排空（或额度没回来）」的子流：它们还欠对端一条
     // `CLOSE(FIN)`，由下面第 2.5 步在有进展时继续收尾（见 `finalize_entry_`）。
@@ -1516,7 +1788,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 handle_write_event_::<C, _>(
                         event,
                     &mut tx_stage,
-                    &mut table,
+                    &mut *table,
                     &mut scratch,
                     &mut pending_fin,
                     &shared,
@@ -1543,7 +1815,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 drain_once_::<C, _>(
                         &mut tx_stage,
                     &shared,
-                    &mut table,
+                    &mut *table,
                     &mut scratch,
                     &cancel,
                 ),
@@ -1590,7 +1862,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 finalize_entry_::<C, _>(
                     &mut tx_stage,
                     &shared,
-                    &mut table,
+                    &mut *table,
                     &mut scratch,
                     &mut pending_fin,
                     &read_events,
@@ -1673,7 +1945,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 //
                 //    判据整体抽成 [`last_ready_has_segment_`]，好让「环已关闭且空」
                 //    这种形态能被单元用例直接钉住。
-                if last_ready_has_segment_::<C>(&mut table, last_ready, cx) {
+                if last_ready_has_segment_::<C>(&mut *table, last_ready, cx) {
                     ring_ready = true;
                     return Poll::Ready(true);
                 }
@@ -1690,7 +1962,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 handle_write_event_::<C, _>(
                         event,
                     &mut tx_stage,
-                    &mut table,
+                    &mut *table,
                     &mut scratch,
                     &mut pending_fin,
                     &shared,

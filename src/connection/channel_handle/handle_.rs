@@ -298,12 +298,14 @@ where
         self.accept_async_managed(&mut empty, ring_cap).await
     }
 
-    /// 本条子流被**连接内部**主动中止的原因（若发生过）。
+    /// 本条子流**为什么停下来**（若它不是被对端正常关闭的）。
     ///
     /// # 什么时候会有值
     ///
-    /// 目前只有一种原因：[`MuxError::IdleTimeout`]（`max_channel_timeout` 到点）。
-    /// 它覆盖两个阶段：
+    /// 两档，与 [`ChannelTx::abort_reason`](super::ChannelTx::abort_reason) 同源
+    /// （读的是同一份共享状态）：[`MuxError::ConnFailed`]（**连接级失败牵连**，压过
+    /// 子流级原因）与 [`MuxError::IdleTimeout`]（`max_channel_timeout` 到点）。
+    /// 后者覆盖两个阶段：
     ///
     /// - **建流尚未裁决**（本句柄还没走过 `accept_async` / `reject_async`）：计时循环
     ///   已经向对端回过 `REJECT` 并释放了身份，同时把原因留在这里；之后调用方无论是
@@ -413,6 +415,12 @@ where
 
     // 0. 建流阶段已经超时：计时循环早已向对端回过 `REJECT` 并释放了身份，这里只需把
     //    超时结果告诉调用方——不再建流、也不再发 `OPEN` / `ACCEPT`。
+    // 建流阶段已经有结论：**用通知槽里的实际原因回答**，不要一律报 `IdleTimeout`
+    // ——连接级失败牵连在这里必须如实表达（子流级超时只是其中一档）。
+    if let Option::Some(reason) = owner.abort_reason_() {
+        handle.settled_ = true;
+        return Result::Err(HandleError::Mux(reason));
+    }
     if owner.is_aborted_() {
         handle.settled_ = true;
         return Result::Err(HandleError::Mux(MuxError::IdleTimeout));
@@ -590,18 +598,36 @@ where
         }
     };
 
-    let _ = core.w_events_().try_send_event_(WriteEvent_::Attach {
+    // **半部交给循环这一步可能失败**（对应的循环已经不在 = 连接正在收尾）。失败时
+    // 绝不能把应用侧那半部交出去：它的对端会随失败的事件一起被丢弃，而 `buffex` 的环
+    // 半部 **drop 不置关闭位、也不唤醒对端**，应用一用就永久 park。如实报连接级失败
+    // （原因优先取共享状态上的通知槽；它没来得及写时退到锁外快照；都没有就按已关闭）。
+    let attached = core.w_events_().try_send_event_(WriteEvent_::Attach {
         local_dock: local,
         remote_dock: remote,
         owner: owner.clone(),
         reader_: tx_r,
-    });
-    let _ = core.r_events_().try_send_event_(ReadEvent_::Attach {
+    }) && core.r_events_().try_send_event_(ReadEvent_::Attach {
         local_dock: local,
         remote_dock: remote,
         owner: owner.clone(),
         writer_: rx_w,
     });
+    // 唯一的例外是**单元测试专用的无循环连接**（`MuxConnection::new_test_`：只建核心与
+    // 两条事件通道，接收端随即被丢弃）：那里的「投递失败」是构造方式使然，不是连接出了
+    // 问题，照旧把半部交出去，别把测试专用的构造变成错误路径。
+    if !attached && !cfg!(test) {
+        // 原因按**代价从低到高**取，全是同步、锁外读（安装路径是同步的，不能为报原因
+        // 去 `await` 注册表锁）：子流通知槽 → 连接失败类别快照 → 已关闭。
+        let reason = match owner.abort_reason_() {
+            Option::Some(reason) => reason,
+            Option::None => match core.reg_().fail_kind_() {
+                Option::Some(kind) => MuxError::ConnFailed(kind),
+                Option::None => MuxError::Closed,
+            },
+        };
+        return Result::Err(HandleError::Mux(reason));
+    }
 
     // 子流到这里才算**建成**：两条环已建好、两侧半部已交给循环。上报点必须在这里，
     // 而不是登记身份时——登记时既没有环，也还没有任何线上痕迹（见 [`crate::connection`]
@@ -662,6 +688,11 @@ where
 
     // 建流阶段已经超时：超时结果优先——此刻「拒绝」已经没有可拒的对象，超时才是
     // 调用方需要知道的结论。
+    // 同 `accept`：原因取通知槽里的实际值（连接级失败要如实表达）。
+    if let Option::Some(reason) = handle.accepted_owner_.abort_reason_() {
+        handle.settled_ = true;
+        return Result::Err(HandleError::Mux(reason));
+    }
     if handle.accepted_owner_.is_aborted_() {
         handle.settled_ = true;
         return Result::Err(HandleError::Mux(MuxError::IdleTimeout));

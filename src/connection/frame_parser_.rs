@@ -58,11 +58,6 @@
 //! `RemoteDock` 都读不出来。按字节索要（`Demand::exactly(1)`）后 `min_len == 1`，
 //! 恒不超过任何合法容量，这条失败路径**从构造上不再存在**。
 
-// 本模块尚未被中心循环调用：接入点在 `session_.rs` 的解复用循环，切换留待下一轮
-// （sans-IO 状态机的逐字节推进）。与 `frame_.rs` 同样保留
-// `dead_code` 允许；**接入完成后必须连同 `frame_.rs` 的那一行一起移除**。
-#![allow(dead_code)]
-
 use abs_buff::{
     TrBuffRead,
     error::{ReadErrTag, TrTaggedError},
@@ -413,6 +408,11 @@ impl FrameHeaderParser {
     }
 
     /// 帧头是否还**一个字节都没读**。
+    ///
+    /// 目前只有本模块的用例在用它（状态机的诊断入口）。模块级的 `dead_code` 允许
+    /// 已经随「接入解复用循环」一并去掉，因此这里按**逐方法**收窄：只在非测试构建里
+    /// 允许「暂时没有生产调用方」，而不是把整块模块的检查关掉。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const fn is_started_(&self) -> bool {
         matches!(self.state_, State_::Start)
     }
@@ -581,6 +581,11 @@ impl FrameHeaderParser {
     /// 2. 供字节来源不归调用方管的场合复核结论。
     ///
     /// 已出结论时幂等；否则返回 `None`（还没解析完，或还一个字节都没读）。
+    ///
+    /// 同 [`FrameHeaderParser::is_started_`]：生产路径经
+    /// `frame_parser_::read_header_async_` 直接拿结论，这个「复核 / 收尾」入口目前只有
+    /// 本模块用例在调，因此按方法收窄 `dead_code`。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const fn finish_(&self) -> Option<Result<FrameHeader, MuxError>> {
         match self.state_ {
             State_::Done(header) => Option::Some(Result::Ok(header)),

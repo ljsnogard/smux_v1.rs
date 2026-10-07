@@ -18,7 +18,7 @@
 //! - 一个变体要按字段取值给不同文案时，把「取值 → 词」写成小函数放进 `#[error]`
 //!   的参数（见 [`MuxError::Transport`] 与 `transport_direction_`）。
 
-use crate::flow_ctrl::FlowCtrlError;
+use crate::{flow_ctrl::FlowCtrlError, metrics::ConnCloseReason};
 
 /// 复用连接与子流操作失败的统一类型。
 ///
@@ -83,6 +83,18 @@ pub enum MuxError {
     /// 流控失败（窗口违例或计数溢出）。
     #[error("流控失败")]
     FlowCtrl(FlowCtrlError),
+
+    /// **连接级失败牵连**：连接已经不可用，在册子流随之终结。
+    ///
+    /// 载荷只带**类别**（[`ConnCloseReason`]）；具体原因（首个失败的那个 `MuxError`，
+    /// 例如 [`MuxError::Transport`] 的方向、[`MuxError::FlowCtrl`] 的细节）留在连接级，
+    /// 由子流经它持有的 `MuxConnection` 读取——理由与用法见
+    /// [`crate::connection::ChannelTx::abort_reason`]。
+    ///
+    /// 它同时是「子流为什么结束」在连接级失败这一档上的答案：应用先看到环的
+    /// `Closing`（现象），再读 `abort_reason()`（结论），最后按需去连接级取细节。
+    #[error("连接级失败牵连（{0:?}）")]
+    ConnFailed(ConnCloseReason),
 }
 
 /// `Transport { write }` 的方向描述词（只用于 [`MuxError`] 的 `Display`）。
