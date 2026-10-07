@@ -18,8 +18,7 @@ cargo run --example active_passive
 - **一条连接复用成多条并行子流**：可以基于 TCP / UNIX socket / QUIC stream 等连接复用成互不干扰的
   channel。
 - **不绑定运行时**，且 `no_std` 友好
-- **两端对称**：没有 client / server 之分——各自在 dock 上绑定，一侧 `open`、
-  一侧 `listen`。
+- **两端对称**：没有 client / server 之分，两边都支持绑定垛口（Dock）后监听建立子流的请求。
 - **零拷贝**：子流两端直接就是 `abs_buff` 的段接口，没有中间缓冲，也不按帧长分配。
 
 ## 2. 怎么用起来

@@ -103,6 +103,11 @@ where
             local_dock_: local_dock,
         }
     }
+
+    pub fn listen_async_default<'f>(&'f mut self) -> MuxListenAsync<'f, 'f, C> {
+        const DEFAULT_RESERVE: usize = 8usize;
+        MuxListenAsync::new(self, DEFAULT_RESERVE)
+    }
 }
 
 /// 丢弃绑定即**解绑**：向核心投递一条释放消息，使同一个 dock 之后可以再次
@@ -156,8 +161,8 @@ where
         &self.local_dock_
     }
 
-    fn listen_async(&mut self) -> Self::ListenAsync<'_> {
-        MuxListenAsync::new(self)
+    fn listen_async(&mut self, reserve: usize) -> Self::ListenAsync<'_> {
+        MuxListenAsync::new(self, reserve)
     }
 
     fn open_telegraph_async(&mut self) -> Self::OpenTelegraphAsync<'_> {
@@ -180,6 +185,7 @@ where
 #[gen_may_cancel_future(MuxListen, pub, new(pub(crate)))]
 async fn mux_listen_async_<'f, C, K>(
     binding: &'f mut DockBinding<C>,
+    reserve: usize,
     cancel: K,
 ) -> Result<ChannelListener<C>, BindingError>
 where

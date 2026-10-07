@@ -109,7 +109,7 @@ pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S, RT>(
         .bind_async(dock_b)
         .await
         .expect("B 侧绑定应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧监听应当成功");
 

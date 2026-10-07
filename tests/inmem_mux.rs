@@ -912,7 +912,7 @@ async fn drive_min_stage_<RA, WA, RB, WB, S, RT>(
         .bind_async(dock_b)
         .await
         .expect("B 侧绑定监听 dock 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧建立 listener 应当成功");
 

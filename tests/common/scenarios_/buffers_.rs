@@ -64,7 +64,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S, RT>(
         .bind_async(remote_b)
         .await
         .expect("B 侧绑定应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧开始监听应当成功");
 
@@ -114,7 +114,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S, RT>(
         .bind_async(remote_c)
         .await
         .expect("B 侧再绑定一个 dock 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧第二个监听应当成功");
     let mut message2: &[u8] = &[];
@@ -204,14 +204,14 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S, RT>(
         .bind_async(dock_small)
         .await
         .expect("B 侧绑定 dock_small 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧监听 dock_small 应当成功");
     let mut listener_large = conn_b
         .bind_async(dock_large)
         .await
         .expect("B 侧绑定 dock_large 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧监听 dock_large 应当成功");
 

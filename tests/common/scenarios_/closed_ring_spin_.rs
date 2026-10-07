@@ -143,7 +143,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
         .bind_async(listener_dock)
         .await
         .expect("B 侧绑定应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧监听应当成功");
 

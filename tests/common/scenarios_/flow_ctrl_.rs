@@ -115,7 +115,7 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S, RT>(
             .bind_async(listener_dock)
             .await
             .expect("B 侧绑定应当成功")
-            .listen_async()
+            .listen_async_default()
             .await
             .expect("B 侧开始监听应当成功");
         let mut incoming = listener.income_async().await.expect("B 侧应当取到入向子流");
@@ -258,14 +258,14 @@ pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S, RT>(
             .bind_async(dock_blocked)
             .await
             .expect("B 侧绑定 dock 1 应当成功")
-            .listen_async()
+            .listen_async_default()
             .await
             .expect("B 侧监听 dock 1 应当成功");
         let mut listener_progress = conn_b
             .bind_async(dock_progress)
             .await
             .expect("B 侧绑定 dock 2 应当成功")
-            .listen_async()
+            .listen_async_default()
             .await
             .expect("B 侧监听 dock 2 应当成功");
 
@@ -431,7 +431,7 @@ pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S, RT>(
             .bind_async(drop_dock)
             .await
             .expect("B 侧绑定 dock 1 应当成功")
-            .listen_async()
+            .listen_async_default()
             .await
             .expect("B 侧监听 dock 1 应当成功");
         let mut incoming_drop = listener_drop
@@ -457,7 +457,7 @@ pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S, RT>(
             .bind_async(probe_dock)
             .await
             .expect("B 侧绑定 dock 2 应当成功")
-            .listen_async()
+            .listen_async_default()
             .await
             .expect("B 侧监听 dock 2 应当成功");
         let mut incoming_probe = listener_probe

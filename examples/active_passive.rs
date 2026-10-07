@@ -195,8 +195,8 @@ async fn passive(
 
     let local_dock = Dock::new(1);
     let mut listener = conn
-        .bind_async(local_dock).await? // 绑定 dock
-        .listen_async().await?;        // 开始收建流请求
+        .bind_async(local_dock).await?  // 绑定 dock
+        .listen_async_default().await?; // 开始收建流请求
 
     let mut incoming = listener.income_async().await?;
     let (_tx, mut rx) = incoming.accept_async_default().await?;

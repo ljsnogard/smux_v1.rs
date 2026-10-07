@@ -148,7 +148,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
         .bind_async(remote_b)
         .await
         .expect("B 侧绑定应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧开始监听应当成功");
 
@@ -200,7 +200,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
         .bind_async(remote_c)
         .await
         .expect("B 侧再绑定一个 dock 应当成功")
-        .listen_async()
+        .listen_async_default()
         .await
         .expect("B 侧第二个监听应当成功");
     let mut message2: &[u8] = &[];
