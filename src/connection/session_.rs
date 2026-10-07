@@ -119,7 +119,7 @@ use crate::{
         frame_::{K_MAX_FRAME_HEADER, encode_header_},
         frame_parser_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
-        owner_::ChannelOwner_,
+        owner_::{ChannelOwner_, TgOwner_},
         ring_::{BufferedRx, BufferedTx},
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, ReadEvent_, TrEventReceiver_,
@@ -345,6 +345,51 @@ type ReadTable_<A> = BTreeMap<(Dock, Dock), ReadEntry_<A>, A>;
 
 /// 复用循环的本地表：dock 对 → 该子流的发送环读端与共享状态。
 type WriteTable_<A> = BTreeMap<(Dock, Dock), WriteEntry_<A>, A>;
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// telegraph 的两个本地表
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 解复用循环本地持有的一条 telegraph：接收环的**写端**与身份句柄。
+///
+/// 身份句柄是必需的：**已收报文长度**记在身份节点内联的接收队列里（`TgLenQueue_`），
+/// 循环每收下一条完整报文都要往那里入队并唤醒应用侧——环本身只是字节流，不知道
+/// 「哪几个字节是一条报文」。
+struct TgReadEntry_<A>
+where
+    A: AllocatorClone + Send + Sync + 'static,
+{
+    /// 该端点的身份节点句柄（含接收长度队列）。
+    owner_: TgOwner_<A>,
+
+    /// 会话侧接收环写端（本循环写、应用读）。
+    writer_: BufferedTx,
+}
+
+/// 复用循环本地持有的一条 telegraph：发送环的**读端** + 身份句柄。
+///
+/// 身份句柄是必需的：**已提交报文长度**记在身份节点内联的队列里（`TgLenQueue_`），
+/// 循环按 FIFO 取长度才知道环里哪一段是一条报文（环本身只是字节流）。
+struct TgWriteEntry_<A>
+where
+    A: AllocatorClone + Send + Sync + 'static,
+{
+    /// 该端点的身份节点句柄（含发送长度队列）。
+    owner_: TgOwner_<A>,
+
+    /// 会话侧发送环读端（应用写、本循环读）。
+    reader_: BufferedRx,
+}
+
+/// 解复用循环的 telegraph 表：`local_dock` → 接收环写端。
+///
+/// 键只有 `local_dock`：telegraph **独占**该 dock（协议不允许它与 channel / listener
+/// 共用），对端地址在数据报里是**地址**而不是**身份**，因此没有第二个键维度。
+type TgReadTable_<A> = BTreeMap<Dock, TgReadEntry_<A>, A>;
+
+/// 复用循环的 telegraph 表：`local_dock` → 发送环读端与身份句柄。
+type TgWriteTable_<A> = BTreeMap<Dock, TgWriteEntry_<A>, A>;
+
 
 /// 「发送方向已收尾、但**数据还没排空**（或额度还没回来），因此还没发 `FIN`」的
 /// 子流集合（复用循环本地持有）。
@@ -856,6 +901,7 @@ where
     }
 }
 
+
 /// 解复用循环：从连接读环解析帧、投递载荷、推进建流状态机。
 pub(crate) async fn demux_loop_async_<C, K>(
     mut rx_stage: BufferedRx,
@@ -873,6 +919,17 @@ pub(crate) async fn demux_loop_async_<C, K>(
         table: BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token()))),
         shared: &shared,
     };
+    // telegraph 的读表与 channel 分开持有：主循环在自查「哪些端点已被释放」时既要读
+    // 它、又要（用同一个分配器）建一个临时集合，同处一个结构体会撞借用检查。
+    let alloc = lock_or_exit_!(shared.reg_.allocator_(cancel.child_token()));
+    // 包进守卫：循环退出时**显式关闭**每个接收环写端（`buffex` 的环半部被 drop 不会
+    // 置位关闭标记，少了这一步应用侧正 park 的 `recv_async` 永远醒不过来）。
+    let mut tg_table: TgReadGuard_<'_, C> = TgReadGuard_ {
+        table: BTreeMap::new_in(alloc.clone()),
+        _use_shared_: core::marker::PhantomData,
+    };
+    // 自查用的临时集合：复用同一个（每轮先 `clear`）。
+    let mut tg_live: BTreeSet<Dock> = BTreeSet::new();
     let mut events: DemuxEventsGuard_<'_, C> = DemuxEventsGuard_ {
         events,
         shared: &shared,
@@ -900,12 +957,37 @@ pub(crate) async fn demux_loop_async_<C, K>(
         lock_or_exit_!(shared
             .reg_
             .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token()));
+        // 0.1 telegraph 自查：本地表里哪些端点**已经不在身份表里**了（tx / rx 两个半边
+        //     都被丢弃 ⇒ 身份已被上面那步释放）。这些端点的接收环写端必须关掉，否则
+        //     应用侧正 park 的 `recv_async` 永远醒不过来。
+        //
+        //     自查本身**非阻塞**：拿不到注册表锁就跳过这一轮（下一轮再来），绝不能为它
+        //     阻塞中心循环。回调里只做一件事——把在册的 dock 记进 `tg_live`。
+        if shared
+            .reg_
+            .for_each_live_telegraph_(|local_dock| {
+                tg_live.insert(local_dock);
+            })
+        {
+            let gone: alloc::vec::Vec<Dock> = tg_table
+                .keys()
+                .copied()
+                .filter(|local_dock| !tg_live.contains(local_dock))
+                .collect();
+            for local_dock in gone {
+                if let Option::Some(mut entry) = tg_table.remove(&local_dock) {
+                    entry.writer_.close();
+                }
+            }
+            tg_live.clear();
+        }
         // 1. 先把挂起的 `Attach` / `Release` / `RxConsumed` 成批排空。
         if let Result::Err(err) =
             drain_read_events_::<C, _>(
                 &mut *events,
-                &mut *table,
-                shared.conn_clock_().now_millis_(),
+                &mut table.table,
+                &mut *tg_table,
+                table.shared.conn_clock_().now_millis_(),
                 &events_tx,
                 &cancel,
             )
@@ -938,8 +1020,9 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 ReadWake_::Event(event) => {
                     if let Result::Err(err) = handle_read_event_::<C, _>(
                         event,
-                        &mut *table,
-                        shared.conn_clock_().now_millis_(),
+                        &mut table.table,
+                        &mut *tg_table,
+                        table.shared.conn_clock_().now_millis_(),
                         &events_tx,
                         &cancel,
                     )
@@ -1254,7 +1337,73 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 }
             }
             FrameKind::Datagram => {
-                // telegraph 本轮未实现（Q9 裁决）：收到即忽略。
+                // 数据报（telegraph）：**地址**语义，按帧头的 `RemoteDock`（= 本端
+                // local_dock）找到那条端点，把**整条**载荷写进它的接收环。
+                //
+                // 三条要点：
+                //
+                // 1. **不查宽限态、不报协议违例**：数据报没有身份可言，发往一个本端
+                //    没有 telegraph 的 dock 只是「没人收」，静默丢弃即可（对端可能按
+                //    `wildcard` 发过来）；
+                // 2. **装不下就整条丢弃**：先按 `free_size` 判空间，不够就丢，绝不留
+                //    半条——半条会破坏应用侧「recv 返回的长度就是报文长度」的契约；
+                // 3. **先写环、再入队**：应用侧 `recv_async` 一旦拿到长度就保证内容已在
+                //    环里，因此顺序不可反。
+                let Some(entry) = tg_table.table.get_mut(&local) else {
+                    continue;
+                };
+                // 两项容量都**先判**，再动手：这样「写进环」与「入长度队列」之间不会
+                // 出现「一半成功、一半失败」的中间态，也就不需要任何撤回操作。
+                //
+                // - 长度队列满：说明应用侧没在取（它只是尽力交付的接收方），整条丢弃；
+                // - 环剩余空间不足：**整条丢弃**，绝不留半条——半条会破坏应用侧
+                //   「`recv_async` 返回的长度就是下一条报文长度」的契约。
+                if entry.owner_.in_().is_full_()
+                    || (len > 0usize && entry.writer_.ring_state().free_size() < len)
+                {
+                    shared
+                        .metrics_()
+                        .on_datagram_dropped(local, remote, u32::try_from(len).unwrap_or(u32::MAX));
+                    continue;
+                }
+                // 段级循环把整条载荷写进接收环：每次借一段、写满再借下一段。环容量可能
+                // 小于报文长度（调用方自愿这么配），因此必须跨段推进；而上面的容量检查
+                // 与本循环之间没有 `await`，所以它一定能写完。
+                let mut offset = 0usize;
+                let mut failed = false;
+                while offset < len {
+                    let demand = Demand::at_least(1usize);
+                    let mut outcome = entry.writer_.try_write(&demand);
+                    let put = match outcome.as_mut().pick_left() {
+                        Option::Some(segm) => {
+                            let mut child = segm.as_segm_mut();
+                            let limit = core::cmp::min(len - offset, child.least_count());
+                            child.clone_items_from_buff(&bytes[offset..offset + limit])
+                        }
+                        Option::None => 0usize,
+                    };
+                    if put == 0usize {
+                        // 容量检查之后环被关闭（连接正在收尾）：如实丢弃已写进去的那部分
+                        // ——它们没有对应的长度记录，应用侧永远不会读到它们。
+                        failed = true;
+                        break;
+                    }
+                    offset += put;
+                }
+                if failed {
+                    shared
+                        .metrics_()
+                        .on_datagram_dropped(local, remote, u32::try_from(len).unwrap_or(u32::MAX));
+                    continue;
+                }
+                // 整条已就位：入队长度（含 `len == 0` 的空报文），再唤醒应用侧。
+                // 接收方向的队列只记长度（来源地址对应用无用：报文已按本端 dock 路由过）。
+                entry
+                    .owner_
+                    .in_()
+                    .try_push_(Dock::unspecified(), len)
+                    .expect("容量已判过");
+                entry.owner_.in_().notify_();
             }
         }
     }
@@ -1282,6 +1431,7 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
 async fn drain_read_events_<C, K>(
     events: &mut EventReceiver_<ReadEvent_<C::Alloc>>,
     table: &mut ReadTable_<C::Alloc>,
+    tg_table: &mut TgReadTable_<C::Alloc>,
     now_millis: u64,
     events_tx: &EventSender_<WriteEvent_<C::Alloc>>,
     cancel: &K,
@@ -1295,7 +1445,7 @@ where
         let Option::Some(event) = events.try_take_event_() else {
             break;
         };
-        handle_read_event_::<C, _>(event, table, now_millis, events_tx, cancel).await?;
+        handle_read_event_::<C, _>(event, table, tg_table, now_millis, events_tx, cancel).await?;
     }
     Result::Ok(())
 }
@@ -1310,6 +1460,7 @@ where
 async fn handle_read_event_<C, K>(
     event: ReadEvent_<C::Alloc>,
     table: &mut ReadTable_<C::Alloc>,
+    tg_table: &mut TgReadTable_<C::Alloc>,
     now_millis: u64,
     events_tx: &EventSender_<WriteEvent_<C::Alloc>>,
     cancel: &K,
@@ -1367,6 +1518,23 @@ where
             let buffered = entry.writer_.ring_state().data_size();
             recheck_recv_level_::<C, _>(&owner, buffered, now_millis, events_tx, pair, cancel)
                 .await?;
+        }
+        // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+        // telegraph（数据报）
+        // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+        ReadEvent_::TgAttach {
+            local_dock,
+            owner,
+            writer_,
+        } => {
+            // 与 channel 的 `Attach` 同形：重复附直接覆盖，不会留下陈旧条目。
+            tg_table.insert(
+                local_dock,
+                TgReadEntry_ {
+                    owner_: owner,
+                    writer_,
+                },
+            );
         }
     }
     Result::Ok(())
@@ -1644,6 +1812,53 @@ where
     }
 }
 
+/// 解复用循环所持 telegraph 读表的**收尾守卫**。
+///
+/// 退出时**必须显式 `close()`** 每个接收环写端：`buffex` 的环半部被 drop 不会置位
+/// 关闭标记，少了这一步，应用侧正 park 的 `recv_async` 永远醒不过来（与
+/// [`DemuxLocalGuard_`] 对 channel 接收环的处理同一条理由）。
+struct TgReadGuard_<'a, C>
+where
+    C: TrConnCfg,
+{
+    /// telegraph 读表：`local_dock` → 接收环写端（本循环持有）。
+    table: TgReadTable_<C::Alloc>,
+
+    /// 生命周期占位：守卫借在解复用循环的 `shared` 上（与 `table` 同寿命）。
+    _use_shared_: core::marker::PhantomData<&'a MuxShared_<C>>,
+}
+
+impl<C> core::ops::Deref for TgReadGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    type Target = TgReadTable_<C::Alloc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl<C> core::ops::DerefMut for TgReadGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.table
+    }
+}
+
+impl<C> Drop for TgReadGuard_<'_, C>
+where
+    C: TrConnCfg,
+{
+    fn drop(&mut self) {
+        for entry in self.table.values_mut() {
+            entry.writer_.close();
+        }
+    }
+}
+
 /// 复用循环**写事件队列**的收尾守卫（规则与理由见 [`MuxLocalGuard_`]）。
 struct MuxEventsGuard_<'a, C>
 where
@@ -1720,6 +1935,12 @@ pub(crate) async fn mux_loop_async_<C, K>(
         table: BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token()))),
         shared: &shared,
     };
+    // telegraph 的本地写表**单独持有**（不进 `MuxLocalGuard_`）：主循环在同一轮里既要
+    // 把 channel 表借给 `handle_write_event_`，又要排空 telegraph——两者若同处一个结构体
+    // 就会在 `&mut table.table` 与 `&mut table.tg_table_` 上撞借用检查。它自己的收尾
+    // 很简单（关掉每个发送环读端即可），因此不值得为对称再加一个守卫类型。
+    let mut tg_table: TgWriteTable_<C::Alloc> =
+        BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())));
     let mut events: MuxEventsGuard_<'_, C> = MuxEventsGuard_ {
         events,
         shared: &shared,
@@ -1775,6 +1996,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                         event,
                     &mut tx_stage,
                     &mut *table,
+                    &mut tg_table,
                     &mut scratch,
                     &mut pending_fin,
                     &shared,
@@ -1811,6 +2033,29 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 Option::None => return,
                 Option::Some(Result::Ok(true)) => continue,
                 Option::Some(Result::Ok(false)) => break,
+                Option::Some(Result::Err(err)) => {
+                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                    return;
+                }
+            }
+        }
+
+        // 2.7. telegraph：把各端点已提交的报文送出去。
+        //
+        //     必须在**主循环**里做、而不是只在 `TgReady` 事件处理里做：`TgReady` 只是
+        //     「可能有新提交」的提醒（每次提交一条），而「写环刚腾出空间」这条进展不会
+        //     再产生任何事件——只靠事件驱动的实现在写环满过一次之后就再也发不出去了。
+        //     这里每轮把所有端点的队列排空（每条一次尝试，失败即留到下一轮），与第 2 步
+        //     对 channel 的处理同构。
+        for (local, entry) in tg_table.iter_mut() {
+            match race_cancel_(
+                &cancel,
+                flush_tg_endpoint_::<C, _>(&mut tx_stage, entry, *local, &shared, &cancel),
+            )
+            .await
+            {
+                Option::None => return,
+                Option::Some(Result::Ok(_)) => {}
                 Option::Some(Result::Err(err)) => {
                     fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                     return;
@@ -1899,7 +2144,9 @@ pub(crate) async fn mux_loop_async_<C, K>(
                         return Poll::Ready(true);
                     }
                     // 所有生产者都没了：连接正在收尾，退出。
-                    Poll::Ready(Option::None) => return Poll::Ready(false),
+                    Poll::Ready(Option::None) => {
+                        return Poll::Ready(false);
+                    }
                     Poll::Pending => {}
                 }
                 // 子流发送环有新数据：回到顶部由 `drain_once_` 正式取走。
@@ -1949,6 +2196,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                         event,
                     &mut tx_stage,
                     &mut *table,
+                    &mut tg_table,
                     &mut scratch,
                     &mut pending_fin,
                     &shared,
@@ -1983,6 +2231,7 @@ async fn handle_write_event_<C, K>(
     event: WriteEvent_<C::Alloc>,
     tx_stage: &mut BufferedTx,
     table: &mut WriteTable_<C::Alloc>,
+    tg_table: &mut TgWriteTable_<C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
     pending_fin: &mut PendingFin_<C::Alloc>,
     shared: &MuxShared_<C>,
@@ -2145,7 +2394,270 @@ where
             )
             .await?;
         }
+        // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+        // telegraph（数据报）
+        // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+        WriteEvent_::TgAttach {
+            local_dock,
+            owner,
+            reader_,
+        } => {
+            tg_table.insert(
+                local_dock,
+                TgWriteEntry_ {
+                    owner_: owner,
+                    reader_,
+                },
+            );
+        }
+        WriteEvent_::TgReady { local_dock } => {
+            // 只对**已在本地表**里的端点动手：`TgAttach` 可能还在队列后面（同一轮的
+            // 事件顺序由应用侧保证不了），真正的排空在主循环第 2.7 步兜底。
+            let Some(entry) = tg_table.get_mut(&local_dock) else {
+                return Result::Ok(());
+            };
+            let _ = race_cancel_(
+                cancel,
+                flush_tg_endpoint_::<C, _>(tx_stage, entry, local_dock, shared, cancel),
+            )
+            .await;
+        }
+        WriteEvent_::TgTxClosed { local_dock } => {
+            // 应用丢掉了发送半边：摘掉表项，并把身份节点里尚未送出的长度记录一并丢弃
+            // （环里那些字节已经没有提交者，留着只会让队列永远非空）。身份本身何时
+            // 释放由两个半边的守卫共同决定，与这里无关。
+            if let Option::Some(entry) = tg_table.remove(&local_dock) {
+                entry.owner_.out_().clear_();
+            }
+        }
     }
+    Result::Ok(())
+}
+
+/// 把一条 telegraph 发送端点里**已提交**的报文逐条送出。
+///
+/// # 循环推进的判据
+///
+/// 报文长度由身份节点内联的发送队列给出（FIFO）。每次尝试发送**一条**：
+///
+/// - 环里暂时没有足够字节（应用写了但还没提交完）或没有长度记录 → 本轮结束；
+/// - 连接写环满 → 由 [`write_frame_to_stage_`] 返回「未写出」，本轮结束、数据留在
+///   发送环里，等主循环下一轮（写环腾出空间后会再来）。
+///
+/// 返回本轮成功送出的**报文条数**（仅供诊断 / 测试断言）。
+async fn flush_tg_endpoint_<C, K>(
+    tx_stage: &mut BufferedTx,
+    entry: &mut TgWriteEntry_<C::Alloc>,
+    local: Dock,
+    shared: &MuxShared_<C>,
+    cancel: &K,
+) -> Result<usize, MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let mut sent = 0usize;
+    // 用 `loop` 而非 `while let`：循环体里有多条**带副作用的提前退出**（丢弃一条卡住
+    // 的长度记录后继续下一条），`while let` 的绑定会把「队头长度」钉在整个循环体上，
+    // 而循环体里恰恰要把它出队改写。
+    #[allow(clippy::while_let_loop)]
+    loop {
+        // 队列空 → 没有待发报文。
+        let Some(_) = entry.owner_.out_().peek_len_() else {
+            break;
+        };
+        match race_cancel_(
+            cancel,
+            send_one_datagram_::<C>(tx_stage, entry, local, shared),
+        )
+        .await
+        {
+            Option::None => return Result::Err(MuxError::Cancelled),
+            // 送出了一条：继续试下一条。
+            Option::Some(Result::Ok(true)) => {
+                sent += 1usize;
+                continue;
+            }
+            // 写环满 / 环里数据还没到齐：留到下一轮。
+            Option::Some(Result::Ok(false)) => break,
+            // 环被关闭（发送半边已丢弃 / 连接收尾）：丢弃这一条长度记录，继续下一条
+            // ——否则它会永远卡在队头，后面的报文一条也发不出去。
+            Option::Some(Result::Err(_)) => {
+                let _ = entry.owner_.out_().try_pop_();
+                continue;
+            }
+        }
+    }
+    Result::Ok(sent)
+}
+
+/// 尝试送出一条数据报。
+///
+/// 返回 `Ok(true)` 表示**确实送出了一条**（长度记录已出队、帧已进连接写环）；
+/// `Ok(false)` 表示本轮条件不满足（写环没空间，或环里还没有那么长的数据），调用方应
+/// 留到下一轮重试——**长度记录不会出队**。
+///
+/// # Errors
+///
+/// 发送环已关闭（应用丢了发送半边）或读段失败时返回错误，调用方据此丢弃该长度记录。
+async fn send_one_datagram_<C>(
+    tx_stage: &mut BufferedTx,
+    entry: &mut TgWriteEntry_<C::Alloc>,
+    local: Dock,
+    shared: &MuxShared_<C>,
+) -> Result<bool, MuxError>
+where
+    C: TrConnCfg,
+{
+    // 1. 队头条目 `(目的地址, 长度)`（不出队）。目的地址是**逐次发送**的实参。
+    let Some((remote, payload_len)) = entry.owner_.out_().peek_len_() else {
+        return Result::Ok(false);
+    };
+    // 2. 连接写环至少要放得下帧头——否则不必去动发送环（避免「读了却写不出去」时
+    //    还要处理回退）。
+    let Some(space) = ring_space_(tx_stage) else {
+        return Result::Ok(false);
+    };
+    if space < K_MAX_FRAME_HEADER {
+        return Result::Ok(false);
+    }
+    // 3. 应用写进环里的数据够不够这一条？不够说明它还没提交完（或已经丢弃发送半
+    //    边）——两者都按「本轮不推进」处理，由下一轮或 `TgTxClosed` 收尾。注意这里
+    //    只做**非阻塞**探测：数据报是尽力交付，主循环不能被一条尚未提交完的报文挡住。
+    let available = entry.reader_.ring_state().data_size();
+    if available < payload_len {
+        return Result::Ok(false);
+    }
+    // 4. 编码并写出。目的地址来自本次发送的实参（见 `peek_len_` 取出的队头条目）。
+    let header = FrameHeader::new_(
+        FrameKind::Datagram,
+        0u8,
+        local,
+        remote,
+        payload_len,
+        Option::None,
+    );
+    let (head, head_len) = encode_header_(&header)?;
+    if head_len + payload_len > shared.max_packet_size_ {
+        // 单条报文超过协商的帧总长上限。这是**应用侧**的问题（它提交了一条连一帧都装
+        // 不下的数据报），**不是连接级故障**：整条丢弃并把长度记录出队，让后面的报文
+        // 照常发出——绝不能把整条连接判失败，也不能把它留在队头（那会把后面的报文全
+        // 堵死）。
+        //
+        // 丢弃与接收侧的「装不下就整条丢弃」同源（都是尽力交付），因此计入同一个计数器。
+        let _ = entry.owner_.out_().try_pop_();
+        shared.metrics_().on_datagram_dropped(
+            local,
+            remote,
+            u32::try_from(payload_len).unwrap_or(u32::MAX),
+        );
+        return Result::Ok(false);
+    }
+    write_frame_to_stage_::<C>(tx_stage, entry, &head[..head_len], payload_len).await?;
+    // 整帧已进连接写环：长度记录出队（这一步之后才允许下一轮读下一条）。
+    let popped = entry.owner_.out_().try_pop_();
+    debug_assert_eq!(
+        popped,
+        Option::Some((remote, payload_len)),
+        "队头条目不应在发送期间变化"
+    );
+    // 上报：帧总长与 channel 侧同口径（帧头 + 载荷）。数据报**不**上报子流级别的
+    // 统计（它没有身份寿命可言）。
+    shared.metrics_().on_frame(
+        FrameDir::Send,
+        local,
+        remote,
+        FrameKind::Datagram,
+        u32::try_from(head_len + payload_len).unwrap_or(u32::MAX),
+    );
+    Result::Ok(true)
+}
+
+/// 把**帧头 + 载荷**写进连接写环，载荷直接从 telegraph 发送环里搬出。
+///
+/// # 为什么要求「整帧放得下」才动手
+///
+/// 帧一旦写出**帧头**就无法回退；而载荷可能分多段。若中途写环满，写环里就会留下一条
+/// 「头已写、载荷不全」的残帧，对端解析必然错位。因此这里要求连接写环当前至少有
+/// `head_len + payload_len` 的可写空间才动手——**否则整帧推迟到下一轮**（调用方把长度
+/// 记录留在队列里，不消费发送环）。
+///
+/// 这条要求在实践中很容易满足：telegraph 的单条载荷上限是 `max_packet_size` 量级
+/// （默认 4 KiB），而连接写环容量是 [`K_STAGE_RING_CAPACITY`]（64 KiB）。它是数据报
+/// 「尽力交付、不背流控」的直接推论：宁愿推迟一条，也不在写环里留残帧。
+///
+/// # 零拷贝
+///
+/// 载荷从发送环的段直接搬进写环的段（`move_items_to_segm`），中间不经过任何暂存。
+///
+/// # Errors
+///
+/// 写环放不下整帧 / 源环被关闭 / 段借用失败时返回错误；调用方据此把该条留到下一轮。
+async fn write_frame_to_stage_<C>(
+    tx_stage: &mut BufferedTx,
+    entry: &mut TgWriteEntry_<C::Alloc>,
+    head: &[u8],
+    payload_len: usize,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+{
+    let total = head.len() + payload_len;
+    if ring_space_(tx_stage).unwrap_or(0usize) < total {
+        // 写环暂时放不下整帧：整帧推迟（长度记录留在队列里，发送环也不动）。
+        return Result::Err(MuxError::Closed);
+    }
+    // 一次性借出写段（空间已确认足够），先把帧头写进去。
+    let demand = Demand::at_least(total);
+    let mut outcome = tx_stage.try_write(&demand);
+    let writable = match outcome.as_mut().pick_left() {
+        Option::Some(segm) => segm,
+        Option::None => return Result::Err(MuxError::Closed),
+    };
+    let mut dst = writable.as_segm_mut();
+    {
+        let mut src = head;
+        while !src.is_empty() {
+            let put = dst.clone_items_from_buff(src);
+            if put == 0usize {
+                return Result::Err(MuxError::Closed);
+            }
+            src = &src[put..];
+        }
+    }
+    // 再从发送环借出**载荷段**，直接搬进同一个写段（零拷贝，不经过任何暂存）。
+    let read_demand = Demand::at_least(payload_len);
+    let mut read_outcome = entry.reader_.try_read(&read_demand);
+    let readable = match read_outcome.as_mut().pick_left() {
+        Option::Some(segm) => segm,
+        Option::None => return Result::Err(MuxError::Closed),
+    };
+    let mut src = readable.as_segm_ref();
+    // **按本条报文长度精确搬移**。
+    //
+    // 关键点：`move_items_to_segm` 是**整段搬运**——它会把源段里**全部**剩余数据搬走
+    // （实测：本条只要 5 字节，它搬了 205 字节，把后续报文的载荷一起吃进这一帧）。
+    // 因此必须**先把源段裁剪到本条长度**，再搬：`take_segm_ref(Demand::exactly(..))`
+    // 会按需求收窄实际消费量，`self` 的剩余量随之减少，多搬在构造上不再可能。
+    let mut left = payload_len;
+    while left > 0usize {
+        let mut piece = src.as_segm_ref();
+        let ask = Demand::exactly(left);
+        let Option::Some(mut piece) = piece.take_segm_ref(&ask) else {
+            return Result::Err(MuxError::Closed);
+        };
+        let take = core::cmp::min(left, piece.least_count());
+        if take == 0usize {
+            return Result::Err(MuxError::Closed);
+        }
+        let moved = piece.move_items_to_segm(&mut dst);
+        if moved != take {
+            return Result::Err(MuxError::Closed);
+        }
+        left -= moved;
+    }
+
+    // 写段与读段在这里 drop：各自提交指针、唤醒对端。
     Result::Ok(())
 }
 

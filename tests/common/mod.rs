@@ -9,7 +9,7 @@
 //! | `buff_` | 帧暂存 / 子流环的缓冲构造 |
 //! | `pump_` | 传输侧的调用方驱动泵与全被动环 |
 //! | `socket_` | socket 装配与两个运行时的驱动入口 |
-//! | `closure_` | `TrPrepareChannelRing` 的测试侧适配 |
+//! | `closure_` | `TrPrepareRing` 的测试侧适配 |
 //! | `channel_io_` | 子流半边的整段读写与 EOF 等待 |
 //! | `payload_` | 确定性载荷生成 |
 //! | `scenarios_` | 与运行时、传输无关的场景主体 |
@@ -52,7 +52,9 @@ pub use buff_::{
 };
 pub use channel_io_::{expect_eof_, read_channel_exact_, write_channel_all_};
 pub use scenarios_::{TestConnCfg, connect_pair_};
-pub use closure_::{AcceptAsyncClosureExt, ClosurePrepare};
+pub use closure_::{
+    AcceptAsyncClosureExt, ClosurePrepare, OpenTelegraphClosureExt, TgClosurePrepare,
+};
 pub use config_::{
     DefaultRt, assert_runtime_is_, default_rt_,
     FlowCtrlConfig,
@@ -93,7 +95,9 @@ pub use scenarios_::{
     run_per_channel_alloc_scenario_,
     run_recv_dropped_scenario_,
     run_ring_rejected_scenario_,
+    drive_telegraph_pair_,
     run_small_mux_scenario_,
     run_smoke_scenario_,
+    run_telegraph_scenario_,
     run_unsettled_handle_scenario_,
 };

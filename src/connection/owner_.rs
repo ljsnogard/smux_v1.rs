@@ -62,7 +62,7 @@
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -73,6 +73,7 @@ use mm_ptr::Shared;
 
 use crate::{
     connection::{
+        Dock,
         error_::MuxError,
         mux_connection::ChannelRegistry_,
         sync_::NotifySlot_,
@@ -837,11 +838,16 @@ impl ChannelState_ {
 ///
 /// 节点一旦建出，**变体终生不变**（身份释放换的是注册表**表槽**，不动节点），
 /// 这是 [`DockHandle_`] 那处无检查取用的安全前提。
+// 变体大小差异是**刻意**的：channel 的节点是热状态（几百字节），而 telegraph 的
+// 节点内联了**两个方向**的定容条目队列（各 `K_TG_LEN_QUEUE` 个槽）。身份节点按变体
+// 各建一次、数量与 dock 数同阶，因此这里用 max 而非装箱：装箱会把「节点内部零堆分配」
+// 这条不变量打破（见本模块文档），而每条身份多出的那点字节远小于一次分配。
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum DockBinding_ {
     /// 一条 channel 的身份节点：内联它的全部热状态。
     Channel(ChannelState_),
 
-    /// 一个 telegraph 端点的身份节点（本轮仍是占位：收发队列待实现）。
+    /// 一个 telegraph 端点的身份节点：内联**两个方向**的定容条目队列。
     Telegraph(TgRec_),
 
     /// 一个 listener 的身份节点：内联它的入向通知槽。
@@ -874,14 +880,257 @@ impl DockBinding_ {
     }
 }
 
-/// 一个 telegraph 端点的身份载荷（**占位**）。
+/// telegraph 每个方向的**条目队列**容量（以报文条数为单位）。
 ///
-/// telegraph 本轮只登记身份（独占 `local_dock`）与释放路径；`send_async` /
-/// `recv_async` 仍是 `todo!()`。落地时在这里挂收发队列与按 `remote_dock` 的分发状态
-/// ——因为节点里不许有堆分配，那些队列**不能**用 `flume`（见
+/// 数据报是**尽力交付**：应用每 `send_async(..)` 一次就产生一条待发报文的长度，写进
+/// 发送方向的队列；复用循环按 FIFO 逐条取走并成帧。接收方向对称——解复用循环每收下
+/// 一条完整报文就把长度入队，应用侧按顺序取出并读走。
+///
+/// 取 64 的理由：一条报文只占一个 `usize` 槽，而 64 条的余量足以吸收「应用突发提交 +
+/// 循环正在搬一条大报文」的错配，同时把每个端点身份节点的固定开销压在千字节以内
+/// （节点随身份一起分配，见本模块文档「零内部堆分配」）。
+///
+/// 两个方向各用一份等长的槽位数组，合并存放（见 [`TgRec_`]）。
+pub(crate) const K_TG_LEN_QUEUE: usize = 64usize;
+
+/// **长度队列**：一个定容、无堆分配的环形槽位队列，外加一个「占用字节数」计数。
+///
+/// # 它解决什么问题
+///
+/// telegraph 的两侧都是**字节环**（`buffex::ring`），而数据报的语义是**离散报文**：
+/// 「这一条报文到哪里结束」这件事环本身不知道。本队列就是那个缺失的边界信息——
+/// 每提交 / 收下一条报文，就把它的载荷长度入队；消费侧按 FIFO 取得长度，再从环里
+/// 精确取走那么多字节。
+///
+/// 因此**一条队列项 = 一条报文**，环里则始终只存**载荷字节**（不含任何长度前缀）。
+///
+/// # 并发形态
+///
+/// 单生产者 / 单消费者：一个方向只有一个入队方与一个出队方，且两者通常不在同一个
+/// 任务里（应用侧 vs 中心循环）。因此用 `Relaxed` 写槽位 + `Release`/`Acquire` 建立
+/// 「槽位先于位置」的可见性即可，不需要锁、也不需要 CAS 循环。
+///
+/// # 零堆分配
+///
+/// 槽位是内联定长数组，容量 [`K_TG_LEN_QUEUE`]；计数器是原子量。整个结构因此可以内联
+/// 在身份节点 [`TgRec_`] 里，不违反本模块「节点内部零堆分配」的不变量。
+#[derive(Debug)]
+pub(crate) struct TgLenQueue_ {
+    /// 待发条目的环形槽位（按序号取模复用）。
+    ///
+    /// 每个槽位把一个 `(remote_dock, len)` **打包进一个 `usize`**：高 32 位是目的
+    /// dock 的裸值、低 32 位是本条报文的载荷长度。打包而不是并存两个数组，是为了让
+    /// 「槽位写入 + 位置推进」仍然只是一条 release/acquire 链（两个数组会有两条，
+    /// 读者可能看到一半新一半旧）。
+    ///
+    /// `Dock<u32>` 的取值域恰好 32 位，长度受 `max_packet_size`（`usize` 但实际远小于
+    /// `u32::MAX`）约束，因此打包无损。
+    arr_: [AtomicUsize; K_TG_LEN_QUEUE],
+
+    /// 入队位置（生产者推进）。
+    head_: AtomicUsize,
+
+    /// 出队位置（消费者推进）。
+    tail_: AtomicUsize,
+
+    /// 队列里所有待处理报文的**长度之和**（字节）。
+    ///
+    /// 记它而不是让调用方每次遍历槽位求和：发送方向要按它反推「环里还有多少字节尚未
+    /// 提交」（`环内可读字节数 − 本值`），那是 `send_async` 每次调用都要问的问题。
+    bytes_: AtomicUsize,
+
+    /// 「队列里可能有报文」的持久通知（协议见 [`NotifySlot_`]）。
+    ///
+    /// 生产者每入队一次就置位；消费者按需 `poll_wait_`。持久位的语义保证「先入队、
+    /// 后 park」不会丢唤醒。
+    notify_: NotifySlot_,
+}
+
+impl Default for TgLenQueue_ {
+    fn default() -> Self {
+        Self::new_()
+    }
+}
+
+impl TgLenQueue_ {
+    /// 空队列。
+    pub(crate) fn new_() -> Self {
+        TgLenQueue_ {
+            // `AtomicUsize` 不是 `Copy`，用 `from_fn` 逐格构造定长数组。
+            arr_: core::array::from_fn(|_| AtomicUsize::new(0usize)),
+            head_: AtomicUsize::new(0usize),
+            tail_: AtomicUsize::new(0usize),
+            bytes_: AtomicUsize::new(0usize),
+            notify_: NotifySlot_::new_(),
+        }
+    }
+
+    /// 队列当前占用的槽数（调诊断 / 测试断言）。
+    pub(crate) fn len_(&self) -> usize {
+        let head = self.head_.load(Ordering::Acquire);
+        let tail = self.tail_.load(Ordering::Acquire);
+        head.wrapping_sub(tail)
+    }
+
+    /// 队列里待处理报文的长度之和（字节）。
+    pub(crate) fn bytes_(&self) -> usize {
+        self.bytes_.load(Ordering::Acquire)
+    }
+
+    /// 队列是否已满。
+    pub(crate) fn is_full_(&self) -> bool {
+        self.len_() >= K_TG_LEN_QUEUE
+    }
+
+    /// 尝试入队一条待发条目 `(remote_dock, len)`；满时原样带回。
+    ///
+    /// `remote_dock` 是**逐次发送**的目的地址（`send_async` 的实参），不是端点的固有
+    /// 属性——因此它必须与长度一起按 FIFO 记下来，循环才可能为每条报文取到正确地址。
+    ///
+    /// 调用方（应用侧 `send_async`）在满时应把「队列挤满」如实报成错误而不是无限等待：
+    /// 数据报本身是尽力交付，而队列满意味着调用方提交得比网络送得快——那是**应用**该
+    /// 看到的背压，不是连接该悄悄吞掉的状态（见 `TelegraphError::OutboxFull`）。
+    pub(crate) fn try_push_(&self, remote_dock: Dock, len: usize) -> Result<(), usize> {
+        let head = self.head_.load(Ordering::Relaxed);
+        let tail = self.tail_.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= K_TG_LEN_QUEUE {
+            return Result::Err(len);
+        }
+        // 槽位按序号取模复用；`head` 与仍在读该槽位的上一圈已错开整整一圈，覆盖安全。
+        self.arr_[head % K_TG_LEN_QUEUE].store(pack_entry_(remote_dock, len), Ordering::Relaxed);
+        self.bytes_.fetch_add(len, Ordering::Relaxed);
+        // Release：槽位与字节数必须先于位置推进对消费侧可见。
+        self.head_.store(head.wrapping_add(1usize), Ordering::Release);
+        Result::Ok(())
+    }
+
+    /// 只读查看队头报文长度（**不出队**）；空时返回 `None`。
+    ///
+    /// 消费侧（复用循环）用它来回答「下一条要发多长」，并在**真正写出之后**才
+    /// [`TgLenQueue_::try_pop_`]——这样「读环 / 写环中途受阻」不会把长度记录吞掉。
+    pub(crate) fn peek_len_(&self) -> Option<(Dock, usize)> {
+        let tail = self.tail_.load(Ordering::Relaxed);
+        let head = self.head_.load(Ordering::Acquire);
+        if head == tail {
+            return Option::None;
+        }
+        // Acquire：必须在读到位置推进之后才读槽位。
+        Option::Some(unpack_entry_(self.arr_[tail % K_TG_LEN_QUEUE].load(Ordering::Relaxed)))
+    }
+
+    /// 尝试取出一条报文长度；空时返回 `None`。
+    ///
+    /// **必须**配套置通知（[`TgLenQueue_::notify_`]）：等待腾位的生产者只看通知位，
+    /// 不轮询队列长度。
+    pub(crate) fn try_pop_(&self) -> Option<(Dock, usize)> {
+        let tail = self.tail_.load(Ordering::Relaxed);
+        let head = self.head_.load(Ordering::Acquire);
+        if head == tail {
+            return Option::None;
+        }
+        // Acquire：必须在读到位置推进之后才读槽位。
+        let entry = unpack_entry_(self.arr_[tail % K_TG_LEN_QUEUE].load(Ordering::Relaxed));
+        self.bytes_.fetch_sub(entry.1, Ordering::Relaxed);
+        self.tail_.store(tail.wrapping_add(1usize), Ordering::Release);
+        Option::Some(entry)
+    }
+
+    /// 丢弃队列里所有待处理项（发送半边被丢弃时用，避免循环永远等一个不会再被读的项）。
+    pub(crate) fn clear_(&self) {
+        // 单消费者语义：只有本方向的消费者会调用它。
+        let mut n = self.len_();
+        while n > 0usize {
+            let _ = self.try_pop_();
+            n -= 1usize;
+        }
+        self.notify_.notify_();
+    }
+
+    /// 置位持久通知并唤醒等待者。幂等、不阻塞。
+    pub(crate) fn notify_(&self) {
+        self.notify_.notify_();
+    }
+
+    /// 消费一次通知（持久位），或登记 waker 后返回 [`Poll::Pending`]。
+    pub(crate) fn poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.notify_.poll_wait_(cx)
+    }
+}
+
+/// 把 `(目的 dock, 载荷长度)` 打包进一个 `usize`（高 32 位 dock、低 32 位长度）。
+fn pack_entry_(remote_dock: Dock, len: usize) -> usize {
+    let dock = u64::from(remote_dock.value());
+    let len = len as u64 & 0xffff_ffffu64;
+    ((dock << 32usize) | len) as usize
+}
+
+/// [`pack_entry_`] 的逆操作。
+fn unpack_entry_(packed: usize) -> (Dock, usize) {
+    let packed = packed as u64;
+    let dock = (packed >> 32usize) as u32;
+    let len = (packed & 0xffff_ffffu64) as usize;
+    (Dock::new(dock), len)
+}
+
+/// 一个 telegraph 端点的身份载荷。
+///
+/// # 为什么需要两个方向的「长度队列」
+///
+/// 发送方向的实现形态是「应用写本地环 → 复用循环从环里取字节成帧」。环本身是**字节**
+/// 缓冲，它不知道「哪几个字节构成一条报文」；而数据报的语义要求**一条提交 = 一条
+/// 帧**。因此每提交一条报文，就把它的长度记进 [`TgRec_::out_`]（外加一条通知），
+/// 循环按队列顺序从环里精确取走那么多字节。
+///
+/// 接收方向对称：解复用循环收到一条完整的 `DATAGRAM` 后，把整条载荷写进接收环，并把
+/// 长度记进 [`TgRec_::in_`]；应用侧从队列取长度、再从环里读走。**装不下就整条丢弃**
+/// ——不写半条，也不入队。
+///
+/// # 零堆分配
+///
+/// 两个队列都是内联的定容环形槽位数组（各 [`K_TG_LEN_QUEUE`] 个 `usize`），节点里因此
+/// 仍然没有任何堆分配——这是身份节点体系的不变量（见本模块文档与
 /// `dev-notes/identity-record-20261005-0648.md`）。
+///
+/// # 唤醒落点
+///
+/// 两个方向的唤醒都由各自的队列承担（持久通知位 + waker 槽）：发送方向是
+/// 「应用 → 复用循环」，接收方向是「解复用循环 → 应用」。环本身不承担这条通知——
+/// 应用侧读走的字节数由队列项决定，而不是由环的可读量决定。
 #[derive(Debug, Default)]
-pub(crate) struct TgRec_;
+pub(crate) struct TgRec_ {
+    /// **发送**方向：已提交、待成帧发出的条目 `(目的 dock, 长度)`
+    /// （应用入队、复用循环出队）。
+    ///
+    /// 为什么连目的地址一起记：它是**逐次发送**的实参（同一个端点可以对不同 dock 发
+    /// 报文），因此必须与长度按同一个 FIFO 顺序配好，循环才知道「这一条该发往哪里」。
+    out_: TgLenQueue_,
+
+    /// **接收**方向：已收下、待应用读走的报文长度（解复用循环入队、应用出队）。
+    ///
+    /// 这里的「目的 dock」槽位无意义（报文已按本端 dock 路由过），入队时填
+    /// `unspecified`。
+    in_: TgLenQueue_,
+}
+
+impl TgRec_ {
+    /// 空载荷（登记 telegraph 身份时建立）。
+    pub(crate) fn new_() -> Self {
+        TgRec_ {
+            out_: TgLenQueue_::new_(),
+            in_: TgLenQueue_::new_(),
+        }
+    }
+
+    /// 发送方向的条目队列（应用侧提交、复用循环取走）。
+    pub(crate) fn out_(&self) -> &TgLenQueue_ {
+        &self.out_
+    }
+
+    /// 接收方向的条目队列（解复用循环入队、应用侧取走）。
+    pub(crate) fn in_(&self) -> &TgLenQueue_ {
+        &self.in_
+    }
+}
 
 /// 一个 listener 的身份载荷：`local_dock` 上的**零分配**入向通知槽。
 ///
@@ -979,6 +1228,25 @@ where
     }
 }
 
+impl<T, A> DockHandle_<T, A>
+where
+    T: ?Sized + 'static,
+    A: AllocatorClone,
+{
+    /// 本句柄是否是这条身份节点的**最后一份强引用**。
+    ///
+    /// 供 telegraph 的两个半边共同判定「身份该释放了」：telegraph 的 tx / rx 各持一份
+    /// 克隆，谁先 drop 都不该释放身份（另一半还在用同一个 `local_dock`），因此两边的
+    /// `Drop` 都先丢自己那份、再看这个判据——为真的一方负责投递释放消息。
+    ///
+    /// 读法与 [`Shared::strong_count`] 同源：它只在**本线程持有的一份额外克隆已经丢下**
+    /// 之后调用才有意义，因此调用点在 `Drop` 里先把 `node_` 的那份交给
+    /// `ManuallyDrop` / 显式 drop，再问这个问题。
+    pub(crate) fn is_last_strong_ref_(&self) -> bool {
+        Shared::strong_count(&self.node_) <= 1usize
+    }
+}
+
 impl<T, A> core::fmt::Debug for DockHandle_<T, A>
 where
     T: ?Sized + 'static,
@@ -1054,7 +1322,7 @@ where
     A: AllocatorClone,
 {
     handle_from_node_(
-        Shared::new(DockBinding_::Telegraph(TgRec_), alloc),
+        Shared::new(DockBinding_::Telegraph(TgRec_::new_()), alloc),
         DockBinding_::telegraph_,
     )
 }
@@ -1426,5 +1694,79 @@ mod tests_ {
         by_fin.set_peer_fin_();
         by_fin.set_local_fin_sent_();
         assert!(by_fin.is_done_(), "对端 FIN + 本端 FIN = 完成");
+    }
+
+    /// 测试 telegraph 发送队列的 FIFO 语义与「占用字节数」记账。
+    /// - 手段：向空队列依次入队 `(11,3)`、`(12,5)`、`(13,0)`、`(14,7)`（每项是
+    ///   「目的 dock + 载荷长度」）；每次入队后读 `len_` / `bytes_` / `peek_len_`，
+    ///   再逐条出队并核对顺序与 `bytes_` 的回收。
+    /// - 判断：`peek_len_` 始终给出**队头**（含目的地址）且不出队；`try_pop_` 按入队
+    ///   顺序吐出这四项（含长度为 0 的空报文）；`bytes_` 恒等于「尚未出队各项长度之和」；
+    ///   全部出队后 `len_` 与 `bytes_` 都归零、`peek_len_` 为 `None`。
+    #[test]
+    fn tg_len_queue_is_fifo_and_tracks_bytes() {
+        let q = TgLenQueue_::new_();
+        let entries = [
+            (Dock::new(11u32), 3usize),
+            (Dock::new(12u32), 5usize),
+            (Dock::new(13u32), 0usize),
+            (Dock::new(14u32), 7usize),
+        ];
+        let mut expected = 0usize;
+        for (idx, entry) in entries.iter().enumerate() {
+            assert!(
+                q.try_push_(entry.0, entry.1).is_ok(),
+                "空队列必须接受入队"
+            );
+            expected += entry.1;
+            assert_eq!(q.len_(), idx + 1usize, "入队后条数应为 idx + 1");
+            assert_eq!(q.bytes_(), expected, "bytes_ 必须等于尚未出队各项长度之和");
+            assert_eq!(
+                q.peek_len_(),
+                Option::Some(entries[0]),
+                "peek 必须始终给出队头（含目的地址）且不出队"
+            );
+            assert_eq!(q.len_(), idx + 1usize, "peek 不得改变条数");
+        }
+        for entry in entries {
+            assert_eq!(
+                q.try_pop_(),
+                Option::Some(entry),
+                "出队顺序必须是入队顺序，且目的地址随条目一起回来"
+            );
+            expected -= entry.1;
+            assert_eq!(q.bytes_(), expected, "出队后 bytes_ 必须扣掉该项");
+        }
+        assert_eq!(q.len_(), 0usize);
+        assert_eq!(q.bytes_(), 0usize);
+        assert_eq!(q.peek_len_(), Option::None, "空队列的 peek 必须是 None");
+        assert_eq!(q.try_pop_(), Option::None, "空队列的出队必须是 None");
+    }
+
+    /// 测试长度队列**满了之后如实拒绝**、`clear_` 能一次清空。
+    /// - 手段：连续入队 `K_TG_LEN_QUEUE` 个长度（恰好填满），再入队一个；
+    ///   随后 `clear_` 并核对状态。
+    /// - 判断：填满后 `is_full_` 为真；再来一个返回 `Err(原值)`（长度未被消费）；
+    ///   `clear_` 之后 `len_` / `bytes_` 都归零、`is_full_` 为假。
+    #[test]
+    fn tg_len_queue_rejects_when_full_and_clears() {
+        let q = TgLenQueue_::new_();
+        for _ in 0..K_TG_LEN_QUEUE {
+            assert!(
+                q.try_push_(Dock::new(1u32), 1usize).is_ok(),
+                "填满之前都应当接受"
+            );
+        }
+        assert!(q.is_full_(), "填满后必须报告已满");
+        assert_eq!(
+            q.try_push_(Dock::new(1u32), 9usize),
+            Result::Err(9usize),
+            "满时拒绝并原样带回长度"
+        );
+        assert_eq!(q.len_(), K_TG_LEN_QUEUE);
+        q.clear_();
+        assert_eq!(q.len_(), 0usize);
+        assert_eq!(q.bytes_(), 0usize);
+        assert!(!q.is_full_());
     }
 }

@@ -71,7 +71,7 @@ use crate::{
     connection::{
         Dock, MuxError,
         frame_::{
-            FieldId, FrameHeader, FrameKind, decode_dock_field_,
+            FieldId, FrameHeader, FrameKind, decode_dock_field_, decode_dock_field_lenient_,
             flags, flags_from_frame_head_, requires_window_report_,
         },
     },
@@ -239,7 +239,14 @@ fn place_value_(
             if slots.remote_dock_.is_some() {
                 return Result::Err(MuxError::MalformedFrame);
             }
-            slots.remote_dock_ = Option::Some(decode_dock_field_(value)?);
+            // `DATAGRAM` 的 remote dock 是**地址**而非**身份**：允许协议保留值
+            // （`wildcard` / `unspecified`），与写侧的放宽点对称，理由见
+            // `crate::connection` 模块文档 §4。
+            slots.remote_dock_ = Option::Some(if slots.kind_ == FrameKind::Datagram {
+                decode_dock_field_lenient_(value)?
+            } else {
+                decode_dock_field_(value)?
+            });
         }
         FieldId::RecvWindow => {
             if slots.recv_window_.is_some() {

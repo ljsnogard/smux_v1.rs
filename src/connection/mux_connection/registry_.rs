@@ -1140,6 +1140,34 @@ where
         Result::Ok(())
     }
 
+    /// 枚举当前**仍在册**的 telegraph 端点 `local_dock`，逐个回调（**非阻塞**）。
+    ///
+    /// 解复用循环用它做一次自查：本地表里那些 telegraph 端点，哪些已经不在身份表里了
+    /// （tx / rx 两个半边都被丢弃 ⇒ 身份已释放）——那些端点的接收环写端必须关掉，否则
+    /// 应用侧正 park 的 `recv_async` 永远醒不过来。
+    ///
+    /// # 为什么是「非阻塞 + 回调」
+    ///
+    /// - **非阻塞**：用 `try_read` 快路径，拿不到锁就返回 `false` 让调用方下一轮再来。
+    ///   这条路径在**每一次**会话释放消息之后都会试一次，绝不能为它阻塞中心循环；
+    /// - **回调**：既不引入堆分配（不建临时集合）、也不让读守卫逃出锁外——因此它不需要
+    ///   调用方提供分配器，也就绕开了「集合必须带自定义分配器」那类类型麻烦。
+    ///
+    /// 返回 `false` 表示**这次没拿到锁**（结果不可用）；`true` 表示回调已按当前快照跑完。
+    pub(crate) fn for_each_live_telegraph_(&self, mut f: impl FnMut(Dock)) -> bool {
+        let mut session = self.inner_.acquire_session();
+        let Result::Ok(guard) = session.try_read() else {
+            return false;
+        };
+        let inner = &*guard;
+        for (local_dock, remote_dock) in inner.bindings_.keys() {
+            if *remote_dock == Dock::unspecified() {
+                f(*local_dock);
+            }
+        }
+        true
+    }
+
     /// 与 `remote_dock` 建立过**活跃子流**的全部 `local_dock`（按 `local` 升序逐个回调）。
     ///
     /// 这是反向索引 `remote_index_` 的读取入口：把「只知对端 dock」的查询做成一次

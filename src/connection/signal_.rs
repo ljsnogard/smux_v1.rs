@@ -54,7 +54,7 @@ use flume::{Receiver, Sender, TrySendError};
 use crate::{
     connection::{
         Dock, FrameKind,
-        owner_::ChannelOwner_,
+        owner_::{ChannelOwner_, TgOwner_},
         ring_::{BufferedRx, BufferedTx},
     },
     flow_ctrl::{Credit, RecvTotal},
@@ -228,6 +228,42 @@ where
         /// 是否为 `RESET`（对端不再接收）而非 `FIN`（对端不再发送）。
         reset_: bool,
     },
+
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // telegraph（数据报）：与 channel 走**同一套**「环半部上线」模式
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    /// 一条 telegraph 的**发送环读端**上线：复用循环把它存进本地表，此后按
+    /// `local_dock` 索引。
+    ///
+    /// 与 [`WriteEvent_::Attach`] 同形，但键只有 `local_dock`——telegraph **独占**
+    /// 该 dock，没有 `remote_dock` 这一维（对端地址是协议里的**地址**而非**身份**，
+    /// 见 `crate::connection` 模块文档 §4）。
+    TgAttach {
+        /// 本端 dock。
+        local_dock: Dock,
+        /// 该端点的身份节点句柄（循环由它取「已提交报文长度」队列）。
+        owner: TgOwner_<A>,
+        /// 会话侧发送环读端（应用写、本循环读）。
+        reader_: BufferedRx,
+    },
+
+    /// 某条 telegraph 的**发送环有已提交数据**（应用侧提交后置位）。
+    ///
+    /// 只带 `local_dock`：「目的地址 + 长度」按 FIFO 记在身份节点的发送队列里
+    /// （目的地址是**逐次发送**的实参，不是端点的固有属性），本事件只负责把循环叫醒。
+    TgReady {
+        /// 本端 dock。
+        local_dock: Dock,
+    },
+
+    /// 应用丢弃了 telegraph 的发送半边：复用循环摘掉本地表项。
+    ///
+    /// 接收半边是否还在与本事件无关——它只影响发送方向是否还值得排空。真的把
+    /// **接收**环写端关掉的是身份释放（[`ReadEvent_::TgRelease`]）。
+    TgTxClosed {
+        /// 本端 dock。
+        local_dock: Dock,
+    },
 }
 
 /// 送给**读循环**的事件。
@@ -270,6 +306,24 @@ where
         /// 对端 dock。
         remote_dock: Dock,
     },
+
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // telegraph（数据报）
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    /// 一条 telegraph 的**接收环写端**上线：解复用循环把它存进本地表，此后按
+    /// `local_dock` 索引。
+    ///
+    /// 除环半部外还要带**身份句柄**：接收方向的「报文边界」记在身份节点内联的接收长度
+    /// 队列里（`TgRec_::in_`），解复用循环每收下一条报文都要往那里入队并唤醒应用侧。
+    TgAttach {
+        /// 本端 dock。
+        local_dock: Dock,
+        /// 该端点的身份节点句柄（循环由它取「已收报文长度」队列）。
+        owner: TgOwner_<A>,
+        /// 会话侧接收环写端（本循环写、应用读）。
+        writer_: BufferedTx,
+    },
+
 }
 
 /// **会话释放消息**：会话句柄的 `Drop` 只投递它，不碰注册表。

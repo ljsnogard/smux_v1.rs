@@ -171,7 +171,7 @@ where
 ///
 /// 取这个值的理由与「子流环是逐条可调的」这件事无关——它只是「调用方没说要多大时
 /// 给一个够用的数」；想逐条控制的调用方走 `accept_async_managed(.., cap)` 或自己实现
-/// [`TrPrepareChannelRing`](abs_smux::chan::TrPrepareChannelRing)。
+/// [`TrPrepareRing`](abs_smux::chan::TrPrepareRing)。
 pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 
 /// 默认配置：`u8` 数据、[`Dock`] dock、[`CoreAlloc`] 分配、[`DefaultPolicy`]

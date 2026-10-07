@@ -1,15 +1,20 @@
-//! `TrPrepareChannelRing` 的测试侧适配：把「闭包里塞两块缓冲」这个常见写法包成
+//! `TrPrepareRing` 的测试侧适配：把「闭包里塞两块缓冲」这个常见写法包成
 //! [`ClosurePrepare`]，并给出 `accept` / `accept_async_closure` 的扩展 trait。
 
 use core::{alloc::AllocatorClone, mem::MaybeUninit};
 use buffex::x_deps::abs_buff::TrBuffWrite;
-use abs_smux::chan::{ChannelBuffAlloc, TrChannelHandle, TrPrepareChannelRing};
+use abs_smux::{
+    chan::{RingBuffAlloc, TrChannelHandle, TrPrepareRing},
+    conn::TrDockBinding,
+};
 use mm_ptr::x_deps::abs_mm::res_man::TrUnique;
-use smux_v1::connection::{ChannelHandle, ChannelRx, ChannelTx, HandleError, TrConnCfg};
+use smux_v1::connection::{
+    ChannelHandle, ChannelRx, ChannelTx, DockBinding, HandleError, Telegraph, TrConnCfg,
+};
 
 /// 测试侧对「闭包造两块缓冲」这一常见写法的适配器。
 ///
-/// 上游 `TrPrepareChannelRing` 由环境自行实现；本测试套件为了不把每个调用点都手写
+/// 上游 `TrPrepareRing` 由环境自行实现；本测试套件为了不把每个调用点都手写
 /// 一个 prepared 类型，提供一个最小的闭包包装器。
 pub struct ClosurePrepare<F>(F);
 
@@ -20,15 +25,15 @@ impl<F> ClosurePrepare<F> {
     }
 }
 
-impl<F, B> TrPrepareChannelRing<B, u8> for ClosurePrepare<F>
+impl<F, B> TrPrepareRing<B, u8> for ClosurePrepare<F>
 where
     F: FnOnce() -> (B, B),
     B: 'static + TrUnique<Item = [MaybeUninit<u8>]>,
     B::Alloc: AllocatorClone,
 {
-    fn prepare(self) -> ChannelBuffAlloc<B, u8> {
+    fn prepare(self) -> RingBuffAlloc<B, u8> {
         let (tx_buff, rx_buff) = (self.0)();
-        ChannelBuffAlloc::new(tx_buff, rx_buff)
+        RingBuffAlloc::new(tx_buff, rx_buff)
     }
 }
 
@@ -75,5 +80,65 @@ where
     {
         self.accept_async::<W, B, _>(welcome, ClosurePrepare::new(prepare))
             .await
+    }
+}
+
+
+/// 测试侧对「闭包造两块 telegraph 环内存」这一常见写法的适配器。
+///
+/// 与 [`ClosurePrepare`] 同形，但产出的是 telegraph 的两块环内存。
+///
+/// 注意它实现的是**同一个**契约 [`TrPrepareRing`]——telegraph 与 channel 共用一套
+/// prepare 语义，没有第二份 trait。
+pub struct TgClosurePrepare<F>(F);
+
+impl<F> TgClosurePrepare<F> {
+    /// 包住一个 `FnOnce() -> (tx_buff, rx_buff)` 闭包。
+    pub const fn new(inner: F) -> Self {
+        TgClosurePrepare(inner)
+    }
+}
+
+impl<F, B> TrPrepareRing<B, u8> for TgClosurePrepare<F>
+where
+    F: FnOnce() -> (B, B),
+    B: 'static + TrUnique<Item = [MaybeUninit<u8>]>,
+    B::Alloc: AllocatorClone,
+{
+    fn prepare(self) -> RingBuffAlloc<B, u8> {
+        let (tx_buff, rx_buff) = (self.0)();
+        RingBuffAlloc::new(tx_buff, rx_buff)
+    }
+}
+
+/// 给上传 [`DockBinding`] 加一个「直接传闭包」的便捷方法，让测试场景保持可读。
+pub trait OpenTelegraphClosureExt<C>: Sized
+where
+    C: TrConnCfg,
+{
+    async fn open_telegraph_async_closure<B, F>(
+        &mut self,
+        prepare: F,
+    ) -> Result<Telegraph<C>, smux_v1::connection::BindingError>
+    where
+        B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
+        B::Alloc: AllocatorClone,
+        F: FnOnce() -> (B, B);
+}
+
+impl<C> OpenTelegraphClosureExt<C> for DockBinding<C>
+where
+    C: TrConnCfg,
+{
+    async fn open_telegraph_async_closure<B, F>(
+        &mut self,
+        prepare: F,
+    ) -> Result<Telegraph<C>, smux_v1::connection::BindingError>
+    where
+        B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
+        B::Alloc: AllocatorClone,
+        F: FnOnce() -> (B, B),
+    {
+        TrDockBinding::open_telegraph_async::<B, _>(self, TgClosurePrepare::new(prepare)).await
     }
 }

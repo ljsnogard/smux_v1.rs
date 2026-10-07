@@ -484,6 +484,21 @@ pub(crate) fn decode_dock_field_(value: usize) -> Result<Dock, MuxError> {
     decode_dock_(value).map_err(map_dock_decode_)
 }
 
+/// 把 `DATAGRAM` 的 **remote dock** 字段收窄为 [`Dock`]，**允许**协议保留值。
+///
+/// 与 [`decode_dock_field_`] 的唯一差别是不拒绝 `wildcard` / `unspecified`：数据报的
+/// remote dock 是**地址**而不是**身份**（见 `crate::connection` 模块文档 §4），
+/// 「发往 wildcard / unspecified」是对端的策略问题，不是协议违例。local dock 仍然
+/// 必须是真实值——它来自本端已绑定的 telegraph。
+///
+/// # Errors
+///
+/// 数值超出 `u32` → [`MuxError::MalformedFrame`]。
+pub(crate) fn decode_dock_field_lenient_(value: usize) -> Result<Dock, MuxError> {
+    let raw = u32::try_from(value).map_err(|_| MuxError::MalformedFrame)?;
+    Result::Ok(Dock::new(raw))
+}
+
 /// 该帧种类是否必需携带接收窗口通告（`RecvWindow` + `RecvTotal` 两个字段）。
 pub(crate) const fn requires_window_report_(kind: FrameKind) -> bool {
     matches!(
@@ -557,11 +572,15 @@ pub(crate) fn encode_header_(
 
     // channel 作用域的帧里 dock 对就是身份：两端都必须是真实 dock。
     //
-    // （`DATAGRAM` 是地址而非身份，它的 remote dock 允许取 `wildcard` / `unspecified`；
-    // 那一条路径的检查必须按帧种类放宽——见 `crate::connection` 模块文档 §4。telegraph
-    // 本轮尚未实现，`DATAGRAM` 的写路径也还没接上。）
+    // `DATAGRAM` 是**地址**而非**身份**：它的 remote dock 允许取 `wildcard` /
+    // `unspecified`（「发到 wildcard」由对端自己的策略决定收还是不收），因此这一条
+    // 按帧种类放宽；local dock 仍然是真实值（它来自本端已绑定的 telegraph）。
+    // 见 `crate::connection` 模块文档 §4。
     let (local_dock, remote_dock) = (header.local_dock_, header.remote_dock_);
-    if local_dock.is_special() || remote_dock.is_special() {
+    if local_dock.is_special() {
+        return Result::Err(MuxError::ReservedDock);
+    }
+    if remote_dock.is_special() && header.kind_ != FrameKind::Datagram {
         return Result::Err(MuxError::ReservedDock);
     }
     let local = usize::try_from(local_dock.value()).map_err(|_| MuxError::UnsupportedField)?;

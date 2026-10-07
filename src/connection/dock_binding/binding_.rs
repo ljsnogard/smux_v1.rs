@@ -1,16 +1,27 @@
+use core::{
+    alloc::AllocatorClone,
+    mem::MaybeUninit,
+};
+
 use abs_buff::{
     TrBuffRead, gen_may_cancel_future,
     x_deps::abs_cancel,
 };
 use abs_cancel::TrCancellationToken;
-use abs_smux::{conn::TrDockBinding, dock::TrDock};
+use abs_mm::res_man::TrUnique;
+use abs_smux::{
+    chan::TrPrepareRing,
+    conn::TrDockBinding,
+    dock::TrDock,
+};
 use buffex::x_deps::abs_buff;
+use mm_ptr::x_deps::abs_mm;
 
 use crate::connection::{
-    ChannelHandle, Dock, MuxError, MuxConnection, ReserveErr_, TrConnCfg,
+    ChannelHandle, Dock, MuxError, MuxConnection, ReserveErr_, Telegraph, TrConnCfg,
     channel_half::{ChannelRx, ChannelTx},
     channel_listener::ChannelListener,
-    signal_::SessionEvent_,
+    signal_::{ReadEvent_, SessionEvent_, TrEventSender_, WriteEvent_},
     util_::read_available_into_vec_,
 };
 
@@ -47,6 +58,15 @@ pub enum BindingError {
     /// 子流 / 连接已关闭（`open_channel`）。
     #[error("子流 / 连接已关闭")]
     Closed,
+
+    /// 调用方给出的环内存不合用（`open_telegraph`：容量非法或分配失败）。
+    ///
+    /// 与 channel 裁决时的 [`HandleError::RingRejected`] 同义：环容量由调用方决定，连接
+    /// 只校验「能不能建出环」，不替它改尺寸。
+    ///
+    /// [`HandleError::RingRejected`]: crate::connection::HandleError::RingRejected
+    #[error("调用方给出的环内存不合用")]
+    RingRejected,
 
     /// **等锁期间被取消**（cancel token 触发）。
     #[error("本次操作被取消")]
@@ -147,7 +167,11 @@ where
 
     type Telegraph = crate::connection::Telegraph<C>;
 
-    type OpenTelegraphAsync<'f> = MuxOpenTelegraphAsync<'f, 'f, C> where Self: 'f;
+    type OpenTelegraphAsync<'f, B, P> = MuxOpenTelegraphAsync<'f, 'f, C>
+    where
+        Self: 'f,
+        B: 'static + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone> + Send + Sync,
+        P: TrPrepareRing<B, C::Data>;
 
     type Tx = ChannelTx<C>;
     type Rx = ChannelRx<C>;
@@ -165,8 +189,18 @@ where
         MuxListenAsync::new(self, reserve)
     }
 
-    fn open_telegraph_async(&mut self) -> Self::OpenTelegraphAsync<'_> {
-        MuxOpenTelegraphAsync::new(self)
+    fn open_telegraph_async<'f, B, P>(
+        &'f mut self,
+        prepare: P,
+    ) -> Self::OpenTelegraphAsync<'f, B, P>
+    where
+        B: 'static + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone> + Send + Sync,
+        P: TrPrepareRing<B, C::Data>,
+    {
+        // **先同步建环**：`P` 与 `B` 因此都不进 future 的类型（与 channel 的
+        // `accept_async` 同一形状）。建环失败在这里就定局，step 只处理结果。
+        let rings = crate::connection::telegraph::build_telegraph_rings_(prepare.prepare());
+        MuxOpenTelegraphAsync::new(self, rings)
     }
 
     fn open_channel_async<'f, M>(
@@ -219,11 +253,31 @@ where
 
 /// [`TrDockBinding::open_telegraph_async`] 的 step 函数。
 ///
-/// 本轮只登记端点身份（telegraph **独占**该 `local_dock`）并交付端点对象；
-/// 端点的收发方法仍是 `todo!()`（见 [`crate::connection::Telegraph`]）。
+/// 与 channel 的最终裁决同形：**ring 内存由调用方当场交出**（`prepare`），本函数把两块
+/// 内存各建一条环，然后
+///
+/// 1. 登记 telegraph 身份（**独占**该 `local_dock`）；
+/// 2. 把**会话侧**两个半部经事件通道交给对应的中心循环
+///    （发送环读端 → 复用循环，接收环写端 → 解复用循环）；
+/// 3. 把**应用侧**两个半部与身份句柄包成端点工厂交给调用方。
+///
+/// 数据报没有建流握手，因此这里**不发任何帧**：身份与环一就位即可收发。
+///
+/// # 失败路径
+///
+/// - 建环失败（容量非法 / 分配失败）→ [`BindingError::RingRejected`]，身份**尚未**登记，
+///   无需撤销；
+/// - 身份被占（`local_dock` 已作 telegraph / listener / channel）→
+///   [`BindingError::DockInUse`]（由 `reserve_telegraph_` 判定）；
+/// - 事件投递失败（连接正在收尾）→ [`BindingError::Closed`]，并投一条
+///   `ReleaseTelegraph` 撤销刚登记的身份。
 #[gen_may_cancel_future(MuxOpenTelegraph, pub, new(pub(crate)))]
 async fn mux_open_telegraph_async_<'f, C, K>(
     binding: &'f mut DockBinding<C>,
+    rings: Result<
+        crate::connection::telegraph::TelegraphRings_,
+        crate::connection::TelegraphError,
+    >,
     cancel: K,
 ) -> Result<crate::connection::Telegraph<C>, BindingError>
 where
@@ -233,7 +287,11 @@ where
 {
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
-    // 同 `listen_async`：先落实积压的释放消息，再认领身份。
+
+    // 1. 纯本地：建两条环（结果在 `open_telegraph_async` 里已经算出）。
+    let ((tx_w, tx_r), (rx_w, rx_r)) = rings.map_err(map_telegraph_err_)?;
+
+    // 2. 先落实积压的释放消息，再认领身份（与 `listen_async` 同一纪律）。
     conn.core_()
         .drain_session_events_(cancel.child_token())
         .await
@@ -243,7 +301,43 @@ where
         .reserve_telegraph_(local, cancel.child_token())
         .await
         .map_err(map_reserve_err_)?;
-    Result::Ok(crate::connection::Telegraph::new_(conn, local, rec))
+
+    // 3. 把会话侧两个半部交给对应的中心循环。失败（循环已不在 = 连接正在收尾）时必须
+    //    撤销身份：否则该 `local_dock` 会被一个永远不能收发、也没有使用者的身份占住。
+    let attached = conn
+        .core_()
+        .w_events_()
+        .try_send_event_(WriteEvent_::TgAttach {
+            local_dock: local,
+            owner: rec.clone(),
+            reader_: tx_r,
+        })
+        && conn
+            .core_()
+            .r_events_()
+            .try_send_event_(ReadEvent_::TgAttach {
+                local_dock: local,
+                owner: rec.clone(),
+                writer_: rx_w,
+            });
+    if !attached && !cfg!(test) {
+        let _ = conn
+            .core_()
+            .reg_()
+            .post_session_event_(SessionEvent_::ReleaseTelegraph { local_dock: local });
+        return Result::Err(BindingError::Closed);
+    }
+
+    // 4. 应用侧两个半部 + 身份句柄 → 端点工厂。
+    Result::Ok(Telegraph::new_(conn, local, rec, tx_w, rx_r))
+}
+
+/// 把 telegraph 的建环错误映射为 binding 面的错误。
+fn map_telegraph_err_(err: crate::connection::TelegraphError) -> BindingError {
+    match err {
+        crate::connection::TelegraphError::RingRejected => BindingError::RingRejected,
+        _ => BindingError::Closed,
+    }
 }
 
 /// [`TrDockBinding::open_channel_async`] 的 step 函数。

@@ -18,7 +18,7 @@ use core::mem::MaybeUninit;
 
 use abs_art::TrLocalScope;
 use abs_smux::{
-    chan::{ChannelBuffAlloc, TrChannelHandle, TrPrepareChannelRing},
+    chan::{RingBuffAlloc, TrChannelHandle, TrPrepareRing},
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use buffex::{
@@ -234,7 +234,7 @@ async fn passive(
 /// 本示例的 `accept` 环准备策略：按给定容量向 `CoreAlloc` 要两块内存，
 /// 交给连接当作本条子流的发送 / 接收环。
 ///
-/// 这正是上游 `TrPrepareChannelRing` 的用法：**类型与容量都由调用方当场决定**，
+/// 这正是上游 `TrPrepareRing` 的用法：**类型与容量都由调用方当场决定**，
 /// 配置不再规定它们（见 `smux_v1::connection::ring_` 模块文档）。
 struct DemoRing_ {
     cap_: usize,
@@ -246,9 +246,9 @@ impl DemoRing_ {
     }
 }
 
-impl TrPrepareChannelRing<MuxChanBuffOwnedBy<Buf>, u8> for DemoRing_ {
-    fn prepare(self) -> ChannelBuffAlloc<MuxChanBuffOwnedBy<Buf>, u8> {
-        ChannelBuffAlloc::new(
+impl TrPrepareRing<MuxChanBuffOwnedBy<Buf>, u8> for DemoRing_ {
+    fn prepare(self) -> RingBuffAlloc<MuxChanBuffOwnedBy<Buf>, u8> {
+        RingBuffAlloc::new(
             MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(self.cap_, CoreAlloc)),
             MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(self.cap_, CoreAlloc)),
         )

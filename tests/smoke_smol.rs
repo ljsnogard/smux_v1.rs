@@ -80,3 +80,12 @@ fn flow_ctrl_isolation_socket_smol_() {
     let scope = rt.local_scope();
     smol::block_on(scope.run_until(smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope)));
 }
+
+/// 测试目标、手段、判断见 [`smoke_common::telegraph_socket_body_`]。
+#[test]
+fn telegraph_socket_smol_() {
+    let rt = abs_art_bridge::current();
+    common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Smol);
+    let scope = rt.local_scope();
+    smol::block_on(scope.run_until(smoke_common::telegraph_socket_body_(&rt, &scope)));
+}

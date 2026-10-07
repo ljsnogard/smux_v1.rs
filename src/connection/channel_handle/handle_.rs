@@ -12,7 +12,7 @@ use abs_cancel::TrCancellationToken;
 use abs_mm::res_man::TrUnique;
 use mm_ptr::x_deps::abs_mm;
 use abs_smux::chan::{
-    ChannelBuffAlloc, TrChannelHalf, TrChannelHandle, TrPrepareChannelRing,
+    RingBuffAlloc, TrChannelHalf, TrChannelHandle, TrPrepareRing,
 };
 use buffex::x_deps::abs_buff;
 
@@ -216,7 +216,7 @@ where
     fn accept_prepare_<B, P>(&mut self, prepare: P) -> AcceptOutcomeProj_<C>
     where
         B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
-        P: TrPrepareChannelRing<B, C::Data>,
+        P: TrPrepareRing<B, C::Data>,
     {
         self.accept_buffs_::<B>(prepare.prepare())
     }
@@ -225,7 +225,7 @@ where
     ///
     /// **不取任何锁**：建环与注册表登记都在这里完成不了——注册表登记挪到 step 函数
     /// （那里才有可取消的异步上下文）。因此本函数只做纯本地构造。
-    fn accept_buffs_<B>(&mut self, buffs: ChannelBuffAlloc<B, C::Data>) -> AcceptOutcomeProj_<C>
+    fn accept_buffs_<B>(&mut self, buffs: RingBuffAlloc<B, C::Data>) -> AcceptOutcomeProj_<C>
     where
         B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
     {
@@ -233,7 +233,7 @@ where
         let local = self.local_dock_;
         let remote = self.remote_dock_;
 
-        let ChannelBuffAlloc { tx_buff, rx_buff, .. } = buffs;
+        let RingBuffAlloc { tx_buff, rx_buff, .. } = buffs;
 
         // 建环 + 安装窗口参数（纯本地；注册表登记在身份登记时已经完成）。
         let (tx, rx, initial) =
@@ -277,7 +277,7 @@ where
         Self: 'f,
         Wb: 'f + TrBuffWrite<C::Data>,
         B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
-        P: TrPrepareChannelRing<B, C::Data>;
+        P: TrPrepareRing<B, C::Data>;
 
     type RejectAsync<'f, Rb> = MuxRejectAsync<'f, 'f, C, Rb>
     where
@@ -292,7 +292,7 @@ where
     where
         Wb: 'f + TrBuffWrite<C::Data>,
         B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
-        P: TrPrepareChannelRing<B, C::Data>,
+        P: TrPrepareRing<B, C::Data>,
     {
         let accept_result = self.accept_prepare_::<B, P>(prepare);
         if accept_result.is_err() {

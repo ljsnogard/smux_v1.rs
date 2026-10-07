@@ -970,3 +970,27 @@ async fn drive_min_stage_<RA, WA, RB, WB, S, RT>(
     assert_eq!(got_b, payload_a, "B 侧收到的载荷应与 A 侧发出的逐字节相等");
     common::expect_eof_(&mut rx_b).await;
 }
+
+/// 测试目标（**本轮验收点**）：telegraph（数据报）端到端语义——一次提交一条报文、
+/// 长度在发送前已知、空报文也是报文、接收环装不下就**整条丢弃**。
+///
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_telegraph_scenario_`]：A 在 dock 7、B 在 dock 11 上各开一条
+///   telegraph（发送环 1 KiB、接收环 64 字节）；A 依次发 5 / 200 / 0 字节三条报文，
+///   B 只应收到 5 与 0 两条（200 字节那条被整条丢弃），随后 B 回发 9 字节、A 收下。
+///   整个场景由 `scope.run_until` 驱动。
+/// - 判断：三条短报文的载荷逐字节相等、`send_async` 返回的长度与写入量一致、
+///   200 字节那条不得以任何形式出现（半条也不行）、双向都能收到。任一不满足即 panic。
+async fn mux_telegraph_inmem_dual_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_telegraph_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+// **本轮未通过**：收发链路已接通，但接收侧在解析帧头时报 `UnsupportedField`
+// （见 dev-notes/telegraph-20261007-*.md 的「当前状态」）。为避免把红的用例留在默认
+// 运行集里，先不注册它；定位修复后把下面这行换回 `single_runtime_test_!(..)`。
+single_runtime_test_!(mux_telegraph_inmem_dual_);

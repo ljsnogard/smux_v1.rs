@@ -25,7 +25,7 @@
 //! | [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) | [`ChannelHandle`] | 入向请求的待决句柄；`accept_async` / `reject_async` |
 //! | [`TrChannelTx`](abs_smux::chan::TrChannelTx) | [`ChannelTx`] | 子流发送半边，包一个 `buffex` 生产端（`TrBuffTryWrite`） |
 //! | [`TrChannelRx`](abs_smux::chan::TrChannelRx) | [`ChannelRx`] | 子流接收半边，包一个 `buffex` 消费端（`TrBuffTryRead`） |
-//! | [`TrTelegraph`](abs_smux::conn::TrTelegraph) | [`Telegraph`] | 数据报端点；`send_async` / `recv_async` |
+//! | [`TrTelegraph`](abs_smux::conn::TrTelegraph) | [`Telegraph`] | 数据报端点工厂；`split` 出 [`TelegraphTx`] / [`TelegraphRx`] |
 //! | [`TrDock`](abs_smux::dock::TrDock) | [`Dock`] | dock 的具体类型（见 §4） |
 //!
 //! 子流的 `Tx` / `Rx` 实现的是**非阻塞（try）**接口：应用只与本地环形缓冲打交道，
@@ -553,5 +553,9 @@ pub use ring_::{
     new_buffered_channel,
 };
 pub use scope_host_::{DefaultRt_, ScopeHost, default_rt_};
-pub use telegraph::{Telegraph, TelegraphError};
+pub use telegraph::{DemandErr, Telegraph, TelegraphError, TelegraphRx, TelegraphTx};
+
+
+
+
 pub use types_::Dock;

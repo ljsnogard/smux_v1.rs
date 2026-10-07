@@ -151,7 +151,7 @@ socket 装配 / 子流读写 / 载荷生成 / 建连 / 五组场景」全塞在�
 | `buff_.rs` | 帧暂存 / 子流环缓冲构造 |
 | `pump_.rs` | 调用方驱动的两条泵 + 全被动环 |
 | `socket_.rs` | socket 装配与两个运行时的驱动入口 |
-| `closure_.rs` | `TrPrepareChannelRing` 的测试侧适配 |
+| `closure_.rs` | `TrPrepareRing` 的测试侧适配 |
 | `channel_io_.rs` | 子流半边整段读写与 EOF 等待 |
 | `payload_.rs` | 确定性载荷生成 |
 | `scenarios_/` | 场景主体：`connect_` / `kit_` / `smoke_` / `small_` / `bind_` / `buffers_` / `flow_ctrl_` |

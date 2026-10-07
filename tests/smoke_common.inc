@@ -327,3 +327,51 @@ fn assert_smol_adapters_fit_() {
     assert_input_(ReadAsInput::new(&mut stream_a));
     assert_output_(WriteAsOutput::new(&mut stream_a));
 }
+
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// telegraph（数据报）：真实 socket 上的端到端验收
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 测试目标：**telegraph（数据报）在真实 UNIX socket 上**的端到端语义。
+///
+/// - 手段：建立 socket 对并完成传输装配，再跑与运行时无关的
+///   [`common::run_telegraph_scenario_`]——两端各在互不相同的 dock 上开一条数据报
+///   端点，A 发 5 / 200 / 0 字节三条报文，B 只应收到 5 与 0（200 那条因接收环装不下
+///   被**整条丢弃**），随后 B 回发 9 字节。整个场景由 `scope.run_until(..)` 驱动。
+/// - 判断：三条短报文的载荷逐字节相等、`send_async` 返回的长度与写入量一致、
+///   200 字节那条不得以任何形式出现（半条也不行）、双向都能收到。任一不满足即 panic。
+///
+/// # 为什么与进程内直连**并存**
+///
+/// 进程内直连（`tests/inmem_mux.rs`）把传输层的不确定性隔离在外，便于定位协议层问题；
+/// 本用例则证明同一套收发在**真实的异步 socket 设备适配**上也成立——两者的场景体
+/// 完全共用（[`common::run_telegraph_scenario_`]），差别只在传输怎么接。
+#[cfg(feature = "test-tokio-runtime")]
+pub async fn telegraph_socket_body_(rt: &abs_art_tokio::Runtime, scope: &abs_art_tokio::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_telegraph_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
+    })
+    .await;
+}
+
+/// 见 tokio 版说明。
+#[cfg(all(
+    not(feature = "test-tokio-runtime"),
+    not(feature = "test-smol-runtime")
+))]
+pub async fn telegraph_socket_body_(rt: &abs_art_compio::Runtime, scope: &abs_art_compio::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_telegraph_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
+    })
+    .await;
+}
+
+/// 见 tokio 版说明。
+#[cfg(feature = "test-smol-runtime")]
+pub async fn telegraph_socket_body_(rt: &abs_art_smol::Runtime, scope: &abs_art_smol::LocalScope) {
+    common::run_socket_scenario_on_runtime_(scope, |a_tx, a_rx, b_tx, b_rx| async move {
+        common::run_telegraph_scenario_(rt, scope, a_tx, a_rx, b_tx, b_rx).await;
+    })
+    .await;
+}

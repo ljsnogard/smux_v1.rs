@@ -75,10 +75,11 @@ RingBlock_<P>            ← 建环那一次分配的全部内容
 - `TrMuxConfig::Buff` **删除**：一条子流用哪种指针持有 ring 内存不再是连接的静态配置；
 - `TrChannelHandle::accept_async<'f, W, B, P>` / `type AcceptAsync<'f, W, B, P>`：
   `B` 升为**方法级泛型**，`B: 'static + Send + Sync + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone>`；
-- `ChannelBuffAlloc<B, T>` / `TrPrepareChannelRing<B, T>`：补 `B::Alloc: AllocatorClone`
+- `RingBuffAlloc<B, T>` / `TrPrepareRing<B, T>`（当时叫 `ChannelBuffAlloc` /
+  `TrPrepareChannelRing`，后经 telegraph 落地一并改名）：补 `B::Alloc: AllocatorClone`
   （连接侧要用 `P` 自己的分配器释放块）；`B` 也从 `BorrowMut` 收紧为 `TrUnique`。
 
-原先 `P: TrPrepareChannelRing<C::Buff, C::Data>` 会直接编不过——`C::Buff` 只保证
+原先 `P: TrPrepareRing<C::Buff, C::Data>` 会直接编不过——`C::Buff` 只保证
 `TrBoxed`（有 `Deref` 没有 `DerefMut`），这正是「不该由配置规定 prepare 的指针类型」
 的硬证据。
 

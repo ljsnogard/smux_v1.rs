@@ -241,6 +241,16 @@ pub trait TrMetricsSink: Send + Sync + 'static {
     /// `by_peer` 为 `true` 表示是对端发来的（本端为接收方）。
     fn on_reset(&self, _local: Dock, _remote: Dock, _by_peer: bool) {}
 
+    /// **整条丢弃**了一条到达的数据报（telegraph）。
+    ///
+    /// 触发条件是接收环剩余空间装不下整条载荷，或接收方向的长度队列已满——两者都是
+    /// 「尽力交付」下正常的丢弃，不构成协议违例。`bytes` 是被丢弃的**载荷**字节数
+    /// （不含帧头），因此它与 [`TrMetricsSink::on_frame`] 的口径不同：后者把帧头也
+    /// 算进去了。
+    ///
+    /// `local` 是本端（接收方）dock，`remote` 是发送方在帧头里写的本端地址。
+    fn on_datagram_dropped(&self, _local: Dock, _remote: Dock, _bytes: u32) {}
+
     /// 连接级**原始字节**流量（两泵口径：字节流上真实搬运的字节，不分帧）。
     ///
     /// 它与 [`TrMetricsSink::on_frame`] 的字节数**不是**同一口径：后者是帧总长，

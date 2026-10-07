@@ -15,6 +15,7 @@ mod idle_write_;
 mod kit_;
 mod small_;
 mod smoke_;
+mod telegraph_;
 
 pub use bind_::{run_bind_exclusivity_scenario_, run_unsettled_handle_scenario_};
 pub use buffers_::{run_per_channel_alloc_scenario_, run_ring_rejected_scenario_};
@@ -29,3 +30,4 @@ pub use frame_cap_::run_frame_cap_scenario_;
 pub use idle_write_::run_idle_small_write_scenario_;
 pub use small_::run_small_mux_scenario_;
 pub use smoke_::run_smoke_scenario_;
+pub use telegraph_::{drive_telegraph_pair_, run_telegraph_scenario_};

@@ -67,3 +67,11 @@ async fn flow_ctrl_isolation_socket_compio_() {
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope).await;
 }
+
+/// 测试目标、手段、判断见 [`smoke_common::telegraph_socket_body_`]。
+#[compio::test]
+async fn telegraph_socket_compio_() {
+    let rt = abs_art_bridge::current();
+    let scope = rt.local_scope();
+    smoke_common::telegraph_socket_body_(&rt, &scope).await;
+}

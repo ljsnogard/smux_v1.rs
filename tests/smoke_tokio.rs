@@ -70,3 +70,11 @@ async fn flow_ctrl_isolation_socket_tokio_() {
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope).await;
 }
+
+/// 测试目标、手段、判断见 [`smoke_common::telegraph_socket_body_`]。
+#[tokio::test]
+async fn telegraph_socket_tokio_() {
+    let rt = abs_art_bridge::current();
+    let scope = rt.local_scope();
+    smoke_common::telegraph_socket_body_(&rt, &scope).await;
+}
