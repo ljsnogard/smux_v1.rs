@@ -83,6 +83,7 @@ pub use socket_::{
 };
 pub use scenarios_::{
     run_bind_exclusivity_scenario_,
+    run_closed_ring_spin_scenario_,
     run_flow_ctrl_isolation_scenario_,
     run_flow_ctrl_socket_scenario_,
     run_frame_cap_scenario_,

@@ -192,6 +192,36 @@ async fn mux_frame_cap_burst_dual_() {
 }
 single_runtime_test_!(mux_frame_cap_burst_dual_);
 
+/// 测试目标（**间歇停摆回归**）：**生产端已关闭且已排空的发送环不得被复用循环当作
+/// 「有数据可发」**，且**待收尾的子流不得被前面一条推不动的子流饿死**。
+///
+/// - 背景：复用循环 park 时的「发送环可读」判据原先只看环读 future 是否 `Ready`；
+///   而环在**生产端已关闭且已排空**时该 future 会**立刻**返回错误（`Closing`），
+///   于是整圈在「回顶部 → drain 取不到段 → 立刻又就绪」之间纯空转（CPU 打满），
+///   把同一条本地队列上的解复用循环、两个泵与应用任务全部饿死——跨进程真机上就是
+///   「两端同时静止」的间歇停摆（现场见
+///   `smux_v1_sock_demo/dev-notes/intermittent-stall-20261007-0200.md`）。
+///   让这条空转路径**持久化**的是收尾扫描的头阻塞：每轮只取键序最小的待收尾子流、
+///   推不动就 `break`，于是「环已关闭且已排空」的那条一直留在本地表里。
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_closed_ring_spin_scenario_`]：`P`（对端窗口小且**永不消费**，
+///   额度用尽后环里永远有积压）与 `Q`（载荷略大于窗口，应用写完即半关闭；对端把已
+///   收到的部分读走触发窗口回补，复用循环把 `Q` 环里剩下的字节发完 → `Q` 变成
+///   「生产端已关闭且已排空、额度为正」）。对端的读与等 `EOF` 都包在「让出 20 万轮
+///   仍无进展即 panic」的看门狗里；场景由 `scope.run_until` 驱动。
+/// - 判断：对端读满 `Q` 的载荷（逐字节相等）**并读到 `EOF`**。修复前 `Q` 的 `FIN` 被
+///   `P` 饿死（看门狗 panic），或空转把看门狗一起饿死（用例挂到测试超时）。
+async fn mux_closed_ring_spin_dual_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_closed_ring_spin_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+single_runtime_test_!(mux_closed_ring_spin_dual_);
+
 /// 测试目标（**本轮验收点**）：**最终裁决**（`accept_async`）成为建流的唯一提交点
 /// ——在它之前丢弃半建立句柄，两个角色都不留垃圾、不悬着对端。
 ///
