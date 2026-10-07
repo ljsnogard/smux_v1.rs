@@ -7,7 +7,10 @@
 //!    `BindError::DockInUse`（[`mux_bind_cross_thread_is_exclusive_tokio_`]）；
 //! 2. 一条线程丢弃 `DockBinding`（`Drop` 只向核心投递释放消息），**另一条线程**
 //!    立刻重绑同一个 dock 必须成功
-//!    （[`mux_rebind_after_cross_thread_drop_tokio_`]）。
+//!    （[`mux_rebind_after_cross_thread_drop_tokio_`]）；
+//! 3. 两条线程**同时**用 `bind_async(Dock::unspecified())` 索要一个空闲 dock 时，
+//!    「找一个空闲的」与「占住它」是一次**原子**操作：两条都必须成功，且拿到的 dock
+//!    **互不相同**（[`mux_auto_dock_allocation_is_atomic_tokio_`]）。
 //!
 //! # 为什么是 tokio 装配（性质在两个后端之间对调了）
 //!
@@ -68,7 +71,7 @@ use std::{
 };
 
 use abs_art::TrLocalScope;
-use abs_smux::conn::TrConnection;
+use abs_smux::conn::{TrConnection, TrDockBinding};
 use smux_v1::connection::{BindError, Dock};
 
 /// 竞争轮数：每轮换一个 dock，避免上一轮的结果影响下一轮。
@@ -151,6 +154,28 @@ impl core::fmt::Debug for RaceOutcome_ {
     }
 }
 
+/// 一次**自动分配**竞争的结果：`DockBinding` 在本线程内丢弃，只回传实际拿到的 dock。
+enum AutoOutcome_ {
+    /// 抢到了绑定，并回传由连接自行安排的那个 dock。
+    Bound(Dock),
+
+    /// 自动分配失败：候选远未用尽，不该发生。
+    Failed(BindError),
+
+    /// 竞争路径 panic（**回归信号**：合法并发竞争不得 panic）。
+    Panicked(String),
+}
+
+/// 手写 `Debug` 的理由同 [`RaceOutcome_`]：把载荷带进断言失败信息。
+impl core::fmt::Debug for AutoOutcome_ {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AutoOutcome_::Bound(dock) => write!(f, "Bound({dock:?})"),
+            AutoOutcome_::Failed(err) => write!(f, "Failed({err:?})"),
+            AutoOutcome_::Panicked(msg) => write!(f, "Panicked({msg:?})"),
+        }
+    }
+}
 /// 在当前线程新建一个 **tokio** 运行时（竞争线程各自一个）。
 fn new_tokio_rt_() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -349,4 +374,112 @@ fn mux_rebind_after_cross_thread_drop_tokio_() {
     );
 
     holder.join().expect("竞争线程不应 panic");
+}
+
+/// 测试目标：两条线程**同时**用 `bind_async(Dock::unspecified())` 索要一个空闲 dock
+/// 时，「找一个空闲的」与「占住它」必须是一次**原子**操作——两条都必须成功，且拿到
+/// 的 dock **互不相同**。
+///
+/// - 手段：先用两条被动内存环在主线程的 tokio 运行时里完成握手并建出连接；随后逐轮起
+///   两条线程，各持一份连接克隆、各自新建一个 tokio 运行时：两条线程先自旋对齐起跑线，
+///   再立刻调 `bind_async(Dock::unspecified())`；拿到 binding 后先把 dock 值记下来并
+///   公布「本轮已出结果」，**等对侧也公布完**才丢弃 binding（两边在整个竞争窗口里都
+///   持有各自的 binding，避免「一边先放掉、另一边于是合法复用」这种时序假象）。主线程
+///   等两条线程报到后放行，并 `join` 收集两侧结果。
+/// - 判断：每一轮两条线程都必须成功，且两个 dock **不相等**。若实现把「查空闲」与
+///   「占位」拆成两个临界区，两条线程就可能选中同一个 dock（表现为「两个成功的 dock
+///   相同」，或一方据此报 `DockInUse`），本用例即失败。任一轮不满足即在断言消息里指出
+///   轮次与两侧结果。
+#[test]
+fn mux_auto_dock_allocation_is_atomic_tokio_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    // 建连仍在主线程的 tokio 运行时里完成（理由同文件头「为什么用 block_on」）。
+    let tokio_rt = new_tokio_rt_();
+    let (conn_a, _conn_b, _scope) = tokio_rt.block_on(async {
+        let art_rt = abs_art_tokio::current();
+        let scope = art_rt.local_scope();
+        let (a, b): (Conn_, Conn_) = scope
+            .run_until(common::connect_pair_(
+                &art_rt,
+                &scope,
+                a_tx,
+                a_rx,
+                b_tx,
+                b_rx,
+                common::make_stage_buffs_(),
+                common::make_stage_buffs_(),
+            ))
+            .await;
+        (a, b, scope)
+    });
+
+    for round in 0..K_RACE_ROUNDS {
+        let ready = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+        let start = Arc::new(AtomicBool::new(false));
+        let done = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+        let mut handles = Vec::with_capacity(2usize);
+
+        for idx in 0..2usize {
+            let conn = conn_a.clone();
+            let ready = Arc::clone(&ready);
+            let start = Arc::clone(&start);
+            let done = Arc::clone(&done);
+            handles.push(std::thread::spawn(move || {
+                let rt = new_tokio_rt_();
+                let raced = catch_unwind(AssertUnwindSafe(|| {
+                    let bound = rt.block_on(async move {
+                        ready[idx].store(true, Ordering::Release);
+                        wait_flag_(&start);
+                        conn.bind_async(Dock::unspecified()).await
+                    });
+                    // 两阶段汇合：先定格结果并公布，再等对侧也公布完，最后才解绑。
+                    match bound {
+                        Result::Ok(binding) => {
+                            let dock = *binding.local_dock();
+                            done[idx].store(true, Ordering::Release);
+                            wait_flag_(&done[1usize - idx]);
+                            drop(binding);
+                            AutoOutcome_::Bound(dock)
+                        }
+                        Result::Err(err) => {
+                            done[idx].store(true, Ordering::Release);
+                            wait_flag_(&done[1usize - idx]);
+                            AutoOutcome_::Failed(err)
+                        }
+                    }
+                }));
+                match raced {
+                    Result::Ok(outcome) => outcome,
+                    Result::Err(payload) => AutoOutcome_::Panicked(panic_message_(payload)),
+                }
+            }));
+        }
+
+        // 两条线程都站上起跑线后再放行；有界等待的理由同 [`wait_flag_`]。
+        wait_flag_(&ready[0]);
+        wait_flag_(&ready[1]);
+        start.store(true, Ordering::Release);
+
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Result::Ok(outcome) => outcome,
+                Result::Err(_) => AutoOutcome_::Panicked("线程在竞争路径之外 panic".to_owned()),
+            })
+            .collect::<Vec<AutoOutcome_>>();
+
+        match (&outcomes[0], &outcomes[1]) {
+            (AutoOutcome_::Bound(a), AutoOutcome_::Bound(b)) => assert_ne!(
+                a, b,
+                "第 {round} 轮两条线程拿到了同一个 dock {a:?}：\
+                 「找空闲」与「占住」不是一次原子操作"
+            ),
+            _ => panic!(
+                "第 {round} 轮两条线程并发自动分配未表现为「两个都成功且各不相同」：\
+                 {outcomes:?}"
+            ),
+        }
+    }
 }

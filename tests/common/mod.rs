@@ -85,6 +85,7 @@ pub use socket_::{
     run_socket_scenario_on_runtime_,
 };
 pub use scenarios_::{
+    run_auto_dock_scenario_,
     run_bind_exclusivity_scenario_,
     run_closed_ring_spin_scenario_,
     run_conn_failed_wakes_scenario_,

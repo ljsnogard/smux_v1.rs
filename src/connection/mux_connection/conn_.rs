@@ -32,11 +32,17 @@ use super::{core_::MuxCore, registry_::{ChannelRegistry_, ReserveErr_}};
 /// [`TrConnection`](abs_smux::conn::TrConnection) 的错误类型：目前只有 `bind_async`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
-    /// 要绑定的 dock 是协议保留值（`unspecified` / `wildcard`），不能当身份用。
+    /// 要绑定的 dock 是协议保留值 `wildcard`，不能当身份用。
+    ///
+    /// `unspecified` **不会**引发这个错误：它表示「由连接自行安排一个空闲 dock」，
+    /// 见 [`TrConnection::bind_async`](abs_smux::conn::TrConnection::bind_async)。
     #[error("要绑定的 dock 是协议保留值，不能作为身份")]
     ReservedDock,
 
-    /// 该 local_dock 已被占用。
+    /// 该 local_dock 已被占用；`bind_async(unspecified)` 下则是**候选范围已占满**。
+    ///
+    /// 两种情形共用一个变体：调用方在它们面前能做的事没有区别（换一个 dock、或者
+    /// 先释放一些 binding 再试）。
     #[error("该 local_dock 已被占用")]
     DockInUse,
 
@@ -462,6 +468,11 @@ where
 }
 
 /// [`TrConnection::bind_async`] 的 step 函数。
+///
+/// `local_dock` 取 `unspecified` 表示**由连接自行安排**：本函数会在注册表的同一个
+/// 写锁临界区里挑一个空闲 dock 并占住它（见 `ChannelRegistry_::bind_any_dock_`），
+/// 实际拿到哪个由返回的 `DockBinding::local_dock` 给出。取 `wildcard` 仍然拒绝
+/// ——它是「任意 remote」的哨兵，不是「请自行安排」。
 #[gen_may_cancel_future(MuxBind, pub, new(pub(crate)))]
 async fn mux_bind_async_<'f, C, K>(
     conn: &'f MuxConnection<C>,
@@ -472,24 +483,34 @@ where
     C: TrConnCfg + 'f,
     K: TrCancellationToken,
 {
-    if local_dock.is_special() {
+    if local_dock.is_wildcard() {
         return Result::Err(BindError::ReservedDock);
     }
     // 先清空释放邮箱：上一个 `DockBinding` 可能刚被丢弃（`Drop` 只投消息），
     // 不先落实就会把「已解绑」误判成 `DockInUse`——这是「丢弃后立刻重绑」这条
-    // 既有约定的确定性来源。
+    // 既有约定的确定性来源。自动分配路径同样依赖它：「丢弃后立刻再要一个」应当能
+    // 拿回刚释放的那个 dock，而它要先进复用池（见 `ChannelRegistry_::unbind_dock_`）。
     conn.core_()
         .drain_session_events_(cancel.child_token())
         .await
         .map_err(|_| BindError::Cancelled)?;
-    // 独占绑定：同一 local_dock 在任意时刻至多一个 `DockBinding`。
-    conn.core_()
-        .bind_dock_(local_dock, cancel.child_token())
-        .await
-        .map_err(|err| match err {
-            ReserveErr_::Cancelled => BindError::Cancelled,
-            // `bind_dock_` 只有这两种失败：被占用，或等锁被取消。
-            _ => BindError::DockInUse,
-        })?;
-    Result::Ok(DockBinding::new_(conn.clone(), local_dock))
+    // 两条路径都只做「登记独占绑定」这一件事：显式路径绑定给定值，自动分配路径把
+    // 「找空闲 + 占位」合成一次临界区内的原子操作，并回传选中的值。
+    let bound_dock = if local_dock.is_unspecified() {
+        conn.core_()
+            .bind_any_dock_(cancel.child_token())
+            .await
+    } else {
+        conn.core_()
+            .bind_dock_(local_dock, cancel.child_token())
+            .await
+            .map(|()| local_dock)
+    }
+    .map_err(|err| match err {
+        ReserveErr_::Cancelled => BindError::Cancelled,
+        // 显式路径是「该 dock 已被占用」，自动分配路径是「候选范围已占满」：调用方
+        // 在两种情形下能做的事没有区别，因此共用 `DockInUse`。
+        _ => BindError::DockInUse,
+    })?;
+    Result::Ok(DockBinding::new_(conn.clone(), bound_dock))
 }

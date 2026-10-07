@@ -78,8 +78,44 @@
 //!
 //! 不需要第 4 张业务表：[`channel_range_`] 给出的开区间恰好覆盖某个
 //! `local_dock` 下的全部具体子流。
+//!
+//! # 自动分配 dock
+//!
+//! `bind_async` 的 `local_dock` 取 `unspecified` 表示「由连接自行安排一个空闲
+//! dock」（见 [`abs_smux::conn::TrConnection::bind_async`]）。这条路径要求
+//! 「找一个空闲的」与「占住它」对并发调用者是**一次原子操作**：分成两步会让两个
+//! 并发调用选中同一个 dock，而 dock 一旦被选中就是身份的一半，没有事后反悔的
+//! 余地。因此它落在本模块的写锁临界区里（[`ChannelRegistry_::bind_any_dock_`]），
+//! 而不是 API 面上的两步调用。
+//!
+//! 候选范围仿照 UNIX 特权端口的约定：**只给 `[1024, wildcard)`**，`0..1024` 留给
+//! 调用方显式指定（`0` 与 `wildcard` 本身是协议保留值，本来就不能作身份）。分配
+//! 不扫表，只用两个来源——它们按定义互不重叠，因此不需要「哪些 dock 分配过」的
+//! 额外集合：
+//!
+//! | 来源 | 含义 | 单次代价 |
+//! | --- | --- | --- |
+//! | `reusable_docks_` | 自动分配**曾发出、现已归还**的 dock（先进先出） | 出队一项，O(1) |
+//! | `next_fresh_dock_` | 从未被自动分配过的单调游标 | 取游标并前进，O(1)（跳过被显式占住的 dock 时才多几步） |
+//!
+//! 不重叠由「游标只增不减 + 只有**自动分配发出过**的 dock 才进复用池」保证：同一个
+//! dock 因此不会被自动分配发出去两次，也不必为了找空洞去线性扫描 `docks_`。游标
+//! 走到 `wildcard` 且复用池为空就是候选耗尽，按「绑定失败」报
+//! [`ReserveErr_::DockInUse`]——与「这个具体 dock 被占」共用一个错误：调用方在这
+//! 两种情形下能做的事没有区别。
+//!
+//! 复用池是**先进先出**的队列：最早归还的最先被复用。入队与出队都是 O(1)，也不必
+//! 为「找最小号」付 O(log n)。代价是**不做中间摘除**——调用方显式绑定恰好走了池里的
+//! 某个值时，那一份会滞留到它出队那一刻才被丢掉（由 `take_free_dock_` 的 `bound_`
+//! 复核拦下，不会发出去）。于是「池里的值此刻一定未绑定」不再成立，只剩「值都在候选
+//! 范围内」与「同一个 dock 至多一份」两条不变量；后者由「取出即消费」与「只有自动
+//! 归还才入池」共同保证。
+//!
+//! 复用池只收自动分配的归还，**不收**调用方显式绑定的 dock 释放：那是调用方自己
+//! 管理的值。这条区分由一个随每次绑定重置的标记承担（`DockCtx_::auto_`），它同时让
+//! 「只用手动绑定的连接」在解绑路径上零额外分配。
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::{
     alloc::AllocatorClone,
     ops::Bound,
@@ -120,6 +156,13 @@ const K_FAIL_TRANSPORT: u8 = 2u8;
 
 /// 协议错误（非法帧、状态机错误、流控违例等）。
 const K_FAIL_PROTOCOL: u8 = 3u8;
+
+/// 自动分配 dock 的第一个候选值。
+///
+/// 仿照 UNIX 的**特权端口**约定：`0..1024` 是「约定用途」区间，只由调用方通过
+/// `bind_async(具体值)` 显式占用；自动分配一律从本值起步，不去动调用方惯用的低号
+/// dock。上界是 `wildcard`（协议保留值，不可作身份）。
+const K_FIRST_AUTO_DOCK: u32 = 1024u32;
 
 /// 把连接级错误投影成**锁外的关闭原因类别**。
 ///
@@ -332,6 +375,17 @@ struct DockCtx_ {
     /// `WaitClose` 不计入（它已经不是活跃子流），由 `bindings_` 里具体键的变体
     /// 决定归属；两者的一致性由单测钉住。
     chan_count_: usize,
+
+    /// 当前这次绑定是否由**自动分配**给出（而非调用方显式指定）。
+    ///
+    /// 解绑时据此决定要不要把这个 dock 还给复用池（见
+    /// [`ChannelRegistry_::unbind_dock_`]）：自动分配发出的值由它自己回收，调用方
+    /// 显式指定的值由调用方自己管理。
+    ///
+    /// 它随**每次绑定**重置（[`ChannelRegistry_::bind_dock_`] 置 `false`、
+    /// [`RegistryInner_::take_free_dock_`] 置 `true`），因此同一个 dock 先被自动分配
+    /// 给出、释放后又被调用方显式绑定，随后的那次解绑不会误把它当成自动分配的归还。
+    auto_: bool,
 }
 
 impl DockCtx_ {
@@ -340,6 +394,7 @@ impl DockCtx_ {
         DockCtx_ {
             bound_: false,
             chan_count_: 0usize,
+            auto_: false,
         }
     }
 
@@ -365,6 +420,26 @@ where
 
     /// `local_dock` → dock 级簿记。
     docks_: BTreeMap<Dock, DockCtx_, A>,
+
+    /// **自动分配曾发出、现已归还**的 dock，**先进先出**，供它优先复用。
+    ///
+    /// 插入（`push_back`）只发生在 `unbind_dock_` 且该次绑定确实是自动分配给出的
+    /// （`DockCtx_::auto_`）；取出（`pop_front`）发生在 `take_free_dock_`，且**取出即
+    /// 消费**——即便那个值此刻已被调用方显式绑定，也直接丢弃、试下一个。
+    ///
+    /// 池里有两条不变量（见 `assert_index_consistent_`）：值都落在候选范围内（自动
+    /// 分配不从低号段发号），且**同一个 dock 至多出现一次**。但它**不**保证「池里的值
+    /// 此刻未绑定」——池不做就地摘除，一个被调用方显式绑定的值会滞留到出队那一刻才被
+    /// 丢掉。
+    reusable_docks_: VecDeque<Dock, A>,
+
+    /// 自动分配的**单调游标**：下一个「从未被自动分配过」的候选 dock。
+    ///
+    /// 初值 [`K_FIRST_AUTO_DOCK`]，每次给出一个候选就前进一格，**永不回头**。
+    /// 与 [`RegistryInner_::reusable_docks_`] 因此天然不重叠，二者合起来不需要
+    /// 「分配过哪些 dock」的额外记录。取到 `wildcard` 表示「新号段用完了」，
+    /// 此后只能靠复用池。
+    next_fresh_dock_: Dock,
 
     /// `(local, remote)` → 身份；**唯一事实源**。
     bindings_: BTreeMap<(Dock, Dock), BindingSlot_<A>, A>,
@@ -439,6 +514,48 @@ where
     fn has_concrete_identity_(&self, local_dock: Dock) -> bool {
         let (start, end) = channel_range_(local_dock);
         self.bindings_.range((start, end)).next().is_some()
+    }
+
+    /// 就地取一个空闲 dock 并**占住它**（调用方须已持写锁）。
+    ///
+    /// 「找」与「占」是同一次调用：这正是自动分配对并发调用者原子化的全部秘密
+    /// （见模块文档「自动分配 dock」）。两个来源依次尝试，任一成功即返回：
+    ///
+    /// 1. **复用池**：取**最早**归还的那一个（先进先出）。优先复用它而不是发新号，
+    ///    是因为 dock 数值会直接出现在线格式与本端可观测状态里，让稳态下的
+    ///    「绑一个、放一个」始终落在同一个值上，比一路增长更便于排查；
+    /// 2. **新号段**：从 [`RegistryInner_::next_fresh_dock_`] 起找一个还没被显式
+    ///    绑定占住的 dock。这里**只可能**被调用方显式绑定的 dock 挡住，逐个跳过
+    ///    即可；被跳过的那些在解绑后会进复用池，不会漏掉。
+    ///
+    /// # Errors
+    ///
+    /// 两个来源都空 → [`ReserveErr_::DockInUse`]（候选耗尽）。
+    fn take_free_dock_(&mut self) -> Result<Dock, ReserveErr_> {
+        while let Option::Some(dock) = self.reusable_docks_.pop_front() {
+            let ctx = self.docks_.entry(dock).or_insert_with(DockCtx_::new_);
+            if !ctx.bound_ {
+                ctx.bound_ = true;
+                ctx.auto_ = true;
+                return Result::Ok(dock);
+            }
+            // 这个归还过的值已经被调用方显式绑定了（池不做就地摘除，见
+            // [`ChannelRegistry_::bind_dock_`]）：**取出即消费**，丢弃它继续找下一个。
+            // 这一步同时保证同一个 dock 不会在池里留下第二份候选。
+        }
+        while self.next_fresh_dock_ < Dock::wildcard() {
+            let dock = self.next_fresh_dock_;
+            // 上界是 `wildcard`，因此这里的 `+1` 最多把游标推到 `wildcard` 本身，
+            // 不会溢出 `u32`。
+            self.next_fresh_dock_ = Dock::new(dock.value() + 1u32);
+            let ctx = self.docks_.entry(dock).or_insert_with(DockCtx_::new_);
+            if !ctx.bound_ {
+                ctx.bound_ = true;
+                ctx.auto_ = true;
+                return Result::Ok(dock);
+            }
+        }
+        Result::Err(ReserveErr_::DockInUse)
     }
 }
 
@@ -594,6 +711,8 @@ where
                     opts_: opts,
                     alloc_: alloc.clone(),
                     docks_,
+                    reusable_docks_: VecDeque::new_in(alloc.clone()),
+                    next_fresh_dock_: Dock::new(K_FIRST_AUTO_DOCK),
                     bindings_,
                     remote_index_,
                     wait_close_expiry_,
@@ -1021,6 +1140,12 @@ where
             return Result::Err(ReserveErr_::DockInUse);
         }
         dock.bound_ = true;
+        // 调用方显式指定的 dock：解绑时不归还复用池。
+        dock.auto_ = false;
+        // 池里可能正躺着同一个值（自动分配曾归还的那一份）。这里**不**就地摘除：
+        // 池是先进先出的队列、没有 O(1) 的中间删除，而滞留至多让一次
+        // `take_free_dock_` 多走一步——那一步复核到 `bound_` 就会丢弃它（取出即
+        // 消费），不会把这个已被占用的 dock 发出去。
         Result::Ok(())
     }
 
@@ -1028,6 +1153,11 @@ where
     ///
     /// 由 `DockBinding` 的 `Drop` 调用。解绑只清 `bound_`；条目回收交给
     /// `prune_dock_` 判空，因此「解绑后该 dock 上还有活动子流」不会影响这些子流。
+    ///
+    /// 若这个绑定是**自动分配**给出的（`DockCtx_::auto_`），值会回到
+    /// [`RegistryInner_::reusable_docks_`]，让后续的自动分配复用它（见模块文档
+    /// 「自动分配 dock」）；调用方**显式**绑定的 dock 不入池——那是调用方自己管理的
+    /// 值，而且这样纯手动绑定的连接在解绑路径上一次分配都不会多付。
     pub(crate) async fn unbind_dock_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
@@ -1036,11 +1166,46 @@ where
         let mut session = self.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
+        let mut was_bound = false;
+        let mut was_auto = false;
         if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
+            was_bound = dock.bound_;
+            was_auto = dock.auto_;
             dock.bound_ = false;
         }
         inner.prune_dock_(local_dock);
+        // 两个条件都要：重复解绑是空操作，不该凭空把一个从未绑定过的值变成候选；
+        // 而「曾经绑定过」还不足够——只有自动分配发出的那些才由它负责回收。
+        if was_bound && was_auto {
+            inner.reusable_docks_.push_back(local_dock);
+        }
         Result::Ok(())
+    }
+
+    /// **自行安排**一个空闲 `local_dock` 并独占绑定它（`bind_async(unspecified)` 的
+    /// 登记点）。
+    ///
+    /// 与 [`ChannelRegistry_::bind_dock_`] 的唯一差别是 dock 由本方法选出：调用方
+    /// 不知道、也不指定它是哪个，拿到的值经 `DockBinding::local_dock` 读回。
+    ///
+    /// 「找一个空闲的」与「占住它」在**同一个写锁临界区**内完成（见
+    /// [`RegistryInner_::take_free_dock_`]）：dock 一旦被选中就是身份的一半，拆成
+    /// 两步会让两个并发调用选中同一个 dock。
+    ///
+    /// 候选范围是 `[K_FIRST_AUTO_DOCK, wildcard)`，即 **1024 及以上**——`0..1024`
+    /// 留给调用方显式指定（见模块文档「自动分配 dock」）。
+    ///
+    /// # Errors
+    ///
+    /// - 候选范围已被占满 → [`ReserveErr_::DockInUse`]；
+    /// - 等锁期间被取消 → [`ReserveErr_::Cancelled`]。
+    pub(crate) async fn bind_any_dock_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<Dock, ReserveErr_> {
+        let mut session = self.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        guard.take_free_dock_()
     }
 
     /// 在 `local_dock` 上登记**监听器身份**（`TrDockBinding::listen_async` 的登记点）。
@@ -1477,6 +1642,9 @@ mod tests_ {
             &self,
             local_dock: Dock,
         ) -> impl core::future::Future<Output = Result<(), ReserveErr_>>;
+        fn bind_any_dock_t_(
+            &self,
+        ) -> impl core::future::Future<Output = Result<Dock, ReserveErr_>>;
         fn unbind_dock_t_(&self, local_dock: Dock) -> impl core::future::Future<Output = ()>;
         fn is_wait_close_t_(
             &self,
@@ -1566,6 +1734,10 @@ mod tests_ {
 
     async fn bind_dock_t_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
             self.bind_dock_(local_dock, NonCancellableToken::new()).await
+        }
+
+    async fn bind_any_dock_t_(&self) -> Result<Dock, ReserveErr_> {
+            self.bind_any_dock_(NonCancellableToken::new()).await
         }
 
     async fn unbind_dock_t_(&self, local_dock: Dock) {
@@ -1710,6 +1882,16 @@ mod tests_ {
             let guard = session.try_read().expect("测试里不该争用");
             f(&guard)
         }
+
+        /// 持写锁执行（测试单线程，直接取快路径）。
+        ///
+        /// 用于直接摆布注册表内部状态，构造那些**经公开路径到不了**的边界——典型是
+        /// 「新号段已被用尽」（真去绑 2^32 次当然不可能）。
+        fn with_write_t_<R>(&self, f: impl FnOnce(&mut RegistryInner_<CoreAlloc>) -> R) -> R {
+            let mut session = self.inner_.acquire_session();
+            let mut guard = session.try_write().expect("测试里不该争用");
+            f(&mut guard)
+        }
     }
 
     /// 注册表单测里的「现在」（连接内毫秒）：固定为 0。
@@ -1790,6 +1972,30 @@ mod tests_ {
                         key.0
                     );
                 }
+            }
+            // 自动分配的复用池（先进先出的队列）：只装「自动分配曾发出、现已归还」
+            // 的候选范围内的 dock，这是它的第一条不变量。
+            //
+            // 第二条是**同一个 dock 至多出现一次**：队列不做去重，若同一值排了两遍，
+            // 取出第一遍之后第二遍仍会被发出去。它由「取出即消费」与「只有自动分配的
+            // 归还才入池」共同保证。
+            //
+            // 这里刻意**不**断言「池里的值此刻未绑定」：池不做就地摘除（见
+            // `ChannelRegistry_::bind_dock_`），一个被调用方显式绑定的值会滞留到出队
+            // 那一刻才被丢弃——那时 `take_free_dock_` 会复核 `bound_`，不会把它发出去。
+            // 要恢复那条强不变量，就得在 `bind_dock_` 里付一次线性摘除，那正是当前
+            // 形状刻意避免的。
+            let mut pooled_seen: Vec<Dock> = Vec::new();
+            for dock in inner.reusable_docks_.iter() {
+                assert!(
+                    !pooled_seen.contains(dock),
+                    "复用池里不得有重复的 dock：{dock:?}"
+                );
+                pooled_seen.push(*dock);
+                assert!(
+                    dock.value() >= K_FIRST_AUTO_DOCK,
+                    "复用池不该收低于自动分配起点的 dock：{dock:?}"
+                );
             }
         });
     }
@@ -1990,6 +2196,238 @@ mod tests_ {
         );
     }
     dual_runtime_test_!(dock_binding_is_exclusive_and_persistent);
+
+    /// 测试 `unspecified` 的自动分配：从候选起点起给出互不相同的空闲 dock，且分配
+    /// 结果与显式绑定一样是**独占**的。
+    ///
+    /// - 手段：新建注册表，连续三次 `bind_any_dock_`；随后对每个返回的 dock 再显式
+    ///   `bind_dock_` 一次。
+    /// - 判断：三次都成功、取值互不相同、都 `>= K_FIRST_AUTO_DOCK`，且第一个恰为
+    ///   `K_FIRST_AUTO_DOCK`；对已分配的 dock 显式绑定必须报 `DockInUse`——这说明
+    ///   自动分配是**真的占住了**它们，而不只是报了一个数回来。
+    async fn auto_dock_hands_out_distinct_free_docks_() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+
+        let first = registry
+            .bind_any_dock_t_()
+            .await
+            .expect("首次自动分配应当成功");
+        assert_eq!(
+            first,
+            Dock::new(K_FIRST_AUTO_DOCK),
+            "首个自动分配的 dock 应当恰好是候选起点"
+        );
+        let second = registry
+            .bind_any_dock_t_()
+            .await
+            .expect("第二次自动分配应当成功");
+        let third = registry
+            .bind_any_dock_t_()
+            .await
+            .expect("第三次自动分配应当成功");
+
+        assert_ne!(first, second, "自动分配不得发出同一个 dock");
+        assert_ne!(second, third, "自动分配不得发出同一个 dock");
+        assert_ne!(first, third, "自动分配不得发出同一个 dock");
+        for dock in [first, second, third] {
+            assert!(
+                dock.value() >= K_FIRST_AUTO_DOCK,
+                "自动分配的 dock 必须落在候选范围内：{dock:?}"
+            );
+            assert!(
+                matches!(
+                    registry.bind_dock_t_(dock).await,
+                    Result::Err(ReserveErr_::DockInUse)
+                ),
+                "自动分配出去的 dock {dock:?} 必须已被占住"
+            );
+        }
+        assert_index_consistent_(&registry);
+    }
+    dual_runtime_test_!(auto_dock_hands_out_distinct_free_docks_);
+
+    /// 测试自动分配**优先复用**已释放的 dock，而不是一路把游标推向新号。
+    ///
+    /// - 手段：连续分配 `d0`、`d1`；解绑 `d0` 后再分配一次；然后把两个曾用 dock 都
+    ///   还回池子，再连续分配两次。
+    /// - 判断：解绑 `d0` 后的那次分配必须拿回 `d0`（复用池优先于新号段，否则会拿到
+    ///   `d0 + 2`）；两位都释放后，接下来的两次分配拿回的正是 `{d0, d1}` 这个集合。
+    async fn auto_dock_reuses_released_docks_before_new_ones_() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+
+        let d0 = registry.bind_any_dock_t_().await.expect("首次分配应当成功");
+        let d1 = registry.bind_any_dock_t_().await.expect("第二次分配应当成功");
+
+        registry.unbind_dock_t_(d0).await;
+        let reused = registry.bind_any_dock_t_().await.expect("复用应当成功");
+        assert_eq!(reused, d0, "刚释放的 dock 应当被优先复用，而不是发新号");
+
+        registry.unbind_dock_t_(reused).await;
+        registry.unbind_dock_t_(d1).await;
+        let again_0 = registry.bind_any_dock_t_().await.expect("再次复用应当成功");
+        let again_1 = registry.bind_any_dock_t_().await.expect("再次复用应当成功");
+        assert_eq!(
+            (again_0.min(again_1), again_0.max(again_1)),
+            (d0.min(d1), d0.max(d1)),
+            "两个曾用 dock 都释放后，接下来的两次分配都应当来自复用池"
+        );
+        assert_index_consistent_(&registry);
+    }
+    dual_runtime_test_!(auto_dock_reuses_released_docks_before_new_ones_);
+
+    /// 测试复用池是**先进先出**的：最早归还的那个 dock 最先被复用。
+    ///
+    /// - 手段：自动分配 `d0`、`d1`，然后**按 `d0`、`d1` 的顺序**解绑，再连续自动
+    ///   分配两次。
+    /// - 判断：第一次拿回 `d0`、第二次拿回 `d1`。若改成后进先出（或「取最小号」的
+    ///   有序集），第一次就会拿到 `d1`，本用例即失败。
+    async fn auto_dock_reuses_the_earliest_released_first_() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+
+        let d0 = registry.bind_any_dock_t_().await.expect("首次分配应当成功");
+        let d1 = registry.bind_any_dock_t_().await.expect("第二次分配应当成功");
+        registry.unbind_dock_t_(d0).await;
+        registry.unbind_dock_t_(d1).await;
+
+        let first_back = registry.bind_any_dock_t_().await.expect("首次复用应当成功");
+        let second_back = registry.bind_any_dock_t_().await.expect("第二次复用应当成功");
+        assert_eq!(first_back, d0, "最早归还的 dock 应当最先被复用（先进先出）");
+        assert_eq!(second_back, d1, "其次是更晚归还的那一个");
+        assert_index_consistent_(&registry);
+    }
+    dual_runtime_test_!(auto_dock_reuses_the_earliest_released_first_);
+
+    /// 测试**池里滞留的项一旦已被分配出去，就在出队时被丢弃**，不会把它再发一遍。
+    ///
+    /// - 手段：自动分配 `d0` 并解绑（它进池）；随后调用方显式 `bind_dock_` 同一个值
+    ///   ——池不做就地摘除，于是这一份滞留；再自动分配一次。
+    /// - 判断：显式绑定必须成功（该 dock 此刻确实空闲）；自动分配必须跳过这个滞留项、
+    ///   改用新号段的下一个值；且它已被出队消费，池里不再有它。
+    async fn auto_dock_discards_a_stale_pooled_dock_() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+
+        let d0 = registry.bind_any_dock_t_().await.expect("自动分配应当成功");
+        registry.unbind_dock_t_(d0).await;
+        registry
+            .bind_dock_t_(d0)
+            .await
+            .expect("归还后的 dock 应当可以被调用方显式绑定");
+
+        let allocated = registry.bind_any_dock_t_().await.expect("自动分配应当成功");
+        assert_eq!(
+            allocated,
+            Dock::new(K_FIRST_AUTO_DOCK + 1u32),
+            "应当跳过已被显式占用的滞留项，改用新号段的下一个值"
+        );
+        registry.with_t_(|inner| {
+            assert!(
+                inner.reusable_docks_.iter().all(|pooled| *pooled != d0),
+                "失效的池项应当在出队那一刻被消费掉：{d0:?}"
+            );
+        });
+        assert_index_consistent_(&registry);
+    }
+    dual_runtime_test_!(auto_dock_discards_a_stale_pooled_dock_);
+
+    /// 测试自动分配**跳过**被显式绑定的候选，且显式绑定的 dock 解绑后**不进**复用池。
+    ///
+    /// - 手段：先显式绑定候选起点 `K_FIRST_AUTO_DOCK`，再自动分配一次；随后解绑它，
+    ///   再自动分配一次。
+    /// - 判断：第一次自动分配得到起点 `+1`（跳过被占的起点）；解绑后第二次自动分配
+    ///   得到起点 `+2`——复用池只收自动分配自己发出的 dock，调用方显式绑定的值由
+    ///   调用方管理，不由自动分配回收。
+    async fn auto_dock_skips_explicitly_bound_docks_() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+        let occupied = Dock::new(K_FIRST_AUTO_DOCK);
+        registry
+            .bind_dock_t_(occupied)
+            .await
+            .expect("显式绑定应当成功");
+
+        let allocated = registry
+            .bind_any_dock_t_()
+            .await
+            .expect("自动分配应当成功");
+        assert_eq!(
+            allocated,
+            Dock::new(K_FIRST_AUTO_DOCK + 1u32),
+            "自动分配必须跳过被显式占住的候选"
+        );
+
+        registry.unbind_dock_t_(occupied).await;
+        let next = registry
+            .bind_any_dock_t_()
+            .await
+            .expect("再分配应当成功");
+        assert_eq!(
+            next,
+            Dock::new(K_FIRST_AUTO_DOCK + 2u32),
+            "调用方显式绑定的 dock 解绑后不应进入复用池"
+        );
+        assert_index_consistent_(&registry);
+    }
+    dual_runtime_test_!(auto_dock_skips_explicitly_bound_docks_);
+
+    /// 测试低号段不参与自动分配，即便它曾被绑定并释放。
+    ///
+    /// - 手段：显式绑定并解绑 `7`（低于候选起点），随后自动分配。
+    /// - 判断：自动分配给出候选起点，而不是 `7`——`0..1024` 是留给调用方显式指定的
+    ///   区间（仿 UNIX 特权端口约定）。
+    async fn auto_dock_never_takes_low_docks_() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+        let low = Dock::new(7u32);
+        registry.bind_dock_t_(low).await.expect("显式绑定应当成功");
+        registry.unbind_dock_t_(low).await;
+
+        let allocated = registry
+            .bind_any_dock_t_()
+            .await
+            .expect("自动分配应当成功");
+        assert_eq!(
+            allocated,
+            Dock::new(K_FIRST_AUTO_DOCK),
+            "自动分配不得使用低号段"
+        );
+        assert_index_consistent_(&registry);
+    }
+    dual_runtime_test_!(auto_dock_never_takes_low_docks_);
+
+    /// 测试候选范围用尽时自动分配按「绑定失败」拒绝，但复用池仍能继续服务。
+    ///
+    /// - 手段：先正常自动分配一个 `d0`（它带着「由自动分配发出」的标记，归还时会进
+    ///   复用池）；再把 `next_fresh_dock_`（新号段游标）直接推到 `wildcard` 来构造
+    ///   「新号段已用尽」——真去绑 2^32 次当然不可能；此时断言分配失败，随后归还 `d0`
+    ///   并再分配一次。
+    /// - 判断：新号段用尽且复用池为空时报 `ReserveErr_::DockInUse`；一旦 `d0` 回到
+    ///   复用池，自动分配又能成功，且拿到的正是它。
+    async fn auto_dock_reports_in_use_when_exhausted_() {
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc);
+        let d0 = registry
+            .bind_any_dock_t_()
+            .await
+            .expect("首次自动分配应当成功");
+        registry.with_write_t_(|inner| {
+            inner.next_fresh_dock_ = Dock::wildcard();
+        });
+
+        let err = registry
+            .bind_any_dock_t_()
+            .await
+            .expect_err("新号段用尽且复用池为空时，自动分配必须失败");
+        assert!(
+            matches!(err, ReserveErr_::DockInUse),
+            "候选耗尽应当报 DockInUse，实际为 {err:?}"
+        );
+
+        registry.unbind_dock_t_(d0).await;
+        let allocated = registry
+            .bind_any_dock_t_()
+            .await
+            .expect("有复用池时自动分配应当成功");
+        assert_eq!(allocated, d0, "耗尽后应当靠复用池继续服务");
+        assert_index_consistent_(&registry);
+    }
+    dual_runtime_test_!(auto_dock_reports_in_use_when_exhausted_);
     /// 用一次「空 waker」poll 监听者的通知槽：返回它是否已就绪（顺带消费掉持久位）。
     ///
     /// 内联槽只有「登记 → 复检」两态，没有 `flume` 那样的 `try_recv`，因此测试里用

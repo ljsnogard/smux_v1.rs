@@ -1,7 +1,10 @@
 //! 绑定与建流生命周期场景：dock 绑定的独占性，以及「发起方句柄尚未裁决就被丢弃」。
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use abs_smux::conn::{TrChannelListener, TrConnection, TrDockBinding};
+use abs_smux::{
+    conn::{TrChannelListener, TrConnection, TrDockBinding},
+    dock::TrDock,
+};
 use smux_v1::connection::{BindError, Dock, HandleError};
 
 use crate::common::{
@@ -12,6 +15,8 @@ use crate::common::{
     connect_pair_,
     make_channel_buff_,
 };
+
+use super::kit_::exchange_and_half_close_;
 
 /// 绑定独占性场景：验证 [`TrConnection::bind_async`] 对同一个 `local_dock` 拒绝
 /// 第二次绑定，且丢弃 binding 后可以重绑。
@@ -231,4 +236,142 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
         matches!(verdict, Result::Err(HandleError::Refused)),
         "响应方丢弃待决句柄后，主动方的 accept_async 应当得到 Refused"
     );
+}
+
+/// 自动分配场景：验证 `bind_async(Dock::unspecified())` 会**自行安排**一个空闲 dock，
+/// 并且安排出来的值是一个能承担完整会话的**真实身份**。
+///
+/// - 手段：两条内存环直连并完成握手。B 侧用 `unspecified` 自动分配一个 dock 并立即
+///   在其上 `listen_async`——对端接下来必须**寻址到这个自动安排出来的值**；A 侧也用
+///   `unspecified` 自动分配一个 binding，向 B 的自动 dock 发起一条子流，两侧完成一次
+///   双向收发与半关闭。随后在 A 侧继续探测分配语义：再自动分配一次、对首次自动分配的
+///   值显式重绑、丢弃一个 binding 后再要一个。
+/// - 判断：
+///   1. 三个自动分配的 dock 都 `>= 1024`（候选范围）且都不是协议保留值；
+///   2. 子流建立成功、载荷逐字节相符、半关闭后读到 EOF——若自动分配只是「报了一个数」
+///      而没有真正登记身份，这一步不可能成功；
+///   3. A 侧连续两次自动分配必须给出**不同**的 dock（说明第一次确实被占住了）；
+///   4. 对已自动分配的 dock 显式 `bind_async` 必须报 `DockInUse`；
+///   5. 丢弃一个 binding 后，下一次自动分配必须**复用**刚释放的那个 dock。
+///
+/// # Panics
+///
+/// 握手、绑定、监听、建流、收发失败，或上述任一条判断不成立，都会 panic。
+pub async fn run_auto_dock_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
+    scope: &S,
+    tx_a: WA,
+    rx_a: RA,
+    tx_b: WB,
+    rx_b: RB,
+) where
+    RA: TrBuffRead<u8> + 'static,
+    WA: TrBuffWrite<u8> + 'static,
+    RB: TrBuffRead<u8> + 'static,
+    WB: TrBuffWrite<u8> + 'static,
+    S: TrSmokeScope + Clone + 'static,
+    RT: TrSmokeRt,
+{
+    let (conn_a, conn_b) =
+        connect_pair_::<
+            SmokeMuxConfig<WA, RA, RT>,
+            SmokeMuxConfig<WB, RB, RT>,
+            RA,
+            WA,
+            RB,
+            WB,
+            S,
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+        .await;
+
+    // -- B 侧：自动安排一个 dock 并在其上监听。A 必须能寻址到它，这要求自动分配是
+    //    「真的登记了一个身份」，而不只是返回了一个数。
+    let mut listener_b = conn_b
+        .bind_async(Dock::unspecified())
+        .await
+        .expect("B 侧自动分配应当成功")
+        .listen_async_default()
+        .await
+        .expect("B 侧在自动分配的 dock 上监听应当成功");
+    let service_dock = *listener_b.local_dock();
+
+    // -- A 侧：连续两次自动分配必须拿到两个不同的 dock。
+    let mut binding_a = conn_a
+        .bind_async(Dock::unspecified())
+        .await
+        .expect("A 侧自动分配应当成功");
+    let first_dock = *binding_a.local_dock();
+    let second_binding = conn_a
+        .bind_async(Dock::unspecified())
+        .await
+        .expect("A 侧第二次自动分配应当成功");
+    let second_dock = *second_binding.local_dock();
+
+    for dock in [service_dock, first_dock, second_dock] {
+        assert!(
+            dock.value() >= 1024u32,
+            "自动分配的 dock 必须落在候选范围内，实际为 {dock:?}"
+        );
+        assert!(!dock.is_special(), "自动分配不得给出保留值：{dock:?}");
+    }
+    assert_ne!(
+        first_dock, second_dock,
+        "两次自动分配不得给出同一个 dock"
+    );
+    assert!(
+        matches!(
+            conn_a.bind_async(first_dock).await,
+            Result::Err(BindError::DockInUse)
+        ),
+        "自动分配出去的 dock 必须已被占住"
+    );
+
+    // -- 端到端：A 在自动分配的 local dock 上发起，B 在自动分配的监听 dock 上应答。
+    let mut message: &[u8] = &[];
+    let mut handle_a = binding_a
+        .open_channel_async(service_dock, &mut message)
+        .await
+        .expect("向自动分配的 dock 发起应当成功");
+    let (a_done, b_done) = futures::join!(
+        async {
+            let mut welcome_buf: [u8; 0] = [];
+            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let (tx, mut rx) = handle_a
+                .accept_async_closure(&mut welcome, || {
+                    (make_channel_buff_(), make_channel_buff_())
+                })
+                .await
+                .expect("A 侧最终裁决应当成功");
+            exchange_and_half_close_(tx, &mut rx, 0x7001u32, 0usize).await;
+        },
+        async {
+            let mut handle_b = listener_b
+                .income_async()
+                .await
+                .expect("B 侧应当取到发起请求");
+            let mut peer_welcome_buf: [u8; 0] = [];
+            let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
+            let (peer_tx, mut peer_rx) = handle_b
+                .accept_async_closure(&mut peer_welcome, || {
+                    (make_channel_buff_(), make_channel_buff_())
+                })
+                .await
+                .expect("B 侧最终裁决应当成功");
+            exchange_and_half_close_(peer_tx, &mut peer_rx, 0x7002u32, 0usize).await;
+        },
+    );
+    let _ = (a_done, b_done);
+
+    // -- 复用：丢弃一个 binding 后，下一次自动分配应当拿回刚释放的那个 dock。
+    drop(second_binding);
+    let reused = conn_a
+        .bind_async(Dock::unspecified())
+        .await
+        .expect("释放后自动分配应当成功");
+    assert_eq!(
+        *reused.local_dock(),
+        second_dock,
+        "刚释放的 dock 应当被自动分配优先复用"
+    );
+    drop((binding_a, reused, listener_b));
 }

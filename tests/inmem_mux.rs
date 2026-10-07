@@ -297,6 +297,30 @@ async fn mux_bind_is_exclusive_dual_() {
 }
 single_runtime_test_!(mux_bind_is_exclusive_dual_);
 
+/// 测试目标：`bind_async(Dock::unspecified())` 会**自行安排**一个空闲 dock，并且安排
+/// 出来的值是一个能承担完整会话的真实身份（不是「参数错误」，也不是「报了个数」）。
+///
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_auto_dock_scenario_`]；后者在 B 侧自动分配一个 dock 并监听、在 A 侧
+///   自动分配一个 binding 并向 B 的自动 dock 发起一条子流，完成一次双向收发与半关闭；
+///   随后继续探测 A 侧的分配语义（再次自动分配、对已分配值显式重绑、丢弃后重取）。
+///   场景由 `scope.run_until` 驱动。
+/// - 判断：自动分配的 dock 都 `>= 1024` 且非保留值；两次分配互不相同；对已分配值显式
+///   `bind_async` 报 `DockInUse`；子流载荷逐字节相符且半关闭后读到 EOF（证明自动分配的
+///   dock 真的可被对端寻址）；丢弃一个 binding 后再要一个会**复用**刚释放的值。任一
+///   不满足即 panic。
+async fn mux_auto_dock_allocation_dual_() {
+
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_auto_dock_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+single_runtime_test_!(mux_auto_dock_allocation_dual_);
+
 /// 测试目标（**本轮验收点**）：环存储的**类型**由使用环境声明、**分配**由 accept 端
 /// 当场决定——同一条连接上两条子流可以切不同容量、来自不同段内存，全程零装箱。
 ///

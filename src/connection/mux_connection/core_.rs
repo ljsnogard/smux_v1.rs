@@ -227,6 +227,18 @@ where
         self.reg_.bind_dock_(local_dock, cancel).await
     }
 
+    /// 自行安排一个空闲 `local_dock` 并独占绑定它（`bind_async(unspecified)` 的
+    /// 登记点）：实际的 dock 由注册表在同一个临界区里选出并占住，见
+    /// [`ChannelRegistry_::bind_any_dock_`]。
+    ///
+    /// [`ChannelRegistry_::bind_any_dock_`]: super::registry_::ChannelRegistry_::bind_any_dock_
+    pub(crate) async fn bind_any_dock_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<Dock, ReserveErr_> {
+        self.reg_.bind_any_dock_(cancel).await
+    }
+
     /// 登记 listener 身份，并交出它的**身份节点句柄**（listener 在该句柄上等入向通知）。
     pub(crate) async fn reserve_listener_<K: TrCancellationToken>(
         &self,

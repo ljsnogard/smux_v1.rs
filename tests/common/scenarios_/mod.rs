@@ -17,7 +17,9 @@ mod small_;
 mod smoke_;
 mod telegraph_;
 
-pub use bind_::{run_bind_exclusivity_scenario_, run_unsettled_handle_scenario_};
+pub use bind_::{
+    run_auto_dock_scenario_, run_bind_exclusivity_scenario_, run_unsettled_handle_scenario_,
+};
 pub use buffers_::{run_per_channel_alloc_scenario_, run_ring_rejected_scenario_};
 pub use closed_ring_spin_::run_closed_ring_spin_scenario_;
 pub use conn_failed_::run_conn_failed_wakes_scenario_;
