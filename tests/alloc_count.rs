@@ -51,6 +51,7 @@
 
 mod common;
 
+use crate::common::AcceptAsyncClosureExt;
 use core::{
     alloc::{AllocError, Allocator, AllocatorClone, Layout},
     marker::PhantomData,
@@ -66,11 +67,12 @@ use abs_smux::{
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use futures::join;
-use mm_ptr::x_deps::abs_mm::CoreAlloc;
+use mm_ptr::Owned;
 use smux_v1::{
     connection::{
-        BuffAllocError, BufferedRx, BufferedTx, ChannelListener, ChannelRx, ChannelTx, Dock,
+        BufferedRx, BufferedTx, ChannelListener, ChannelRx, ChannelTx, Dock,
         K_STAGE_RING_CAPACITY, MuxChanBuffOwnedBy, MuxConnection, TrConnCfg,
+        new_buffered_channel,
     },
     flow_ctrl::DefaultPolicy,
     handshake::{
@@ -175,11 +177,6 @@ unsafe impl AllocatorClone for CountingAlloc {}
 
 /// 子流环存储的类型（与冒烟配置同构，只换分配器）。
 ///
-/// 它与生产默认装配是同一种智能指针：内存与分配器内联在一起，因此「造一块环内存」
-/// 只向注入分配器记一次账，不会额外经全局分配器（旧版把分配器擦除成
-/// `Arc<dyn Allocator>`，每块缓冲都要多一次 `Arc::new`）。
-type CountBuff = MuxChanBuffAlloc<CountingAlloc>;
-
 /// 用[注入分配器](CountingAlloc)记账的连接配置。
 #[derive(Debug)]
 struct CountMuxConfig<W, R, RT> {
@@ -237,7 +234,6 @@ where
 {
     type Data = u8;
     type Dock = Dock;
-    type Buff = CountBuff;
 }
 
 impl<W, R, RT> TrConnCfg for CountMuxConfig<W, R, RT>
@@ -251,7 +247,6 @@ where
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
-    type StageBuff = CountBuff;
     type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
@@ -272,20 +267,7 @@ where
         &NoMetrics
     }
 
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        CountBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
-    }
 
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        CountBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
-    }
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -351,8 +333,8 @@ fn report_(phase: &str, global: Usage_, injected: Usage_) {
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 /// 被动环两端的类型（与 `common::make_passive_ring_` 的返回一致）。
-type RingTx = BufferedTx<common::SmokeBuff, CoreAlloc>;
-type RingRx = BufferedRx<common::SmokeBuff, CoreAlloc>;
+type RingTx = BufferedTx;
+type RingRx = BufferedRx;
 
 /// 本文件用的连接类型（分配器换成计数用的那个；第三个参数是**运行时值**）。
 type CountingConn<RT> = MuxConnection<CountMuxConfig<RingTx, RingRx, RT>>;
@@ -403,7 +385,6 @@ where
     S: common::TrSmokeScope + Clone + 'static,
     C: TrConnCfg<ConnRx = RingRx, ConnTx = RingTx> + common::TestConnCfg + Clone + 'static,
     C::Rt: common::TrSmokeRt,
-    C::StageBuff: Send + Sync,
 {
     let invite_opts = BasicOpts::default();
     let listen_opts = BasicOpts::default();
@@ -415,12 +396,28 @@ where
 
     let config_a = C::new_(rt.clone());
     let config_b = C::new_(rt.clone());
-    let (stage_ar, stage_aw) = config_a
-        .make_stage_buffs(config_a.allocator())
-        .expect("A 侧连接级帧暂存应当分配成功");
-    let (stage_br, stage_bw) = config_b
-        .make_stage_buffs(config_b.allocator())
-        .expect("B 侧连接级帧暂存应当分配成功");
+    // 两块连接级缓冲由测试自己给出（配置不再规定缓冲类型）：容量取连接级的
+    // `K_STAGE_RING_CAPACITY`，拥有者同样用注入分配器记账。
+    let (stage_ar, stage_aw) = (
+        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
+            K_STAGE_RING_CAPACITY,
+            config_a.allocator(),
+        )),
+        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
+            K_STAGE_RING_CAPACITY,
+            config_a.allocator(),
+        )),
+    );
+    let (stage_br, stage_bw) = (
+        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
+            K_STAGE_RING_CAPACITY,
+            config_b.allocator(),
+        )),
+        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
+            K_STAGE_RING_CAPACITY,
+            config_b.allocator(),
+        )),
+    );
     (
         MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw),
         MuxConnection::new(delivery_b, config_b, stage_br, stage_bw),
@@ -547,7 +544,12 @@ where
                 let mut welcome: [u8; 0] = [];
                 let mut welcome: &mut [u8] = &mut welcome[..];
                 handle
-                    .accept_async_managed(&mut welcome, common::K_CHANNEL_CAPACITY)
+                    .accept_async_closure(&mut welcome, || {
+                        let make = || {
+                            Owned::new_uninit_slice(common::K_CHANNEL_CAPACITY, CountingAlloc)
+                        };
+                        (make(), make())
+                    })
                     .await
             },
             async {
@@ -558,7 +560,12 @@ where
                 let mut welcome: [u8; 0] = [];
                 let mut welcome: &mut [u8] = &mut welcome[..];
                 incoming
-                    .accept_async_managed(&mut welcome, common::K_CHANNEL_CAPACITY)
+                    .accept_async_closure(&mut welcome, || {
+                        let make = || {
+                            Owned::new_uninit_slice(common::K_CHANNEL_CAPACITY, CountingAlloc)
+                        };
+                        (make(), make())
+                    })
                     .await
             },
         );
@@ -690,8 +697,8 @@ fn measure_pair_from_alloc_() -> (Usage_, Usage_) {
     let g0 = global_usage_();
     let i0 = injected_usage_();
     arm_();
-    let pair = CountBuff::pair_from_alloc(CountingAlloc, K_PROBE_CAP)
-        .expect("探针缓冲应当分配成功");
+    let pair = new_buffered_channel(Owned::new_uninit_slice(K_PROBE_CAP, CountingAlloc))
+        .expect("探针环应当建起来");
     // 释放也在这段区间里：`Drop` 只把内存交还分配器，本身不应触发任何分配。
     drop(pair);
     disarm_();

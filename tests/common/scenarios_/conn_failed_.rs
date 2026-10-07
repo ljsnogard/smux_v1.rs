@@ -26,6 +26,7 @@
 //! A 侧每条子流的读与写都在有界看门狗内返回错误，且两个半部的 `abort_reason()` 都是
 //! `ConnFailed(Transport)`。挂起会先被看门狗抓成 panic（本用例在修复前正是**挂死**）。
 
+use crate::common::AcceptAsyncClosureExt;
 use core::{
     cell::Cell,
     future::Future,
@@ -271,7 +272,7 @@ pub async fn run_conn_failed_wakes_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
     .await;
 
     let listener_dock = Dock::new(0x7601u32);
@@ -306,7 +307,7 @@ pub async fn run_conn_failed_wakes_scenario_<RA, WA, RB, WB, S, RT>(
             async {
                 let mut welcome: [u8; 0] = [];
                 let mut welcome: &mut [u8] = &mut welcome[..];
-                handle.accept_async_managed(&mut welcome, K_RING).await
+                handle.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_RING), crate::common::make_channel_buff_with_(K_RING))).await
             },
             async {
                 let mut incoming = listener_b
@@ -315,7 +316,7 @@ pub async fn run_conn_failed_wakes_scenario_<RA, WA, RB, WB, S, RT>(
                     .expect("B 侧应当取到入向请求");
                 let mut welcome: [u8; 0] = [];
                 let mut welcome: &mut [u8] = &mut welcome[..];
-                incoming.accept_async_managed(&mut welcome, K_RING).await
+                incoming.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_RING), crate::common::make_channel_buff_with_(K_RING))).await
             },
         );
         a_channels.push(opened.expect("A 侧最终裁决应当成功"));

@@ -75,7 +75,7 @@ where
     C: TrConnCfg<Data = u8>,
 {
     /// `buffex` 生产端半部（[`BufferedTx`] 的实例）。
-    ring_: BufferedTx<C::Buff, C::Alloc>,
+    ring_: BufferedTx,
 
     /// 该子流的共享状态（「已入队」去重与关闭记账）。
     owner_: ChannelOwner_<C::Alloc>,
@@ -116,7 +116,7 @@ where
     /// 只供连接内部（建流路径）与单元测试使用：对外部使用者而言，这两个半边只应由
     /// `abs_smux` 的 trait 产出。
     pub(crate) fn new_(
-        ring: BufferedTx<C::Buff, C::Alloc>,
+        ring: BufferedTx,
         owner: ChannelOwner_<C::Alloc>,
         conn: MuxConnection<C>,
         local_dock: Dock,
@@ -292,11 +292,11 @@ where
     C: TrConnCfg,
 {
     type SegmMut<'f>
-        = <BufferedTx<C::Buff, C::Alloc> as TrBuffTryWrite<u8>>::SegmMut<'f>
+        = <BufferedTx as TrBuffTryWrite<u8>>::SegmMut<'f>
     where
         Self: 'f;
 
-    type Err = <BufferedTx<C::Buff, C::Alloc> as TrBuffTryWrite<u8>>::Err;
+    type Err = <BufferedTx as TrBuffTryWrite<u8>>::Err;
 
     fn try_write<'f>(
         &'f mut self,
@@ -312,7 +312,7 @@ where
     C: TrConnCfg,
 {
     type WriteAsync<'f>
-        = <BufferedTx<C::Buff, C::Alloc> as TrBuffWrite<u8>>::WriteAsync<'f>
+        = <BufferedTx as TrBuffWrite<u8>>::WriteAsync<'f>
     where
         Self: 'f;
 
@@ -370,7 +370,7 @@ where
     C: TrConnCfg,
 {
     /// `buffex` 消费端半部（[`BufferedRx`] 的实例）。
-    ring_: BufferedRx<C::Buff, C::Alloc>,
+    ring_: BufferedRx,
 
     /// 该子流的共享状态（「已消费」去重位在锁外，见
     /// [`ChannelOwner_::mark_rx_consumed_`]）。
@@ -392,7 +392,7 @@ where
 {
     /// 由环消费端、共享状态、连接与 dock 对构造；可见性同 [`ChannelTx::new_`]。
     pub(crate) fn new_(
-        ring: BufferedRx<C::Buff, C::Alloc>,
+        ring: BufferedRx,
         owner: ChannelOwner_<C::Alloc>,
         conn: MuxConnection<C>,
         local_dock: Dock,
@@ -527,11 +527,11 @@ where
     C: TrConnCfg,
 {
     type SegmRef<'f>
-        = <BufferedRx<C::Buff, C::Alloc> as TrBuffTryRead<u8>>::SegmRef<'f>
+        = <BufferedRx as TrBuffTryRead<u8>>::SegmRef<'f>
     where
         Self: 'f;
 
-    type Err = <BufferedRx<C::Buff, C::Alloc> as TrBuffTryRead<u8>>::Err;
+    type Err = <BufferedRx as TrBuffTryRead<u8>>::Err;
 
     fn try_read<'f>(
         &'f mut self,
@@ -547,7 +547,7 @@ where
     C: TrConnCfg,
 {
     type ReadAsync<'f>
-        = <BufferedRx<C::Buff, C::Alloc> as TrBuffRead<u8>>::ReadAsync<'f>
+        = <BufferedRx as TrBuffRead<u8>>::ReadAsync<'f>
     where
         Self: 'f;
 

@@ -145,8 +145,8 @@ pub(crate) enum TimerAction_ {
 /// [`TrClock`]: abs_art::TrClock
 pub(crate) async fn timer_loop_async_<C, K>(
     shared: MuxShared_<C>,
-    w_events: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
-    r_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
+    w_events: EventSender_<WriteEvent_<C::Alloc>>,
+    r_events: EventSender_<ReadEvent_<C::Alloc>>,
     cancel: K,
 ) where
     C: TrConnCfg,
@@ -239,8 +239,8 @@ pub(crate) async fn timer_loop_async_<C, K>(
 /// 投递一条保活动作；返回 `false` 表示连接正在收尾（调用方应当退出）。
 async fn deliver_action_<C, K>(
     shared: &MuxShared_<C>,
-    w_events: &EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
-    r_events: &EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
+    w_events: &EventSender_<WriteEvent_<C::Alloc>>,
+    r_events: &EventSender_<ReadEvent_<C::Alloc>>,
     action: &TimerAction_,
     cancel: K,
 ) -> bool

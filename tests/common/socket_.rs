@@ -102,10 +102,10 @@ async fn run_socket_scenario_with_<IA, OA, IB, OB, F, Fut>(
     IB: TrInput<u8>,
     OB: TrOutput<u8>,
     F: FnOnce(
-        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx,
+        smux_v1::connection::BufferedRx,
+        smux_v1::connection::BufferedTx,
+        smux_v1::connection::BufferedRx,
     ) -> Fut,
     Fut: core::future::Future<Output = ()>,
 {
@@ -150,10 +150,10 @@ pub async fn run_socket_scenario_on_runtime_<F, Fut>(
     scenario: F,
 ) where
     F: FnOnce(
-        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx,
+        smux_v1::connection::BufferedRx,
+        smux_v1::connection::BufferedTx,
+        smux_v1::connection::BufferedRx,
     ) -> Fut,
     Fut: core::future::Future<Output = ()>,
 {
@@ -186,10 +186,10 @@ pub async fn run_socket_scenario_on_runtime_<F, Fut>(
     scenario: F,
 ) where
     F: FnOnce(
-        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx,
+        smux_v1::connection::BufferedRx,
+        smux_v1::connection::BufferedTx,
+        smux_v1::connection::BufferedRx,
     ) -> Fut,
     Fut: core::future::Future<Output = ()>,
 {
@@ -226,10 +226,10 @@ pub async fn run_socket_scenario_on_runtime_<F, Fut>(
     scenario: F,
 ) where
     F: FnOnce(
-        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-        smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+        smux_v1::connection::BufferedTx,
+        smux_v1::connection::BufferedRx,
+        smux_v1::connection::BufferedTx,
+        smux_v1::connection::BufferedRx,
     ) -> Fut,
     Fut: core::future::Future<Output = ()>,
 {

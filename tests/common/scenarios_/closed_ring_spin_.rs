@@ -32,6 +32,7 @@
 //! - 两处都不修 → 空转把看门狗一起饿死，用例挂到测试超时；
 //! - 两处都修 → 对端读到完整载荷与 `EOF`，场景正常返回。
 
+use crate::common::AcceptAsyncClosureExt;
 use abs_smux::conn::{TrChannelListener, TrConnection, TrDockBinding};
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use futures::{
@@ -131,7 +132,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
     .await;
 
     // B 侧只绑一个监听 dock：两条入向子流都建在它上面（对端的临时 dock 区分身份）。
@@ -174,7 +175,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
         async {
             let mut welcome: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome[..];
-            handle_p.accept_async_managed(&mut welcome, K_RING).await
+            handle_p.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_RING), crate::common::make_channel_buff_with_(K_RING))).await
         },
         async {
             let mut incoming = listener_b
@@ -183,14 +184,14 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
                 .expect("B 侧应当取到 P 的入向请求");
             let mut welcome: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome[..];
-            incoming.accept_async_managed(&mut welcome, K_WINDOW).await
+            incoming.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_WINDOW), crate::common::make_channel_buff_with_(K_WINDOW))).await
         },
     );
     let (opened_q, accepted_q) = join!(
         async {
             let mut welcome: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome[..];
-            handle_q.accept_async_managed(&mut welcome, K_RING).await
+            handle_q.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_RING), crate::common::make_channel_buff_with_(K_RING))).await
         },
         async {
             let mut incoming = listener_b
@@ -199,7 +200,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
                 .expect("B 侧应当取到 Q 的入向请求");
             let mut welcome: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome[..];
-            incoming.accept_async_managed(&mut welcome, K_WINDOW).await
+            incoming.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_WINDOW), crate::common::make_channel_buff_with_(K_WINDOW))).await
         },
     );
 

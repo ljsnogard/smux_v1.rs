@@ -48,7 +48,7 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S, RT>(
             RB,
             WB,
             S,
-        >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
         .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
@@ -133,7 +133,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
             RB,
             WB,
             S,
-        >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
         .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。

@@ -53,8 +53,8 @@ mod common;
 /// 本文件用到的连接配置别名：两侧同构的冒烟策略（传输类型由 [`common::connect_pair_`]
 /// 的类型参数推断，这里只固定「配置」这一层，便于给连接类型起名）。
 type SmokeCfg_ = common::SmokeMuxConfig<
-    smux_v1::connection::BufferedTx<common::SmokeBuff, mm_ptr::x_deps::abs_mm::CoreAlloc>,
-    smux_v1::connection::BufferedRx<common::SmokeBuff, mm_ptr::x_deps::abs_mm::CoreAlloc>,
+    smux_v1::connection::BufferedTx,
+    smux_v1::connection::BufferedRx,
     common::DefaultRt,
 >;
 
@@ -186,7 +186,14 @@ fn mux_bind_cross_thread_is_exclusive_tokio_() {
         let scope = art_rt.local_scope();
         let (a, b): (Conn_, Conn_) = scope
             .run_until(common::connect_pair_(
-                &art_rt, &scope, a_tx, a_rx, b_tx, b_rx,
+                &art_rt,
+                &scope,
+                a_tx,
+                a_rx,
+                b_tx,
+                b_rx,
+                common::make_stage_buffs_(),
+                common::make_stage_buffs_(),
             ))
             .await;
         (a, b, scope)
@@ -282,7 +289,14 @@ fn mux_rebind_after_cross_thread_drop_tokio_() {
         let scope = art_rt.local_scope();
         let (a, b): (Conn_, Conn_) = scope
             .run_until(common::connect_pair_(
-                &art_rt, &scope, a_tx, a_rx, b_tx, b_rx,
+                &art_rt,
+                &scope,
+                a_tx,
+                a_rx,
+                b_tx,
+                b_rx,
+                common::make_stage_buffs_(),
+                common::make_stage_buffs_(),
             ))
             .await;
         (a, b, scope)

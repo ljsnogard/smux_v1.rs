@@ -31,6 +31,7 @@
 #![feature(allocator_ext)]
 mod common;
 
+use crate::common::AcceptAsyncClosureExt;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use std::rc::Rc;
@@ -776,7 +777,6 @@ where
 {
     type Data = u8;
     type Dock = smux_v1::connection::Dock;
-    type Buff = common::SmokeBuff;
 }
 
 /// [`DefaultPolicy`](smux_v1::flow_ctrl::DefaultPolicy) 是 ZST；取静态引用即可。
@@ -794,7 +794,6 @@ where
     type Policy = smux_v1::flow_ctrl::DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
-    type StageBuff = common::SmokeBuff;
     type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
@@ -812,31 +811,6 @@ where
     /// 本配置不上报；带 sink 的端到端用例见 `tests/metrics_e2e.rs`。
     fn metrics(&self) -> &Self::Metrics {
         &NoMetrics
-    }
-
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), smux_v1::connection::BuffAllocError> {
-        // 与冒烟配置一致：子流环仍是 `SmokeBuff`，这里**只**改帧暂存容量。
-        common::SmokeBuff::pair_from_alloc(alloc, capacity)
-            .map_err(|_| smux_v1::connection::BuffAllocError)
-    }
-
-    /// **极小容量**帧暂存：连接读环与连接写环各只有
-    /// [`K_MIN_STAGE_CAPACITY_`] 字节。
-    ///
-    /// 这正是「一个满帧（头 + 最大载荷）远大于环容量」的极端：任何要求「先攒齐整帧
-    /// 再解析」的实现都会在这里互等。
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), smux_v1::connection::BuffAllocError> {
-        let (read_stage, write_stage) = common::make_stage_buffs_with_(K_MIN_STAGE_CAPACITY_);
-        // 分配器参数这里用不上（缓冲由测试直接给），显式消费掉以免告警。
-        let _ = alloc;
-        Ok((read_stage, write_stage))
     }
 }
 
@@ -904,7 +878,16 @@ async fn drive_min_stage_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+    >(
+        rt,
+        scope,
+        tx_a,
+        rx_a,
+        tx_b,
+        rx_b,
+        common::make_stage_buffs_with_(K_MIN_STAGE_CAPACITY_),
+        common::make_stage_buffs_with_(K_MIN_STAGE_CAPACITY_),
+    )
     .await;
 
     let dock_b = Dock::new(1u32);
@@ -935,7 +918,7 @@ async fn drive_min_stage_<RA, WA, RB, WB, S, RT>(
         async {
             let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
             handle
-                .accept_async_managed(&mut welcome_a, common::K_CHANNEL_CAPACITY)
+                .accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY)))
                 .await
         },
         async {
@@ -945,7 +928,7 @@ async fn drive_min_stage_<RA, WA, RB, WB, S, RT>(
                 .expect("B 侧应当取到入向建流请求");
             let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
             incoming_handle
-                .accept_async_managed(&mut welcome_b, common::K_CHANNEL_CAPACITY)
+                .accept_async_closure(&mut welcome_b, || (crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY)))
                 .await
         },
     );

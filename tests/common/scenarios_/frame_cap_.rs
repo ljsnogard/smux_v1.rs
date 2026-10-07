@@ -18,6 +18,7 @@
 //! 症状是挂死而不是断言失败：本场景在等读之前让出有限轮执行权，超限即 panic，
 //! 于是回归时看到的是一条可读的 panic，而不是 CI 挂到超时。
 
+use crate::common::AcceptAsyncClosureExt;
 use abs_smux::conn::{TrChannelListener, TrConnection, TrDockBinding};
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use futures::{
@@ -106,7 +107,7 @@ pub async fn run_frame_cap_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
     .await;
 
     let dock_b = Dock::new(0x7201u32);
@@ -136,7 +137,7 @@ pub async fn run_frame_cap_scenario_<RA, WA, RB, WB, S, RT>(
             let mut welcome: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome[..];
             handle
-                .accept_async_managed(&mut welcome, K_FRAME_CAP_RING)
+                .accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_FRAME_CAP_RING), crate::common::make_channel_buff_with_(K_FRAME_CAP_RING)))
                 .await
         },
         async {
@@ -147,7 +148,7 @@ pub async fn run_frame_cap_scenario_<RA, WA, RB, WB, S, RT>(
             let mut welcome: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome[..];
             incoming
-                .accept_async_managed(&mut welcome, K_FRAME_CAP_RING)
+                .accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_FRAME_CAP_RING), crate::common::make_channel_buff_with_(K_FRAME_CAP_RING)))
                 .await
         },
     );

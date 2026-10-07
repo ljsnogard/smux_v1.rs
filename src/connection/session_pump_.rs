@@ -39,8 +39,6 @@
 
 use core::{
     alloc::AllocatorClone,
-    borrow::BorrowMut,
-    mem::MaybeUninit,
 };
 
 use abs_buff::{
@@ -62,11 +60,7 @@ use crate::{
 
 
 /// 连接读环当前的**可写**空间，以及它是否已经封口（读端消失）。
-fn stage_space_<B, A>(writer: &BufferedTx<B, A>) -> (usize, bool)
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + 'static,
-    A: AllocatorClone + Send + Sync,
-{
+fn stage_space_(writer: &BufferedTx) -> (usize, bool) {
     match writer.producer_state() {
         Option::Some((free, closed)) => (free, closed),
         // 只有切片之类的桩端才会返回 `None`；环端不会。
@@ -75,11 +69,7 @@ where
 }
 
 /// 连接写环当前的**可读**字节数，以及它是否已经封口（写端消失）。
-fn stage_readable_<B, A>(reader: &BufferedRx<B, A>) -> (usize, bool)
-where
-    B: BorrowMut<[MaybeUninit<u8>]> + 'static,
-    A: AllocatorClone + Send + Sync,
-{
+fn stage_readable_(reader: &BufferedRx) -> (usize, bool) {
     // 从**读端**看「有多少可读」用 `consumer_state`；第二项的含义是
     // 「生产端（内侧复用循环）是否已经关闭」。
     match reader.consumer_state() {
@@ -106,7 +96,7 @@ where
 pub(crate) async fn rx_pump_loop_async_<C, K>(
     mut rx: C::ConnRx,
     shared: ByteLoopShared_<C::Alloc, C::Metrics>,
-    mut stage: BufferedTx<C::StageBuff, C::Alloc>,
+    mut stage: BufferedTx,
     cancel: K,
 ) where
     C: TrConnCfg,
@@ -182,7 +172,7 @@ pub(crate) async fn rx_pump_loop_async_<C, K>(
 pub(crate) async fn tx_pump_loop_async_<C, K>(
     mut tx: C::ConnTx,
     shared: ByteLoopShared_<C::Alloc, C::Metrics>,
-    mut stage: BufferedRx<C::StageBuff, C::Alloc>,
+    mut stage: BufferedRx,
     cancel: K,
 ) where
     C: TrConnCfg,

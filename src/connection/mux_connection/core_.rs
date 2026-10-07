@@ -103,10 +103,10 @@ where
     reg_: ChannelRegistry_<C::Alloc>,
 
     /// 写事件发送端（控制帧、建流注册、水位与拆流通知）。
-    w_events_: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
+    w_events_: EventSender_<WriteEvent_<C::Alloc>>,
 
     /// 读事件发送端（接收环注册与释放）。
-    r_events_: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
+    r_events_: EventSender_<ReadEvent_<C::Alloc>>,
 
     /// 五个循环的取消令牌（`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵、
     /// `4` = 计时）。
@@ -131,8 +131,8 @@ where
         opts: HandshakeOpts,
         reg: ChannelRegistry_<C::Alloc>,
         epoch: <C::Rt as TrClock>::Instant,
-        w_events: EventSender_<WriteEvent_<C::Buff, C::Alloc>>,
-        r_events: EventSender_<ReadEvent_<C::Buff, C::Alloc>>,
+        w_events: EventSender_<WriteEvent_<C::Alloc>>,
+        r_events: EventSender_<ReadEvent_<C::Alloc>>,
         loops: [CancelToken_<C::Alloc>; 5],
     ) -> Self {
         MuxCore {
@@ -169,12 +169,12 @@ where
     }
 
     /// 写事件发送端。
-    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<C::Buff, C::Alloc>> {
+    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<C::Alloc>> {
         &self.w_events_
     }
 
     /// 读事件发送端。
-    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<C::Buff, C::Alloc>> {
+    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<C::Alloc>> {
         &self.r_events_
     }
 

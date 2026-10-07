@@ -1,13 +1,19 @@
+use core::{
+    alloc::AllocatorClone,
+    mem::MaybeUninit,
+};
+
 use abs_art::{TrJoinHandle, TrLocalScope};
 use abs_buff::gen_may_cancel_future;
 use abs_cancel::TrCancellationToken;
+use abs_mm::res_man::TrUnique;
 use abs_smux::{conn::TrConnection, dock::TrDock};
 use buffex::x_deps::{abs_buff, abs_cancel};
-use mm_ptr::Shared;
+use mm_ptr::{Shared, x_deps::abs_mm};
 
 use crate::{
     connection::{
-        Dock, MuxError, ScopeHost, TrConnCfg,
+        Dock, MuxChanBuffOwnedBy, MuxError, ScopeHost, TrConnCfg,
         dock_binding::DockBinding,
         ring_::StageRingPair_,
         session_::{ByteLoopShared_, MuxShared_, demux_loop_async_, mux_loop_async_},
@@ -122,22 +128,29 @@ where
     /// 需要显式控制两者时走 [`MuxConnection::new_with_rt`]；只想换运行时值而不动
     /// 调用形状时，自写一个 `C` 并让它的 [`TrConnCfg::runtime`] 返回别的值即可。
     ///
+    /// # 两块帧暂存缓冲由**调用方当场给出**
+    ///
+    /// 它们的类型是任意 `P: TrUnique`（见 [`MuxChanBuffOwnedBy`]），容量也由调用方
+    /// 决定——配置不再规定缓冲类型。**零额外分配**：`P` 连同环与控制块一起被搬进
+    /// 同一次分配（见 `ring_` 模块）。
+    ///
     /// # Panics
     ///
-    /// 传入的连接级缓冲容量不在 `buffex::ring` 允许区间内时 panic。容量由
-    /// [`TrConnCfg::StageBuff`] 的提供者与调用的构造路径决定，属**配置错误**，
-    /// 与子流环走 `Err` 的处理方式不同：那一条是运行期按调用方给的 buff 建，
-    /// 这一条在建连前就定死了。
-    pub fn new(
+    /// 传入的缓冲容量不在 `buffex::ring` 允许区间内时 panic（属**配置错误**：容量
+    /// 由调用方交出的那块内存决定，建连前就定死了）。
+    ///
+    /// [`MuxChanBuffOwnedBy`]: crate::connection::MuxChanBuffOwnedBy
+    pub fn new<P>(
         delivery: HandshakeDelivery<C::ConnTx, C::ConnRx>,
         config: C,
-        read_stage_buff: C::StageBuff,
-        write_stage_buff: C::StageBuff,
+        read_stage_buff: MuxChanBuffOwnedBy<P>,
+        write_stage_buff: MuxChanBuffOwnedBy<P>,
     ) -> Self
     where
         C: 'static + Clone,
         C::Alloc: 'static,
-        C::StageBuff: Send + Sync,
+        P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
+        P::Alloc: AllocatorClone,
         C::Rt: ScopeHost,
     {
         let rt = config.runtime();
@@ -160,36 +173,38 @@ where
     /// # Panics
     ///
     /// 同 [`MuxConnection::new`]：连接级缓冲容量非法时 panic。
-    pub fn new_with_rt<S>(
+    pub fn new_with_rt<S, P>(
         rt: &C::Rt,
         scope: &S,
         delivery: HandshakeDelivery<C::ConnTx, C::ConnRx>,
         config: C,
-        read_stage_buff: C::StageBuff,
-        write_stage_buff: C::StageBuff,
+        read_stage_buff: MuxChanBuffOwnedBy<P>,
+        write_stage_buff: MuxChanBuffOwnedBy<P>,
     ) -> Self
     where
         C: 'static + Clone,
         C::Alloc: 'static,
-        C::StageBuff: Send + Sync,
+        P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
+        P::Alloc: AllocatorClone,
         S: TrLocalScope + Clone + 'static,
     {
         Self::new_with_rt_(rt, scope, delivery, config, read_stage_buff, write_stage_buff)
     }
 
     /// 两个公开构造入口的共同实现体。
-    fn new_with_rt_<S>(
+    fn new_with_rt_<S, P>(
         rt: &C::Rt,
         scope: &S,
         delivery: HandshakeDelivery<C::ConnTx, C::ConnRx>,
         config: C,
-        read_stage_buff: C::StageBuff,
-        write_stage_buff: C::StageBuff,
+        read_stage_buff: MuxChanBuffOwnedBy<P>,
+        write_stage_buff: MuxChanBuffOwnedBy<P>,
     ) -> Self
     where
         C: 'static + Clone,
         C::Alloc: 'static,
-        C::StageBuff: Send + Sync,
+        P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
+        P::Alloc: AllocatorClone,
         S: TrLocalScope + Clone + 'static,
     {
         let HandshakeDelivery { opts, tx, rx } = delivery;
@@ -204,18 +219,17 @@ where
 
         // 两块连接级缓冲 ⇒ 两条环的四个半部；「外侧」（贴传输）与「内侧」（贴子流）
         // 各拿一份（见 `ring_::StageRingPair_`）。
-        let read_stage_cap = ring_capacity_(&read_stage_buff);
-        let write_stage_cap = ring_capacity_(&write_stage_buff);
-        let stage = StageRingPair_::from_buffs_(
-            read_stage_buff,
-            write_stage_buff,
-            config.allocator(),
+        let read_stage_cap = read_stage_buff.capacity();
+        let write_stage_cap = write_stage_buff.capacity();
+        let stage = StageRingPair_::from_owners_(
+            read_stage_buff.into_owner_(),
+            write_stage_buff.into_owner_(),
         )
-        .unwrap_or_else(|bad_cap| {
+        .unwrap_or_else(|err| {
             panic!(
-                "连接级帧暂存环容量非法：读环 {read_stage_cap}、写环 {write_stage_cap}，\
-                 被拒的是 {bad_cap}；容量须落在 buffex::ring 允许区间内，\
-                 该容量源自 TrConnCfg::StageBuff 的构造，属配置错误"
+                "连接级帧暂存环建不起来：读环容量 {read_stage_cap}、写环容量 \
+                 {write_stage_cap}（{err}）；容量须落在 buffex::ring 允许区间内，\
+                 且块分配要成功——两者都由调用方交出的缓冲决定，属配置 / 资源错误"
             )
         });
         let ((rx_stage_w_, tx_stage_r_), (rx_stage_r_, tx_stage_w_)) = stage.into_halves_();
@@ -314,14 +328,6 @@ where
     inner.await
 }
 
-/// 取一块连接级缓冲的容量（`MaybeUninit<u8>` 的个数）。
-fn ring_capacity_<B>(buff: &B) -> usize
-where
-    B: core::borrow::BorrowMut<[core::mem::MaybeUninit<u8>]>,
-{
-    core::borrow::Borrow::<[core::mem::MaybeUninit<u8>]>::borrow(buff).len()
-}
-
 impl<C> MuxConnection<C>
 where
     C: TrConnCfg,
@@ -349,8 +355,8 @@ where
     core_: Shared<MuxCore<C>, C::Alloc>,
     shared_: MuxShared_<C>,
     byte_shared_: ByteLoopShared_<C::Alloc, C::Metrics>,
-    w_receiver_: EventReceiver_<WriteEvent_<C::Buff, C::Alloc>>,
-    r_receiver_: EventReceiver_<ReadEvent_<C::Buff, C::Alloc>>,
+    w_receiver_: EventReceiver_<WriteEvent_<C::Alloc>>,
+    r_receiver_: EventReceiver_<ReadEvent_<C::Alloc>>,
 }
 
 impl<C> CoreBundle_<C>

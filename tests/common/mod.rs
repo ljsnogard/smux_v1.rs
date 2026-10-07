@@ -44,6 +44,7 @@ mod scenarios_;
 
 pub use buff_::{
     SmokeBuff,
+    SmokeStageBuff,
     make_channel_buff_,
     make_channel_buff_with_,
     make_stage_buffs_,

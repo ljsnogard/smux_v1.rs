@@ -56,7 +56,7 @@ pub(super) async fn run_mux_scenario_<RA, WA, RB, WB, S, RT>(
             RB,
             WB,
             S,
-        >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+        >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
         .await;
 
     futures::join!(
@@ -85,7 +85,7 @@ pub(super) async fn drive_side_<C>(
     dock_count: u32,
     per_dock: usize,
 ) where
-    C: TrConnCfg + TrMuxConfig<Buff = SmokeBuff>,
+    C: TrConnCfg,
 {
     let conn_ref = conn;
 

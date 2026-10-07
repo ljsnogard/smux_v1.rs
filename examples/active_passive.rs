@@ -17,7 +17,10 @@
 use core::mem::MaybeUninit;
 
 use abs_art::TrLocalScope;
-use abs_smux::conn::{TrChannelListener, TrConnection, TrDockBinding};
+use abs_smux::{
+    chan::{ChannelBuffAlloc, TrChannelHandle, TrPrepareChannelRing},
+    conn::{TrChannelListener, TrConnection, TrDockBinding},
+};
 use buffex::{
     ring::{Ring, RingReader, RingWriter},
     x_deps::abs_buff::{
@@ -27,9 +30,9 @@ use buffex::{
     },
 };
 use buffex_compio_adapt::{ReadAsInput, WriteAsOutput};
-use mm_ptr::{Shared, x_deps::abs_mm::CoreAlloc};
+use mm_ptr::{Owned, Shared, x_deps::abs_mm::CoreAlloc};
 use smux_v1::{
-    connection::{DefaultConnCfg, Dock, MuxChanBuffOwnedBy, MuxConnection, TrConnCfg},
+    connection::{DefaultConnCfg, Dock, MuxChanBuffOwnedBy, MuxConnection},
     flow_ctrl::DefaultPolicy,
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
@@ -56,10 +59,8 @@ type Cfg = DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>;
 /// 与 [`Rt`] 一样取 bridge 的**裸名**——这样示例与库用的就是同一个后端解析结果，
 /// smux 侧也因此**不需要**直接依赖任何后端 crate。
 type Scope = abs_art_bridge::LocalScope;
-/// 全被动环的存储类型（连接级帧暂存也用它）。
-///
-/// 用与生产默认装配同一个智能指针：一块内存与释放它的分配器打包在一起。
-type Buf = MuxChanBuffOwnedBy<CoreAlloc>;
+/// 全被动传输环的存储类型（本示例自己用 `Shared` 建的环，与 smux 的缓冲契约无关）。
+type Buf = Owned<[MaybeUninit<u8>], CoreAlloc>;
 /// 交给 smux 当 `Tx` 的写半边。
 type Tx = RingWriter<Shared<Ring<Buf, u8>, CoreAlloc>, Buf, u8>;
 /// 交给 smux 当 `Rx` 的读半边。
@@ -155,7 +156,10 @@ async fn active(
             DefaultPolicy,
             rt.clone(),
         );
-    let (stage_r, stage_w) = cfg.make_stage_buffs(cfg.allocator())?;
+    let (stage_r, stage_w) = (
+        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc)),
+        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc)),
+    );
     let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
 
     let local_dock = Dock::new(0x2001);
@@ -164,7 +168,11 @@ async fn active(
 
     let mut invitation: &[u8] = b"Hi, SMUX!";
     let mut ch = binding.open_channel_async(remote_dock, &mut invitation).await?;
-    let (mut tx, _rx) = ch.accept_async_default().await?;
+    let mut welcome: [u8; 0] = [];
+    let mut welcome: &mut [u8] = &mut welcome[..];
+    let (mut tx, _rx) = ch
+        .accept_async(&mut welcome, DemoRing_::new(K_RING_CAP))
+        .await?;
 
     tx.write_all(b"hello").await?;
     drop(tx); // 半关闭：对端读到 EOF
@@ -194,7 +202,10 @@ async fn passive(
             DefaultPolicy,
             rt.clone(),
         );
-    let (stage_r, stage_w) = cfg.make_stage_buffs(cfg.allocator())?;
+    let (stage_r, stage_w) = (
+        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc)),
+        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc)),
+    );
     let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
 
     let local_dock = Dock::new(1);
@@ -203,7 +214,11 @@ async fn passive(
         .listen_async_default().await?; // 开始收建流请求
 
     let mut incoming = listener.income_async().await?;
-    let (_tx, mut rx) = incoming.accept_async_default().await?;
+    let mut welcome: [u8; 0] = [];
+    let mut welcome: &mut [u8] = &mut welcome[..];
+    let (_tx, mut rx) = incoming
+        .accept_async(&mut welcome, DemoRing_::new(K_RING_CAP))
+        .await?;
 
     let mut buf = [0u8; 5];
     rx.read_exact(&mut buf).await?; // 对端 drop(tx) 之后就到这里
@@ -216,9 +231,33 @@ async fn passive(
 // 后端胶水：socket ↔ 全被动环 ↔ 调用方驱动的泵
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
+/// 本示例的 `accept` 环准备策略：按给定容量向 `CoreAlloc` 要两块内存，
+/// 交给连接当作本条子流的发送 / 接收环。
+///
+/// 这正是上游 `TrPrepareChannelRing` 的用法：**类型与容量都由调用方当场决定**，
+/// 配置不再规定它们（见 `smux_v1::connection::ring_` 模块文档）。
+struct DemoRing_ {
+    cap_: usize,
+}
+
+impl DemoRing_ {
+    const fn new(cap: usize) -> Self {
+        DemoRing_ { cap_: cap }
+    }
+}
+
+impl TrPrepareChannelRing<MuxChanBuffOwnedBy<Buf>, u8> for DemoRing_ {
+    fn prepare(self) -> ChannelBuffAlloc<MuxChanBuffOwnedBy<Buf>, u8> {
+        ChannelBuffAlloc::new(
+            MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(self.cap_, CoreAlloc)),
+            MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(self.cap_, CoreAlloc)),
+        )
+    }
+}
+
 /// 造一条全被动环，切成 `(写端, 读端)`。
 fn passive_ring_() -> (Tx, Rx) {
-    let buffer = Buf::try_new(CoreAlloc, K_RING_CAP).expect("容量合法");
+    let buffer = Owned::new_uninit_slice(K_RING_CAP, CoreAlloc);
     let ring = Ring::try_new(buffer).expect("容量合法");
     let shared = Shared::new(ring, CoreAlloc);
     // SAFETY: 这条环由刚建出的 `Shared` 独占，且不存在对应的 `Weak`，

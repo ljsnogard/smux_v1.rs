@@ -6,9 +6,12 @@ version = "0.1.0"
 description = "流复用协议第一版"
 
 [dependencies]
-# 【本地 spike，未提交】`abs_art` 家族改用**本地路径**依赖，以便试用
-# `feat/time` 分支新增的计时能力（`TrTime`）。正式落地时应当改回 git tag/branch。
-abs_art = { path = "../abs_art/abs_art" }
+# `abs_art` 家族全部取 **gitee 的 `dev/0.3.0`**：同一个仓库的六个 crate
+# （`abs_art` / `-bridge` / `-mock_clock` / `-tokio` / `-compio` / `-smol`）必须写**完全
+# 相同**的 git spec（同一 URL + 同一 branch），否则 Cargo 会把它们当成两个 source、
+# 检出两份代码——那时 `TrLocalScope` / `TrTime` 这些 trait 会出现「同名不同源」而
+# 对不上。跨依赖表（`[dependencies]` 与 `[dev-dependencies]`）也必须一致。
+abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
 # **桥接 crate**：业务库只依赖它就能拿到运行时值（`Runtime` / `current`）与本地
 # 作用域（`LocalScope`），而不直接按后端写代码——后端由 `Cargo.toml` 的 feature
 # 选定（见下方 `[features]` 的说明）。
@@ -24,14 +27,13 @@ abs_art = { path = "../abs_art/abs_art" }
 # `default-backend-compio` 一起打开，于是 `--features test-tokio-runtime` 下会出现
 # 「两个 backend + 两个默认后端」而撞上 bridge 的守护。关掉之后，后端选择**完全**
 # 由 smux 自己的 feature 决定（各自只开一个 `backend-*`，此时裸名即它）。
-abs_art-bridge = { path = "../abs_art/abs_art-bridge", default-features = false }
+abs_art-bridge = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", default-features = false }
 # 虚拟时间（仅测试装配需要）：连接的建连路径要自己取作用域（`ScopeHost`），而
 # `ManualTime` 是外部类型，它的 `ScopeHost` 实现只能写在**拥有该 trait 的本 crate**
 # 里（孤儿规则）。因此这里开一个可选依赖 + 测试 feature，生产依赖图里不出现它。
-abs_art-mock_clock = { path = "../abs_art/abs_art-mock_clock", optional = true }
+abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", optional = true }
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
-# abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
-abs_smux = { path = "../abs_smux" }
+abs_smux = { git = "https://gitee.com/lino_snsalias/abs_smux.git", branch = "dev/0.1.0" }
 atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch = "dev/0.3.0" }
 
 # 复用子流与协议帧的缓冲区一律使用 `buffex::circular_buff`，因此它是正式依赖
@@ -98,26 +100,25 @@ default = ["test-compio-runtime"]
 # 环层 `BuffRead` / `BuffWrite`，**按需驱动、不 spawn**，因此这里的装配与 tokio 侧
 # 逐字同构。
 buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_compio_adapt.git" }
-buffex_smol_adapt = { path = "../buffex_smol_adapt" }
+buffex_smol_adapt = { git = "https://gitee.com/lino_snsalias/buffex_smol_adapt.git" }
 buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt.git" }
 
 # 连接层经 `abs_art` 的**值化本地作用域**（`TrLocalScope`）投递读 / 写循环，
 # 并从一个**运行时值**（`abs_art::TrTime`：计时 + 时刻）取时间能力。因此测试要给出
 # 具体的后端值：tokio 版用 `abs_art_tokio::current()` + 它交出的 `LocalScope`，
-# compio / smol 版同理。三者从与 `abs_art` 同一个源取，保证 trait 是同一份。
-# 【本地 spike，未提交】同 `abs_art`：改本地路径，保证两边用的是同一份
-# `TrLocalScope` / `TrTime` trait（否则两个 abs_art 版本会让 trait 对不上）。
+# compio / smol 版同理。三者与 `abs_art` 必须是**同一个 git spec**（同 URL + 同
+# branch），否则 trait 会对不上。
 #
 # `mock-clock`：各后端的手动时钟驱动入口（`LocalScope::block_on_advancing`）。
 # keepalive 的端到端验收靠它把「等 1 秒 / 2.5 秒」变成**虚拟时间**，
 # 场景本体与设计见 `tests/keepalive_common.inc` 与 `dev-notes/runtime-adoption-20261006-1352.md`。
-abs_art-tokio = { path = "../abs_art/abs_art-tokio", features = ["mock-clock"] }
-abs_art-compio = { path = "../abs_art/abs_art-compio", features = ["mock-clock"] }
-abs_art-smol = { path = "../abs_art/abs_art-smol", features = ["mock-clock"] }
+abs_art-tokio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
+abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
+abs_art-smol = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
 
 # 手动（虚拟）时钟本体：`ManualClock` / `ManualTime` / `Supervisor`。
 # 它只出现在测试里（正式依赖不需要），因此留在 dev-dependencies。
-abs_art-mock_clock = { path = "../abs_art/abs_art-mock_clock" }
+abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
 
 # 场景并发用与运行时无关的组合子（join! / join_all / select），因此只需要
 # `futures`，不需要为两个运行时各写一份并发代码。

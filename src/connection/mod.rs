@@ -542,13 +542,16 @@ mod util_;
 pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
-pub use config_::{BuffAllocError, DefaultConnCfg, K_STAGE_RING_CAPACITY, TrConnCfg};
+pub use config_::{DefaultConnCfg, K_STAGE_RING_CAPACITY, TrConnCfg};
 pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
 pub(crate) use mux_connection::ReserveErr_;
-pub use ring_::{BufferedChannel, BufferedRx, BufferedTx, MuxChanBuffOwnedBy};
+pub use ring_::{
+    BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff_, MuxChanBuffOwnedBy, RingBuildErr,
+    new_buffered_channel,
+};
 pub use scope_host_::{DefaultRt_, ScopeHost, default_rt_};
 pub use telegraph::{Telegraph, TelegraphError};
 pub use types_::Dock;

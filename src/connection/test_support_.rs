@@ -19,9 +19,7 @@ use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, BuffAllocError, K_STAGE_RING_CAPACITY,
-        MuxConnection, TrConnCfg,
-        ring_::test_support_::TestBuff,
+        BufferedRx, BufferedTx, MuxConnection, TrConnCfg,
     },
     flow_ctrl::DefaultPolicy,
     handshake::opts::{BasicOpts, HandshakeOpts},
@@ -116,7 +114,6 @@ static TEST_POLICY_: DefaultPolicy = DefaultPolicy;
 impl TrMuxConfig for TestMuxConfig_ {
     type Data = u8;
     type Dock = crate::connection::Dock;
-    type Buff = TestBuff;
 }
 
 impl TrConnCfg for TestMuxConfig_ {
@@ -125,7 +122,6 @@ impl TrConnCfg for TestMuxConfig_ {
     type Policy = DefaultPolicy;
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
-    type StageBuff = TestBuff;
     type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
@@ -145,27 +141,13 @@ impl TrConnCfg for TestMuxConfig_ {
         &NoMetrics
     }
 
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        TestBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
-    }
-
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        TestBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
-    }
 }
 
 /// 测试连接用的两个传输类型（真实的内存环端；本连接不驱动它们，只为满足类型参数）。
-pub(crate) type TestWireRx_ = BufferedRx<TestBuff, CoreAlloc>;
+pub(crate) type TestWireRx_ = BufferedRx;
 
 /// 同 [`TestWireRx_`]，写半边。
-pub(crate) type TestWireTx_ = BufferedTx<TestBuff, CoreAlloc>;
+pub(crate) type TestWireTx_ = BufferedTx;
 
 /// 建一个**不含任何循环**的测试连接。
 ///

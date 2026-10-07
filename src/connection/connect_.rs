@@ -5,9 +5,9 @@
 //! 1. **握手**：[`HandshakeAgent`] 只与两条半边打交道，协商出
 //!    [`HandshakeDelivery`]（协商结果 + 归还的收发通道）。它**不需要本地作用域值**
 //!    ——这一阶段没有任何东西要被投递到别处，纯粹是两条半边上的字节往返；
-//! 2. **建连接**（本模块）：用默认配置铺开资源策略、造两块连接级帧暂存缓冲，再把
-//!    交付物与五个收发循环交给 [`MuxConnection::new`]。**运行时值与作用域值都只在
-//!    这一段出现**：前者提供计时与时刻，后者提供五个循环要投递进去的本地队列。
+//! 2. **建连接**（本模块）：用默认配置铺开资源策略，把交付物、**调用方交出的两块
+//!    连接级帧暂存缓冲**与五个收发循环交给 [`MuxConnection::new`]。**运行时值与作用域
+//!    值都只在这一段出现**：前者提供计时与时刻，后者提供五个循环要投递进去的本地队列。
 //!
 //! 之所以把两段分开、而不是合成一个「从 socket 建连接」的调用：握手的协商条目、
 //! 拒绝策略、要不要取消，都是**使用者真会碰**的东西，藏进一层 `async fn` 反而不好用。
@@ -16,10 +16,17 @@
 //!
 //! [`HandshakeAgent`]: crate::handshake::agent::HandshakeAgent
 
+use core::{
+    alloc::AllocatorClone,
+    mem::MaybeUninit,
+};
+
+use abs_mm::res_man::TrUnique;
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use mm_ptr::x_deps::abs_mm;
 
 use crate::{
-    connection::{BuffAllocError, DefaultConnCfg, DefaultRt_, MuxConnection, TrConnCfg},
+    connection::{DefaultConnCfg, DefaultRt_, MuxChanBuffOwnedBy, MuxConnection},
     flow_ctrl::DefaultPolicy,
     handshake::agent::HandshakeDelivery,
     metrics::NoMetrics,
@@ -32,18 +39,14 @@ where
 {
     /// 用**默认配置**把一次成功的握手交付物接成连接。
     ///
-    /// 等价于「[`DefaultConnCfg`] + [`TrConnCfg::make_stage_buffs`] +
-    /// [`MuxConnection::new`]」三步；要自选资源策略就自己走那三步。
+    /// 等价于「[`DefaultConnCfg`] + [`MuxConnection::new`]」两步；要自选资源策略就自己走
+    /// 那两步。两块帧暂存缓冲由调用方给出（类型任意 `TrUnique`，容量自定）。
     ///
     /// 运行时值与本地作用域都**由配置与后端自己解决**：建连时取
     /// `abs_art_bridge::current()`（默认后端的运行时值）、再由它交出 `local_scope()`。
     /// 需要显式控制时走 [`MuxConnection::new_with_rt`] 或自写一个 `C`。
     ///
     /// 它是**同步**的：两段里只有握手需要 await，建连接本身没有等待点。
-    ///
-    /// # Errors
-    ///
-    /// 连接级帧暂存的分配失败时返回 [`BuffAllocError`]。
     ///
     /// # Panics
     ///
@@ -56,14 +59,19 @@ where
     /// let delivery = HandshakeAgent::new(tx, rx)
     ///     .invite_async(&BasicOpts::default(), AcceptAllEntries)
     ///     .await?;
-    /// // ② 建连接：运行时值与作用域都由连接自己取，调用方不必准备。
-    /// let conn = MuxConnection::from_delivery(delivery)?;
+    /// // ② 建连接：运行时值与作用域都由连接自己取；两块帧暂存缓冲由调用方交出。
+    /// let conn = MuxConnection::from_delivery(delivery, read_stage, write_stage);
     /// ```
-    pub fn from_delivery(
+    pub fn from_delivery<P>(
         delivery: HandshakeDelivery<Tx, Rx>,
-    ) -> Result<Self, BuffAllocError> {
+        read_stage: MuxChanBuffOwnedBy<P>,
+        write_stage: MuxChanBuffOwnedBy<P>,
+    ) -> Self
+    where
+        P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
+        P::Alloc: AllocatorClone,
+    {
         let (delivery, cfg) = DefaultConnCfg::new(delivery, DefaultPolicy);
-        let (stage_r, stage_w) = cfg.make_stage_buffs(cfg.allocator())?;
-        Result::Ok(MuxConnection::new(delivery, cfg, stage_r, stage_w))
+        MuxConnection::new(delivery, cfg, read_stage, write_stage)
     }
 }

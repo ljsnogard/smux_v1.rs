@@ -147,7 +147,6 @@ use abs_smux::{
     dock::TrDock,
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{
         BindError, ChannelListener, ChannelRx, ChannelTx, Dock, DockBinding, MuxConnection,
@@ -179,14 +178,11 @@ const K_CLIENT_DOCK_BASE: u32 = 0x1000u32;
 // 类型别名
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-/// 内存环的存储类型（与 `common::make_passive_ring_` 的返回类型一致）。
-type WireBuff = common::SmokeBuff;
-
 /// L4 的读半边。
-type WireRx = smux_v1::connection::BufferedRx<WireBuff, CoreAlloc>;
+type WireRx = smux_v1::connection::BufferedRx;
 
 /// L4 的写半边。
-type WireTx = smux_v1::connection::BufferedTx<WireBuff, CoreAlloc>;
+type WireTx = smux_v1::connection::BufferedTx;
 
 /// L5 的连接对象。客户端与服务端同型，只是握手角色不同。
 ///

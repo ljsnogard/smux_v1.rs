@@ -46,9 +46,7 @@
 
 use core::{
     alloc::AllocatorClone,
-    borrow::BorrowMut,
     future::Future,
-    mem::MaybeUninit,
 };
 
 use flume::{Receiver, Sender, TrySendError};
@@ -160,9 +158,8 @@ impl ControlFrame_ {
 }
 
 /// 送给**写循环**的事件。
-pub(crate) enum WriteEvent_<B, A>
+pub(crate) enum WriteEvent_<A>
 where
-    B: BorrowMut<[MaybeUninit<u8>]>,
     A: AllocatorClone + Send + Sync,
 {
     /// 会话侧发送环读端上线：写循环把它存进本地表，此后按 dock 对索引。
@@ -174,7 +171,7 @@ where
         /// 该子流的共享状态。
         owner: ChannelOwner_<A>,
         /// 会话侧发送环读端（应用写、本循环读）。
-        reader_: BufferedRx<B, A>,
+        reader_: BufferedRx,
     },
 
     /// 一条待写出的控制帧。
@@ -234,9 +231,8 @@ where
 }
 
 /// 送给**读循环**的事件。
-pub(crate) enum ReadEvent_<B, A>
+pub(crate) enum ReadEvent_<A>
 where
-    B: BorrowMut<[MaybeUninit<u8>]>,
     A: AllocatorClone + Send + Sync,
 {
     /// 会话侧接收环写端上线：读循环把它存进本地表。
@@ -248,7 +244,7 @@ where
         /// 该子流的共享状态。
         owner: ChannelOwner_<A>,
         /// 会话侧接收环写端（本循环写、应用读）。
-        writer_: BufferedTx<B, A>,
+        writer_: BufferedTx,
     },
 
     /// 释放一条子流：读循环丢弃本地表项。

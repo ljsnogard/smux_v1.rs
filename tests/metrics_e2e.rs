@@ -39,14 +39,14 @@ use abs_smux::{
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
-    connection::{BuffAllocError, Dock, K_STAGE_RING_CAPACITY, ScopeHost, TrConnCfg},
+    connection::{Dock, ScopeHost, TrConnCfg},
     flow_ctrl::DefaultPolicy,
     metrics::{DebugMetrics, TrMetricsSink},
     single_runtime_test_,
 };
 
 use common::{
-    AcceptAsyncClosureExt, K_NET_BUFFER_SIZE, SmokeBuff, TestConnCfg, TrLocalScope, TrSmokeRt,
+    AcceptAsyncClosureExt, K_NET_BUFFER_SIZE, TestConnCfg, TrLocalScope, TrSmokeRt,
     connect_pair_, expect_eof_, make_channel_buff_, make_passive_ring_, read_channel_exact_,
     write_channel_all_,
 };
@@ -116,7 +116,6 @@ where
 {
     type Data = u8;
     type Dock = Dock;
-    type Buff = SmokeBuff;
 }
 
 impl<W, R, RT> TrConnCfg for MetricsCfg<W, R, RT>
@@ -130,7 +129,6 @@ where
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
-    type StageBuff = SmokeBuff;
 
     /// **只多这一处**：把关联类型指向内置采集器的句柄。
     type Metrics = DebugMetrics;
@@ -156,20 +154,7 @@ where
         &self.sink_
     }
 
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        SmokeBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
-    }
 
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        SmokeBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
-    }
 }
 
 impl<W, R, RT> TestConnCfg for MetricsCfg<W, R, RT>
@@ -212,7 +197,16 @@ async fn metrics_reports_lifecycle_() {
             _,
             _,
             _,
-        >(&rt, &scope, a_tx, a_rx, b_tx, b_rx)
+        >(
+            &rt,
+            &scope,
+            a_tx,
+            a_rx,
+            b_tx,
+            b_rx,
+            common::make_stage_buffs_(),
+            common::make_stage_buffs_(),
+        )
         .await;
 
         let a_side = async {

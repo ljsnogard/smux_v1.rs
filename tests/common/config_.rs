@@ -9,7 +9,7 @@ use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use abs_smux::conf::TrMuxConfig;
 use smux_v1::{
-    connection::{BuffAllocError, Dock, K_STAGE_RING_CAPACITY, MuxConnection, TrConnCfg},
+    connection::{Dock, K_STAGE_RING_CAPACITY, MuxConnection, TrConnCfg},
     flow_ctrl::DefaultPolicy,
     metrics::NoMetrics,
 };
@@ -144,7 +144,6 @@ where
 {
     type Data = u8;
     type Dock = Dock;
-    type Buff = SmokeBuff;
 }
 
 impl<W, R, RT> TrConnCfg for SmokeMuxConfig<W, R, RT>
@@ -158,7 +157,6 @@ where
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
-    type StageBuff = SmokeBuff;
     type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
@@ -178,20 +176,7 @@ where
         &NoMetrics
     }
 
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        SmokeBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
-    }
 
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        SmokeBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
-    }
 }
 
 
@@ -250,7 +235,6 @@ where
 {
     type Data = u8;
     type Dock = Dock;
-    type Buff = SmokeBuff;
 }
 
 impl<W, R, RT> TrConnCfg for FlowCtrlConfig<W, R, RT>
@@ -264,7 +248,6 @@ where
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
-    type StageBuff = SmokeBuff;
     type Metrics = NoMetrics;
 
     fn runtime(&self) -> Self::Rt {
@@ -284,25 +267,7 @@ where
         &NoMetrics
     }
 
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        // 容量的**上钳**在这里：验收用例无论请求多大，都只拿到小环，从而保证窗口
-        // 一定被用尽（取 `min` 而不是直接替换，是为了让「调用方请求 0」这类边界
-        // 仍然按原语义走）。
-        let capacity = capacity.min(K_FLOW_CTRL_RING_CAPACITY);
-        SmokeBuff::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
-    }
 
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        // 连接级帧暂存仍走 64 KiB，避免把「帧暂存」这一无关变量带进对照。
-        SmokeBuff::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY).map_err(|_| BuffAllocError)
-    }
 }
 
 

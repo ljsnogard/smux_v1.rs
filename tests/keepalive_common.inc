@@ -40,6 +40,7 @@
 //! | [`establish_timeout_on_responder_`] | **建流未裁决**的响应方：超时后连接代它向对端回 `REJECT`（对端拿到 `Refused`），它自己之后调 `accept_async` 直接拿到 `IdleTimeout` |
 //! | [`cancel_accept_notifies_peer_`] | 带取消令牌的 `accept_async` 在裁决完成前被取消：调用方拿到 `Cancelled`，**同时**对端收到 `REJECT`（拿到 `Refused`），不会悬着 |
 
+use crate::common::AcceptAsyncClosureExt;
 use core::{future::IntoFuture, time::Duration};
 
 use abs_smux::{
@@ -51,7 +52,7 @@ use futures::join;
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{
-        BufferedRx, BufferedTx, ChannelRx, ChannelTx, Dock, MuxConnection, MuxError, TrConnCfg,
+        BufferedRx, BufferedTx, ChannelRx, ChannelTx, Dock, MuxConnection, MuxError,
     },
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
@@ -71,10 +72,10 @@ use crate::common::{
 // ── 具体类型：两条环由同一个构造器造出，因此两端传输类型相同 ────────────────
 
 /// 内存环的发送半边。
-type RingTx = BufferedTx<SmokeBuff, CoreAlloc>;
+type RingTx = BufferedTx;
 
 /// 内存环的接收半边。
-type RingRx = BufferedRx<SmokeBuff, CoreAlloc>;
+type RingRx = BufferedRx;
 
 /// 本文件使用的连接类型（传输由上面的两个别名固定；第三个参数是**运行时值**）。
 type Conn<RT> = SmokeConn<RingRx, RingTx, RT>;
@@ -147,12 +148,8 @@ where
 
     let config_a = SmokeMuxConfig::<RingTx, RingRx, RT>::new(rt.clone());
     let config_b = SmokeMuxConfig::<RingTx, RingRx, RT>::new(rt.clone());
-    let (stage_ar, stage_aw) = config_a
-        .make_stage_buffs(config_a.allocator())
-        .expect("A 侧连接级帧暂存应当分配成功");
-    let (stage_br, stage_bw) = config_b
-        .make_stage_buffs(config_b.allocator())
-        .expect("B 侧连接级帧暂存应当分配成功");
+    let (stage_ar, stage_aw) = crate::common::make_stage_buffs_();
+    let (stage_br, stage_bw) = crate::common::make_stage_buffs_();
     // 运行时值与作用域都由配置解决（`TrConnCfg::runtime` + `ScopeHost`）。
     let conn_a: Conn<RT> =
         MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw);
@@ -206,7 +203,7 @@ where
         async {
             let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
             handle_a
-                .accept_async_managed(&mut welcome_a, K_CHANNEL_CAPACITY)
+                .accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await
                 .expect("A 侧最终裁决子流应当成功")
         },
@@ -217,7 +214,7 @@ where
                 .expect("B 侧应当取到入向建流请求");
             let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
             handle_b
-                .accept_async_managed(&mut welcome_b, K_CHANNEL_CAPACITY)
+                .accept_async_closure(&mut welcome_b, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await
                 .expect("B 侧接受子流应当成功")
         },
@@ -430,7 +427,7 @@ where
 /// `max_channel_timeout` 到点必须让它拿到明确的超时错误，而不是永久悬在等裁决上。
 ///
 /// - 手段：A 侧超时 1 秒、B 侧 1 小时；B 只建 listener **不** accept；A 的
-///   `accept_async_managed`（它内部才发 `OPEN` 并等裁决）与 `virtual_sleep_(1.6s)`
+///   `accept_async`（它内部才发 `OPEN` 并等裁决）与 `virtual_sleep_(1.6s)`
 ///   竞速推进。
 /// - 判断：竞速必须由「建流 future 完成」取胜，且错误是
 ///   `HandleError::Mux(MuxError::IdleTimeout)`；句柄上的 `abort_reason()` 同样是它。
@@ -467,7 +464,7 @@ where
     let mut welcome_a_buf: [u8; 0] = [];
     let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
     {
-        let accept_fut = handle_a.accept_async_managed(&mut welcome_a, K_CHANNEL_CAPACITY);
+        let accept_fut = handle_a.accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)));
         futures::pin_mut!(accept_fut);
         // 先推几轮让 `OPEN` 发出去并进入等待。
         for _ in 0..8 {
@@ -503,7 +500,7 @@ where
 ///     或一次注定无效的成功。
 ///
 /// - 手段：A 侧超时 1 小时、B 侧超时 1 秒；A 发 `OPEN` 并等裁决，B 取到入向句柄后
-///   **不裁决**；推进虚拟时间越过 B 侧超时，再让 B 调 `accept_async_managed`。
+///   **不裁决**；推进虚拟时间越过 B 侧超时，再让 B 调 `accept_async`。
 /// - 判断：A 侧先得到 `HandleError::Refused`；B 侧随后得到
 ///   `HandleError::Mux(MuxError::IdleTimeout)`，且 `abort_reason()` 与之相同。
 pub async fn establish_timeout_on_responder_<RT>(rt: &RT)
@@ -538,7 +535,7 @@ where
 
     let mut welcome_a_buf: [u8; 0] = [];
     let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
-    let accept_a = handle_a.accept_async_managed(&mut welcome_a, K_CHANNEL_CAPACITY);
+    let accept_a = handle_a.accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)));
     futures::pin_mut!(accept_a);
 
     // ① A 发 `OPEN`、B 取到入向句柄：两者竞速，B 一侧先完成。
@@ -575,7 +572,7 @@ where
     let mut welcome_b_buf: [u8; 0] = [];
     let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
     match handle_b
-        .accept_async_managed(&mut welcome_b, K_CHANNEL_CAPACITY)
+        .accept_async_closure(&mut welcome_b, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
         .await
     {
         Result::Err(HandleError::Mux(MuxError::IdleTimeout)) => {}
@@ -642,7 +639,7 @@ where
         async {
             // A：发 `OPEN` 并等裁决（B 取消后回 `REJECT` ⇒ 这里得到 `Refused`）。
             handle_a
-                .accept_async_managed(&mut welcome_a, K_CHANNEL_CAPACITY)
+                .accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await
         },
         async {
@@ -653,10 +650,8 @@ where
                 .expect("B 侧应当取到入向建流请求");
             let mut welcome_b_buf: [u8; 0] = [];
             let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
-            let tx_buff = SmokeBuff::try_new(CoreAlloc, K_CHANNEL_CAPACITY)
-                .expect("测试的子流环内存应当分配成功");
-            let rx_buff = SmokeBuff::try_new(CoreAlloc, K_CHANNEL_CAPACITY)
-                .expect("测试的子流环内存应当分配成功");
+            let tx_buff = SmokeBuff::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc);
+            let rx_buff = SmokeBuff::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc);
             let prep = ClosurePrepare::new(move || (tx_buff, rx_buff));
             let outcome = handle_b
                 .accept_async(&mut welcome_b, prep)

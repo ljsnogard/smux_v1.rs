@@ -1,5 +1,5 @@
 use core::{
-    borrow::BorrowMut,
+    alloc::AllocatorClone,
     mem::MaybeUninit,
 };
 
@@ -9,6 +9,8 @@ use abs_buff::{
     x_deps::abs_cancel,
 };
 use abs_cancel::TrCancellationToken;
+use abs_mm::res_man::TrUnique;
+use mm_ptr::x_deps::abs_mm;
 use abs_smux::chan::{
     ChannelBuffAlloc, TrChannelHalf, TrChannelHandle, TrPrepareChannelRing,
 };
@@ -19,7 +21,7 @@ use crate::{
         Dock, FrameKind, MuxConnection, MuxError, ReserveErr_, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
-        ring_::new_buffered_channel_,
+        ring_::{RingBuildErr, new_buffered_channel},
         signal_::{ControlFrame_, ReadEvent_, SessionEvent_, TrEventSender_, WriteEvent_},
             util_::read_available_into_vec_,
     },
@@ -207,95 +209,37 @@ impl<C> ChannelHandle<C>
 where
     C: TrConnCfg,
 {
-    /// 「接受」这一步：校验调用方给的两块缓冲，建两条环，并把会话侧半部交给两个
-    /// 循环。
-    fn accept_prepare_<P>(&mut self, prepare: P) -> AcceptOutcomeProj_<C>
+    /// 「接受」这一步：把调用方交出的两块缓冲建两条环，并把会话侧半部交给两个循环。
+    ///
+    /// `B` 是**调用方当场给出的** ring 存储智能指针类型；它不来自配置，因此同一条
+    /// 连接上不同子流可以用不同的 `B`（见 `ring_` 模块）。
+    fn accept_prepare_<B, P>(&mut self, prepare: P) -> AcceptOutcomeProj_<C>
     where
-        P: TrPrepareChannelRing<C::Buff, C::Data>,
+        B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+        P: TrPrepareChannelRing<B, C::Data>,
     {
-        self.accept_buffs_(prepare.prepare())
+        self.accept_buffs_::<B>(prepare.prepare())
     }
 
-    /// 已经拿到两块 `C::Buff` 之后的公共安装逻辑。
+    /// 已经拿到两块 `B` 之后的公共安装逻辑。
     ///
     /// **不取任何锁**：建环与注册表登记都在这里完成不了——注册表登记挪到 step 函数
     /// （那里才有可取消的异步上下文）。因此本函数只做纯本地构造。
-    fn accept_buffs_(
-        &mut self,
-        buffs: ChannelBuffAlloc<C::Buff, C::Data>,
-    ) -> AcceptOutcomeProj_<C> {
+    fn accept_buffs_<B>(&mut self, buffs: ChannelBuffAlloc<B, C::Data>) -> AcceptOutcomeProj_<C>
+    where
+        B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+    {
         let conn = self.conn_.clone();
         let local = self.local_dock_;
         let remote = self.remote_dock_;
 
-        // 调用方 / managed 路径已经给出本子流的环存储。
         let ChannelBuffAlloc { tx_buff, rx_buff, .. } = buffs;
 
         // 建环 + 安装窗口参数（纯本地；注册表登记在身份登记时已经完成）。
         let (tx, rx, initial) =
-            install_channel_(&conn, local, remote, self.accepted_owner_.clone(), tx_buff, rx_buff)?;
+            install_channel_::<C, B>(&conn, local, remote, self.accepted_owner_.clone(), tx_buff, rx_buff)?;
         self.accepted_initial_window_ = initial;
         Result::Ok((tx, rx))
-    }
-
-    /// **由 `MuxConnection` 管理内存的 `accept` 路径**：不需要调用方实现
-    /// `TrPrepareChannelRing`，连接按调用方给出的 `ring_cap` 从自身分配器申请两块缓冲，
-    /// 具体类型由 `C::Buff` 决定。欢迎消息也要由调用方给（不需要就传一个空切片）。
-    ///
-    /// 连「空欢迎消息 + 缺省容量」都不想写时用 [`Self::accept_async_default`]。
-    pub async fn accept_async_managed<'f, W>(
-        &'f mut self,
-        welcome: &'f mut W,
-        ring_cap: usize,
-    ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
-    where
-        W: 'f + TrBuffWrite<u8>,
-
-    {
-        let conn = self.conn_.clone();
-        let config = conn.core_().config_();
-        let alloc = config.allocator();
-        let accept_result = match config.make_ring_buffs(alloc, ring_cap) {
-            Result::Ok((tx_buff, rx_buff)) => {
-                self.accept_buffs_(ChannelBuffAlloc::new(tx_buff, rx_buff))
-            }
-            Result::Err(_) => Result::Err(HandleError::AllocationFailed),
-        };
-        if accept_result.is_err() {
-            self.settled_ = true;
-            abort_pending_(
-                &self.conn_,
-                self.local_dock_,
-                self.remote_dock_,
-                self.is_initiator_,
-            );
-        }
-        MuxAcceptAsync::new(self, welcome, accept_result).await
-    }
-
-    /// **`accept` 的省事形式**：空欢迎消息 + [`TrConnCfg::RING_CAPACITY`] 缺省容量。
-    ///
-    /// 等价于 `self.accept_async_managed(&mut [], <C as TrConnCfg>::RING_CAPACITY)`。
-    ///
-    /// # 为什么不直接叫 `accept_async`
-    ///
-    /// [`TrChannelHandle::accept_async`]（`abs_smux` 的 trait 方法）已经占了这个名字，
-    /// 而且**收两个参数**（欢迎消息 + 环准备策略）。在 `ChannelHandle` 上再加一个同名的
-    /// 固有方法会把 trait 方法**遮蔽**掉——它就只能用全限定语法调用，泛型下游代码
-    /// （`handle.accept_async(&mut w, prep)`）会直接编不过。因此这里另起一个名字，
-    /// 与同族的 [`Self::accept_async_managed`] / `accept_async_closure`（测试侧扩展
-    /// trait 提供的便捷包装）保持
-    /// 同样的「加后缀」惯例。
-    ///
-    /// # Errors
-    ///
-    /// 与 [`Self::accept_async_managed`] 相同。
-    pub async fn accept_async_default(
-        &mut self,
-    ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError> {
-        let ring_cap = <C as TrConnCfg>::RING_CAPACITY;
-        let mut empty: &mut [u8] = &mut [];
-        self.accept_async_managed(&mut empty, ring_cap).await
     }
 
     /// 本条子流**为什么停下来**（若它不是被对端正常关闭的）。
@@ -309,7 +253,7 @@ where
     ///
     /// - **建流尚未裁决**（本句柄还没走过 `accept_async` / `reject_async`）：计时循环
     ///   已经向对端回过 `REJECT` 并释放了身份，同时把原因留在这里；之后调用方无论是
-    ///   走 [`Self::accept_async_managed`] / [`Self::accept_async_default`] 还是
+    ///   走 `accept_async` 还是
     ///   `reject_async`，都会**直接拿到这个超时错误**，而不是一个语义含糊的
     ///   `Closed`（或一次注定失败的成功）。
     /// - **已裁决之后**：与 [`ChannelTx::abort_reason`](super::ChannelTx::abort_reason)
@@ -328,27 +272,29 @@ where
     type Tx = ChannelTx<C>;
     type Rx = ChannelRx<C>;
 
-    type AcceptAsync<'f, Wb, P> = MuxAcceptAsync<'f, 'f, C, Wb>
+    type AcceptAsync<'f, Wb, B, P> = MuxAcceptAsync<'f, 'f, C, Wb>
     where
         Self: 'f,
         Wb: 'f + TrBuffWrite<C::Data>,
-        P: TrPrepareChannelRing<C::Buff, C::Data>;
+        B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+        P: TrPrepareChannelRing<B, C::Data>;
 
     type RejectAsync<'f, Rb> = MuxRejectAsync<'f, 'f, C, Rb>
     where
         Self: 'f,
         Rb: 'f + TrBuffRead<C::Data>;
 
-    fn accept_async<'f, Wb, P>(
+    fn accept_async<'f, Wb, B, P>(
         &'f mut self,
         welcome: &'f mut Wb,
         prepare: P,
-    ) -> Self::AcceptAsync<'f, Wb, P>
+    ) -> Self::AcceptAsync<'f, Wb, B, P>
     where
         Wb: 'f + TrBuffWrite<C::Data>,
-        P: TrPrepareChannelRing<C::Buff, C::Data>,
+        B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+        P: TrPrepareChannelRing<B, C::Data>,
     {
-        let accept_result = self.accept_prepare_(prepare);
+        let accept_result = self.accept_prepare_::<B, P>(prepare);
         if accept_result.is_err() {
             self.settled_ = true;
             abort_pending_(
@@ -548,21 +494,21 @@ type InstallOutcome_<C> = (
 
 /// 建流最终裁决的公共部分：按调用方给的缓冲建两条环、把会话侧半部交给两个循环，
 /// 并把**登记身份时建立的共享状态**安装上窗口参数。
-fn install_channel_<C>(
+fn install_channel_<C, B>(
     conn: &MuxConnection<C>,
     local: Dock,
     remote: Dock,
     owner: ChannelOwner_<<C as TrConnCfg>::Alloc>,
-    tx_buff: C::Buff,
-    mut rx_buff: C::Buff,
+    tx_buff: B,
+    mut rx_buff: B,
 ) -> Result<InstallOutcome_<C>, HandleError>
 where
     C: TrConnCfg,
+    B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
 {
     let core = conn.core_();
-    let alloc = core.config_().allocator();
     let policy = core.config_().policy();
-    let rx_cap = BorrowMut::<[MaybeUninit<u8>]>::borrow_mut(&mut rx_buff).len();
+    let rx_cap = rx_buff.deref_mut().len();
 
     // 本端接收窗口由**接收环容量**决定；发送窗口先按同一初值起算，随后被对端 `OPEN`
     // 的通告覆盖。窗口参数安装进**随身份一起建立**的共享状态里。
@@ -576,25 +522,32 @@ where
     owner.flow_().recv_window().report();
 
     // 两条环：应用写 / 循环读的是发送环，循环写 / 应用读的是接收环。
-    // 环被拒时**投一条释放消息**（不取锁）：身份由核心在下一轮 drain 里归还。
-    let (tx_w, tx_r) = match new_buffered_channel_(tx_buff, alloc.clone()) {
+    // 环被拒（容量非法）或块分配失败时**投一条释放消息**（不取锁）：身份由核心在
+    // 下一轮 drain 里归还。
+    let (tx_w, tx_r) = match new_buffered_channel(tx_buff) {
         Result::Ok(pair) => pair,
-        Result::Err(_) => {
+        Result::Err(err) => {
             let _ = core.post_session_event_(SessionEvent_::ReleaseChannel {
                 local_dock: local,
                 remote_dock: remote,
             });
-            return Result::Err(HandleError::RingRejected);
+            return Result::Err(match err {
+                RingBuildErr::Capacity(_) => HandleError::RingRejected,
+                RingBuildErr::Alloc => HandleError::AllocationFailed,
+            });
         }
     };
-    let (rx_w, rx_r) = match new_buffered_channel_(rx_buff, alloc.clone()) {
+    let (rx_w, rx_r) = match new_buffered_channel(rx_buff) {
         Result::Ok(pair) => pair,
-        Result::Err(_) => {
+        Result::Err(err) => {
             let _ = core.post_session_event_(SessionEvent_::ReleaseChannel {
                 local_dock: local,
                 remote_dock: remote,
             });
-            return Result::Err(HandleError::RingRejected);
+            return Result::Err(match err {
+                RingBuildErr::Capacity(_) => HandleError::RingRejected,
+                RingBuildErr::Alloc => HandleError::AllocationFailed,
+            });
         }
     };
 

@@ -18,6 +18,7 @@
 //!
 //! [`ChannelTx::notify_tx_ready_`]: smux_v1::connection::ChannelTx
 
+use crate::common::AcceptAsyncClosureExt;
 use abs_smux::conn::{TrChannelListener, TrConnection, TrDockBinding};
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use futures::{
@@ -101,7 +102,7 @@ pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
     .await;
 
     let dock_b = Dock::new(0x7101u32);
@@ -130,7 +131,7 @@ pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S, RT>(
             let mut welcome: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome[..];
             handle
-                .accept_async_managed(&mut welcome, K_CHANNEL_CAPACITY)
+                .accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await
         },
         async {
@@ -141,7 +142,7 @@ pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S, RT>(
             let mut welcome: [u8; 0] = [];
             let mut welcome: &mut [u8] = &mut welcome[..];
             incoming
-                .accept_async_managed(&mut welcome, K_CHANNEL_CAPACITY)
+                .accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await
         },
     );

@@ -29,17 +29,11 @@ use crate::common::SmokeBuff;
 pub fn make_passive_ring_(
     capacity: usize,
 ) -> (
-    smux_v1::connection::BufferedTx<SmokeBuff, CoreAlloc>,
-    smux_v1::connection::BufferedRx<SmokeBuff, CoreAlloc>,
+    smux_v1::connection::BufferedTx,
+    smux_v1::connection::BufferedRx,
 ) {
-    let buffer = SmokeBuff::try_new(CoreAlloc, capacity)
-        .expect("测试的传输环内存应当分配成功");
-    let ring = Ring::try_new(buffer).expect("环容量应当落在 buffex 允许的区间内");
-    let shared = Shared::new(ring, CoreAlloc);
-    // SAFETY: 这条环只被刚建出的 `Shared` 独占，且没有对应的 `Weak`（不存在升级
-    // 路径），因此两个半部各持一个强引用是安全的；与 `Ring::split_unchecked` 文档
-    // 要求的两条调用方保证一致。
-    unsafe { Ring::split_unchecked(shared) }
+    smux_v1::connection::new_buffered_channel(SmokeBuff::new_uninit_slice(capacity, CoreAlloc))
+        .expect("环容量应当落在 buffex 允许的区间内")
 }
 
 

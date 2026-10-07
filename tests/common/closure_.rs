@@ -4,7 +4,7 @@
 use core::{alloc::AllocatorClone, mem::MaybeUninit};
 use buffex::x_deps::abs_buff::TrBuffWrite;
 use abs_smux::chan::{ChannelBuffAlloc, TrChannelHandle, TrPrepareChannelRing};
-use mm_ptr::x_deps::abs_mm::res_man::TrBoxed;
+use mm_ptr::x_deps::abs_mm::res_man::TrUnique;
 use smux_v1::connection::{ChannelHandle, ChannelRx, ChannelTx, HandleError, TrConnCfg};
 
 /// 测试侧对「闭包造两块缓冲」这一常见写法的适配器。
@@ -23,7 +23,7 @@ impl<F> ClosurePrepare<F> {
 impl<F, B> TrPrepareChannelRing<B, u8> for ClosurePrepare<F>
 where
     F: FnOnce() -> (B, B),
-    B: 'static + TrBoxed<Item = [MaybeUninit<u8>]>,
+    B: 'static + TrUnique<Item = [MaybeUninit<u8>]>,
     B::Alloc: AllocatorClone,
 {
     fn prepare(self) -> ChannelBuffAlloc<B, u8> {
@@ -46,29 +46,34 @@ pub trait AcceptAsyncClosureExt<C>: Sized
 where
     C: TrConnCfg,
 {
-    async fn accept_async_closure<'f, W, F>(
+    async fn accept_async_closure<'f, W, B, F>(
         &'f mut self,
         welcome: &'f mut W,
         prepare: F,
     ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
         W: 'f + TrBuffWrite<u8>,
-        F: FnOnce() -> (C::Buff, C::Buff);
+        B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
+        B::Alloc: AllocatorClone,
+        F: FnOnce() -> (B, B);
 }
 
 impl<C> AcceptAsyncClosureExt<C> for ChannelHandle<C>
 where
     C: TrConnCfg,
 {
-    async fn accept_async_closure<'f, W, F>(
+    async fn accept_async_closure<'f, W, B, F>(
         &'f mut self,
         welcome: &'f mut W,
         prepare: F,
     ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
         W: 'f + TrBuffWrite<u8>,
-        F: FnOnce() -> (C::Buff, C::Buff),
+        B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
+        B::Alloc: AllocatorClone,
+        F: FnOnce() -> (B, B),
     {
-        self.accept_async(welcome, ClosurePrepare::new(prepare)).await
+        self.accept_async::<W, B, _>(welcome, ClosurePrepare::new(prepare))
+            .await
     }
 }

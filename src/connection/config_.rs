@@ -1,41 +1,34 @@
 //! 复用连接的资源策略 [`TrConnCfg`]。
 //!
-//! 上游 [`abs_smux::conf::TrMuxConfig`] 已收敛 `Data` / `Dock` / `Buff` 三个
-//! 类型；本 trait 只补上连接内部还需要、但上游不关心的两样东西：内部结构使用的
-//! 分配器，以及流控策略。两条传输半边的类型也放在这里，公开类型因此只需要
-//! `MuxConnection<C>` 一个参数（运行时值由本 trait 的 `Rt` 关联类型给出）。
+//! 上游 [`abs_smux::conf::TrMuxConfig`] 只剩 `Data` / `Dock` 两个类型；本 trait 补上
+//! 连接内部还需要、但上游不关心的几样东西：内部结构使用的分配器、流控策略、两条传输
+//! 半边，以及运行时值。公开类型因此只需要 `MuxConnection<C>` 一个参数。
 //!
-//! # 子流环的存储
+//! **缓冲类型不在配置里**：一条子流用哪种智能指针持有它的 ring 内存，是调用方在
+//! `accept_async` 时**当场**交出的；连接级帧暂存缓冲同理（`MuxConnection::new` 的
+//! 实参）。配置只回答「内部结构用什么分配器、跑在哪个运行时」。
 //!
-//! 子流环的智能指针类型由上游 [`TrMuxConfig::Buff`](abs_smux::conf::TrMuxConfig::Buff) 声明，连接侧按它静态参数化
-//! 两个循环的本地表、两条事件通道与两个半部。**具体实例**（每条 channel 分配
-//! 多少、从哪来）由使用环境在最终裁决建立 channel 时通过
-//! [`TrPrepareChannelRing`](abs_smux::chan::TrPrepareChannelRing)（`accept_async`
-//! 的 `prepare` 参数）当场交出；连接只负责校验——大小不合适就拒绝接受。
+//! # 缓冲从哪来
 //!
-//! # 连接级环的存储
-//!
-//! 连接级（「帧暂存」）两条环的存储类型由 [`TrConnCfg::StageBuff`] 声明，实例由
-//! [`TrConnCfg::make_stage_buffs`] 造出：它与 [`TrMuxConfig::Buff`] **解耦**，
-//! 因此帧暂存的容量不受「子流环容量」这一策略支配（连接级环至少要能驻留一个
-//! 满帧，见 `session_` 模块文档）。
+//! 子流环与连接级帧暂存的缓冲都由**调用方当场交出**（前者经 `accept_async` 的
+//! `prepare`，后者是 `MuxConnection::new` 的实参），类型是任意 `TrUnique` 的智能
+//! 指针。连接把它们一律吸收成 `ring_` 模块里的类型无关句柄，内部签名里看不到具体
+//! 指针类型；分配次数与容量都由调用方决定，连接只校验容量是否可用。
 
 extern crate alloc;
 
 use core::{
     alloc::AllocatorClone,
-    borrow::BorrowMut,
     marker::PhantomData,
-    mem::MaybeUninit,
 };
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
 use abs_smux::conf::TrMuxConfig;
-use abs_mm::{CoreAlloc, res_man::TrBoxed};
+use abs_mm::CoreAlloc;
 use mm_ptr::x_deps::abs_mm;
 
 use crate::{
-    connection::{Dock, MuxChanBuffOwnedBy},
+    connection::Dock,
     flow_ctrl::{DefaultPolicy, TrFlowCtrlPolicy},
     handshake::agent::HandshakeDelivery,
     metrics::{NoMetrics, TrMetricsSink},
@@ -49,11 +42,6 @@ pub trait TrMuxAllocConfig {
     /// Allocator for ChannelOwner
     type ChanOwnerAlloc: AllocatorClone;
 }
-
-/// managed 路径构造环缓冲失败。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("构造 channel ring 缓冲失败")]
-pub struct BuffAllocError;
 
 /// **连接级**帧暂存环的容量常数（两块：读环、写环）。
 ///
@@ -87,18 +75,7 @@ pub const K_STAGE_RING_CAPACITY: usize = 64usize * 1024usize;
 /// （即集成方在 `Cargo.toml` 里选定的后端），测试配置可以换成假运行时值。
 pub trait TrConnCfg
 where
-    Self: TrMuxConfig<
-        Data = u8,
-        Dock = Dock,
-        // 上游只用 `TrBoxed` 描述 `Buff`——能 `Deref` 到切片、并能报出自己那块内存的
-        // 分配器。连接侧还要把它当 `buffex::ring` 的环存储用，而那要求**可变**借用
-        // （`BorrowMut`），上游不保证这一条，因此在这里补上。
-        //
-        // 它必须挂在 **supertrait 的关联类型绑定**上（而不是写成 trait 的普通
-        // `where Self::Buff: …`）：绑定会随 `C: TrConnCfg` 一起进入使用环境，而普通
-        // where 子句不会——后者会逼着每一个用到 `C::Buff` 的签名自己再抄一遍约束。
-        Buff: BorrowMut<[MaybeUninit<u8>]>,
-    > + 'static,
+    Self: TrMuxConfig<Data = u8, Dock = Dock> + 'static,
 {
     /// **运行时值**：提供「现在几点」（[`TrClock`]）与「怎么等」（[`TrDelay`]）。
     ///
@@ -130,20 +107,6 @@ where
     /// 连接侧的写 / 读半边（即两条传输的缓冲类型）。
     type ConnTx: TrBuffWrite<u8>;
     type ConnRx: TrBuffRead<u8>;
-
-    /// **连接级**两条帧暂存环的存储类型（读环一块、写环一块）。
-    ///
-    /// 与 [`TrMuxConfig::Buff`] **同形**：两者都是「由外部交出、供环使用」的智能指针
-    /// （[`TrBoxed`]），只是容量来源不同——子流环容量由调用方在 `accept_async` 逐条
-    /// 决定，帧暂存容量是**连接级**策略，两者不该互相绑架。容量下限由实现者保证
-    /// （至少能整块驻留一个满帧，见 `session_` 模块文档），连接不再二次校验。
-    ///
-    /// 这里刻意**不**要求 `Send + Sync`：是否需要跨线程搬运由具体装配决定
-    /// （`MuxConnection::new` 才要求 `C::StageBuff: Send + Sync`），与
-    /// [`TrMuxConfig::Buff`] 的约束保持同一层级。
-    type StageBuff: 'static
-        + BorrowMut<[MaybeUninit<u8>]>
-        + TrBoxed<Item = [MaybeUninit<u8>]>;
 
     /// 取一个**运行时值**（克隆句柄；各处共享同一个时间轴与计时器）。
     ///
@@ -197,37 +160,10 @@ where
     /// ```
     fn metrics(&self) -> &Self::Metrics;
 
-    /// 用自身分配器造出一对该 channel 使用的环缓冲（Tx、Rx）。
+    /// 子流环的**建议容量**：调用方自己分配那块内存时可以参考它。
     ///
-    /// 这是 managed 路径的扩展点：`C::Buff` 是具体类型时返回具体缓冲，
-    /// 因此整个数据面可以完全单态化、没有 `dyn`。
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError>;
-
-    /// 用自身分配器造出连接级两条帧暂存环的存储：`(读环, 写环)`。
-    ///
-    /// 与 [`Self::make_ring_buffs`] 的差别不只是类型：**容量在这里由配置决定**，
-    /// 调用方不需要（也不应该）知道帧暂存要多大。
-    ///
-    /// # Errors
-    ///
-    /// 分配失败时返回 [`BuffAllocError`]；调用方（[`MuxConnection::new`]）把它视为
-    /// 连接无法建立。
-    ///
-    /// [`MuxConnection::new`]: crate::connection::MuxConnection::new
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError>;
-
-    /// 子流环的**缺省容量**：`accept` 那条「连接替你管内存」的省事路径用它。
-    ///
-    /// 它只是省事路径的缺省值，不是协议或实现的下限——子流环容量本身由调用方逐条
-    /// 决定（[`Self::make_ring_buffs`] 收的就是逐条传进来的容量），本项给默认值，
-    /// 因此实现者不必关心它。
+    /// 它不是协议或实现的下限——容量完全由调用方决定（交多大就用多大），本项只是
+    /// 「没特别想法时给一个够用的数」。
     const RING_CAPACITY: usize = K_DEFAULT_CHANNEL_RING_CAPACITY;
 }
 
@@ -385,7 +321,6 @@ where
 {
     type Data = u8;
     type Dock = Dock;
-    type Buff = MuxChanBuffOwnedBy<CoreAlloc>;
 }
 
 impl<W, R, M, P, Rt> TrConnCfg for DefaultConnCfg<W, R, M, P, Rt>
@@ -402,7 +337,6 @@ where
     type ConnTx = W;
     type ConnRx = R;
     type Metrics = M;
-    type StageBuff = MuxChanBuffOwnedBy<CoreAlloc>;
 
     fn runtime(&self) -> Self::Rt {
         self.rt_.clone()
@@ -427,19 +361,4 @@ where
         &self.metrics_
     }
 
-    fn make_ring_buffs(
-        &self,
-        alloc: Self::Alloc,
-        capacity: usize,
-    ) -> Result<(Self::Buff, Self::Buff), BuffAllocError> {
-        MuxChanBuffOwnedBy::pair_from_alloc(alloc, capacity).map_err(|_| BuffAllocError)
-    }
-
-    fn make_stage_buffs(
-        &self,
-        alloc: Self::Alloc,
-    ) -> Result<(Self::StageBuff, Self::StageBuff), BuffAllocError> {
-        MuxChanBuffOwnedBy::pair_from_alloc(alloc, K_STAGE_RING_CAPACITY)
-            .map_err(|_| BuffAllocError)
-    }
 }
