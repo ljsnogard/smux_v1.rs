@@ -678,7 +678,7 @@ fn probe_write_code_against_mux_error_(err: MuxError) -> ErrClass_ {
 /// 【F9 ✅ 探针】同一段代码也可以直接吃**连接的关联错误类型**。
 #[allow(dead_code)]
 fn probe_classify_connection_error_<RT>(
-    err: <Mux<RT> as TrConnection<SmokeCfg<RT>>>::Err,
+    err: <Mux<RT> as TrConnection>::Err,
 ) -> ErrClass_
 where
     RT: common::TrSmokeRt,

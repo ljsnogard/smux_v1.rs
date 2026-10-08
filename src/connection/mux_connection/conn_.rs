@@ -7,7 +7,11 @@ use abs_art::{TrJoinHandle, TrLocalScope};
 use abs_buff::gen_may_cancel_future;
 use abs_cancel::TrCancellationToken;
 use abs_mm::res_man::TrUnique;
-use abs_smux::{conn::TrConnection, dock::TrDock};
+use abs_smux::{
+    conf::TrMuxConfig,
+    conn::TrConnection,
+    dock::TrDock,
+};
 use buffex::x_deps::{abs_buff, abs_cancel};
 use mm_ptr::{Shared, x_deps::abs_mm};
 
@@ -450,19 +454,22 @@ where
     }
 }
 
-impl<C> TrConnection<C> for MuxConnection<C>
+impl<C> TrConnection for MuxConnection<C>
 where
     C: TrConnCfg,
 {
-    type Err = BindError;
-
+    type Config = C;
     type DockBinding = DockBinding<C>;
+    type Err = BindError;
 
     type BindAsync<'f> = MuxBindAsync<'f, 'f, C>
     where
         Self: 'f;
 
-    fn bind_async<'f>(&'f self, local_dock: C::Dock) -> Self::BindAsync<'f> {
+    fn bind_async<'f>(
+        &'f self,
+        local_dock: <Self::Config as TrMuxConfig>::Dock,
+    ) -> Self::BindAsync<'f> {
         MuxBindAsync::new(self, local_dock)
     }
 }
