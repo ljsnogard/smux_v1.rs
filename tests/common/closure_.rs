@@ -6,6 +6,7 @@ use buffex::x_deps::abs_buff::TrBuffWrite;
 use abs_smux::{
     chan::{RingBuffAlloc, TrChannelHandle, TrPrepareRing},
     conn::TrDockBinding,
+    telegraph::TrTelegraphBinding,
 };
 use mm_ptr::x_deps::abs_mm::res_man::TrUnique;
 use smux_v1::connection::{
@@ -139,6 +140,10 @@ where
         B::Alloc: AllocatorClone,
         F: FnOnce() -> (B, B),
     {
-        TrDockBinding::open_telegraph_async::<B, _>(self, TgClosurePrepare::new(prepare)).await
+        <DockBinding<C> as TrTelegraphBinding<C>>::open_telegraph_async(
+            self,
+            TgClosurePrepare::new(prepare),
+        )
+        .await
     }
 }

@@ -42,7 +42,7 @@
 //!
 //! 1. 「按 `local_dock` 枚举**具体子流**」是一次开区间 `range`，两个哨兵行自然被
 //!    排除（见 [`channel_range_`]）；
-//! 2. 「channel 与 telegraph 不得共用 local_dock」（[`abs_smux::conn::TrTelegraph`]
+//! 2. 「channel 与 telegraph 不得共用 local_dock」（[`abs_smux::telegraph::TrTelegraph`]
 //!    的约束）退化成对 `(local, unspecified)` 的一次查找，不再需要单独的用途枚举；
 //! 3. listener 与 channel 是不同键，天然可以共存于同一个 `local_dock`。
 //!
@@ -1264,7 +1264,7 @@ where
     /// 在 `local_dock` 上登记**telegraph 端点身份**（`open_telegraph_async` 的登记点）。
     ///
     /// telegraph **独占**该 `local_dock`：不允许已有 telegraph、listener 或任何
-    /// 具体子流（见 [`abs_smux::conn::TrTelegraph`] 的文档约束）。
+    /// 具体子流（见 [`abs_smux::telegraph::TrTelegraph`] 的文档约束）。
     ///
     /// # Errors
     ///

@@ -25,7 +25,7 @@
 //! | [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) | [`ChannelHandle`] | 入向请求的待决句柄；`accept_async` / `reject_async` |
 //! | [`TrChannelTx`](abs_smux::chan::TrChannelTx) | [`ChannelTx`] | 子流发送半边，包一个 `buffex` 生产端（`TrBuffTryWrite`） |
 //! | [`TrChannelRx`](abs_smux::chan::TrChannelRx) | [`ChannelRx`] | 子流接收半边，包一个 `buffex` 消费端（`TrBuffTryRead`） |
-//! | [`TrTelegraph`](abs_smux::conn::TrTelegraph) | [`Telegraph`] | 数据报端点工厂；`split` 出 [`TelegraphTx`] / [`TelegraphRx`] |
+//! | [`TrTelegraph`](abs_smux::telegraph::TrTelegraph) | [`Telegraph`] | 数据报端点工厂；`split` 出 [`Sender`] / [`Receiver`] |
 //! | [`TrDock`](abs_smux::dock::TrDock) | [`Dock`] | dock 的具体类型（见 §4） |
 //!
 //! 子流的 `Tx` / `Rx` 实现的是**非阻塞（try）**接口：应用只与本地环形缓冲打交道，
@@ -242,7 +242,7 @@
 //! 错的地方。
 //!
 //! `channel` 与 `telegraph` **不得共用同一个 local_dock**（见
-//! [`TrTelegraph`](abs_smux::conn::TrTelegraph) 的文档）；绑定期由注册表拒绝，
+//! [`TrTelegraph`](abs_smux::telegraph::TrTelegraph) 的文档）；绑定期由注册表拒绝，
 //! 报 [`BindError::DockInUse`]。
 //!
 //! 同样在绑定期：一个 `local_dock` 在任意时刻**至多被一个 `DockBinding` 占用**
@@ -322,7 +322,7 @@
 //! ### 4.3 统一身份表：channel / telegraph / listener / wait-close
 //!
 //! 三类子流的身份**元数并不相同**：channel 有 `(local_dock, remote_dock)` 两个
-//! 具体值；telegraph（[`TrTelegraph`](abs_smux::conn::TrTelegraph)）的
+//! 具体值；telegraph（[`TrTelegraph`](abs_smux::telegraph::TrTelegraph)）的
 //! `remote_dock` 是**逐次操作的实参**，端点本身只占一个 `local_dock`；listener
 //! 则天然等待**任意** `remote_dock`。但连接内部只用**一张**索引表管理它们：
 //!
@@ -510,7 +510,7 @@
 //! | `channel_listener` | [`ChannelListener`] + `income_async` | `TrChannelListener` |
 //! | `channel_handle` | [`ChannelHandle`] + accept / reject | `TrChannelHandle` |
 //! | `channel_half` | [`ChannelTx`] / [`ChannelRx`]（各自即环半部的具名包装） | `TrChannelTx` / `TrChannelRx` / `TrChannelHalf` |
-//! | `telegraph` | [`Telegraph`] | `TrTelegraph` |
+//! | `telegraph` | [`Telegraph`] / [`Sender`] / [`Receiver`] / [`RecvDatagram`] | `TrTelegraph` / `TrDatagramSender` / `TrDatagramRecver` / `TrRecvDatagram` |
 //! | `config_` | [`TrConnCfg`] | —（本 crate 自有） |
 //! | `types_` / `util_` | 公开类型别名 / 控制面小工具 | — |
 //! | `test_support_` | 测试专用：无循环连接、空作用域、测试策略（`#[cfg(test)]`） | — |
@@ -570,9 +570,7 @@ pub use ring_::{
     new_buffered_channel,
 };
 pub use scope_host_::{DefaultRt_, ScopeHost, default_rt_};
-pub use telegraph::{DemandErr, Telegraph, TelegraphError, TelegraphRx, TelegraphTx};
 
-
-
+pub use telegraph::{DemandErr, Receiver, RecvDatagram, Sender, Telegraph, TelegraphError};
 
 pub use types_::Dock;

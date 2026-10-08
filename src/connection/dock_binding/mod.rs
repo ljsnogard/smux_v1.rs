@@ -8,3 +8,5 @@ mod binding_;
 pub use binding_::{
     BindingError, DockBinding,
 };
+
+pub(crate) use binding_::map_reserve_err_;

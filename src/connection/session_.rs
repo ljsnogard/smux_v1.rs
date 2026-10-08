@@ -125,6 +125,7 @@ use crate::{
             ControlFrame_, EventReceiver_, EventSender_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteEvent_,
         },
+        telegraph::TgRecvCtx_,
     },
     flow_ctrl::{Credit, WindowReport},
     metrics::{ChannelCloseReason, FrameDir, TrMetricsSink},
@@ -350,22 +351,11 @@ type WriteTable_<A> = BTreeMap<(Dock, Dock), WriteEntry_<A>, A>;
 // telegraph 的两个本地表
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-/// 解复用循环本地持有的一条 telegraph：接收环的**写端**与身份句柄。
+/// telegraph 的读表项：解复用循环持有的**接收上下文**（接收环写端 + 身份句柄）。
 ///
-/// 身份句柄是必需的：**已收报文长度**记在身份节点内联的接收队列里（`TgLenQueue_`），
-/// 循环每收下一条完整报文都要往那里入队并唤醒应用侧——环本身只是字节流，不知道
-/// 「哪几个字节是一条报文」。
-struct TgReadEntry_<A>
-where
-    A: AllocatorClone + Send + Sync + 'static,
-{
-    /// 该端点的身份节点句柄（含接收长度队列）。
-    owner_: TgOwner_<A>,
-
-    /// 会话侧接收环写端（本循环写、应用读）。
-    writer_: BufferedTx,
-}
-
+/// 它把「帧头 + 载荷」整帧投进接收环，并由**接收侧**自行拆出远端地址与载荷——中心
+/// 循环因此完全不理解 `DATAGRAM` 的字段语义（见 [`TgRecvCtx_`] 的模块文档）。
+///
 /// 复用循环本地持有的一条 telegraph：发送环的**读端** + 身份句柄。
 ///
 /// 身份句柄是必需的：**已提交报文长度**记在身份节点内联的队列里（`TgLenQueue_`），
@@ -381,11 +371,14 @@ where
     reader_: BufferedRx,
 }
 
-/// 解复用循环的 telegraph 表：`local_dock` → 接收环写端。
+/// 解复用循环的 telegraph 表：`local_dock` → 接收上下文。
 ///
 /// 键只有 `local_dock`：telegraph **独占**该 dock（协议不允许它与 channel / listener
 /// 共用），对端地址在数据报里是**地址**而不是**身份**，因此没有第二个键维度。
-type TgReadTable_<A> = BTreeMap<Dock, TgReadEntry_<A>, A>;
+///
+/// 表里**有**条目就是「有接收方」：没有条目时到达的 `DATAGRAM` 整帧丢弃，连丢弃计数
+/// 都不记（无人可归因）。
+type TgReadTable_<A> = BTreeMap<Dock, TgRecvCtx_<A>, A>;
 
 /// 复用循环的 telegraph 表：`local_dock` → 发送环读端与身份句柄。
 type TgWriteTable_<A> = BTreeMap<Dock, TgWriteEntry_<A>, A>;
@@ -976,7 +969,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 .collect();
             for local_dock in gone {
                 if let Option::Some(mut entry) = tg_table.remove(&local_dock) {
-                    entry.writer_.close();
+                    entry.close_();
                 }
             }
             tg_live.clear();
@@ -1338,72 +1331,21 @@ pub(crate) async fn demux_loop_async_<C, K>(
             }
             FrameKind::Datagram => {
                 // 数据报（telegraph）：**地址**语义，按帧头的 `RemoteDock`（= 本端
-                // local_dock）找到那条端点，把**整条**载荷写进它的接收环。
+                // local_dock）找到那条端点的接收上下文，把**整帧**（帧头 + 载荷）
+                // 交给它——由它自行拆出远端地址与载荷，并自行处置「装不下就整条丢弃」。
                 //
-                // 三条要点：
+                // 两条要点：
                 //
                 // 1. **不查宽限态、不报协议违例**：数据报没有身份可言，发往一个本端
-                //    没有 telegraph 的 dock 只是「没人收」，静默丢弃即可（对端可能按
-                //    `wildcard` 发过来）；
-                // 2. **装不下就整条丢弃**：先按 `free_size` 判空间，不够就丢，绝不留
-                //    半条——半条会破坏应用侧「recv 返回的长度就是报文长度」的契约；
-                // 3. **先写环、再入队**：应用侧 `recv_async` 一旦拿到长度就保证内容已在
-                //    环里，因此顺序不可反。
-                let Some(entry) = tg_table.table.get_mut(&local) else {
+                //    没有 telegraph 的 dock 只是「没人收」（对端可能按 `wildcard` 发
+                //    过来），**整个帧直接丢弃**即可——连丢弃计数都不记，因为无人可
+                //    归因；
+                // 2. 中心循环**不认识数据报的内部结构**：帧头不被拆解，帧头与载荷
+                //    一起投出去（见 `telegraph::recv_ctx_` 的模块文档）。
+                let Some(ctx) = tg_table.table.get_mut(&local) else {
                     continue;
                 };
-                // 两项容量都**先判**，再动手：这样「写进环」与「入长度队列」之间不会
-                // 出现「一半成功、一半失败」的中间态，也就不需要任何撤回操作。
-                //
-                // - 长度队列满：说明应用侧没在取（它只是尽力交付的接收方），整条丢弃；
-                // - 环剩余空间不足：**整条丢弃**，绝不留半条——半条会破坏应用侧
-                //   「`recv_async` 返回的长度就是下一条报文长度」的契约。
-                if entry.owner_.in_().is_full_()
-                    || (len > 0usize && entry.writer_.ring_state().free_size() < len)
-                {
-                    shared
-                        .metrics_()
-                        .on_datagram_dropped(local, remote, u32::try_from(len).unwrap_or(u32::MAX));
-                    continue;
-                }
-                // 段级循环把整条载荷写进接收环：每次借一段、写满再借下一段。环容量可能
-                // 小于报文长度（调用方自愿这么配），因此必须跨段推进；而上面的容量检查
-                // 与本循环之间没有 `await`，所以它一定能写完。
-                let mut offset = 0usize;
-                let mut failed = false;
-                while offset < len {
-                    let demand = Demand::at_least(1usize);
-                    let mut outcome = entry.writer_.try_write(&demand);
-                    let put = match outcome.as_mut().pick_left() {
-                        Option::Some(segm) => {
-                            let mut child = segm.as_segm_mut();
-                            let limit = core::cmp::min(len - offset, child.least_count());
-                            child.clone_items_from_buff(&bytes[offset..offset + limit])
-                        }
-                        Option::None => 0usize,
-                    };
-                    if put == 0usize {
-                        // 容量检查之后环被关闭（连接正在收尾）：如实丢弃已写进去的那部分
-                        // ——它们没有对应的长度记录，应用侧永远不会读到它们。
-                        failed = true;
-                        break;
-                    }
-                    offset += put;
-                }
-                if failed {
-                    shared
-                        .metrics_()
-                        .on_datagram_dropped(local, remote, u32::try_from(len).unwrap_or(u32::MAX));
-                    continue;
-                }
-                // 整条已就位：入队长度（含 `len == 0` 的空报文），再唤醒应用侧。
-                // 接收方向的队列只记长度（来源地址对应用无用：报文已按本端 dock 路由过）。
-                entry
-                    .owner_
-                    .in_()
-                    .try_push_(Dock::unspecified(), len)
-                    .expect("容量已判过");
-                entry.owner_.in_().notify_();
+                ctx.deliver_frame_(&header, bytes, shared.metrics_());
             }
         }
     }
@@ -1528,13 +1470,7 @@ where
             writer_,
         } => {
             // 与 channel 的 `Attach` 同形：重复附直接覆盖，不会留下陈旧条目。
-            tg_table.insert(
-                local_dock,
-                TgReadEntry_ {
-                    owner_: owner,
-                    writer_,
-                },
-            );
+            tg_table.insert(local_dock, TgRecvCtx_::new_(local_dock, owner, writer_));
         }
     }
     Result::Ok(())
@@ -1854,7 +1790,7 @@ where
 {
     fn drop(&mut self) {
         for entry in self.table.values_mut() {
-            entry.writer_.close();
+            entry.close_();
         }
     }
 }
