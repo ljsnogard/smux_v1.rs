@@ -2543,54 +2543,65 @@ where
         // 写环暂时放不下整帧：整帧推迟（长度记录留在队列里，发送环也不动）。
         return Result::Err(MuxError::Closed);
     }
-    // 一次性借出写段（空间已确认足够），先把帧头写进去。
-    let demand = Demand::at_least(total);
-    let mut outcome = tx_stage.try_write(&demand);
-    let writable = match outcome.as_mut().pick_left() {
-        Option::Some(segm) => segm,
-        Option::None => return Result::Err(MuxError::Closed),
-    };
-    let mut dst = writable.as_segm_mut();
-    {
-        let mut src = head;
-        while !src.is_empty() {
-            let put = dst.clone_items_from_buff(src);
-            if put == 0usize {
-                return Result::Err(MuxError::Closed);
-            }
-            src = &src[put..];
-        }
-    }
-    // 再从发送环借出**载荷段**，直接搬进同一个写段（零拷贝，不经过任何暂存）。
+
+    // **先把载荷段借到手，再往写环里写第一个字节**：帧头一旦写出就无法回退，因此一切
+    // 可能失败的借段都必须发生在写之前。借出的段在函数末尾 drop，按**实际搬出量**提交
+    // 消费；提前返回时消费量为 0，发送环不受影响。
     let read_demand = Demand::at_least(payload_len);
     let mut read_outcome = entry.reader_.try_read(&read_demand);
-    let readable = match read_outcome.as_mut().pick_left() {
-        Option::Some(segm) => segm,
-        Option::None => return Result::Err(MuxError::Closed),
+    let mut payload_segm = if payload_len == 0usize {
+        Option::None
+    } else {
+        match read_outcome.as_mut().pick_left() {
+            Option::Some(segm) => Option::Some(segm),
+            Option::None => return Result::Err(MuxError::Closed),
+        }
     };
-    let mut src = readable.as_segm_ref();
-    // **按本条报文长度精确搬移**。
-    //
-    // 关键点：`move_items_to_segm` 是**整段搬运**——它会把源段里**全部**剩余数据搬走
-    // （实测：本条只要 5 字节，它搬了 205 字节，把后续报文的载荷一起吃进这一帧）。
-    // 因此必须**先把源段裁剪到本条长度**，再搬：`take_segm_ref(Demand::exactly(..))`
-    // 会按需求收窄实际消费量，`self` 的剩余量随之减少，多搬在构造上不再可能。
+
+    // 写环的**总**空间已判够，且本循环是它唯一的写入者：下面两个段级循环因此一定能推
+    // 到底。跨**物理片**由循环承担——这正是「整帧原子性」的落点：`try_write` 每次只给
+    // 当前那一片，写满就换下一片，绝不会把「头已写、载荷没跟上」的残帧留在环里。
+    let mut head_left = head;
+    while !head_left.is_empty() {
+        let demand = Demand::at_least(1usize);
+        let mut outcome = tx_stage.try_write(&demand);
+        let writable = match outcome.as_mut().pick_left() {
+            Option::Some(segm) => segm,
+            Option::None => return Result::Err(MuxError::Closed),
+        };
+        let put = writable.as_segm_mut().clone_items_from_buff(head_left);
+        if put == 0usize {
+            return Result::Err(MuxError::Closed);
+        }
+        head_left = &head_left[put..];
+    }
+
     let mut left = payload_len;
     while left > 0usize {
-        let mut piece = src.as_segm_ref();
-        let ask = Demand::exactly(left);
-        let Option::Some(mut piece) = piece.take_segm_ref(&ask) else {
-            return Result::Err(MuxError::Closed);
+        let demand = Demand::at_least(1usize);
+        let mut outcome = tx_stage.try_write(&demand);
+        let writable = match outcome.as_mut().pick_left() {
+            Option::Some(segm) => segm,
+            Option::None => return Result::Err(MuxError::Closed),
         };
-        let take = core::cmp::min(left, piece.least_count());
-        if take == 0usize {
+        let moved = {
+            let mut dst = writable.as_segm_mut();
+            let mut src = match payload_segm.as_mut() {
+                Option::Some(segm) => segm.as_segm_ref(),
+                Option::None => return Result::Err(MuxError::Closed),
+            };
+            // **按本条剩余长度精确裁剪源段**：`move_items_to_segm` 是整段搬运，不裁剪
+            // 会把后续报文的载荷一起吃进这一帧（旧实现撞过的坑）。
+            let ask = Demand::exactly(left);
+            let Option::Some(mut piece) = src.take_segm_ref(&ask) else {
+                return Result::Err(MuxError::Closed);
+            };
+            dst.move_items_from_segm(&mut piece)
+        };
+        if moved == 0usize {
             return Result::Err(MuxError::Closed);
         }
-        let moved = piece.move_items_to_segm(&mut dst);
-        if moved != take {
-            return Result::Err(MuxError::Closed);
-        }
-        left -= moved;
+        left -= core::cmp::min(left, moved);
     }
 
     // 写段与读段在这里 drop：各自提交指针、唤醒对端。
