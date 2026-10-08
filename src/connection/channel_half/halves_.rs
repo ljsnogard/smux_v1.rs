@@ -33,13 +33,13 @@
 
 use abs_buff::{
     Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
+    buffer::TrProducerState,
     x_deps::anylr,
 };
 use abs_smux::chan::{TrChannelHalf, TrChannelRx, TrChannelTx};
 use anylr::SomeOf;
 use buffex::{
-    ring::{ConsumerError, ProducerError},
-    x_deps::abs_buff,
+    ring::{ConsumerError, ProducerError}, x_deps::abs_buff::{self, buffer::TrConsumerState},
 };
 
 use crate::{
@@ -349,7 +349,16 @@ where
 impl<C> TrChannelTx<C> for ChannelTx<C>
 where
     C: TrConnCfg,
+{}
+
+impl<C> TrProducerState for ChannelTx<C>
+where
+    C: TrConnCfg,
 {
+    #[inline]
+    fn producer_state(&self) -> Option<(usize, bool)> {
+        self.ring_.producer_state()
+    }
 }
 
 /// 子流接收半边（应用侧**消费端**）。
@@ -526,8 +535,7 @@ impl<C> TrBuffTryRead<u8> for ChannelRx<C>
 where
     C: TrConnCfg,
 {
-    type SegmRef<'f>
-        = <BufferedRx as TrBuffTryRead<u8>>::SegmRef<'f>
+    type SegmRef<'f> = <BufferedRx as TrBuffTryRead<u8>>::SegmRef<'f>
     where
         Self: 'f;
 
@@ -585,6 +593,15 @@ impl<C> TrChannelRx<C> for ChannelRx<C>
 where
     C: TrConnCfg,
 {}
+
+impl<C> TrConsumerState for ChannelRx<C>
+where
+    C: TrConnCfg,
+{
+    fn consumer_state(&self) -> Option<(usize, bool)> {
+        self.ring_.consumer_state()
+    }
+}
 
 #[cfg(test)]
 mod tests_ {
