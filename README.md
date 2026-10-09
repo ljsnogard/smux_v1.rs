@@ -143,6 +143,8 @@ flush 钩子、`buffex` 主动泵只做单次 poll）写在
 ```bash
 cd smux_v1
 cargo run --example active_passive           # 本文 §2 的两段代码，可运行版本
+cargo run --example connect_single_thread    # 单线程起连接：DefaultConnCfg + 内存环直连
+cargo run --example connect_multi_thread     # 多线程起连接：CurrentConnCfg + 句柄跨线程
 
 cargo test --test inmem_mux                  # 内存环直连：握手 → 建流 → 收发 → 半关闭
 cargo test --test smoke_compio small_socket  # 真实 UNIX socket，2 dock × 2 子流，秒级（缺省装配）
@@ -152,6 +154,13 @@ just test                                    # 全量：两套冒烟 + 文档测
 ```
 
 单条用例 `just test-one <名字片段>`；单个目标 `just test-target inmem_mux`。
+
+后两个示例是**同一件事的两种装配**，都只演示「起连接」（内存环直连，不碰 socket）：
+
+| 示例 | 配置 | 连接跨线程 |
+| --- | --- | --- |
+| [`connect_single_thread`](examples/connect_single_thread.rs) | `DefaultConnCfg`：运行时值**存进**配置 | compio 装配下 `!Send`（单线程下最省事） |
+| [`connect_multi_thread`](examples/connect_multi_thread.rs) | `CurrentConnCfg`：运行时值**不存**，每次从当前上下文取 | `Send + Sync`：worker 线程自建一个运行时上下文，就能拿连接句柄 `bind_async` / `open_channel_async` |
 
 ## 5. 六条使用须知
 
