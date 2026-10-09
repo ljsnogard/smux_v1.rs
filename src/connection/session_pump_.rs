@@ -90,18 +90,60 @@ where
     }
 }
 
+/// 读泵持有的连接读环写端，**退出时显式封口**。
+///
+/// # 为什么不能只靠 drop
+///
+/// `buffex` 的环半部被 drop **不会**置位关闭标记、也不会唤醒 park 的读者。而读泵退出
+/// 时，内侧解复用循环（`demux_loop_async_`）很可能正 park 在这条连接读环的读端上
+/// ——只 drop 写端等于把「字节流到此为止」这件事静默丢掉：demux 永远醒不过来，连接读环
+/// 永远不封口，各子流的接收环也就不会被关掉，应用侧那条「同步等到 EOF」的读
+/// （`AsStdRead` → `block_on_local`）随之永久挂起。
+///
+/// 本 crate 在 demux 退出时已经显式 `close()` 各子流环的写端（见 `DemuxLocalGuard_`，
+/// 那里的注释记着同一条理由）；这里用同一个手法覆盖读泵的**每一条**退出路径。
+/// 做成守卫而不是逐点调用，是为了连 panic 展开也算在内。
+struct StageCloseGuard_ {
+    /// 连接读环的写端（`transport Rx → 连接读环` 的那个环）。
+    stage: BufferedTx,
+}
+
+impl core::ops::Deref for StageCloseGuard_ {
+    type Target = BufferedTx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stage
+    }
+}
+
+impl core::ops::DerefMut for StageCloseGuard_ {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stage
+    }
+}
+
+impl Drop for StageCloseGuard_ {
+    fn drop(&mut self) {
+        // 显式封口：把「环空而 park 的读者」唤醒成 `Closing`（EOF 语义）。
+        self.stage.close();
+    }
+}
+
 /// 读泵：`transport Rx → 连接读环`。
 ///
 /// `shared` 只用于在连接级失败时打标记；本循环不认识任何子流。
 pub(crate) async fn rx_pump_loop_async_<C, K>(
     mut rx: C::ConnRx,
     shared: ByteLoopShared_<C::Alloc, C::Metrics>,
-    mut stage: BufferedTx,
+    stage: BufferedTx,
     cancel: K,
 ) where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
+    // 写端交给守卫：无论从哪条路径退出（对端关闭 / 取消 / 写失败 / panic），
+    // 都要显式封口并唤醒 demux。
+    let mut stage = StageCloseGuard_ { stage };
     loop {
         if cancel.is_cancelled() {
             return;
