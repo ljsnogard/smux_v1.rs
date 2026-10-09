@@ -205,3 +205,38 @@ doctest 全绿（含新增的 `try_current` 示例）。
    推断与 tokio 一致）。
 4. **探针与脚本**保留在 `old-cantare/.tmp/probe_smux_send/`
    （`probe.sh`、`results_compio.txt`、`results_tokio.txt`），可随时重跑。
+
+---
+
+## 8. 跨线程验收（三后端）
+
+§7 原来的第 1 条「跨线程行为测试未做」已补上：`tests/cross_thread_{tokio,compio,smol}.rs`
+三个 target 共用 `tests/common/scenarios_/cross_thread_.rs`。
+
+场景（三个后端是**同一份**实现）：
+
+1. **主线程**建连（两条内存被动环直连；配置是 `CurrentConnCfg`，不存储运行时值），先
+   绑定监听 dock 并建立 listener，再由 `scope.run_until(..)` 驱动五个循环；
+2. 起一条 **worker 线程**：它拿连接的克隆，**自建所选后端的运行时上下文**并 `block_on`，
+   在其中并发 `bind_async`（每条子流一个独有临时 dock）→ `open_channel_async` 到主线程
+   监听的 dock → 最终裁决 → 双向收发 → 半关闭等 EOF，共 `K_CROSS_THREAD_CHANNELS`
+   （= 256）条；
+3. 主线程同时收齐 256 条入向子流并完成同一套收发；两侧结果经 oneshot 汇总，任一侧失败
+   即 panic。整段套 `with_watchdog_`（20 s）——跨线程的典型失效模式是**死锁**（主线程队列
+   没人驱动 / worker 缺上下文），看门狗把它变成一条可读的 panic。
+
+三后端的差别**只在「worker 怎么进上下文」**这一处（由壳负责）：tokio 自建
+`current_thread` 运行时、compio 自建 `Runtime::new()`、smol 直接 `smol::block_on`
+（无上下文前提）。主线程侧三端一致。
+
+实测（每条子流双向收发 + 半关闭）：
+
+| target | 装配 | 结果 |
+| --- | --- | --- |
+| `cross_thread_compio` | 默认 compio | ✅ 0.88 s |
+| `cross_thread_tokio` | `--no-default-features --features test-tokio-runtime` | ✅ 0.84 s |
+| `cross_thread_smol` | `--no-default-features --features test-smol-runtime` | ✅ 0.85 s |
+
+这一格同时是 §5.1 方案 B 的**行为级**验收：compio 的运行时值是 `!Send`，若连接仍把它
+存在配置里（`DefaultConnCfg`），worker 那一侧的 `std::thread::spawn` 根本编译不过；
+`CurrentConnCfg` 让「句柄可以走、reactor 不走」在 compio 上真正成立。
