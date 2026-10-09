@@ -161,8 +161,8 @@ const K_MAX_DATA_CHUNK: usize = 16usize * 1024usize;
 /// [`ConnClock_`] 放在共享量里，五个循环因此都拿得到**同一个 epoch** 下的毫秒。
 ///
 /// 运行时值在这里是「配置给的」（[`TrConnCfg::Rt`]），**不是**共享量自己的类型参数：
-/// 核心已经因为「必须无条件 `Send + Sync`」而不持有运行时值，共享量只在**本地**
-/// 循环里活着，因此可以自由持有它。
+/// 核心**不直接**持有运行时值（compio 的运行时值是 `!Send + !Sync`），共享量只在
+/// **本地**循环里活着，因此可以自由持有它。
 #[derive(Clone)]
 pub(crate) struct MuxLoopShared_<A, R, M>
 where

@@ -62,14 +62,15 @@ pub enum BindError {
 /// 复用连接：**对一个 `MuxCore` 的智能指针的薄封装**，同时实现
 /// [`TrConnection`]。
 ///
-/// 泛型参数：
+/// 泛型参数只有 `C`：资源策略，见 [`TrConnCfg`]。**运行时值不是类型参数**——它由
+/// [`TrConnCfg::Rt`] 给出（`abs_art::TrTime` 的实现值，例如
+/// `abs_art_tokio::Runtime<{ FULL }>`），提供「现在几点」与「怎么等」，二者同源——
+/// 见 [`crate::time`] 模块文档。
 ///
-/// - `C`：资源策略，见 [`TrConnCfg`]；
-/// - `R`：**运行时值**（`abs_art::TrTime` 的实现值，例如
-///   `abs_art_tokio::Runtime<{ FULL }>`）。它提供「现在几点」与「怎么等」，
-///   二者同源——见 [`crate::time`] 模块文档。
+/// 因此连接是否 `Send + Sync` 由 `C::Rt` 决定：tokio 装配下是，compio 装配下否
+/// （见 `mux_connection::core_` 的类型文档）。
 ///
-/// 本地作用域**不**出现在本类型的参数上：它只在 [`MuxConnection::new`] 的
+/// 本地作用域同样**不**出现在本类型的参数上：它只在 [`MuxConnection::new`] 的
 /// 方法级泛型里出现，投递完五个循环后由循环各自持有（见
 /// [`core_`](super::core_) 模块文档「队列保活」）。
 ///

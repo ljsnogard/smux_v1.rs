@@ -65,11 +65,16 @@ pub const K_STAGE_RING_CAPACITY: usize = 64usize * 1024usize;
 ///
 /// # 运行时值为什么由配置提供
 ///
-/// `MuxCore` 必须**无条件** `Send + Sync`（它是 `mm_ptr::Shared` 的被指对象，而
-/// `Shared<T, A>: Send + Sync` 要求 `T: Send + Sync`），因此核心**不能**自己持有
-/// 运行时值——compio 后端的 `Runtime` 是 `!Send + !Sync`（内含线程本地执行器）。
+/// `MuxCore` 是 `mm_ptr::Shared` 的被指对象，而 `Shared<T, A>: Send + Sync` 要求
+/// `T: Send + Sync`，因此核心**不直接**持有运行时值——compio 后端的 `Runtime` 是
+/// `!Send + !Sync`（内含线程本地执行器），直接持有它就再也不可能 `Send + Sync`。
 /// 于是「现在几点」的来源改由配置回答：核心只留**建连 epoch**（一个纯数据），
 /// 需要时刻时调 [`TrConnCfg::runtime`] 取一个运行时值（克隆句柄，廉价）。
+///
+/// 这只解决「核心不直接持有」，**没有**让 `MuxCore<C>` 无条件 `Send + Sync`：核心
+/// 仍持有配置本身，而 [`DefaultConnCfg`] 内含 `Self::Rt`，所以连接是否 `Send + Sync`
+/// 最终由 `C::Rt` 决定——tokio 装配下是，compio 装配下否（见
+/// `mux_connection::core_` 的类型文档与 `tests/thread_safety.rs` 的编译期断言）。
 ///
 /// 这也让后端选择**留在配置侧**：`DefaultConnCfg` 用 `abs_art-bridge` 的裸名
 /// （即集成方在 `Cargo.toml` 里选定的后端），测试配置可以换成假运行时值。

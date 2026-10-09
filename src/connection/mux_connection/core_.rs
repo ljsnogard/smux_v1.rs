@@ -64,17 +64,32 @@ use crate::{
 /// 泛型参数只有 `C`：资源策略（见 [`TrConnCfg`](crate::connection::TrConnCfg)），
 /// 它同时给出**运行时值**（[`C::Rt`](crate::connection::TrConnCfg::Rt)：时刻与计时）。
 ///
-/// # 为什么核心**不**持有运行时值
+/// # 核心**不直接**持有运行时值，但 `Send`/`Sync` 仍由后端决定
 ///
 /// 本类型是 `mm_ptr::Shared` 的被指对象，而
 /// `Shared<T, A>: Send + Sync` 要求 `T: Send + Sync`。compio 后端的
-/// `Runtime` 是 `!Send + !Sync`（内含线程本地执行器），一旦核心持有它就再也不可能
+/// `Runtime` 是 `!Send + !Sync`（内含线程本地执行器），直接持有它就再也不可能
 /// `Send + Sync`——那不是加约束能解决的，是结构性的。
 ///
 /// 因此核心只留**建连 epoch**（一个纯数据），需要「现在」时经
 /// [`TrConnCfg::runtime`](crate::connection::TrConnCfg::runtime) 取一个运行时值
-/// （克隆句柄，廉价）再相减。于是 `MuxCore<C>: Send + Sync` 与后端是否为
-/// `Send` **无关**。
+/// （克隆句柄，廉价）再相减。
+///
+/// 但这条纪律**不足以**让 `MuxCore<C>` 无条件 `Send + Sync`：核心还持有整个配置
+/// （`config_: C`），而配置（如
+/// [`DefaultConnCfg`](crate::connection::DefaultConnCfg)）内含 `C::Rt`。于是
+/// `MuxCore<C>: Send + Sync` 依然取决于后端：
+///
+/// | 装配 | `C::Rt` | `MuxCore<C>` / `MuxConnection<C>` |
+/// | --- | --- | --- |
+/// | tokio | `Handle` 把手（`Send + Sync`） | `Send + Sync` |
+/// | compio | 线程本地的运行时实例（`!Send + !Sync`） | `!Send + !Sync` |
+///
+/// compio 那一侧是**如实**的表达（它的运行时绑定创建线程），由
+/// `tests/thread_safety.rs` 的编译期断言与本文档共同钉住。要让核心在 compio 装配下
+/// 也是 `Send + Sync`，必须让配置**不存储**运行时值、改为每次从当前上下文取用；代价
+/// 是同时放弃「注入运行时值」（`new_with_rt` 与虚拟时钟 `ManualTime` 验收），并让
+/// `MuxCore::now_millis_` 的每个调用点都要求处于后端上下文内。
 ///
 /// 本地作用域**不在**本类型的参数里：它只出现在
 /// [`MuxConnection::new`](super::MuxConnection::new) 的方法级泛型上，投递完五个循环

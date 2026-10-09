@@ -14,13 +14,18 @@
 //!
 //! # 为什么是 tokio 装配（性质在两个后端之间对调了）
 //!
-//! 运行时值现在进 [`MuxConnection`] 的类型参数（`MuxConnection<C, R>`），于是连接与
-//! 各句柄是否 `Send` 由**运行时值**决定：
+//! 运行时值是配置的关联类型 **`C::Rt`**（不是 `MuxConnection` 的类型参数——公开类型
+//! 只有 `<C>` 一个参数），于是连接与各句柄是否 `Send`/`Sync` 由它决定：
 //!
-//! | 装配 | 运行时值 | `MuxConnection` / 各句柄 |
+//! | 装配 | `C::Rt` | `MuxConnection` / 各句柄 |
 //! | --- | --- | --- |
 //! | tokio | `abs_art_tokio::Runtime`（`tokio::runtime::Handle` 把手） | `Send + Sync` |
-//! | compio | `abs_art_compio::Runtime`（线程本地的运行时实例） | `!Send` |
+//! | compio | `abs_art_compio::Runtime`（线程本地的运行时实例） | `!Send + !Sync` |
+//!
+//! compio 那一格的 `!Send + !Sync` 由编译期探针实测：核心经 `config_: C` →
+//! `DefaultConnCfg::rt_` 间接持有 `compio_runtime::Runtime`（内含
+//! `Rc<compio_executor::Executor>`），这是 `MuxCore<C>` 无法 `Send + Sync` 的唯一
+//! 入口；详见 `mux_connection::core_` 的类型文档。
 //!
 //! 这与改造前**恰好相反**：当时类型参数是零大小的作用域**标记**，tokio 的
 //! `LocalScope` 含 `Rc<LocalSet>` 而 `!Send`，compio 的作用域是零大小的值而 `Send`。

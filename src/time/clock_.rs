@@ -88,9 +88,10 @@ where
 
     /// 建连时刻（epoch）本身。
     ///
-    /// 核心只存这个**纯数据**（而不是整个运行时值），因为核心必须无条件
-    /// `Send + Sync`，而 compio 的运行时值是 `!Send + !Sync`——见
-    /// `mux_connection::core_` 的类型文档。
+    /// 核心只存这个**纯数据**（而不是整个运行时值），因为 compio 的运行时值是
+    /// `!Send + !Sync`，直接持有它会让核心永远无法 `Send + Sync`。注意光这样做
+    /// **还不够**：核心经配置间接持有 `C::Rt`，故 `Send`/`Sync` 仍由后端决定——
+    /// 见 `mux_connection::core_` 的类型文档。
     pub(crate) fn epoch_(&self) -> R::Instant {
         self.epoch_
     }
