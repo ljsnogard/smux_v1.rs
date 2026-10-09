@@ -30,7 +30,7 @@ mod smoke_common;
 /// 测试目标、手段、判断见 [`smoke_common::smoke_socket_body_`]。
 #[compio::test]
 async fn smoke_socket_compio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::Runtime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::smoke_socket_body_(&rt, &scope).await;
@@ -39,7 +39,7 @@ async fn smoke_socket_compio_() {
 /// 测试目标、手段、判断见 [`smoke_common::small_socket_body_`]。
 #[compio::test]
 async fn small_socket_compio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::Runtime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::small_socket_body_(&rt, &scope).await;
@@ -53,7 +53,7 @@ async fn small_socket_compio_() {
 /// `dev-notes/flow-ctrl-20261005-0115.md` §2、§3。
 #[compio::test]
 async fn flow_ctrl_socket_compio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::Runtime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_socket_body_(&rt, &scope).await;
@@ -62,7 +62,7 @@ async fn flow_ctrl_socket_compio_() {
 /// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_isolation_socket_body_`]。
 #[compio::test]
 async fn flow_ctrl_isolation_socket_compio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::Runtime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope).await;
@@ -71,7 +71,7 @@ async fn flow_ctrl_isolation_socket_compio_() {
 /// 测试目标、手段、判断见 [`smoke_common::telegraph_socket_body_`]。
 #[compio::test]
 async fn telegraph_socket_compio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::Runtime::current();
     let scope = rt.local_scope();
     smoke_common::telegraph_socket_body_(&rt, &scope).await;
 }

@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_b = UnixStream::from_std(std_b)?;
     // 运行时值只能从「当前运行时上下文」取得（`#[compio::main]` 满足）；作用域不再能
     // 凭空构造，只能由运行时值交出。
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::Runtime::current();
     let scope = rt.local_scope();
 
     // -- 传输装配：每端两个全被动环，四个半部按「谁贴 socket、谁贴 smux」分派。

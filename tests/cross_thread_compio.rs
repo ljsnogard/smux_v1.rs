@@ -26,7 +26,7 @@
 #![cfg(not(feature = "test-tokio-runtime"))]
 #![feature(allocator_ext)]
 
-use abs_art::TrLocalScope;
+use abs_art::{TrAsyncRuntime, TrLocalScope};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -45,7 +45,8 @@ mod common;
 ///   场景挂住，即测试失败。
 #[compio::test]
 async fn cross_thread_bind_and_channels_compio_() {
-    let rt = abs_art_bridge::current();
+    const FULL: usize = <abs_art_bridge::Runtime as TrAsyncRuntime>::FULL_CAP;
+    let rt = abs_art_bridge::Runtime::<FULL>::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
 

@@ -37,7 +37,7 @@
 use core::mem::MaybeUninit;
 use std::process::ExitCode;
 
-use abs_art::TrLocalScope;
+use abs_art::{TrAsyncRuntime, TrLocalScope};
 use abs_smux::{
     chan::{RingBuffAlloc, TrChannelHandle, TrPrepareRing},
     conn::{TrChannelListener, TrConnection, TrDockBinding},
@@ -90,9 +90,10 @@ fn main() -> ExitCode {
 
 /// 主线程侧的全过程：取运行时值 → 建连 → 把句柄交给 worker → 同时收数据。
 async fn run_() -> Result<(), String> {
+    const FULL: usize = <abs_art_bridge::Runtime as TrAsyncRuntime>::FULL_CAP;
     // ① 运行时值与作用域：`block_on` 已经 enter 了这份 compio 运行时，因此 `current()`
     //    有上下文可用。作用域仍然是**本线程**那条队列的别名。
-    let art = abs_art_bridge::current();
+    let art = abs_art_bridge::Runtime::<FULL>::current();
     let scope = art.local_scope();
 
     // ② 两条内存被动环直连两个端点（A→B、B→A）。传输不需要跨线程，也不需要泵。

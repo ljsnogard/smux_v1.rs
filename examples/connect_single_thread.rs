@@ -70,7 +70,7 @@ const K_PAYLOAD: &[u8] = b"hello, smux_v1!";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ① 运行时值：必须在运行时上下文内取得（`#[compio::main]` 提供了它）。
     //    它由 `abs_art-bridge` 的裸名解析到**当前编译里那个唯一的后端**。
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::Runtime::current();
     // ② 本地作用域：五个循环的投递点。同一线程上多次取得拿到的是**同一条**队列。
     let scope = rt.local_scope();
 

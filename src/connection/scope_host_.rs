@@ -123,11 +123,11 @@ impl TrRtCurrent for abs_art_bridge::Runtime {
              **由调用者保证**——跨线程使用连接时，每条使用它的线程都必须自己处于后端\
              上下文内（见 `TrRtCurrent` 文档）。",
         );
-        abs_art_bridge::current()
+        abs_art_bridge::Runtime::current()
     }
 
     fn try_current_rt() -> Option<Self> {
-        abs_art_bridge::try_current()
+        abs_art_bridge::Runtime::try_current()
     }
 }
 
@@ -156,7 +156,7 @@ const _: fn() = || {
 /// 那条路要求调用点已经在运行时里；不在时请走
 /// [`DefaultConnCfg::new_with_rt`](super::DefaultConnCfg::new_with_rt) 显式传入。
 pub fn default_rt_() -> DefaultRt_ {
-    abs_art_bridge::current()
+    abs_art_bridge::Runtime::current()
 }
 
 /// **虚拟时间**的运行时值：把作用域请求委托给被装饰的运行时值。
