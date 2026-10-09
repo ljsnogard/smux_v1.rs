@@ -17,8 +17,9 @@
    后端是否为 `Send` 无关」是**错的**，本次全部改掉（§6）。
 4. 「让 `TrConnCfg` 不存储运行时值、改为随时取用」在**类型上成立**，但代价是放弃
    「注入运行时值」这条既有能力（`new_with_rt`、虚拟时钟 `ManualTime` 验收），并把
-   「跨线程取时刻」从合法降级为「要求该线程也在后端上下文内」。**本次不实施**，
-   留作方案 B（§5、§7）。
+   「跨线程取时刻」从合法降级为「要求该线程也在后端上下文内」。因此**不是**改
+   `DefaultConnCfg`，而是**新增**一个不存储的配置 `CurrentConnCfg`（方案 B，**已实施**，
+   见 §5.1、§6.2），把这条代价交给**显式选择它**的调用方。
 
 ---
 
@@ -134,19 +135,31 @@ compio 的运行时值是**线程本地**的（`Rc` 簇，绑定创建它的线�
 | 方案 | 做法 | 代价 / 结论 |
 | --- | --- | --- |
 | **A. 只修文档**（本次采用） | 把「核心不持有 ⇒ 无条件 `Send+Sync`」改准确；修正过时的 `MuxConnection<C, R>` 描述 | 零代码风险；compio 装配仍 `!Send`（如实） |
-| **B. 新增「无存储」配置**（未实施） | 保留 `DefaultConnCfg`（注入照旧），另加 `CurrentConnCfg<…>`：`rt_` 换 `PhantomData`，`runtime()` 从上下文取 | 新增公开类型（API 变更需讨论）+ 调用点须在上下文内 |
+| **B. 新增「无存储」配置**（已实施，见 §5.1） | 保留 `DefaultConnCfg`（注入照旧），新增 `CurrentConnCfg<…>`：`rt_` 换 `PhantomData`，`runtime()` 从上下文取 | 新增公开类型；调用点须在上下文内（**调用者责任**） |
 | C. 拆 `TrConnCfg` 两层 | 核心配置（`Send+Sync`）与运行时值来源分开 | 改动面覆盖所有 API 面方法，收益与 B 相同 |
 | D. 放弃「时刻与计时器同源」 | 核心改用进程级单调时钟 | 虚拟时钟失效，与 `abs_art` 的 `TrTime` 设计冲突，不推荐 |
 
-本次裁决：**先做 A**。理由是 B 属于公开 API 变更，需要先明确「compio 装配下跨线程
-bind/解绑」这个场景的前提——**那些线程上是否也在 compio 上下文内**。若不在，B 也
-救不了那个场景（会以 panic 收场）；若在，B 才是可行解。
+本次裁决：**先做 A（把文档改诚实），随后做 B**。需求方确认了 B 的前提：**那些线程由
+调用者保证处于 compio 上下文内**（否则 panic 属调用者违约），并要求在实现里以 debug
+断言给出提示、在文档里明确声明这条责任。B 因此**不改 `DefaultConnCfg`**——注入
+（虚拟时钟、`new_with_rt`、假运行时值）那条路原样保留，代价由显式选择 `CurrentConnCfg`
+的调用方承担。
+
+### 5.1 B 的落地形状
+
+| 位置 | 内容 |
+| --- | --- |
+| `abs_art`（三后端 + bridge） | 新增 `try_current()`：各后端 `Runtime::try_current()` 与 crate 级自由函数的**不 panic** 版本（tokio `Handle::try_current` / compio `Runtime::try_current` / smol 恒 `Some`），bridge 按 feature 转发裸名 |
+| `smux_v1::connection::TrRtCurrent` | 本地适配 trait（与 `ScopeHost` 同形）：`current_rt()` 从上下文取值、`try_current_rt()` 探测；`DefaultRt_` 的实现里 `debug_assert!` 给出「调用者责任」提示 |
+| `smux_v1::connection::CurrentConnCfg` | 与 `DefaultConnCfg` **同序泛型**、**不存储**运行时值的配置；`runtime()` = `Rt::current_rt()`。额外约束 `Rt: TrRtCurrent` 天然排除 `ManualTime`（它无法凭空构造），把「虚拟时钟只能走 `DefaultConnCfg`」变成**编译期**事实 |
 
 ---
 
 ## 6. 本次落地
 
-只改文档注释，六处（不含逻辑）：
+### 6.1 文档修正
+
+六处（不含逻辑）：
 
 | 文件 | 原论断 | 现在 |
 | --- | --- | --- |
@@ -160,15 +173,35 @@ bind/解绑」这个场景的前提——**那些线程上是否也在 compio �
 另：`src/probe_send_.rs` 是**未被 `lib.rs` 声明、不参与编译**的孤立探针文件
 （只有一个空的 `assert_send_sync`）。本次未触碰；后续要么接进模块写实，要么删除。
 
+### 6.2 代码改动（方案 B）
+
+| 仓 / 文件 | 改动 |
+| --- | --- |
+| `abs_art-tokio` / `-compio` / `-smol` | 各新增 `try_current()`（crate 级自由函数 + `Runtime<CAPS>` 固有方法），带文档与 doctest |
+| `abs_art-bridge` | 按三条 feature 路径转发裸名 `try_current`（与 `current` 同一组 cfg 守卫） |
+| `smux_v1` `connection/scope_host_.rs` | 新增 `TrRtCurrent`（`current_rt` / `try_current_rt`）与 `DefaultRt_` 的实现（含 `debug_assert!` 提示） |
+| `smux_v1` `connection/config_.rs` | 新增 `CurrentConnCfg<W, R, M, P, Rt>` 及其 `TrMuxConfig` / `TrConnCfg` / `Clone` / `Copy` / `Debug` 实现 |
+| `smux_v1` `connection/mod.rs` | 导出 `CurrentConnCfg`、`TrRtCurrent` |
+| `smux_v1` `tests/current_conn_cfg.rs` | 编译期断言：默认（compio）装配下 `CurrentConnCfg<BufferedTx, BufferedRx>` 与 `MuxConnection<同>` 都是 `Send + Sync` |
+
+验证：默认 compio 与 `--no-default-features --features test-tokio-runtime` 两种装配下
+断言测试均通过；`cargo check` / `clippy` 干净；`--lib` 220 条单元测试全绿；三后端
+doctest 全绿（含新增的 `try_current` 示例）。
+
+`MuxConnection` 的公开 API **一行都没改**：`CurrentConnCfg` 与 `DefaultConnCfg` 泛型同序，
+`new` / `new_with_rt` / 五个循环的投递路径全部原样。
+
 ---
 
 ## 7. 未决与后续
 
-1. **场景前提**：compio 装配下需要跨线程 bind/解绑时，那些线程是否也处于 compio
-   上下文内？这决定方案 B 是否成立（否则要先解决「别的线程上从哪取时刻」）。
-2. **方案 B 的形状**（若要做）：`CurrentConnCfg` + 一个「从上下文取运行时值」的 trait
-   （三后端 + `ManualTime` 各一份实现），并保持 `DefaultConnCfg` 不变。
-3. **smol 装配未实测**（其 `Runtime` 同为线程绑定形态，推断应与 compio 一致）。
-   需要时把 probe 再加一列即可。
+1. **跨线程行为测试未做**：`CurrentConnCfg` 目前只有编译期断言（类型确实 `Send + Sync`）。
+   要覆盖「另一条线程上 bind / 解绑」，需要在那条线程里自建 compio 上下文——这是下一步的
+   验收目标（形如 `tests/thread_safety.rs`，但 compio 侧）。
+2. **「虚拟时钟」与 `CurrentConnCfg` 互斥是编译期事实**：`Rt: TrRtCurrent` 排除了
+   `ManualTime`；虚拟时钟装配继续走 `DefaultConnCfg`（其连接在 compio 装配下仍 `!Send`）。
+   测试矩阵因此按装配拆开，不做「同一份用例两种配置都跑」。
+3. **smol 装配未实测**（`try_current` 恒 `Some`，`CurrentConnCfg` 在 smol 下无上下文前提；
+   推断与 tokio 一致）。
 4. **探针与脚本**保留在 `old-cantare/.tmp/probe_smux_send/`
    （`probe.sh`、`results_compio.txt`、`results_tokio.txt`），可随时重跑。
