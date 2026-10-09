@@ -36,14 +36,9 @@ use crate::common::SmokeBuff;
 pub use abs_art::{TrLocalScope, TrTime};
 pub use smux_v1::connection::ScopeHost;
 
-/// **测试用默认运行时值类型**：由测试 feature 二选一（缺省 compio，
-/// `test-tokio-runtime` 时 tokio）——与 `smux_v1::connection::DefaultRt_` 同一套规则，
-/// 因此测试里的连接类型就是生产默认装配下的那一个。
-#[cfg(not(feature = "test-tokio-runtime"))]
-pub type DefaultRt = smux_v1::connection::DefaultRt_;
-
-/// 见上。
-#[cfg(feature = "test-tokio-runtime")]
+/// **测试用默认运行时值类型**：就是生产侧的 `smux_v1::connection::DefaultRt_`
+/// ——由 `test-*-runtime` **三选一**（缺省 compio）。测试里的连接类型因此就是生产
+/// 默认装配下的那一个。
 pub type DefaultRt = smux_v1::connection::DefaultRt_;
 
 pub trait TrSmokeScope: abs_art::TrLocalScope + Clone + 'static {}

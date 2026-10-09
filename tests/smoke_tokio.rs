@@ -1,16 +1,21 @@
 //! 冒烟测试的 **tokio** 壳：只做「建立运行时值 + 作用域 + 选运行时」。
 //!
-//! 场景本体在 `tests/smoke_common.inc`，与 compio 壳引入的是**同一份文件**——测试
-//! target 是独立 crate，无法共享同一个模块定义，因此两个壳各自用 `#[path]` 包含它。
+//! 场景本体在 `tests/common/smoke_common.rs`，与 compio / smol 壳引入的是**同一份
+//! 文件**——测试 target 是独立 crate，无法共享同一个模块定义，因此各壳用 `#[path]`
+//! 指向它。放在 `tests/common/` 子目录是为了不被 Cargo 当成独立测试 target 自动发现
+//! （`tests/` 顶层的 `.rs` 会被自动发现，那种文件会因找不到 `mod common` 而编译失败）。
 //!
-//! 本 target 以 `required-features = ["test-tokio-runtime"]` 选中 tokio 的设备类型；
-//! 共享文件按同一个 feature 分派（打开 ⇒ tokio 分支），因此 `cargo test --all-targets`
-//! （两个 feature 都在默认里）两边的用例都能跑到。
+//! 本 target 以 `required-features = ["test-tokio-runtime"]` 选中 tokio 的设备类型，
+//! 共享文件按同一个 feature 分派（打开 ⇒ tokio 分支）。跑它要显式换掉缺省的 compio：
+//!
+//! ```bash
+//! cargo test --test smoke_tokio --no-default-features --features test-tokio-runtime
+//! ```
 //!
 //! # 两个值从哪里来
 //!
 //! `LocalScope::new()` 已不存在：作用域只能从**运行时值**取得（`rt.local_scope()`）。
-//! 因此每个用例先取当前运行时值（`abs_art_bridge::current()`，要求调用点已在 tokio
+//! 因此每个用例先取当前运行时值（`abs_art_bridge::TokioRuntime::current()`，要求调用点已在 tokio
 //! 运行时上下文内——`#[tokio::test]` 满足），再向它要作用域；两个值分别作为
 //! `MuxConnection<C>` 的类型参数与 `MuxConnection::new` 的方法级泛型。
 
@@ -20,13 +25,13 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "smoke_common.inc"]
+#[path = "common/smoke_common.rs"]
 mod smoke_common;
 
 /// 测试目标、手段、判断见 [`smoke_common::smoke_socket_body_`]。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_socket_tokio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::TokioRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     smoke_common::smoke_socket_body_(&rt, &scope).await;
@@ -35,7 +40,7 @@ async fn smoke_socket_tokio_() {
 /// 测试目标、手段、判断见 [`smoke_common::small_socket_body_`]。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn small_socket_tokio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::TokioRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     smoke_common::small_socket_body_(&rt, &scope).await;
@@ -56,7 +61,7 @@ async fn small_socket_tokio_() {
 /// 不触发归零后的回补，是本条之外的独立对照。）
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flow_ctrl_socket_tokio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::TokioRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_socket_body_(&rt, &scope).await;
@@ -65,7 +70,7 @@ async fn flow_ctrl_socket_tokio_() {
 /// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_isolation_socket_body_`]。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flow_ctrl_isolation_socket_tokio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::TokioRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope).await;
@@ -74,7 +79,7 @@ async fn flow_ctrl_isolation_socket_tokio_() {
 /// 测试目标、手段、判断见 [`smoke_common::telegraph_socket_body_`]。
 #[tokio::test]
 async fn telegraph_socket_tokio_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::TokioRuntime::current();
     let scope = rt.local_scope();
     smoke_common::telegraph_socket_body_(&rt, &scope).await;
 }

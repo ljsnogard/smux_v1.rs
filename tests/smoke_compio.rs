@@ -1,21 +1,23 @@
 //! 冒烟测试的 **compio** 壳：只做「建立运行时值 + 作用域 + 选运行时」。
 //!
-//! 场景本体在 `tests/smoke_common.inc`，与 tokio 壳引入的是**同一份文件**。
+//! 场景本体在 `tests/common/smoke_common.rs`，与 tokio / smol 壳引入的是**同一份
+//! 文件**（放 `tests/common/` 子目录，避免被 Cargo 当成独立测试 target 自动发现）。
 //! compio 的本地队列归运行时所有并由它驱动，作用域只是那份运行时的一个把手。
 //!
-//! 跑本 target 时必须**显式关掉** `test-tokio-runtime`：
+//! 缺省 feature 集就是 compio，因此 `cargo test --all-targets` 直接跑到本 target；
+//! 显式指定的等价写法是：
 //!
 //! ```bash
 //! cargo test --test smoke_compio --no-default-features --features test-compio-runtime
 //! ```
 //!
-//! `--all-targets`（两个 feature 都在默认里）下本 target 会被 cfg 掉、不重复跑 compio；
-//! compio 侧由上面这条命令单独覆盖。
+//! 换 tokio / smol 装配时才需要 `--no-default-features`（smux 的 `DefaultRt_` 是
+//! `test-*-runtime` 三选一）。
 //!
 //! # 两个值从哪里来
 //!
 //! 与 tokio 壳同理：`LocalScope::new()` 已不存在，作用域只能经
-//! `abs_art_bridge::current().local_scope()` 取得（`current()` 要求调用点已在 compio
+//! `abs_art_bridge::CompioRuntime::current().local_scope()` 取得（`current()` 要求调用点已在 compio
 //! 运行时上下文内——`#[compio::test]` 满足）。
 
 #![cfg(not(feature = "test-tokio-runtime"))]
@@ -24,13 +26,13 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "smoke_common.inc"]
+#[path = "common/smoke_common.rs"]
 mod smoke_common;
 
 /// 测试目标、手段、判断见 [`smoke_common::smoke_socket_body_`]。
 #[compio::test]
 async fn smoke_socket_compio_() {
-    let rt = abs_art_bridge::Runtime::current();
+    let rt = abs_art_bridge::CompioRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::smoke_socket_body_(&rt, &scope).await;
@@ -39,7 +41,7 @@ async fn smoke_socket_compio_() {
 /// 测试目标、手段、判断见 [`smoke_common::small_socket_body_`]。
 #[compio::test]
 async fn small_socket_compio_() {
-    let rt = abs_art_bridge::Runtime::current();
+    let rt = abs_art_bridge::CompioRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::small_socket_body_(&rt, &scope).await;
@@ -53,7 +55,7 @@ async fn small_socket_compio_() {
 /// `dev-notes/flow-ctrl-20261005-0115.md` §2、§3。
 #[compio::test]
 async fn flow_ctrl_socket_compio_() {
-    let rt = abs_art_bridge::Runtime::current();
+    let rt = abs_art_bridge::CompioRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_socket_body_(&rt, &scope).await;
@@ -62,7 +64,7 @@ async fn flow_ctrl_socket_compio_() {
 /// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_isolation_socket_body_`]。
 #[compio::test]
 async fn flow_ctrl_isolation_socket_compio_() {
-    let rt = abs_art_bridge::Runtime::current();
+    let rt = abs_art_bridge::CompioRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope).await;
@@ -71,7 +73,7 @@ async fn flow_ctrl_isolation_socket_compio_() {
 /// 测试目标、手段、判断见 [`smoke_common::telegraph_socket_body_`]。
 #[compio::test]
 async fn telegraph_socket_compio_() {
-    let rt = abs_art_bridge::Runtime::current();
+    let rt = abs_art_bridge::CompioRuntime::current();
     let scope = rt.local_scope();
     smoke_common::telegraph_socket_body_(&rt, &scope).await;
 }

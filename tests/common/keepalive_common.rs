@@ -1,12 +1,15 @@
 //! 保活（`PULSE`）与空闲超时拆流的**端到端**场景（两个运行时共用）。
 //!
-//! # 为什么是一份 `.inc` 而不是普通测试文件
+//! # 为什么放在 `tests/common/` 子目录
 //!
 //! 计时与时刻挂在**运行时值**上：tokio 用 `abs_art_tokio::Runtime`、compio 用
 //! `abs_art_compio::Runtime`（本地作用域各自从对应的运行时值经 `rt.local_scope()`
-//! 取得）。两对类型都不同，而测试 target 各自是独立 crate，无法共享模块定义——按仓内
-//! 既有约定（`tests/smoke_common.inc`），把场景放进本文件，由两个薄壳
-//! （`keepalive.rs` / `keepalive_compio.rs`）各 `#[path]` 引入一次。
+//! 取得）。两对类型都不同，而测试 target 各自是独立 crate，无法共享模块定义，因此把
+//! 场景放进本文件，由两个薄壳（`keepalive.rs` / `keepalive_compio.rs`）各
+//! `#[path]` 引入一次——与 `tests/common/smoke_common.rs` 同一套办法。
+//!
+//! 位置必须在这个子目录：`tests/` 顶层的 `.rs` 会被 Cargo 当成独立测试 target 自动
+//! 发现，本文件会因为找不到 `mod common` 而单独编译失败。
 //!
 //! # 时间：**虚拟**的
 //!

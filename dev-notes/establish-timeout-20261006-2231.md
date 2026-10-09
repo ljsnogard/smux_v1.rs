@@ -71,7 +71,7 @@ B 只监听不 accept，A 的 `accept_async` 在推过 **3.2 s** 虚拟时间后
 | `src/connection/timer_.rs` | 新增 `TimerAction_::RejectEstablish` 与其投递（发 `REJECT` + `release_channel_` + 置「已裁决」+ `notify_establish_`） |
 | `src/connection/channel_handle/handle_.rs` | 新增公开 `ChannelHandle::abort_reason()`；`mux_accept_async_` 补「入口超时检查」「入口取消检查」「响应方发 `ACCEPT` 前的取消检查」「取消出口回 `REJECT`」；`mux_reject_async_` 补「入口超时检查」「取消也照发 `REJECT`」；新增 `reject_after_open_` |
 | `src/connection/error_.rs` | `MuxError::IdleTimeout` 的文档扩为「两个阶段」 |
-| `tests/keepalive_common.inc` + 两个壳 | 新增三条端到端用例（见下） |
+| `tests/common/keepalive_common.rs` + 两个壳 | 新增三条端到端用例（见下） |
 
 **错误类型复用 `MuxError::IdleTimeout`**，不新增公开变体：调用点本身就能区分阶段
 （`accept`/`reject` 返回的它 = 建流阶段；两个半部 `abort_reason()` 里的它 = 活跃阶段）。

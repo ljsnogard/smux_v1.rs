@@ -15,11 +15,18 @@
 //! [`MuxConnection::new_with_rt`](super::MuxConnection::new_with_rt)，由调用者
 //! 把作用域一并交进来。
 //!
-//! # 只对「默认后端」实现
+//! # 实现写在**具名别名**上，按 smux 自己的 feature 三选一
 //!
-//! 实现写在 `abs_art_bridge` 的具名别名上（`CompioRuntime` / `TokioRuntime` /
-//! `SmolRuntime`），由 smux 自己的测试 feature 二选一，因此**不依赖 bridge 的
-//! 默认后端解析**——那样在同时启用多个后端时会直接编译失败（bridge 的守卫）。
+//! `abs_art_bridge` 的缺省后端（compio）始终在线，因此下游**不该**靠
+//! `default-features = false` 去关掉它再换默认——那不是 bridge 约定的用法。按 bridge
+//! 的设计，非缺省后端用**具名别名**取用（[`TokioRuntime`](abs_art_bridge::TokioRuntime)
+//! / [`SmolRuntime`](abs_art_bridge::SmolRuntime) /
+//! [`CompioRuntime`](abs_art_bridge::CompioRuntime)，以及对应的 `*LocalScope`）。
+//!
+//! 本模块因此对三个具名别名逐个实现，并由 smux 自己的测试 feature **三选一**选出
+//! [`DefaultRt_`]：打开了哪个 `test-*-runtime`，哪个后端就是当前装配的默认；bridge 的
+//! 裸名 [`Runtime`](abs_art_bridge::Runtime) 始终还是 compio，不再参与本 crate 的
+//! 「默认后端」判断。
 //!
 //! # Examples
 //!
@@ -97,48 +104,82 @@ pub trait TrRtCurrent: Sized {
 }
 
 
-/// **默认后端**的实现：`abs_art_bridge::Runtime` / `LocalScope` 是本 crate 的
-/// 唯一后端入口。
+/// 为某个后端的运行时值生成 [`ScopeHost`] + [`TrRtCurrent`] 两条实现。
 ///
-/// 裸名由 bridge 按 **feature** 解析（本仓缺省 compio；打开 `test-tokio-runtime`
-/// 时是 tokio），而 smux 自己的 feature 就是按同一条规则在 `Cargo.toml` 里转发给
-/// bridge 的（`test-compio-runtime` → `backend-compio` + `default-backend-compio`），
-/// 因此这里**只有一条**条件实现，不需要为每个后端各写一份、也不需要 smux 直接依赖
-/// 任何后端 crate。
-impl ScopeHost for abs_art_bridge::Runtime {
-    type Scope = abs_art_bridge::LocalScope;
+/// 三份实现逐字同构，唯一的变量是「运行时值类型 + 它交出的作用域类型」，因此用宏
+/// 生成：`$rt` 取 `abs_art_bridge` 的具名别名，`$scope` 取它对应的 `LocalScope` 别名。
+macro_rules! impl_scope_host_ {
+    ($rt:ty, $scope:ty) => {
+        impl ScopeHost for $rt {
+            type Scope = $scope;
 
-    fn local_scope(&self) -> Self::Scope {
-        abs_art_bridge::Runtime::local_scope(self)
-    }
+            fn local_scope(&self) -> Self::Scope {
+                <$rt>::local_scope(self)
+            }
+        }
+
+        impl TrRtCurrent for $rt {
+            fn current_rt() -> Self {
+                debug_assert!(
+                    <Self as TrRtCurrent>::try_current_rt().is_some(),
+                    "取运行时值时调用点不在所选后端的运行时上下文内：`CurrentConnCfg` 的这一前提\
+                     **由调用者保证**——跨线程使用连接时，每条使用它的线程都必须自己处于后端\
+                     上下文内（见 `TrRtCurrent` 文档）。",
+                );
+                <$rt>::current()
+            }
+
+            fn try_current_rt() -> Option<Self> {
+                <$rt>::try_current()
+            }
+        }
+    };
 }
 
-/// 默认后端的「从当前上下文取一个运行时值」实现：委托给 bridge 的裸名
-/// [`try_current`](abs_art_bridge::try_current) / [`current`](abs_art_bridge::current)。
-impl TrRtCurrent for abs_art_bridge::Runtime {
-    fn current_rt() -> Self {
-        debug_assert!(
-            <Self as TrRtCurrent>::try_current_rt().is_some(),
-            "取运行时值时调用点不在所选后端的运行时上下文内：`CurrentConnCfg` 的这一前提\
-             **由调用者保证**——跨线程使用连接时，每条使用它的线程都必须自己处于后端\
-             上下文内（见 `TrRtCurrent` 文档）。",
-        );
-        abs_art_bridge::Runtime::current()
-    }
+// tokio 装配：`test-tokio-runtime` 打开时它就是本 crate 的默认后端。
+//
+// 它与 compio 的实现可以并存——`abs_art-bridge/backend-tokio` 只是**追加**一个后端，
+// 不改 bridge 的缺省后端。
+#[cfg(feature = "test-tokio-runtime")]
+impl_scope_host_!(
+    abs_art_bridge::TokioRuntime,
+    abs_art_bridge::TokioLocalScope
+);
 
-    fn try_current_rt() -> Option<Self> {
-        abs_art_bridge::Runtime::try_current()
-    }
-}
+// smol 装配：`test-smol-runtime` 打开时生效。
+#[cfg(feature = "test-smol-runtime")]
+impl_scope_host_!(
+    abs_art_bridge::SmolRuntime,
+    abs_art_bridge::SmolLocalScope
+);
 
-/// **本 crate 的默认运行时值类型**：就是 bridge 的裸名。
+// compio 装配：bridge 的缺省后端始终在线（`default = ["default-backend-compio"]`），
+// 因此这个类型在任何 feature 组合下都存在，实现也就**无条件**给出——`examples/` 是
+// compio 演示，在 tokio 装配的 `--all-targets` 下同样要编过。
+impl_scope_host_!(
+    abs_art_bridge::CompioRuntime,
+    abs_art_bridge::CompioLocalScope
+);
+
+/// **本 crate 的默认运行时值类型**：由 smux 自己的测试 feature **三选一**。
 ///
-/// 它是 [`TrConnCfg::Rt`](super::TrConnCfg::Rt) 的缺省值，也是
-/// [`DefaultConnCfg`](super::DefaultConnCfg) 的默认运行时值类型。
-///
-/// 「哪个后端」这件事因此**只有一个来源**：bridge 的 feature 解析。smux 的
-/// `test-tokio-runtime` / `test-compio-runtime` 只是转发者，不再自己维护第二套规则。
-pub type DefaultRt_ = abs_art_bridge::Runtime;
+/// 它与 bridge 的裸名 [`Runtime`](abs_art_bridge::Runtime) **不是**同一回事：bridge 的
+/// 缺省后端（compio）始终在线，裸名因此恒为 compio；本别名让「当前装配的默认后端」
+/// 仍然唯一，且完全由 smux 的 feature 决定。取它的作用域走 [`ScopeHost`]，取当前
+/// 上下文里的值走 [`default_rt_`]。
+#[cfg(feature = "test-tokio-runtime")]
+pub type DefaultRt_ = abs_art_bridge::TokioRuntime;
+
+/// 见上。
+#[cfg(feature = "test-smol-runtime")]
+pub type DefaultRt_ = abs_art_bridge::SmolRuntime;
+
+/// 见上。
+#[cfg(not(any(
+    feature = "test-tokio-runtime",
+    feature = "test-smol-runtime"
+)))]
+pub type DefaultRt_ = abs_art_bridge::CompioRuntime;
 
 /// 编译期断言：默认运行时值必须满足 [`TrConnCfg::Rt`](super::TrConnCfg::Rt) 的约束。
 const _: fn() = || {
@@ -146,7 +187,7 @@ const _: fn() = || {
     assert_rt_::<DefaultRt_>();
 };
 
-/// 构造**默认运行时值**：等价于当前默认后端的 `current()`。
+/// 构造**默认运行时值**：等价于当前默认后端（[`DefaultRt_`]）的 `current()`。
 ///
 /// # Panics
 ///
@@ -156,7 +197,7 @@ const _: fn() = || {
 /// 那条路要求调用点已经在运行时里；不在时请走
 /// [`DefaultConnCfg::new_with_rt`](super::DefaultConnCfg::new_with_rt) 显式传入。
 pub fn default_rt_() -> DefaultRt_ {
-    abs_art_bridge::Runtime::current()
+    <DefaultRt_ as TrRtCurrent>::current_rt()
 }
 
 /// **虚拟时间**的运行时值：把作用域请求委托给被装饰的运行时值。

@@ -3,9 +3,13 @@
 //! 冒烟测试的**共用餐**:同一份场景与断言，三个运行时各跑一遍。
 //!
 //! 本文件由三个薄壳（`tests/smoke_tokio.rs` / `tests/smoke_compio.rs` /
-//! `tests/smoke_smol.rs`）各自
-//! `mod smoke_common;` 引入——测试 target 是独立 crate，无法共享同一个模块定义，
-//! 但被引入的是**同一份文件**。壳里只做「建立作用域 + 选运行时」。
+//! `tests/smoke_smol.rs`）各自以 `#[path = "common/smoke_common.rs"] mod smoke_common;`
+//! 引入——测试 target 是独立 crate，无法共享同一个模块定义，但被引入的是**同一份
+//! 文件**。壳里只做「建立作用域 + 选运行时」。
+//!
+//! 之所以放在 `tests/common/` 子目录而不是 `tests/` 顶层：Cargo 会把 `tests/` 顶层的
+//! `.rs` 当成独立测试 target 自动发现，本文件会被单独拿去编译并因找不到 `mod common`
+//! 而失败；子目录里的文件不会被自动发现。
 //!
 //! 链路：真实 UNIX domain socket（同一条全双工连接的两个端点）→ 设备级适配 →
 //! 四条**调用方驱动**的 async 泵 → 全被动环 → `MuxConnection` 内部的四个循环。

@@ -34,7 +34,7 @@ park / 唤醒 / 本地队列语义并不相同（compio 是完成式 IO + 线程
 | `handshake::agent` 的两条用例 | 原本用 `abs_art_bridge::Runtime::spawn_local`（compio 专属）→ 改成 `futures::join!` 在同一任务内并发，从而与运行时无关 |
 | `tests/inmem_mux.rs` | 6 对 tokio/compio 重复用例合并成「一个 body + 宏」；两条只有 tokio 版的 drop 探针用例也补上双运行时（`yield_now` 改成运行时无关的 `yield_once_!` 宏） |
 | `tests/layered_rpc.rs` | 两条重复用例合并成「一个泛型 body + 宏」 |
-| `tests/smoke_{tokio,compio}.rs` | 两个近乎逐字重复的文件合并：共享场景挪到 `tests/smoke_common.inc`，两个壳只做「建作用域 + 选运行时」，用 `#[path]` 引入同一份文件 |
+| `tests/smoke_{tokio,compio}.rs` | 两个近乎逐字重复的文件合并：共享场景挪到 `tests/common/smoke_common.rs`，两个壳只做「建作用域 + 选运行时」，用 `#[path]` 引入同一份文件 |
 | `tests/thread_safety.rs` | 文件头补写「为什么只有 compio、为什么这里 `block_on` 是故意的」 |
 
 ## 3. 为什么 `tests/` 的双运行时装配要用 feature
@@ -45,7 +45,7 @@ park / 唤醒 / 本地队列语义并不相同（compio 是完成式 IO + 线程
 
 - `Cargo.toml` 增加两个 feature：`test-tokio-runtime` / `test-compio-runtime`，
   **都进 `default`**；
-- 共享文件 `tests/smoke_common.inc` 按「`test-tokio-runtime` 是否打开」二选一分派
+- 共享文件 `tests/common/smoke_common.rs` 按「`test-tokio-runtime` 是否打开」二选一分派
   socket 装配与作用域类型；
 - 两个冒烟 target 各自 `required-features` 选中自己那一侧。
 
@@ -71,8 +71,14 @@ cargo test --test smoke_compio --no-default-features --features test-compio-runt
    `smoke_tokio` 被 cfg 掉（跑 0 个用例）。最终统一成**只看 `test-tokio-runtime`**：
    打开 ⇒ tokio 分支，关闭 ⇒ compio 分支。
 4. **`tests/` 下的共享 `.rs` 文件会被当成独立测试 target**，于是它会尝试自己编译
-   （找不到 `mod common` 而失败）。改用非 `.rs` 后缀（`smoke_common.inc`）+ `#[path]`
-   引入，顺带 `#![warn(unused)]` 抑制「同一文件出现在多个 target」的提示。
+   （找不到 `mod common` 而失败）。当时的临时解法是改用非 `.rs` 后缀
+   （`smoke_common.inc`）+ `#[path]` 引入，顺带 `#![warn(unused)]` 抑制「同一文件出现
+   在多个 target」的提示。
+   **后续修订**：非 `.rs` 后缀对 rust-analyzer 等工具不透明，文件平时得不到静态检查，
+   是隐患。现已把两个共享文件挪进 `tests/common/`（Cargo 只自动发现 `tests/` 顶层的
+   `.rs` 与 `tests/*/main.rs`，子目录里的文件不会被当成 target），并恢复 `.rs` 后缀：
+   `tests/common/smoke_common.rs` / `tests/common/keepalive_common.rs`；各壳改用
+   `#[path = "common/xxx.rs"] mod xxx;` 引入。`#![warn(unused)]` 保留。
 5. **批量转换会留下「文档注释与函数之间的空行」**，触发 clippy 的
    `empty_line_after_doc_comments`。改完记得 `cargo clippy --all-targets` 收尾。
 

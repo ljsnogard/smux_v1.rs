@@ -76,8 +76,9 @@ pub const K_STAGE_RING_CAPACITY: usize = 64usize * 1024usize;
 /// 最终由 `C::Rt` 决定——tokio 装配下是，compio 装配下否（见
 /// `mux_connection::core_` 的类型文档与 `tests/thread_safety.rs` 的编译期断言）。
 ///
-/// 这也让后端选择**留在配置侧**：`DefaultConnCfg` 用 `abs_art-bridge` 的裸名
-/// （即集成方在 `Cargo.toml` 里选定的后端），测试配置可以换成假运行时值。
+/// 这也让后端选择**留在配置侧**：[`DefaultConnCfg`] 的 `Rt` 缺省取本 crate 的
+/// [`DefaultRt_`](crate::connection::DefaultRt_)（由 `test-*-runtime` 三选一），
+/// 测试配置可以换成假运行时值。
 pub trait TrConnCfg
 where
     Self: TrMuxConfig<Data = u8, Dock = Dock> + 'static,
@@ -184,9 +185,9 @@ pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 /// 分配器」打包在一起的智能指针，分配器内联在值里，因此每次建缓冲都不必再为保存
 /// 分配器做一次额外堆分配。
 ///
-/// 泛型参数 `Rt` 是**运行时值**，默认取 `abs_art-bridge` 的裸名
-/// [`Runtime`](abs_art_bridge::Runtime)——即集成方在 `Cargo.toml` 里选定的后端
-/// （本仓缺省是 compio）。要用另一个后端或假运行时值，显式写出 `Rt` 即可。
+/// 泛型参数 `Rt` 是**运行时值**，默认取本 crate 的
+/// [`DefaultRt_`](crate::connection::DefaultRt_)——由 smux 自己的 `test-*-runtime`
+/// feature 三选一（缺省是 compio）。要用另一个后端或假运行时值，显式写出 `Rt` 即可。
 ///
 /// # 泛型参数顺序：`<W, R, M, P, Rt>`
 ///

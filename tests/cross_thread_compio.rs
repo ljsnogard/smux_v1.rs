@@ -16,8 +16,8 @@
 //!   线程必须自建一个 compio 运行时并 `block_on`——这正是 `CurrentConnCfg` 契约里的
 //!   调用者责任。做不到这一点时 debug 构建会先给出 smux 自己的断言提示。
 //!
-//! 跑本 target 时必须显式关掉 `test-tokio-runtime`（bridge 的裸名要求当前编译里只有
-//! 一个后端）：
+//! 跑本 target 时必须显式关掉 `test-tokio-runtime`（smux 的 `DefaultRt_` 是
+//! `test-*-runtime` 三选一）：
 //!
 //! ```bash
 //! cargo test --test cross_thread_compio --no-default-features --features test-compio-runtime
@@ -45,8 +45,8 @@ mod common;
 ///   场景挂住，即测试失败。
 #[compio::test]
 async fn cross_thread_bind_and_channels_compio_() {
-    const FULL: usize = <abs_art_bridge::Runtime as TrAsyncRuntime>::FULL_CAP;
-    let rt = abs_art_bridge::Runtime::<FULL>::current();
+    const FULL: usize = <abs_art_bridge::CompioRuntime as TrAsyncRuntime>::FULL_CAP;
+    let rt = abs_art_bridge::CompioRuntime::<FULL>::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Compio);
     let scope = rt.local_scope();
 

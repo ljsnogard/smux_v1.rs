@@ -49,8 +49,10 @@ mod wire_io_;
 
 pub mod x_deps {
     pub use abs_art;
-    /// **桥接 crate**：`Runtime` / `LocalScope` / `current` 的裸名解析点，后端由
-    /// 集成方在 `Cargo.toml` 里选（本仓缺省 compio）。
+    /// **桥接 crate**：运行时值（`Runtime` 及其具名别名 `TokioRuntime` /
+    /// `SmolRuntime` / `CompioRuntime`）与本地作用域的解析点，后端由集成方在
+    /// `Cargo.toml` 里选（缺省 compio；smux 自己的默认后端见
+    /// [`connection::DefaultRt_`](crate::connection::DefaultRt_)）。
     ///
     /// 从这里转出口，是为了让下游**只依赖 smux** 也能取到运行时值——否则调用方要
     /// 自己再加一条 `abs_art-bridge` 依赖、并保证与 smux 用的是同一个后端 feature。

@@ -14,6 +14,15 @@
 //! | `payload_` | 确定性载荷生成 |
 //! | `scenarios_` | 与运行时、传输无关的场景主体 |
 //!
+//! # 本目录里还有两个**不属于本模块**的文件
+//!
+//! `smoke_common.rs` 与 `keepalive_common.rs` 虽然放在本目录，却**没有**在下面声明为
+//! 子模块——它们是各测试壳（`smoke_tokio` / `smoke_compio` / `smoke_smol`、
+//! `keepalive` / `keepalive_compio`）用 `#[path = "common/xxx.rs"] mod xxx;` 直接挂在
+//! **crate 根**上的按运行时分派的场景体。放本目录只为借「子目录不被 Cargo 当成独立测试
+//! target 自动发现」这一点，模块层级与 `common` 无关（它们用 `crate::common::…` 反过来
+//! 引用本模块）。
+//!
 //! # 跨文件约定（所有场景都必须遵守）
 //!
 //! 1. **不 spawn**：并发一律用 `futures` 的组合子（`join!` / `join_all` / `select`）。

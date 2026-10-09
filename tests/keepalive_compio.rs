@@ -1,15 +1,16 @@
 //! 保活与空闲超时的 **compio** 薄壳：只做「建运行时 + 取运行时值 / 作用域 + 驱动虚拟时间」。
 //!
-//! 场景本体与设计说明在 `tests/keepalive_common.inc`；tokio 侧见 `keepalive.rs`。
+//! 场景本体与设计说明在 `tests/common/keepalive_common.rs`；tokio 侧见 `keepalive.rs`。
 //!
-//! 跑本 target 时必须**显式关掉** `test-tokio-runtime`（两个 feature 都在缺省里，
-//! 共享文件按它分派运行时的具体类型）：
+//! 缺省 feature 集就是 compio，因此 `cargo test --all-targets` 直接跑到本 target；
+//! 显式指定的等价写法是：
 //!
 //! ```bash
 //! cargo test --test keepalive_compio --no-default-features --features test-compio-runtime
 //! ```
 //!
-//! `--all-targets`（两个 feature 都在默认里）下本 target 会被 cfg 掉、不重复跑 compio。
+//! 换 tokio / smol 装配时才需要 `--no-default-features`（smux 的 `DefaultRt_` 是
+//! `test-*-runtime` 三选一）。
 //!
 //! # 作用域与时间
 //!
@@ -29,7 +30,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "keepalive_common.inc"]
+#[path = "common/keepalive_common.rs"]
 mod keepalive_common;
 
 use abs_art_mock_clock::{ManualClock, ManualTime};

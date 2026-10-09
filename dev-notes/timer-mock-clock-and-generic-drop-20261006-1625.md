@@ -86,7 +86,7 @@ time::tests_::an_already_past_deadline_collapses_to_a_zero_delay
 无到期定时器仍挂起则 panic（「在等一个永远不会来的东西」是用例写错，不是产品缺陷）。
 它与 `Supervisor` 对 tokio 的处理同形（tokio 没有可用 tick 钩子，靠 `poll` 循环驱动）。
 
-集成测试侧（`tests/keepalive.rs` / `keepalive_compio.rs` + `keepalive_common.inc`）
+集成测试侧（`tests/keepalive.rs` / `keepalive_compio.rs` + `common/keepalive_common.rs`）
 已经在用 `ManualTime` + `LocalScope::block_on_advancing`，本轮不动。
 
 ---
@@ -326,7 +326,7 @@ tokio 侧改为**显式 opt-in**；`tests/keepalive.rs` 加 `#![cfg(feature = "t
 - `src/connection/mux_connection/core_.rs`、`config_.rs`、`connection/mod.rs`、
   `tests/layered_rpc.rs`、`tests/common/scenarios_/{small_,kit_}.rs`：把
   「运行时值进类型参数」一类过时描述改为现状。
-- `tests/keepalive_common.inc`：删掉「保留 `scope` 参数是为了不改动调用点」的过渡
+- `tests/common/keepalive_common.rs`：删掉「保留 `scope` 参数是为了不改动调用点」的过渡
   注释与那个参数本身（建连已经不需要它）。
 
 
@@ -422,7 +422,7 @@ Compio」，而不是若干秒后的怪 panic 或无限挂起。这也让「哪�
 ### 9.1 先排除掉的两个假设
 
 用「同样的形状，只改一个变量」做了两组对照（诊断场景临时加在
-`keepalive_common.inc`，结论记在这里、脚手架已撤除）：
+`keepalive_common.rs`，结论记在这里、脚手架已撤除）：
 
 | 对照 | 结果 | 排除了什么 |
 | --- | --- | --- |

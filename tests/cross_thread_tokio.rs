@@ -34,7 +34,9 @@ mod common;
 ///   场景挂住，即测试失败。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_thread_bind_and_channels_tokio_() {
-    let rt = abs_art_bridge::current();
+    // 走后端 crate 的自由函数 `current()`：返回 `Runtime<FULL>`，避免 `Runtime::current()`
+    // 的 `CAPS` 推断问题（同 `inmem_mux.rs`）。
+    let rt = abs_art_tokio::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Tokio);
     let scope = rt.local_scope();
 

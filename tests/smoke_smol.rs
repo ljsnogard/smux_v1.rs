@@ -1,6 +1,7 @@
 //! 冒烟测试的 **smol** 壳：只做「建立运行时值 + 作用域 + 驱动本地队列」。
 //!
-//! 场景本体在 `tests/smoke_common.inc`，与 tokio / compio 壳引入的是**同一份文件**。
+//! 场景本体在 `tests/common/smoke_common.rs`，与 tokio / compio 壳引入的是**同一份
+//! 文件**（放 `tests/common/` 子目录，避免被 Cargo 当成独立测试 target 自动发现）。
 //!
 //! # 与前两个壳的差别：谁来驱动本地队列
 //!
@@ -13,7 +14,7 @@
 //!
 //! # 两个值从哪里来
 //!
-//! 与另两个壳同理：`abs_art_bridge::current()` 取当前后端（本 target 由
+//! 与另两个壳同理：`abs_art_bridge::SmolRuntime::current()` 取当前运行时值（本 target 由
 //! `required-features = ["test-smol-runtime"]` 钉死为 smol），再向它要本地作用域
 //! （`rt.local_scope()`，同一线程多次取得拿到同一条队列）。
 //!
@@ -23,8 +24,9 @@
 //! cargo test --test smoke_smol --no-default-features --features test-smol-runtime
 //! ```
 //!
-//! 必须 `--no-default-features`：缺省 feature 会同时打开 compio 后端，而 bridge 的
-//! 裸名 `Runtime` 要求「当前编译里只有一个后端」。
+//! 必须 `--no-default-features`：缺省的 `test-compio-runtime` 若同时打开，smux 自己的
+//! [`DefaultRt_`](smux_v1::connection::DefaultRt_) 就没有唯一解（它是 `test-*-runtime`
+//! 三选一）。bridge 的缺省后端不受影响——它始终是 compio，与 smol 后端并存无碍。
 
 #![cfg(feature = "test-smol-runtime")]
 #![feature(allocator_ext)]
@@ -34,7 +36,7 @@ use abs_art::TrLocalScope;
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "smoke_common.inc"]
+#[path = "common/smoke_common.rs"]
 mod smoke_common;
 
 /// 测试目标、手段、判断见 [`smoke_common::smoke_socket_body_`]。
@@ -45,7 +47,7 @@ mod smoke_common;
 /// 对不上。
 #[test]
 fn smoke_socket_smol_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::SmolRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Smol);
     let scope = rt.local_scope();
     smol::block_on(scope.run_until(smoke_common::smoke_socket_body_(&rt, &scope)));
@@ -54,7 +56,7 @@ fn smoke_socket_smol_() {
 /// 测试目标、手段、判断见 [`smoke_common::small_socket_body_`]。
 #[test]
 fn small_socket_smol_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::SmolRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Smol);
     let scope = rt.local_scope();
     smol::block_on(scope.run_until(smoke_common::small_socket_body_(&rt, &scope)));
@@ -66,7 +68,7 @@ fn small_socket_smol_() {
 /// 不得死锁。超时由场景内的 `smol::Timer` 看门狗负责。
 #[test]
 fn flow_ctrl_socket_smol_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::SmolRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Smol);
     let scope = rt.local_scope();
     smol::block_on(scope.run_until(smoke_common::flow_ctrl_socket_body_(&rt, &scope)));
@@ -75,7 +77,7 @@ fn flow_ctrl_socket_smol_() {
 /// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_isolation_socket_body_`]。
 #[test]
 fn flow_ctrl_isolation_socket_smol_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::SmolRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Smol);
     let scope = rt.local_scope();
     smol::block_on(scope.run_until(smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope)));
@@ -84,7 +86,7 @@ fn flow_ctrl_isolation_socket_smol_() {
 /// 测试目标、手段、判断见 [`smoke_common::telegraph_socket_body_`]。
 #[test]
 fn telegraph_socket_smol_() {
-    let rt = abs_art_bridge::current();
+    let rt = abs_art_bridge::SmolRuntime::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Smol);
     let scope = rt.local_scope();
     smol::block_on(scope.run_until(smoke_common::telegraph_socket_body_(&rt, &scope)));

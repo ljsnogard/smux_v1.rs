@@ -8,7 +8,7 @@
 //!
 //! | 东西 | 从哪来 | 为什么 |
 //! | --- | --- | --- |
-//! | 运行时值 `Rt` | [`abs_art_bridge::current`] | 提供「现在几点」与「怎么等」（`TrTime`），并负责交出本地作用域 |
+//! | 运行时值 `Rt` | [`abs_art_bridge::Runtime::current`] | 提供「现在几点」与「怎么等」（`TrTime`），并负责交出本地作用域 |
 //! | 本地作用域 `Scope` | `rt.local_scope()` | 五个循环的投递点；`!Send`，与取得它的线程绑定 |
 //! | `HandshakeDelivery` | `HandshakeAgent::invite_async` / `listen_async` | 握手产物，**建连接的唯一入口** |
 //! | 连接配置 `C` | `DefaultConnCfg::new_with_rt` | 资源策略 + **运行时值**（本示例把它存进配置） |

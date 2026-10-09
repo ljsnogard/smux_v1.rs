@@ -1,6 +1,6 @@
 //! 保活与空闲超时的 **tokio** 薄壳：只做「建运行时 + 取运行时值 / 作用域 + 驱动虚拟时间」。
 //!
-//! 场景本体与设计说明在 `tests/keepalive_common.inc`；compio 侧见 `keepalive_compio.rs`。
+//! 场景本体与设计说明在 `tests/common/keepalive_common.rs`；compio 侧见 `keepalive_compio.rs`。
 //!
 //! # 作用域怎么来（不需要 tokio 上下文）
 //!
@@ -27,10 +27,11 @@
 //! # 只在 **tokio** 装配下编译
 //!
 //! 本文件用 `abs_art_tokio::Runtime::with_handle` + `LocalScope::block_on_advancing`
-//! 驱动虚拟时间，因此「默认后端」必须也是 tokio——`TrConnCfg::Rt` 取的是
-//! `DefaultRt_`，它在缺省（compio）装配下是 compio 类型，本文件会在自己的 tokio
-//! 上下文里调 compio 的 `current()` 而 panic。compio 侧的对应物是同名的
-//! `keepalive_compio.rs`。
+//! 驱动虚拟时间，因此本 crate 的默认后端必须也是 tokio。`TrConnCfg::Rt` 的缺省是
+//! `DefaultRt_`，它由 `test-*-runtime` **三选一**（`test-tokio-runtime` 下即 tokio）。
+//! compio 侧的对应物是 `keepalive_compio.rs`；跑本 target 要
+//! `--no-default-features --features test-tokio-runtime`——缺省的 `test-compio-runtime`
+//! 若同时打开，三选一就没有唯一解。
 
 #![cfg(feature = "test-tokio-runtime")]
 #![feature(allocator_ext)]
@@ -38,7 +39,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "keepalive_common.inc"]
+#[path = "common/keepalive_common.rs"]
 mod keepalive_common;
 
 use abs_art_mock_clock::{ManualClock, ManualTime};

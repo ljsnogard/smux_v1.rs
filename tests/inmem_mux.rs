@@ -66,9 +66,9 @@ use abs_smux::conn::{TrChannelListener, TrDockBinding};
 // 构造（`LocalScope::new()` 已删除），只能由运行时值经 `local_scope()` 交出——它的
 // 具体类型因此不必在本文件里写出。
 #[cfg(feature = "test-tokio-runtime")]
-use abs_art_bridge::Runtime;
+use abs_art_tokio::Runtime;
 #[cfg(not(feature = "test-tokio-runtime"))]
-use abs_art_bridge::Runtime;
+use abs_art_compio::Runtime;
 use abs_smux::conn::TrConnection;
 use buffex::x_deps::abs_buff::{Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite};
 use buffex::x_deps::anylr::SomeOf;

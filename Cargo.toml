@@ -12,22 +12,11 @@ description = "流复用协议第一版"
 # 检出两份代码——那时 `TrLocalScope` / `TrTime` 这些 trait 会出现「同名不同源」而
 # 对不上。跨依赖表（`[dependencies]` 与 `[dev-dependencies]`）也必须一致。
 abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
-# **桥接 crate**：业务库只依赖它就能拿到运行时值（`Runtime` / `current`）与本地
-# 作用域（`LocalScope`），而不直接按后端写代码——后端由 `Cargo.toml` 的 feature
-# 选定（见下方 `[features]` 的说明）。
-#
-# 缺省后端 = **compio**（bridge 的 `default = ["default-backend-compio"]`）。
-#
-# 本 crate **不直接依赖任何后端 crate**：运行时值（`Runtime` / `current`）与本地
-# 作用域（`LocalScope`）都经 bridge 的**裸名**取用，后端由 smux 自己的 feature
-# 转发给 bridge 的 `backend-*` + `default-backend-*`（见 `[features]`）。
-# 因此「哪个后端」只有一个来源，换后端只改 feature。
-#
-# **关掉 bridge 自己的默认 feature**：它的 `default` 会把 `backend-compio` 与
-# `default-backend-compio` 一起打开，于是 `--features test-tokio-runtime` 下会出现
-# 「两个 backend + 两个默认后端」而撞上 bridge 的守护。关掉之后，后端选择**完全**
-# 由 smux 自己的 feature 决定（各自只开一个 `backend-*`，此时裸名即它）。
-abs_art-bridge = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+abs_art-bridge = {
+    git = "https://gitee.com/lino_snsalias/abs_art.git",
+    branch = "dev/0.3.0",
+    default-features = false,  # 为了不让下游集成者没得选，这一句一定要加
+}
 # 虚拟时间（仅测试装配需要）：连接的建连路径要自己取作用域（`ScopeHost`），而
 # `ManualTime` 是外部类型，它的 `ScopeHost` 实现只能写在**拥有该 trait 的本 crate**
 # 里（孤儿规则）。因此这里开一个可选依赖 + 测试 feature，生产依赖图里不出现它。
@@ -50,22 +39,21 @@ flume = { version = "0.12.*" }
 thiserror = { version = "2.0.*", default-features = false }
 
 [features]
-# **后端选择**（经 `abs_art-bridge`）：缺省 = compio；`test-tokio-runtime` 把它换成
-# tokio（用于在 tokio 装配下再跑一遍同一批场景）。
+# **后端选择**：缺省 = compio；`test-tokio-runtime` / `test-smol-runtime` 用于在
+# 另两个装配下再跑一遍同一批场景。
 #
-# 每个 feature 只开 bridge 的**一个** `backend-*`：照 bridge 的规则，「只启用一个
-# backend 时它就是默认」，裸名 `Runtime` / `current` 因此有唯一解，不需要（也不能）
-# 再写 `default-backend-*`——那一位**两个 feature 同时生效时**会撞 bridge 的
-# 「只能声明一个默认后端」守护（`--all-features` 正是这种情形，dev-dependencies
-# 里的后端 crate 也会把第二个 backend 拉进并集）。
+# 每个 feature 只**追加** bridge 的**一个** `backend-*`。bridge 的缺省后端（compio，
+# 由它自己的 `default` 打开）始终在线，因此**不**去写 `default-backend-*`——那会与
+# 缺省的那一个撞上 bridge 的「只能声明一个默认后端」守护。
 #
-# 换言之：「谁是默认」的**唯一**声明点始终只有一个——当前编译里那个唯一的 backend。
+# 「谁是本 crate 的默认后端」因此由 `DefaultRt_`（`src/connection/scope_host_.rs`）
+# 按下面这批 feature **三选一**决定：开了哪个 `test-*-runtime`，哪个后端就是默认。
+# 换非缺省后端要带 `--no-default-features`，否则缺省 compio 与它同时生效、三选一
+# 没有唯一解。
 test-tokio-runtime = ["abs_art-bridge/backend-tokio", "test-mock-clock", "test-loop-probe"]
-# compio 侧：与 tokio feature 构成**互斥二选一**（共享文件按「compio feature 是否
-# 打开」分派设备类型）。两个都在缺省集里：这样 `cargo test --all-targets` 不带任何
-# 参数就能把两个冒烟 target 各按自己的运行时编译一遍，与改动前 `smoke_tokio.rs` +
-# `smoke_compio.rs` 两个文件各自运行的效果一致；单独跑某一个 target 时用
-# `--no-default-features --features <该侧>` 即可。
+# compio 侧：缺省的默认后端（`default = ["test-compio-runtime"]`）。共享文件按
+# 「tokio / smol feature 是否打开」分派设备类型，因此 `cargo test --all-targets`
+# 不带任何参数跑的就是这一格。
 test-compio-runtime = ["abs_art-bridge/backend-compio", "test-mock-clock", "test-loop-probe"]
 # smol 侧：与上面两个 feature 构成**互斥三选一**（共享文件按「smol feature 是否打开」
 # 分派设备类型与传输装配）。
@@ -115,7 +103,7 @@ buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt
 #
 # `mock-clock`：各后端的手动时钟驱动入口（`LocalScope::block_on_advancing`）。
 # keepalive 的端到端验收靠它把「等 1 秒 / 2.5 秒」变成**虚拟时间**，
-# 场景本体与设计见 `tests/keepalive_common.inc` 与 `dev-notes/runtime-adoption-20261006-1352.md`。
+# 场景本体与设计见 `tests/common/keepalive_common.rs` 与 `dev-notes/runtime-adoption-20261006-1352.md`。
 abs_art-tokio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
 abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
 abs_art-smol = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
@@ -133,7 +121,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-uti
 # `smol::net::unix::UnixStream::pair()` + `smol::io::split`（socket 与读写半边）。
 smol = "2"
 
-# 冒烟测试的三个 target：**同一份场景**（`tests/smoke_common.inc`）在三个运行时下各
+# 冒烟测试的三个 target：**同一份场景**（`tests/common/smoke_common.rs`）在三个运行时下各
 # 跑一遍，`required-features` 决定每个 target 用哪一套 socket / 适配类型。
 [[test]]
 name = "smoke_tokio"
@@ -170,7 +158,7 @@ name = "cross_thread_smol"
 path = "tests/cross_thread_smol.rs"
 required-features = ["test-smol-runtime"]
 
-# 保活 / 空闲超时的端到端验收：两个薄壳共用 `tests/keepalive_common.inc`。
+# 保活 / 空闲超时的端到端验收：两个薄壳共用 `tests/common/keepalive_common.rs`。
 # 与冒烟 target 分开的同一条理由：这两个场景要真实时间，而计时循环必须跑在**真正支持
 # 计时**的后端上（tokio 与 compio 的作用域是两个不同类型，无法在同一测试进程里互换）。
 [[test]]

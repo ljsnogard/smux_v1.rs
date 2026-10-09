@@ -49,7 +49,7 @@
 //! # 虚拟时间验收在**集成测试**里
 //!
 //! 用 `abs_art-mock_clock` 的 `ManualTime` + `Supervisor` 把**整条连接**跑在虚拟时间
-//! 上，属于端到端场景，见 `tests/keepalive_common.inc`。
+//! 上，属于端到端场景，见 `tests/common/keepalive_common.rs`。
 
 use core::{
     future::Future,

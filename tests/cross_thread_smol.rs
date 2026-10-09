@@ -17,8 +17,8 @@
 //! cargo test --test cross_thread_smol --no-default-features --features test-smol-runtime
 //! ```
 //!
-//! 必须 `--no-default-features`：缺省 feature 会同时打开 compio 后端，而 bridge 的裸名
-//! `Runtime` 要求「当前编译里只有一个后端」。
+//! 必须 `--no-default-features`：缺省的 `test-compio-runtime` 若同时打开，smux 自己的
+//! `DefaultRt_` 就没有唯一解（它是 `test-*-runtime` 三选一）；bridge 的缺省后端不受影响。
 
 #![cfg(feature = "test-smol-runtime")]
 #![feature(allocator_ext)]
@@ -42,7 +42,9 @@ mod common;
 ///   场景挂住，即测试失败。
 #[test]
 fn cross_thread_bind_and_channels_smol_() {
-    let rt = abs_art_bridge::current();
+    // 走后端 crate 的自由函数 `current()`：返回 `Runtime<FULL>`，避免 `Runtime::current()`
+    // 的 `CAPS` 推断问题（同 `inmem_mux.rs`）。
+    let rt = abs_art_smol::current();
     common::assert_runtime_is_(&rt, abs_art_bridge::RuntimeTag::Smol);
     let scope = rt.local_scope();
 
