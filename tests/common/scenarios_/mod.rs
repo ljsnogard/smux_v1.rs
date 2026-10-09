@@ -9,6 +9,7 @@ mod buffers_;
 mod closed_ring_spin_;
 mod conn_failed_;
 mod connect_;
+mod cross_thread_;
 mod flow_ctrl_;
 mod frame_cap_;
 mod idle_write_;
@@ -24,6 +25,11 @@ pub use buffers_::{run_per_channel_alloc_scenario_, run_ring_rejected_scenario_}
 pub use closed_ring_spin_::run_closed_ring_spin_scenario_;
 pub use conn_failed_::run_conn_failed_wakes_scenario_;
 pub use connect_::{TestConnCfg, connect_pair_};
+pub use cross_thread_::{
+    CrossThreadCfg, CrossThreadConn, K_CROSS_THREAD_CHANNELS, K_CROSS_THREAD_DOCK,
+    K_CROSS_THREAD_FIRST_LOCAL_DOCK, K_CROSS_THREAD_WATCHDOG, run_cross_thread_scenario_,
+    with_watchdog_, worker_body_,
+};
 pub use flow_ctrl_::{
     run_flow_ctrl_isolation_scenario_, run_flow_ctrl_socket_scenario_,
     run_recv_dropped_scenario_,

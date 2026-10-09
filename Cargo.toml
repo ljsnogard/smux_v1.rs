@@ -150,6 +150,26 @@ name = "smoke_smol"
 path = "tests/smoke_smol.rs"
 required-features = ["test-smol-runtime"]
 
+# 跨线程验收：**一条线程建连并驱动全部循环，另一条线程（自建后端上下文）做句柄操作**
+# ——bind 自己的 dock、向对端监听 dock 发起大量子流（`K_CROSS_THREAD_CHANNELS`）并完成
+# 双向收发。
+# 三个后端各一个 target，共用 `tests/common/scenarios_/cross_thread_.rs` 的场景本体；
+# 连接用 `CurrentConnCfg`（不存储运行时值），因此 compio 装配下句柄也是 Send + Sync。
+[[test]]
+name = "cross_thread_tokio"
+path = "tests/cross_thread_tokio.rs"
+required-features = ["test-tokio-runtime"]
+
+[[test]]
+name = "cross_thread_compio"
+path = "tests/cross_thread_compio.rs"
+required-features = ["test-compio-runtime"]
+
+[[test]]
+name = "cross_thread_smol"
+path = "tests/cross_thread_smol.rs"
+required-features = ["test-smol-runtime"]
+
 # 保活 / 空闲超时的端到端验收：两个薄壳共用 `tests/keepalive_common.inc`。
 # 与冒烟 target 分开的同一条理由：这两个场景要真实时间，而计时循环必须跑在**真正支持
 # 计时**的后端上（tokio 与 compio 的作用域是两个不同类型，无法在同一测试进程里互换）。

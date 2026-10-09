@@ -85,6 +85,10 @@ pub use socket_::{
     run_socket_scenario_on_runtime_,
 };
 pub use scenarios_::{
+    CrossThreadCfg,
+    CrossThreadConn,
+    K_CROSS_THREAD_CHANNELS,
+    K_CROSS_THREAD_DOCK,
     run_auto_dock_scenario_,
     run_bind_exclusivity_scenario_,
     run_closed_ring_spin_scenario_,
@@ -101,4 +105,7 @@ pub use scenarios_::{
     run_smoke_scenario_,
     run_telegraph_scenario_,
     run_unsettled_handle_scenario_,
+    run_cross_thread_scenario_,
+    with_watchdog_,
+    worker_body_,
 };
