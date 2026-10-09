@@ -170,3 +170,16 @@ required-features = ["test-compio-runtime"]
 name = "metrics_e2e"
 path = "tests/metrics_e2e.rs"
 required-features = ["metrics"]
+
+# **开发期**：`abs_art` 家族的本地联调。`TrLocalScope::block_on_local`（三端实现）正在
+# 本仓同级的 `abs_art/` 里改，尚未推到 gitee；不重定向的话 Cargo 只会拿到远端旧 commit。
+# 六个 crate 必须**一起**重定向，否则 `TrLocalScope` 会出现「同名不同源」。
+# 推到 gitee 之后可以删除本段。
+[patch."https://gitee.com/lino_snsalias/abs_art.git"]
+abs_art = { path = "../abs_art/abs_art" }
+abs_art-bridge = { path = "../abs_art/abs_art-bridge" }
+abs_art-mock_clock = { path = "../abs_art/abs_art-mock_clock" }
+abs_art-tokio = { path = "../abs_art/abs_art-tokio" }
+abs_art-compio = { path = "../abs_art/abs_art-compio" }
+abs_art-smol = { path = "../abs_art/abs_art-smol" }
+
