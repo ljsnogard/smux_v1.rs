@@ -28,7 +28,7 @@ use abs_mm::CoreAlloc;
 use mm_ptr::x_deps::abs_mm;
 
 use crate::{
-    connection::Dock,
+    connection::{Dock, TrRtCurrent},
     flow_ctrl::{DefaultPolicy, TrFlowCtrlPolicy},
     handshake::agent::HandshakeDelivery,
     metrics::{NoMetrics, TrMetricsSink},
@@ -366,4 +366,164 @@ where
         &self.metrics_
     }
 
+}
+
+/// 与 [`DefaultConnCfg`] 同形的配置，但**不存储**运行时值：每次需要时从当前上下文取一个。
+///
+/// # 它存在的理由：无条件 `Send + Sync`
+///
+/// [`DefaultConnCfg`] 把运行时值存进字段（`rt_: Rt`），而 compio 的运行时值是
+/// `!Send + !Sync`（线程本地执行器）。`MuxCore<C>` 持有的正是配置本身，于是那套装配下
+/// `MuxCore<C>` / `MuxConnection<C>` 也 `!Send + !Sync`。本类型**不存**运行时值，
+/// 因此只要 `P` / `M` 满足，`C: Send + Sync` 无条件成立，连接句柄也随之可以跨线程
+/// （`MuxConnection` 的公开类型与 API 形状与用 [`DefaultConnCfg`] 时**完全一致**）。
+///
+/// # 代价：调用者保证上下文
+///
+/// 「不存」意味着每次取用时都要求**调用点处于所选后端的运行时上下文内**（tokio /
+/// compio 的 `current()` 在上下文之外 panic；smol 无先决条件）。这是本配置的
+/// **调用者责任**：跨线程使用连接时，每条使用它的线程都必须自己处于后端上下文内；
+/// 语义细节见 [`TrRtCurrent`]。debug 构建下取用会先给出断言提示，release 下由后端的
+/// panic 兜底。
+///
+/// 需要**注入**运行时值（虚拟时钟 `abs_art_mock_clock::ManualTime`、上下文之外建连、
+/// 固定具名后端）时，用 [`DefaultConnCfg`]——它保留存储，代价是连接是否 `Send + Sync`
+/// 由 `C::Rt` 决定。
+///
+/// # 泛型参数
+///
+/// 与 [`DefaultConnCfg`] **完全同序**（`<W, R, M, P, Rt>`），便于两者互换。
+///
+/// # Examples
+///
+/// ```ignore
+/// // 默认（compio）装配下：连接句柄可以跨线程，代价是取时刻的线程必须在上下文内。
+/// type Cfg = CurrentConnCfg<BufferedTx, BufferedRx>;
+/// let (delivery, cfg) = CurrentConnCfg::<BufferedTx, BufferedRx>::new(delivery, DefaultPolicy);
+/// let conn = MuxConnection::new(delivery, cfg, read_stage, write_stage);
+/// ```
+pub struct CurrentConnCfg<
+    W, R,
+    M = NoMetrics,
+    P = DefaultPolicy,
+    Rt = crate::connection::DefaultRt_,
+> {
+    policy_: P,
+    metrics_: M,
+    /// 运行时值的**类型**占位：本配置不存值，只在需要时从上下文取一个（见类型文档）。
+    _use_rt_: PhantomData<fn() -> Rt>,
+    /// 连接侧两条半边的类型占位（它们只以类型形式参与）。
+    _use_w_: PhantomData<fn() -> W>,
+    _use_r_: PhantomData<fn() -> R>,
+}
+
+// `Clone` / `Copy` / `Debug` **手写**：理由与 `DefaultConnCfg` 相同（不给 `W` / `R`
+// 添加这些约束），且本类型比它少一个 `Rt` 值，约束因此更少。
+impl<W, R, M, P, Rt> Clone for CurrentConnCfg<W, R, M, P, Rt>
+where
+    M: Clone,
+    P: Clone,
+{
+    fn clone(&self) -> Self {
+        CurrentConnCfg {
+            policy_: self.policy_.clone(),
+            metrics_: self.metrics_.clone(),
+            _use_rt_: PhantomData,
+            _use_w_: PhantomData,
+            _use_r_: PhantomData,
+        }
+    }
+}
+
+impl<W, R, M, P, Rt> Copy for CurrentConnCfg<W, R, M, P, Rt>
+where
+    M: Copy,
+    P: Copy,
+{}
+
+impl<W, R, M: core::fmt::Debug, P: core::fmt::Debug, Rt> core::fmt::Debug
+    for CurrentConnCfg<W, R, M, P, Rt>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CurrentConnCfg")
+            .field("policy_", &self.policy_)
+            .field("metrics_", &self.metrics_)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W, R, M, P, Rt> CurrentConnCfg<W, R, M, P, Rt>
+where
+    M: TrMetricsSink + Clone + Default,
+    P: TrFlowCtrlPolicy,
+{
+    /// 用策略造出配置（**不取**运行时值：本配置在需要时自己从上下文取）。
+    ///
+    /// `delivery` 原样交回，形状与 [`DefaultConnCfg::new`] 一致。因为不取运行时值，
+    /// 本函数在**上下文之外**调用也不会 panic（真正的前提落到每次取用时）。
+    pub fn new(
+        delivery: HandshakeDelivery<W, R>,
+        policy: P,
+    ) -> (HandshakeDelivery<W, R>, Self) {
+        let cfg = CurrentConnCfg {
+            policy_: policy,
+            metrics_: M::default(),
+            _use_rt_: PhantomData,
+            _use_w_: PhantomData,
+            _use_r_: PhantomData,
+        };
+        (delivery, cfg)
+    }
+}
+
+impl<W, R, M, P, Rt> TrMuxConfig for CurrentConnCfg<W, R, M, P, Rt>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+    P: TrFlowCtrlPolicy + 'static,
+{
+    type Data = u8;
+    type Dock = Dock;
+}
+
+impl<W, R, M, P, Rt> TrConnCfg for CurrentConnCfg<W, R, M, P, Rt>
+where
+    W: TrBuffWrite<u8> + 'static,
+    R: TrBuffRead<u8> + 'static,
+    M: TrMetricsSink + Clone,
+    P: TrFlowCtrlPolicy + 'static,
+    Rt: TrTime + Clone + 'static + TrRtCurrent,
+{
+    type Rt = Rt;
+    type Alloc = CoreAlloc;
+    type Policy = P;
+    type ConnTx = W;
+    type ConnRx = R;
+    type Metrics = M;
+
+    /// 从**当前上下文**取一个运行时值。
+    ///
+    /// # Panics
+    ///
+    /// 调用点不在所选后端的运行时上下文内时 panic——这是本配置的**调用者责任**
+    /// （见类型文档与 [`TrRtCurrent`]）。
+    fn runtime(&self) -> Self::Rt {
+        <Rt as TrRtCurrent>::current_rt()
+    }
+
+    fn allocator(&self) -> Self::Alloc {
+        CoreAlloc
+    }
+
+    fn policy(&self) -> &Self::Policy {
+        &self.policy_
+    }
+
+    /// 取本配置**自己携带**的那一份 sink。
+    ///
+    /// 约定与 [`DefaultConnCfg`] 相同：`M` 由 `M::default()` 造出，因此要挂一个有状态、
+    /// 能被自己读到的采集器，请自定义配置类型并把 sink 句柄放进字段。
+    fn metrics(&self) -> &Self::Metrics {
+        &self.metrics_
+    }
 }

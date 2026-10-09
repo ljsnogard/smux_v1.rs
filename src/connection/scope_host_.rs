@@ -55,6 +55,47 @@ pub trait ScopeHost {
     fn local_scope(&self) -> Self::Scope;
 }
 
+/// **能从当前上下文取到一个运行时值**的运行时值。
+///
+/// 与 [`ScopeHost`] 同一性质、同一理由：`abs_art` 里「按上下文构造运行时值」是各后端
+/// `Runtime::current()` 的**固有方法**（不是 trait 入口），泛型代码写不出来，因此这里
+/// 补一条本地约束。
+///
+/// # 它存在的理由：让配置**不存储**运行时值
+///
+/// [`CurrentConnCfg`](super::CurrentConnCfg) 不在配置里存运行时值，而是在每次需要
+/// 「现在几点」时经本 trait 从**当前上下文**取一个。于是 `C: Send + Sync` 无条件成立，
+/// `MuxConnection` 在 compio 装配下也能跨线程——代价见下面的「调用者责任」。
+///
+/// # 调用者责任：调用点必须处于后端上下文内
+///
+/// 「取用」发生在**调用线程**上，因此那条线程必须在所选后端的运行时上下文内：
+///
+/// | 后端 | 上下文要求 | 不在上下文内时 |
+/// | --- | --- | --- |
+/// | tokio | 处于某个 tokio 运行时上下文内 | `current()` panic（`Handle::current()` 的行为） |
+/// | compio | 处于 compio 运行时上下文内 | `current()` panic |
+/// | smol | **无**（值是零大小标记） | 不会发生 |
+///
+/// 跨线程使用连接时「每条线程都自己处于上下文内」这件事**由调用者保证**：
+/// debug 构建下 [`current_rt`](Self::current_rt) 会先经
+/// [`try_current_rt`](Self::try_current_rt) 给出本 crate 的断言提示，release 构建下由
+/// 后端的 panic 兜底——两者都属于调用者违约，不是实现缺陷。
+pub trait TrRtCurrent: Sized {
+    /// 取当前上下文里的运行时值。
+    ///
+    /// # Panics
+    ///
+    /// 调用点不在所选后端的运行时上下文内时 panic（debug 构建下先给出本 crate 的断言
+    /// 提示，见 trait 文档）。
+    fn current_rt() -> Self;
+
+    /// 当前是否处于上下文内：`Option::None` = **确定不在**，`Option::Some` = 在。
+    ///
+    /// 只用于 debug 构建下的提示，不改变任何运行期语义。
+    fn try_current_rt() -> Option<Self>;
+}
+
 
 /// **默认后端**的实现：`abs_art_bridge::Runtime` / `LocalScope` 是本 crate 的
 /// 唯一后端入口。
@@ -69,6 +110,24 @@ impl ScopeHost for abs_art_bridge::Runtime {
 
     fn local_scope(&self) -> Self::Scope {
         abs_art_bridge::Runtime::local_scope(self)
+    }
+}
+
+/// 默认后端的「从当前上下文取一个运行时值」实现：委托给 bridge 的裸名
+/// [`try_current`](abs_art_bridge::try_current) / [`current`](abs_art_bridge::current)。
+impl TrRtCurrent for abs_art_bridge::Runtime {
+    fn current_rt() -> Self {
+        debug_assert!(
+            <Self as TrRtCurrent>::try_current_rt().is_some(),
+            "取运行时值时调用点不在所选后端的运行时上下文内：`CurrentConnCfg` 的这一前提\
+             **由调用者保证**——跨线程使用连接时，每条使用它的线程都必须自己处于后端\
+             上下文内（见 `TrRtCurrent` 文档）。",
+        );
+        abs_art_bridge::current()
+    }
+
+    fn try_current_rt() -> Option<Self> {
+        abs_art_bridge::try_current()
     }
 }
 

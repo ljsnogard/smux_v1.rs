@@ -87,9 +87,11 @@ use crate::{
 ///
 /// compio 那一侧是**如实**的表达（它的运行时绑定创建线程），由
 /// `tests/thread_safety.rs` 的编译期断言与本文档共同钉住。要让核心在 compio 装配下
-/// 也是 `Send + Sync`，必须让配置**不存储**运行时值、改为每次从当前上下文取用；代价
-/// 是同时放弃「注入运行时值」（`new_with_rt` 与虚拟时钟 `ManualTime` 验收），并让
-/// `MuxCore::now_millis_` 的每个调用点都要求处于后端上下文内。
+/// 也是 `Send + Sync`，用**不存储**运行时值的配置
+/// [`CurrentConnCfg`](crate::connection::CurrentConnCfg)：它每次从当前上下文取用，
+/// 代价是每个取用点都要求处于后端上下文内（**调用者责任**，见
+/// [`TrRtCurrent`](crate::connection::TrRtCurrent)），且它不适用于「注入运行时值」的
+/// 装配（虚拟时钟等仍走 `DefaultConnCfg`）。
 ///
 /// 本地作用域**不在**本类型的参数里：它只出现在
 /// [`MuxConnection::new`](super::MuxConnection::new) 的方法级泛型上，投递完五个循环

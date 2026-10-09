@@ -559,7 +559,7 @@ mod util_;
 pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
-pub use config_::{DefaultConnCfg, K_STAGE_RING_CAPACITY, TrConnCfg};
+pub use config_::{CurrentConnCfg, DefaultConnCfg, K_STAGE_RING_CAPACITY, TrConnCfg};
 pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
@@ -569,7 +569,7 @@ pub use ring_::{
     BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff_, MuxChanBuffOwnedBy, RingBuildErr,
     new_buffered_channel,
 };
-pub use scope_host_::{DefaultRt_, ScopeHost, default_rt_};
+pub use scope_host_::{DefaultRt_, ScopeHost, TrRtCurrent, default_rt_};
 
 pub use telegraph::{DemandErr, Receiver, RecvDatagram, Sender, Telegraph, TelegraphError};
 
