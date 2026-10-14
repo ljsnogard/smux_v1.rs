@@ -1,0 +1,15 @@
+[package]
+edition = "2024"
+name = "smux_v1_listener"
+version = "0.1.0"
+
+description = "流复用协议第一版"
+
+[dependencies]
+abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
+smux_v1 = { path = "../smux_v1" }
+
+[features]
+rt-compio = []
+rt-smol = []
+rt-tokio = []
