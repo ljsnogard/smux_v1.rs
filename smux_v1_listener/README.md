@@ -47,7 +47,11 @@ while let Ok(conn) = listener.next_async().await {
   一条慢握手不会挡住后面已经握完的连接；
 - **惰性**：接受槽位由 `next_async` 按需投递——调用方不拉取，就没有人在接受连接；
 - **背压**：同时在途的条数由 `TrListenerConfig::max_inflight` 界定（缺省 16），取满
-  之后不再接受新连接，内核的 accept 队列替本端挡着。
+  之后不再接受新连接，内核的 accept 队列替本端挡着；
+- **队列实现**：交付队列就是一条 `buffex::ring`，环里直接放交付物本身（move 语义，
+  既不装箱也不包 `Option`）；投递端有多个，写权由 `atomic_sync` 的协作式读写锁裁决，
+  消费端独占读端。环容量取 `max_inflight`，因此「队列有多长」与「在途有几条」是同一
+  个量。设计因果见 `src/listening/queue_.rs` 的模块文档。
 
 ## 出错时的行为
 

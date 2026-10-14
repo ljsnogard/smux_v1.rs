@@ -54,6 +54,7 @@ use crate::{
     config::{
         TrInbound, TrListenerConfig, TrNegotiatorFactory, into_halves_async_,
     },
+    listening::queue_::{Receiver_, RingQueue_, Sender_},
     SmuxListenerError,
     x_deps::abs_cancel::{
         NonCancellableToken, TrCancellationToken, TrMayCancel,
@@ -148,12 +149,11 @@ where
     Cfg: TrListenerConfig,
     A: TrInbound,
 {
-    /// 已完成连接的投递队列（**发送端**）：每个槽位克隆一份，把握完的连接投进来。
-    queue_: flume::Sender<QueueMsg_<MuxConnection<Cfg::Conn>, A::Error>>,
-
-    /// 已完成连接的投递队列（**接收端**）：只有 `next_async` 持有，它因此也是
-    /// 「队列是否还活着」的唯一裁判。
-    inbox_: flume::Receiver<QueueMsg_<MuxConnection<Cfg::Conn>, A::Error>>,
+    /// 已完成连接的投递队列（**生产端**）：每个槽位克隆一份，把握完的连接投进来。
+    ///
+    /// 队列本身是 [`RingQueue_`]，容量即 `max_inflight`——因此「队列长度」与「在途条数」
+    /// 是同一个量，不需要两套账（见 [`crate::listening::queue_`] 的模块文档）。
+    queue_: Sender_<QueueMsg_<MuxConnection<Cfg::Conn>, A::Error>>,
 
     /// 当前存活任务（接受槽位与在途握手）的句柄表。
     ///
@@ -195,7 +195,7 @@ where
     scope_: U,
 
     /// 已完成连接的投递队列。
-    queue_: flume::Sender<QueueMsg_<MuxConnection<Cfg::Conn>, A::Error>>,
+    queue_: Sender_<QueueMsg_<MuxConnection<Cfg::Conn>, A::Error>>,
 
     /// 本 listener 的关闭信号。
     shutdown_: K,
@@ -257,6 +257,11 @@ where
     /// 共享状态。
     shared_: Arc<Shared_<Cfg, A>>,
 
+    /// 已完成连接的队列**消费端**。
+    ///
+    /// 它由 listener 独占（只有一个消费者），因此不放进 `Arc<Shared_>`。
+    inbox_: Receiver_<QueueMsg_<MuxConnection<Cfg::Conn>, A::Error>>,
+
     /// 本 listener 的关闭信号。
     shutdown_: K,
 }
@@ -283,19 +288,20 @@ where
     ) -> Self {
         // 上限归一化：0 与 1 等价。若允许 0，就一个槽位都不跑，listener 永远接不到连接。
         let max_inflight = cfg.max_inflight().max(1usize);
-        let (tx, rx) = flume::unbounded();
+        // 队列容量就是在途上限：环满即背压（见 `crate::listening::queue_`）。
+        let (queue, inbox) = RingQueue_::new_(max_inflight).split_();
         SmuxListener {
             inbound_: Arc::new(inbound),
             cfg_: cfg,
             neg_: Arc::new(neg),
             scope_: scope,
             shared_: Arc::new(Shared_ {
-                queue_: tx,
-                inbox_: rx,
+                queue_: queue,
                 live_: Arc::new(Mutex::new(Vec::new())),
                 max_inflight_: max_inflight,
                 _mark_: PhantomData,
             }),
+            inbox_: inbox,
             shutdown_: shutdown,
         }
     }
@@ -375,9 +381,11 @@ where
         let neg = self.neg_.clone();
         let scope = self.scope_.clone();
         let cancel = self.shutdown_.clone();
+        // 队列接收端由 listener 独占，因此**借**给内部实现（它不能被克隆）。
+        let inbox = &mut self.inbox_;
         NextWait_::new_(
             Box::pin(async move {
-                next_async_(shared, inbound, cfg, neg, scope, cancel).await
+                next_async_(inbox, shared, inbound, cfg, neg, scope, cancel).await
             }),
             SmuxListenerError::Cancelled,
         )
@@ -393,7 +401,9 @@ where
 /// 2. **等队列**：与关闭信号竞速，因此关闭能立刻返回；
 /// 3. **取队首**：队列非空时直接取，不补槽位——那说明调用方还没把已有结果取走，
 ///    此刻再加槽位只会把在途条数推过上限。
+#[allow(clippy::too_many_arguments)]
 async fn next_async_<Cfg, A, N, U, K>(
+    inbox: &mut Receiver_<QueueMsg_<MuxConnection<Cfg::Conn>, A::Error>>,
     shared: Arc<Shared_<Cfg, A>>,
     inbound: Arc<A>,
     cfg: Cfg,
@@ -416,7 +426,7 @@ where
 
     // 1. 补槽位。队列非空时不补——那说明调用方还没把已有结果取走，此刻再加槽位只会把
     //    在途条数推过上限。
-    if shared.queue_.is_empty() {
+    if inbox.len_() == 0usize {
         // 先清理已完成任务：`live_` 的长度就是存活数，不清就会一直涨。
         let active = match shared.live_.lock() {
             Result::Ok(mut live) => Live_::retain_done_(&mut live),
@@ -439,38 +449,23 @@ where
         }
     }
 
-    // 2. 等队列 / 关闭。三者合并在一次竞速里：调用方的令牌一触发，等待立刻结束，
-    //    不会被「先入队的连接」压住。
-    match receive_(shared.inbox_.clone(), cancel.clone()).await {
-        Result::Ok(QueueMsg_::Connection(conn)) => Result::Ok(conn),
+    // 2. 等队列。取消由 `pop` 自己透传给 ring 的 park 协议（见 `queue_` 的模块文档），
+    //    因此调用方的令牌一触发，等待立刻结束，不会被「先入队的连接」压住。
+    match inbox.pop(cancel.clone()).await {
+        Result::Ok(Option::Some(QueueMsg_::Connection(conn))) => Result::Ok(conn),
         // 接受失败是致命的：交给调用方（见 `SmuxListenerError::Accept`）。
-        Result::Ok(QueueMsg_::AcceptFailed(err)) => {
+        Result::Ok(Option::Some(QueueMsg_::AcceptFailed(err))) => {
             Result::Err(SmuxListenerError::Accept(err))
         }
-        // 关闭信号已触发：不会再有连接进来。
-        Result::Ok(QueueMsg_::Stopped) => Result::Err(SmuxListenerError::Cancelled),
-        // 队列断开（发送端全没了）：同样按「不会再有连接」处理。
-        Result::Err(_recv_err) => Result::Err(SmuxListenerError::Cancelled),
-    }
-}
-
-/// 等队列里出现下一条消息，或等到关闭信号。
-///
-/// 语义见 [`next_async_`] 的第 2 步。
-async fn receive_<T, AE, K>(
-    queue: flume::Receiver<QueueMsg_<T, AE>>,
-    cancel: K,
-) -> Result<QueueMsg_<T, AE>, flume::RecvError>
-where
-    K: TrCancellationToken + Clone,
-{
-    let token = cancel.clone();
-    let stopped = token.cancellation();
-    let msg = select_with_cancel_(queue.recv_async(), stopped).await;
-    match msg {
-        // 关闭信号先到：本次等待结束，队列里已排队的连接不受影响。
-        Option::None => Result::Err(flume::RecvError::Disconnected),
-        Option::Some(msg) => msg,
+        // 显式的停止哨兵：不会再有连接进来。
+        Result::Ok(Option::Some(QueueMsg_::Stopped)) => {
+            Result::Err(SmuxListenerError::Cancelled)
+        }
+        // 队列终结：所有生产端都已关闭，且残留数据也取完了。
+        // 这包括「最后一个槽位退出时投了 `Stopped`」与「listener 被丢弃」两种情形。
+        Result::Ok(Option::None) => Result::Err(SmuxListenerError::Cancelled),
+        // 本次等待被取消。
+        Result::Err(_empty) => Result::Err(SmuxListenerError::Cancelled),
     }
 }
 
@@ -539,8 +534,9 @@ async fn acceptor_async_<Cfg, A, N, U, K>(
 {
     let outcome = acceptor_inner_async_(&slot, cfg).await;
     if let Result::Err(msg) = outcome {
-        // 队列可能已经断开（接收端被丢弃）：那时没人会看这条消息，丢掉即可。
-        let _ = slot.queue_.send(msg);
+        // 投递「停止」或「接受失败」这类终止消息。队列已满只可能是「调用方长时间不
+        // 拉取」，那时这条消息也没人看，丢掉即可。
+        let _ = slot.queue_.push(msg, slot.shutdown_.clone()).await;
     }
 }
 
@@ -627,9 +623,7 @@ async fn serve_async_<Cfg, A, N, K>(
     cfg: Cfg,
     inbound: Arc<A>,
     neg: Arc<N>,
-    queue: flume::Sender<
-        QueueMsg_<MuxConnection<Cfg::Conn>, <A as TrInbound>::Error>,
-    >,
+    queue: Sender_<QueueMsg_<MuxConnection<Cfg::Conn>, <A as TrInbound>::Error>>,
     shutdown: K,
     tx: <A::ConnCfg as TrConnCfg>::ConnTx,
     rx: <A::ConnCfg as TrConnCfg>::ConnRx,
@@ -675,6 +669,8 @@ async fn serve_async_<Cfg, A, N, K>(
         write_stage,
     );
 
-    // 3. 投递。发送失败只可能是「所有接收端都没了」（调用方已丢弃 listener）。
-    let _ = queue.send(QueueMsg_::Connection(conn));
+    // 3. 投递。失败只可能是「等待被取消」（listener 正在收摊）——那时放弃这条连接。
+    let _ = queue
+        .push(QueueMsg_::Connection(conn), shutdown.clone())
+        .await;
 }

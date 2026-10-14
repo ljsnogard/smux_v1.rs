@@ -66,9 +66,10 @@ pub use error_::SmuxListenerError;
 /// 依赖重导出，便于调用方在不额外声明依赖的情况下对齐版本。
 pub mod x_deps {
     pub use abs_async_iter;
-    pub use flume;
     pub use futures;
     pub use smux_v1;
 
-    pub use smux_v1::x_deps::{abs_art, abs_buff, abs_cancel, abs_mm, abs_smux};
+    pub use smux_v1::x_deps::{
+        abs_art, abs_buff, abs_cancel, abs_mm, abs_smux, buffex,
+    };
 }

@@ -6,18 +6,9 @@ version = "0.1.0"
 description = "流复用协议第一版：跨运行时 listener"
 
 [dependencies]
-# `abs_cancel` 与 `gen_mcf2` 必须能**顶格**解析：`gen_may_cancel_future` 展开出的
-# 代码里写的是 `abs_cancel::...`（见 `gen_mcf2` 的 README「关于 crate 路径」）。
-# git spec 与 `smux_v1` 依赖图上的那两个**完全一致**，否则会出现同名不同源。
-abs_cancel = { git = "https://gitee.com/lino_snsalias/abs_cancel-rs.git", branch = "dev/0.2.0" }
-gen_mcf2 = { git = "https://gitee.com/lino_snsalias/gen_mcf2.rs.git", branch = "feat/vis-for-new" }
-
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
 smux_v1 = { path = "../smux_v1", default-features = false }
 
-# 握手结果的 FIFO 队列（`flume` 的队列不要求元素 `Send`，与连接句柄的 auto trait
-# 无关）；`futures` 只用于把「队列有数据」与「收到取消信号」合成一次 `select!`。
-flume = { version = "0.12.*" }
 thiserror = { version = "2.0.*", default-features = false }
 futures = { version = "0.3.*", default-features = false, features = ["async-await", "std"] }
 
@@ -55,6 +46,10 @@ rt-compio = ["dep:abs_art-compio", "dep:buffex_compio_adapt", "dep:compio"]
 rt-smol = ["dep:abs_art-smol", "dep:async-net", "dep:buffex_smol_adapt", "dep:futures-lite", "dep:smol"]
 
 [dev-dependencies]
+# 单元测试用的中立执行器：`queue_` 的「多生产者 / 背压 / 取消」三条路径都要在
+# **不依赖任何 rt-* 后端**的前提下被驱动，因此不能用 tokio / compio / smol 的运行时。
+futures-executor = { version = "0.3.*", default-features = false, features = ["std"] }
+
 # 三套运行时的**具名别名**（`TokioRuntime` / `CompioRuntime` / `SmolRuntime`）。它们必须
 # 来自与 `smux_v1` 依赖图上**同一个源**（同一 URL + 同一 branch），否则会出现两个
 # `abs_art` 实例：编译期未必报错，但 `LocalScope` 会挂到另一个实例的本地队列上，
