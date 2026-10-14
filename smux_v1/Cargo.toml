@@ -1,0 +1,188 @@
+[package]
+edition = "2024"
+name = "smux_v1"
+version = "0.1.0"
+
+description = "流复用协议第一版"
+
+[dependencies]
+abs_smux = { path = "../abs_smux" }
+# `abs_art` 家族全部取 **gitee 的 `dev/0.3.0`**：同一个仓库的六个 crate
+# （`abs_art` / `-bridge` / `-mock_clock` / `-tokio` / `-compio` / `-smol`）必须写**完全
+# 相同**的 git spec（同一 URL + 同一 branch），否则 Cargo 会把它们当成两个 source、
+# 检出两份代码——那时 `TrLocalScope` / `TrTime` 这些 trait 会出现「同名不同源」而
+# 对不上。跨依赖表（`[dependencies]` 与 `[dev-dependencies]`）也必须一致。
+abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+# **后端门面**：本 crate 只认 `abs_art_facade::Runtime`，不再直接依赖 `abs_art-bridge`，
+# 也不再自己维护「三选一 + 具名别名」那套表。门面是全家族**唯一**决定「当前后端」的地方：
+# 下游谁点亮 `abs_art-facade/rt-tokio`，全图（含本 crate）就都是 tokio。
+abs_art-facade = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+# 虚拟时间（仅测试装配需要）：连接的建连路径要自己取作用域（`ScopeHost`），而
+# `ManualTime` 是外部类型，它的 `ScopeHost` 实现只能写在**拥有该 trait 的本 crate**
+# 里（孤儿规则）。因此这里开一个可选依赖 + 测试 feature，生产依赖图里不出现它。
+abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", optional = true }
+abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
+atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch = "dev/0.3.0" }
+
+# 复用子流与协议帧的缓冲区一律使用 `buffex::circular_buff`，因此它是正式依赖
+# 而非测试专用依赖（`no_std` 成立；缺省分配器由 `buffex` 重导出）。
+buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
+mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
+
+crc = { version = "3.4.*" }
+flume = { version = "0.12.*" }
+thiserror = { version = "2.0.*", default-features = false }
+
+[features]
+# **后端选择**：缺省 = compio；`test-tokio-runtime` / `test-smol-runtime` 用于在
+# 另两个装配下再跑一遍同一批场景。
+#
+# 每个 feature 只把选择**转发**给门面上的一个 `rt-*`。门面自己处理「缺省后端 + override」
+# 的映射（`rt-compio` 只链裸 backend，`rt-tokio` / `rt-smol` 用 `default-backend-*` 压过
+# 它），所以这里既不写 `backend-*`，也不需要 `default-features = false`。
+#
+# 注意：门面的缺省 `rt-compio` 始终在线（本 crate 依赖它也带默认），因此非缺省装配下
+# compio 仍会被链接——这是"可选优化"而非"正确性要求"，想省掉可在决定点写
+# `default-features = false`。
+test-tokio-runtime = ["abs_art-facade/rt-tokio", "test-mock-clock", "test-loop-probe"]
+# compio 侧：缺省的默认后端（`default = ["test-compio-runtime"]`）。共享文件按
+# 「tokio / smol feature 是否打开」分派设备类型，因此 `cargo test --all-targets`
+# 不带任何参数跑的就是这一格。
+test-compio-runtime = ["abs_art-facade/rt-compio", "test-mock-clock", "test-loop-probe"]
+# smol 侧：与上面两个 feature 构成**互斥三选一**（共享文件按「smol feature 是否打开」
+# 分派设备类型与传输装配）。
+#
+# 与 tokio 的差别只在「谁驱动本地队列」：smol 没有隐式运行时上下文，作用域是本线程
+# `thread_local!` 里的 `Rc<LocalExecutor<'static>>`，因此测试壳用
+# `smol::block_on(scope.run_until(..))` 驱动（见 `tests/smoke_smol.rs`）。
+test-smol-runtime = ["abs_art-facade/rt-smol", "test-mock-clock", "test-loop-probe"]
+# 虚拟时钟（`abs_art_mock_clock`）只在这些测试 feature 下被拉进来。
+test-mock-clock = ["dep:abs_art-mock_clock", "abs_art-facade/mock-clock"]
+# 循环活动探针（诊断挂起类问题）：给连接加一个只增的「解复用循环跑了几轮」计数，
+# 集成测试经 `MuxConnection::demux_ticks_()` 采样它。不在生产 feature 集里。
+test-loop-probe = []
+# **指标上报**（见 `src/metrics/` 与 `dev-notes/metrics-20261006-2253.md`）：
+# 打开后内置的 bench / debug 采集器（`DebugCounters` / `DebugMetrics`）可用，且上报
+# 调用点按具体 sink 类型单态化。**关掉**时内置采集器整个不进编译单元，热路径上的
+# 上报调用点被消除为零指令——缺省 sink 是零大小的 `NoMetrics`，每个方法都是
+# `#[inline(always)]` 空实现。本 feature **不引入任何依赖**。
+metrics = []
+default = ["test-compio-runtime"]
+
+[dev-dependencies]
+# 测试在 compio 上运行（目标 3），因此内存分配器只在 dev-dependencies 中出现
+# （`buffex` 已是正式依赖，不在此重复）。
+# 注意：`abs_art-facade` 与 `abs_art` **不在这里**——它们已是正式依赖（见上），Cargo
+# 不允许同一个依赖有两个来源（path 与 registry 混用会直接拒绝解析 manifest）。
+
+# 集成冒烟测试（tests/）用三个运行时各跑一遍同一场景，且都跑真实 UNIX socket：
+# - 三个运行时都用「调用方驱动的泵 + 全被动 buffex 环」搬运 socket 数据；
+# - tokio 侧用 `abs_buff_tokio_adapt` 的设备适配，compio 侧用
+#   `abs_buff_compio_adapt`，smol 侧用本仓同级的 `buffex_smol_adapt`
+#   （原因与三处阻塞点见 dev-notes §9）。
+#
+# `buffex_smol_adapt` 与前面两个 adapt crate 的形态一致：设备层是「借用形态」的
+# `ReadAsInput` / `WriteAsOutput`（设备 trait 取 `futures-lite`，即 `smol::io` 的正身），
+# 环层 `BuffRead` / `BuffWrite`，**按需驱动、不 spawn**，因此这里的装配与 tokio 侧
+# 逐字同构。
+buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_compio_adapt.git" }
+buffex_smol_adapt = { git = "https://gitee.com/lino_snsalias/buffex_smol_adapt.git" }
+buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt.git" }
+
+# 连接层经 `abs_art` 的**值化本地作用域**（`TrLocalScope`）投递读 / 写循环，
+# 并从一个**运行时值**（`abs_art::TrTime`：计时 + 时刻）取时间能力。因此测试要给出
+# 具体的后端值：tokio 版用 `abs_art_tokio::current()` + 它交出的 `LocalScope`，
+# compio / smol 版同理。三者与 `abs_art` 必须是**同一个 git spec**（同 URL + 同
+# branch），否则 trait 会对不上。
+#
+# `mock-clock`：各后端的手动时钟驱动入口（`LocalScope::block_on_advancing`）。
+# keepalive 的端到端验收靠它把「等 1 秒 / 2.5 秒」变成**虚拟时间**，
+# 场景本体与设计见 `tests/common/keepalive_common.rs` 与 `dev-notes/runtime-adoption-20261006-1352.md`。
+abs_art-tokio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
+abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
+abs_art-smol = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
+
+# 手动（虚拟）时钟本体：`ManualClock` / `ManualTime` / `Supervisor`。
+# 它只出现在测试里（正式依赖不需要），因此留在 dev-dependencies。
+abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+
+# 场景并发用与运行时无关的组合子（join! / join_all / select），因此只需要
+# `futures`，不需要为两个运行时各写一份并发代码。
+futures = "0.3.*"
+compio = { version = "0.19.*", features = ["fs", "macros", "time", "net", "runtime"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+# smol 侧只需要两样：`smol::block_on`（外部阻塞驱动源，用于 `scope.run_until`）与
+# `smol::net::unix::UnixStream::pair()` + `smol::io::split`（socket 与读写半边）。
+smol = "2"
+
+# 冒烟测试的三个 target：**同一份场景**（`tests/common/smoke_common.rs`）在三个运行时下各
+# 跑一遍，`required-features` 决定每个 target 用哪一套 socket / 适配类型。
+[[test]]
+name = "smoke_tokio"
+path = "tests/smoke_tokio.rs"
+required-features = ["test-tokio-runtime"]
+
+[[test]]
+name = "smoke_compio"
+path = "tests/smoke_compio.rs"
+required-features = ["test-compio-runtime"]
+
+[[test]]
+name = "smoke_smol"
+path = "tests/smoke_smol.rs"
+required-features = ["test-smol-runtime"]
+
+# 跨线程验收：**一条线程建连并驱动全部循环，另一条线程（自建后端上下文）做句柄操作**
+# ——bind 自己的 dock、向对端监听 dock 发起大量子流（`K_CROSS_THREAD_CHANNELS`）并完成
+# 双向收发。
+# 三个后端各一个 target，共用 `tests/common/scenarios_/cross_thread_.rs` 的场景本体；
+# 连接用 `CurrentConnCfg`（不存储运行时值），因此 compio 装配下句柄也是 Send + Sync。
+[[test]]
+name = "cross_thread_tokio"
+path = "tests/cross_thread_tokio.rs"
+required-features = ["test-tokio-runtime"]
+
+[[test]]
+name = "cross_thread_compio"
+path = "tests/cross_thread_compio.rs"
+required-features = ["test-compio-runtime"]
+
+[[test]]
+name = "cross_thread_smol"
+path = "tests/cross_thread_smol.rs"
+required-features = ["test-smol-runtime"]
+
+# 保活 / 空闲超时的端到端验收：两个薄壳共用 `tests/common/keepalive_common.rs`。
+# 与冒烟 target 分开的同一条理由：这两个场景要真实时间，而计时循环必须跑在**真正支持
+# 计时**的后端上（tokio 与 compio 的作用域是两个不同类型，无法在同一测试进程里互换）。
+[[test]]
+name = "keepalive"
+path = "tests/keepalive.rs"
+required-features = ["test-tokio-runtime"]
+
+[[test]]
+name = "keepalive_compio"
+path = "tests/keepalive_compio.rs"
+required-features = ["test-compio-runtime"]
+
+# metrics 特性的**端到端**验收：一条子流的完整生命周期之后，连接数 / 子流数 / 帧数 /
+# 字节数都必须真的被上报（内置采集器 `DebugCounters` 只在 `metrics` feature 下存在，
+# 因此这个 target 也挂在它上面）。它只跑一个用例——计数是进程级累计量。
+[[test]]
+name = "metrics_e2e"
+path = "tests/metrics_e2e.rs"
+required-features = ["metrics"]
+
+# **开发期**：`abs_art` 家族的本地联调。新增的 `abs_art-facade` 只存在于本机同级
+# `abs_art/`，而本 crate 仍以 git spec 依赖 `abs_art` / `-mock_clock` / 三个后端；
+# 不重定向的话依赖图里会出现**两个 `abs_art`**（git 版与门面带进来的 path 版），
+# `TrLocalScope` / `TrTime` 会「同名不同源」。
+#
+# 不列 `abs_art-bridge`：本 crate 已不直接依赖它，门面走的本来就是 path。
+# 推到 gitee 之后可以删除本段。
+# [patch."https://gitee.com/lino_snsalias/abs_art.git"]
+# abs_art = { path = "../abs_art/abs_art" }
+# abs_art-mock_clock = { path = "../abs_art/abs_art-mock_clock" }
+# abs_art-tokio = { path = "../abs_art/abs_art-tokio" }
+# abs_art-compio = { path = "../abs_art/abs_art-compio" }
+# abs_art-smol = { path = "../abs_art/abs_art-smol" }

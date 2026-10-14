@@ -1,0 +1,57 @@
+# smux_v1_sock_demo 的配方。
+#
+# 超时纪律（根 AGENTS.md §12）：单元测试不超过 1 分钟；本机环回这类全量验收不超过 5 分钟。
+# 本 demo 的「全量」是 3 组运行时配对 × 两阶段 × 8 条子流，实测在分钟级以内。
+set shell := ["bash", "-uc"]
+
+demo := justfile_directory()
+# 需要离线（本机 cargo 缓存只读 / 断网）时：`DEMO_CARGO_OFFLINE=--offline just loopback`
+offline := env('DEMO_CARGO_OFFLINE', '')
+
+default:
+    @just --list
+
+# 三格各编译一次（三个运行时 feature 互斥，必须分开编）
+build:
+    cargo build --manifest-path {{demo}}/Cargo.toml {{offline}} --no-default-features --features rt-compio --bin peer_compio
+    cargo build --manifest-path {{demo}}/Cargo.toml {{offline}} --no-default-features --features rt-tokio --bin peer_tokio
+    cargo build --manifest-path {{demo}}/Cargo.toml {{offline}} --no-default-features --features rt-smol --bin peer_smol
+    cargo build --manifest-path {{demo}}/Cargo.toml {{offline}} --no-default-features --features rt-compio
+
+# 单元测试（信封编解码 / 确定性载荷 / 命令行 / metrics 口径），60 秒上限
+test:
+    timeout 60 cargo test --manifest-path {{demo}}/Cargo.toml {{offline}} --no-default-features --features rt-compio
+
+# 静态检查
+clippy:
+    cargo clippy --manifest-path {{demo}}/Cargo.toml {{offline}} --no-default-features --features rt-compio --all-targets
+
+# 本机环回（debug，先验正确性）：3 组运行时配对，300 秒上限
+loopback:
+    timeout 300 python3 {{demo}}/scripts/run_loopback.py {{offline}}
+
+# channel + telegraph 混合项：同一条连接上，子流与数据报**并发**跑，telegraph 侧用
+# 「发一帧 → 等对端 ACK → 再发下一帧」的停止等待闭环。300 秒上限
+mix:
+    timeout 300 python3 {{demo}}/scripts/run_loopback.py {{offline}} --mix-telegraph --label mix
+
+# 性能口径（release，8 子流 x 每方向 8 MiB）：600 秒上限
+perf:
+    timeout 600 python3 {{demo}}/scripts/run_loopback.py {{offline}} --release
+
+# 只跑一组配对：`just one tokio compio`
+one a b:
+    timeout 300 python3 {{demo}}/scripts/run_loopback.py {{offline}} --pairs {{a}}-{{b}}
+
+# 复现「一次积压超过一个帧 => FrameTooLarge => 静默挂起」：只把 max-packet-size 调回缺省 4096
+# （预期挂住，用于取证；对照：同参数加 --max-packet-size 65536 即通过）
+stall:
+    timeout 60 python3 {{demo}}/scripts/run_loopback.py {{offline}} --skip-build --pairs tokio-compio \
+        --streams 1 --bytes 65536 --chunk 4096 --ring-cap 4096 --max-packet-size 4096 \
+        --timeout 15 --label stall || true
+
+# 跨机（真实局域网）：`just lan root@A root@B <A 的 IP> <B 的 IP>`
+lan a b ipa ipb:
+    timeout 600 python3 {{demo}}/scripts/run_lan.py \
+        --ssh-a {{a}} --ssh-b {{b}} --ip-a {{ipa}} --ip-b {{ipb}} \
+        --dir-a {{demo}} --dir-b {{demo}}

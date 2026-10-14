@@ -1,0 +1,85 @@
+//! 冒烟测试的 **tokio** 壳：只做「建立运行时值 + 作用域 + 选运行时」。
+//!
+//! 场景本体在 `tests/common/smoke_common.rs`，与 compio / smol 壳引入的是**同一份
+//! 文件**——测试 target 是独立 crate，无法共享同一个模块定义，因此各壳用 `#[path]`
+//! 指向它。放在 `tests/common/` 子目录是为了不被 Cargo 当成独立测试 target 自动发现
+//! （`tests/` 顶层的 `.rs` 会被自动发现，那种文件会因找不到 `mod common` 而编译失败）。
+//!
+//! 本 target 以 `required-features = ["test-tokio-runtime"]` 选中 tokio 的设备类型，
+//! 共享文件按同一个 feature 分派（打开 ⇒ tokio 分支）。跑它要显式换掉缺省的 compio：
+//!
+//! ```bash
+//! cargo test --test smoke_tokio --no-default-features --features test-tokio-runtime
+//! ```
+//!
+//! # 两个值从哪里来
+//!
+//! `LocalScope::new()` 已不存在：作用域只能从**运行时值**取得（`rt.local_scope()`）。
+//! 因此每个用例先取当前运行时值（`abs_art_facade::TokioRuntime::current()`，要求调用点已在 tokio
+//! 运行时上下文内——`#[tokio::test]` 满足），再向它要作用域；两个值分别作为
+//! `MuxConnection<C>` 的类型参数与 `MuxConnection::new` 的方法级泛型。
+
+#![cfg(feature = "test-tokio-runtime")]
+#![feature(allocator_ext)]
+
+#[path = "common/mod.rs"]
+mod common;
+
+#[path = "common/smoke_common.rs"]
+mod smoke_common;
+
+/// 测试目标、手段、判断见 [`smoke_common::smoke_socket_body_`]。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smoke_socket_tokio_() {
+    let rt = abs_art_facade::TokioRuntime::current();
+    common::assert_runtime_is_(&rt, abs_art_facade::RuntimeTag::Tokio);
+    let scope = rt.local_scope();
+    smoke_common::smoke_socket_body_(&rt, &scope).await;
+}
+
+/// 测试目标、手段、判断见 [`smoke_common::small_socket_body_`]。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_socket_tokio_() {
+    let rt = abs_art_facade::TokioRuntime::current();
+    common::assert_runtime_is_(&rt, abs_art_facade::RuntimeTag::Tokio);
+    let scope = rt.local_scope();
+    smoke_common::small_socket_body_(&rt, &scope).await;
+}
+
+/// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_socket_body_`]。
+///
+/// 「小接收环 + 大发送」在真实 UNIX socket 上验收流控：窗口用尽与回补不得丢字节、
+/// 不得死锁。`multi_thread` 与真实 socket 一起构成「有真实 IO 参与时流控仍然成立」
+/// 的验收（内存环直连的版本见 `tests/inmem_mux.rs`）。
+///
+/// **本条曾经 `#[ignore]`，本轮已转绿（`#[ignore]` 已去掉）**：它专为「窗口反复归零
+/// 再回补」而设，因此曾稳定卡死。两个真因都已修：发送方复用循环把跨环末端的逻辑读段
+/// 误判成 `MalformedFrame` 而终止；接收侧「已消费量」按 `data_size` 采样记账、被并发
+/// 写入掩盖。因果链与实测记录见 `dev-notes/flow-ctrl-20261005-0115.md` §2、§3。
+///
+/// （同目录的 `flow_ctrl_isolation_socket_tokio_` 只把一条子流写到恰好一个窗口，
+/// 不触发归零后的回补，是本条之外的独立对照。）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flow_ctrl_socket_tokio_() {
+    let rt = abs_art_facade::TokioRuntime::current();
+    common::assert_runtime_is_(&rt, abs_art_facade::RuntimeTag::Tokio);
+    let scope = rt.local_scope();
+    smoke_common::flow_ctrl_socket_body_(&rt, &scope).await;
+}
+
+/// 测试目标、手段、判断见 [`smoke_common::flow_ctrl_isolation_socket_body_`]。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flow_ctrl_isolation_socket_tokio_() {
+    let rt = abs_art_facade::TokioRuntime::current();
+    common::assert_runtime_is_(&rt, abs_art_facade::RuntimeTag::Tokio);
+    let scope = rt.local_scope();
+    smoke_common::flow_ctrl_isolation_socket_body_(&rt, &scope).await;
+}
+
+/// 测试目标、手段、判断见 [`smoke_common::telegraph_socket_body_`]。
+#[tokio::test]
+async fn telegraph_socket_tokio_() {
+    let rt = abs_art_facade::TokioRuntime::current();
+    let scope = rt.local_scope();
+    smoke_common::telegraph_socket_body_(&rt, &scope).await;
+}

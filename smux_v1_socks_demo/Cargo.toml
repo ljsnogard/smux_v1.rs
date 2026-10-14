@@ -1,0 +1,92 @@
+# smux_v1 的真实 TCP socket 跨运行时互通 demo。
+#
+# 本 crate 是一个**独立 workspace**（见下面的空 `[workspace]` 表）：三个运行时 feature
+# 互斥，要按 feature 各编译一次。把它并进别的 workspace 只会让 feature 被取并集，
+# 直接撞上 `abs_art-bridge` 的「多后端必须显式声明默认后端」守护。
+[package]
+name = "smux_v1_sock_demo"
+version = "0.1.0"
+edition = "2024"
+description = "smux_v1 在真实 TCP socket 上、两进程前后交替主动/被动、跨 tokio/compio/smol 互通的正确性与 metrics demo。"
+license = "MIT/Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+# `smux_v1` 的三个运行时 feature 是**互斥三选一**，因此这里必须 `default-features = false`：
+# 关掉它的缺省 compio 后端，后端选择完全交给本 crate 的 `rt-*` feature。
+# smux_v1 = { git = "https://gitee.com/lino_snsalias/smux_v1.rs.git" }
+smux_v1 = { path = "../smux_v1", default-features = false }
+
+# 环与分配器：**不再直接依赖**——`smux_v1` 已把 `buffex` / `mm_ptr` 经 `x_deps`
+# 转出（`smux_v1::x_deps::{buffex, mm_ptr, abs_buff}`）。下游只依赖 `smux_v1`，
+# 就自动与它用的是**同一个源、同一个 commit**，不会再出现「同名不同源的 buffex」
+# 那种环半部类型对不上的问题。
+# buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
+# mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
+# 三个**设备适配器**一律走本机同级路径：本 demo 依赖它们「自驱动写环」的那次更新
+# （`BuffWrite::try_new_local` / `Drop` 里的关生产端 + detach 泵），而那份改动还没推
+# 到 gitee；走 git 依赖只会拿到旧 commit，demo 会在握手阶段就静止。三者必须与
+# `buffex` / `mm_ptr` / `abs_art` 同源同分支（见上面的说明）。
+
+buffex_tokio_adapt  = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt.git" }
+buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_compio_adapt.git" }
+buffex_smol_adapt   = { git = "https://gitee.com/lino_snsalias/buffex_smol_adapt.git" }
+
+# buffex_tokio_adapt  = { path = "../buffex_tokio_adapt" }
+# buffex_compio_adapt = { path = "../buffex_compio_adapt" }
+# buffex_smol_adapt   = { path = "../buffex_smol_adapt" }
+
+# 场景并发一律用与运行时无关的组合子（`join!` / `join_all` / `select`）：compio 的
+# socket 半边是 `!Send`，`spawn` 不可用。
+futures = "0.3.*"
+
+# 三个运行时都是正式依赖：三个 peer 可执行文件由同一份源码按 feature 各编译一次，
+# 每个构建里只有一个运行时的代码真的被用到。
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+compio = { version = "0.19.*", features = ["macros", "net", "runtime", "time"] }
+smol = "2"
+
+[features]
+# 缺省 = compio，与 `smux_v1` 自己的缺省一致，这样裸 `cargo build` 也能出一个 peer。
+# 换运行时必须 `--no-default-features --features rt-<名字>`，否则两个后端同时打开。
+default = ["rt-compio"]
+# `smux_v1/metrics` 是**零依赖**的可选特性；本 demo 的每一格都要采集计数。
+rt-tokio = ["smux_v1/metrics", "smux_v1/test-tokio-runtime"]
+rt-compio = ["smux_v1/metrics", "smux_v1/test-compio-runtime"]
+rt-smol = ["smux_v1/metrics", "smux_v1/test-smol-runtime"]
+
+# crate 名与 bin 名都是下划线形式，nightly cargo 的 kebab-case 命名 lint 在这里纯属噪音。
+[lints.cargo]
+non_kebab_case_bins = "allow"
+
+[[bin]]
+name = "peer_tokio"
+path = "src/bin/peer_tokio.rs"
+required-features = ["rt-tokio"]
+
+[[bin]]
+name = "peer_compio"
+path = "src/bin/peer_compio.rs"
+required-features = ["rt-compio"]
+
+[[bin]]
+name = "peer_smol"
+path = "src/bin/peer_smol.rs"
+required-features = ["rt-smol"]
+
+# **开发期**：`abs_art` 家族的本地联调。**必须打开**——`smux_v1` 现在依赖本机同级的
+# 新门面 `abs_art-facade`（它带进来的是 **path** 版 `abs_art` 家族），而本 crate 图上的
+# `smux_v1` 与三个 `buffex_*_adapt` 仍以 git spec 依赖 `abs_art` / `abs_art-tokio` /
+# `abs_art-smol`。
+#
+# 本 crate 是**独立 workspace**，`[patch]` 只在构建根生效——`smux_v1` 自己那份对我们无效。
+# 不重定向就会出现两个 `abs_art` 实例：编译期未必报错，但 `LocalScope` 会挂到另一个实例
+# 的本地队列上，表现是永久挂起。
+# [patch."https://gitee.com/lino_snsalias/abs_art.git"]
+# abs_art = { path = "../abs_art/abs_art" }
+# abs_art-mock_clock = { path = "../abs_art/abs_art-mock_clock" }
+# abs_art-tokio = { path = "../abs_art/abs_art-tokio" }
+# abs_art-compio = { path = "../abs_art/abs_art-compio" }
+# abs_art-smol = { path = "../abs_art/abs_art-smol" }

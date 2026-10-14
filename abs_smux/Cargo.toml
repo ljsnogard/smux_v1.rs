@@ -1,0 +1,15 @@
+[package]
+name = "abs_smux"
+version = "0.1.0"
+edition = "2024"
+
+authors = ["lino <lino_snsalias@outlook.com>"]
+description = "Abstraction of stream multiplexing."
+repository = "https://github.com/ljsnogard/abs_smux"
+keywords = ["traits"]
+categories = ["no-std"]
+license = "MIT/Apache-2.0"
+
+[dependencies]
+abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev/0.3.0" }
+abs_mm = { git = "https://gitee.com/lino_snsalias/abs_mm.git", branch = "dev/0.3.0" }
