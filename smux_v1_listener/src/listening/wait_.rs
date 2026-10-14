@@ -30,7 +30,9 @@ use core::{
     task::{Context, Poll},
 };
 
-use crate::x_deps::abs_cancel::{TrCancellationToken, TrMayCancel};
+use abs_cancel::{TrCancellationToken, TrMayCancel};
+
+use crate::x_deps::abs_cancel;
 
 /// 待决的 `next_async`：一条装箱的等待体 + 两个标记类型参数。
 ///

@@ -11,7 +11,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, thread, time::Duration};
 
-use smux_v1::x_deps::abs_cancel::{CancelledToken, NonCancellableToken};
+use abs_cancel::{CancelledToken, NonCancellableToken};
+use smux_v1::x_deps::abs_cancel;
 
 use super::queue_::{Full_, RingQueue_};
 

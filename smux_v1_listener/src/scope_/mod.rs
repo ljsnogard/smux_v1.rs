@@ -18,9 +18,10 @@
 //! 现在几点」。listener 两者都要，因此
 //! [`TrListenerConfig::Rt`](crate::config::TrListenerConfig::Rt) 同时约束它们。
 
+use abs_art::TrLocalScope;
 use smux_v1::{
     time::TrTime,
-    x_deps::abs_art::TrLocalScope,
+    x_deps::abs_art,
 };
 
 /// **能交出本地作用域**的运行时值。

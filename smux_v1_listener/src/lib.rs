@@ -18,6 +18,17 @@
 //! [`next_async`](abs_async_iter::TrAsyncIterator::next_async) 交付一条**已经握手完成、
 //! 可以直接使用**的连接。
 //!
+//! # 取消与关闭
+//!
+//! 两者是不同的事，因此 listener 的类型上**没有**令牌参数：
+//!
+//! - **每次等待各自可取消**：`next_async` 返回的 future 实现
+//!   [`TrMayCancel`](crate::x_deps::abs_cancel::TrMayCancel)，用 `may_cancel_with` 施加
+//!   调用方自己的令牌即可；取消只中止**这一次**等待，listener 仍然可用；
+//! - **listener 整体关闭**：用
+//!   [`close_async`](crate::listening::SmuxListener::close_async) 优雅停止（不再接受、
+//!   取消在途握手、等所有任务收尾），或直接丢弃本对象——那是不优雅的停止。
+//!
 //! # 跨运行时
 //!
 //! 三套异步运行时各自提供自己的 `TcpListener` / `UnixListener`，接受入口与拆分方式都
@@ -69,7 +80,5 @@ pub mod x_deps {
     pub use futures;
     pub use smux_v1;
 
-    pub use smux_v1::x_deps::{
-        abs_art, abs_buff, abs_cancel, abs_mm, abs_smux, buffex,
-    };
+    pub use smux_v1::x_deps::{abs_art, abs_buff, abs_cancel, abs_mm, abs_smux, buffex};
 }

@@ -32,11 +32,13 @@ let cfg = MyCfg::new(/* … */);
 // ② 协商策略：`smux_v1` 自带的 `AcceptAllEntries` 就可以直接用
 let neg = AcceptAll;
 // ③ 选传输：`runtime::TcpTransport` / `runtime::UdsTransport`
-let listener = SmuxListener::new_(runtime::TcpTransport::new(tcp_listener), cfg, neg, scope);
+let mut listener = SmuxListener::new_(runtime::TcpTransport::new(tcp_listener), cfg, neg, scope);
 
 while let Ok(conn) = listener.next_async().await {
     // `conn` 已经是握手完成的 `MuxConnection`
 }
+// 不再听了就优雅收尾：停止接受、取消在途握手、等所有任务退出。
+listener.close_async().await;
 ```
 
 ## 交付模型
@@ -53,6 +55,18 @@ while let Ok(conn) = listener.next_async().await {
   消费端独占读端。环容量取 `max_inflight`，因此「队列有多长」与「在途有几条」是同一
   个量。设计因果见 `src/listening/queue_.rs` 的模块文档。
 
+## 取消与关闭
+
+两者是**不同**的事，因此也不共用同一个令牌：
+
+- **每次等待各自可取消**：`next_async` 返回的 future 实现 `TrMayCancel`，用
+  `may_cancel_with(token)` 施加调用方自己的令牌即可。取消只中止**这一次**等待
+  （`Err(Cancelled)`），listener 仍然可用，已经排队的连接不会丢。因此 `SmuxListener`
+  的类型上**没有**令牌参数。
+- **listener 整体关闭**：`close_async` 优雅停止——不再接受新连接、取消在途握手、等所有
+  任务收尾，此后 `next_async` 一律返回 `Err(Closed)`。直接丢弃 `SmuxListener` 是
+  **不优雅**的停止：不等待任何任务收尾。
+
 ## 出错时的行为
 
 | 情形 | 行为 |
@@ -60,6 +74,7 @@ while let Ok(conn) = listener.next_async().await {
 | 不是 smux 帧、CRC 不匹配、协商被拒、对端半途关闭 | **静默丢弃**这条连接，继续接受下一条 |
 | 从监听套接字接受失败（如 `EMFILE`） | 以 `Err(SmuxListenerError::Accept)` 交给调用方——listener 自己已经产不出连接了 |
 | 本次等待被取消 | 以 `Err(SmuxListenerError::Cancelled)` 结束**这一次**等待；listener 仍可用，已排队的连接不丢 |
+| 已经 `close_async` 之后 | 以 `Err(SmuxListenerError::Closed)` 立刻返回——不会再有连接 |
 
 ## feature
 

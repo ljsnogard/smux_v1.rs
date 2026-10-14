@@ -18,6 +18,10 @@
 
 use core::mem::MaybeUninit;
 
+use abs_buff::{TrBuffRead, TrBuffWrite};
+use abs_cancel::TrCancellationToken;
+use gen_mcf2::gen_may_cancel_future;
+
 use smux_v1::{
     connection::{MuxChanBuffOwnedBy, TrConnCfg},
     handshake::{
@@ -25,18 +29,7 @@ use smux_v1::{
         opts::{BasicOpts, NegotiationEntry},
     },
     time::TrTime,
-    x_deps::abs_buff::{TrBuffRead, TrBuffWrite},
-};
-
-// `gen_may_cancel_future` 展开出的代码里写的是**顶格** `abs_cancel::...` 与
-// `gen_mcf2::...`（见该宏的 README「关于 crate 路径」），因此这两个名字必须在**使用宏的
-// 模块**里可直接解析。本 crate 经 `smux_v1::x_deps` 转出它们，不重复声明依赖。
-// `gen_may_cancel_future` 展开出的代码里写的是**顶格** `abs_cancel::...`（见该宏的
-// README「关于 crate 路径」），因此这个名字必须在**使用宏的模块**里可直接解析。本 crate
-// 经 `smux_v1::x_deps` 转出它，不重复声明依赖。
-use smux_v1::x_deps::{
-    abs_buff::x_deps::gen_mcf2::gen_may_cancel_future,
-    abs_cancel::{self, TrCancellationToken},
+    x_deps::{abs_buff, abs_cancel, gen_mcf2},
 };
 
 /// 连接级帧暂存缓冲的拥有者类型：一块 `MaybeUninit<u8>` 存储 + `smux_v1` 内部结构同款的

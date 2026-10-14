@@ -83,14 +83,15 @@
 use alloc::sync::Arc;
 use core::mem::MaybeUninit;
 
+use abs_buff::{Demand, buffer::TrBuffSegmRef};
+use abs_cancel::{TrCancellationToken, TrMayCancel};
+use abs_mm::CoreAlloc;
+use abs_sync::preludes::TrAsyncRwLock;
+use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
+use buffex::ring::{ConsumerError, Ring, RingReader, RingWriter};
+use mm_ptr::Owned;
 use smux_v1::x_deps::{
-    abs_buff::{Demand, buffer::TrBuffSegmRef},
-    abs_cancel::{TrCancellationToken, TrMayCancel},
-    abs_mm::CoreAlloc,
-    abs_sync::preludes::TrAsyncRwLock,
-    atomic_sync::rwlock::cooperative::CooperativeRwLockOwned,
-    buffex::ring::{ConsumerError, Ring, RingReader, RingWriter},
-    mm_ptr::Owned,
+    abs_buff, abs_cancel, abs_mm, abs_sync, atomic_sync, buffex, mm_ptr,
 };
 
 /// 环的存储体：一块 `MaybeUninit<T>`。
@@ -162,6 +163,22 @@ impl<T> Drop for Sender_<T> {
 }
 
 impl<T> Sender_<T> {
+    /// 立刻关闭写端：此后不再接受投递，等待中的消费者会被唤醒并拿到「不会再有东西」。
+    ///
+    /// 与 [`Drop`](Sender_) 里的关闭是同一件事，区别是它**不需要**「我是最后一个生产端」
+    /// 这个前提——[`close_async`](crate::listening::SmuxListener::close_async) 用它收尾：
+    /// 那时 listener 自己那一份投递端仍然活着，写端不会自行关闭。
+    ///
+    /// 幂等。
+    pub fn close_(&self) {
+        // 此刻所有投递任务都已退出（`close_async` 是等它们收尾之后才调用的），因此没有
+        // 别的写者会占着写权，这次 `try_write` 必然成功。
+        let mut session = self.write_.acq_session();
+        if let Result::Ok(mut writer) = session.try_write() {
+            RingWriter::close(&mut *writer);
+        }
+    }
+
     /// 投递一条已握手的连接。
     ///
     /// # 语义

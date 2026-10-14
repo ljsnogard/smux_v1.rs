@@ -2,7 +2,8 @@ use buffex_compio_adapt::{
     BuffRead, BuffWrite, DefaultAllocConfig, SharedRingOf,
 };
 use compio::net::{
-    TcpStream as CompioTcpStream, UnixStream as CompioUnixStream,
+    TcpStream as CompioTcpStream,
+    UnixStream as CompioUnixStream,
 };
 
 use smux_v1::connection::DefaultConnCfg;

@@ -35,18 +35,17 @@ use smux_v1::{
     },
     x_deps::{
         abs_art::TrLocalScope,
-        abs_cancel::{NonCancellableToken, TrMayCancel},
+        abs_cancel::{CancelledToken, NonCancellableToken, TrMayCancel},
         abs_mm::CoreAlloc,
         abs_smux::conn::TrConnection,
         mm_ptr::Owned,
     },
 };
 use smux_v1_listener::{
+    SmuxListenerError,
     config::{CoreAllocOwned_, TrInbound, TrListenerConfig, TrNegotiatorFactory},
     listening::SmuxListener,
-    runtime::{
-        K_DEFAULT_RING_CAPACITY, TcpConnCfg, TcpTransport, UdsConnCfg, UdsTransport,
-    },
+    runtime::{K_DEFAULT_RING_CAPACITY, TcpConnCfg, TcpTransport, UdsConnCfg, UdsTransport},
 };
 
 /// 协商策略：接受对端提出的一切条件。
@@ -99,14 +98,102 @@ where
         MuxChanBuffOwnedBy<Self::StageBuff>,
         MuxChanBuffOwnedBy<Self::StageBuff>,
     ) {
-        let make = || {
-            MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
-                K_STAGE_RING_CAPACITY,
-                CoreAlloc,
-            ))
-        };
+        let make =
+            || MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, CoreAlloc));
         (make(), make())
     }
+}
+
+/// 验收：单次等待可取消且不影响 listener；`close_async` 能打断卡在 accept 上的槽位、
+/// 等它收尾，之后不再交付。
+/// - 手段：构造 listener 后先用一个**已取消**的令牌调一次 `next_async`（它已经补出槽位
+///   并卡在 accept 上）；接着在本地队列上起一个客户端完成一次正常握手并再取一次连接；
+///   最后调用 `close_async`。
+/// - 判断：第一次等待得到 `Err(Cancelled)`；第二次拿到连接且能 `bind_async`（证明取消
+///   没有弄坏 listener）；`close_async` 返回后 `active_slots_()` 为 0，且 `next_async`
+///   一律得到 `Err(Closed)`。
+
+#[test]
+fn smol_next_async_cancellable_and_close_async_() {
+    let rt = SmolRuntime::current();
+    let scope = rt.local_scope();
+
+    let cfg = TestCfg {
+        rt_: rt.clone(),
+        conn_: TcpConnCfg::make_with_rt(smux_v1::flow_ctrl::DefaultPolicy, rt.clone()),
+    };
+
+    // smol 没有环境运行时：入口与另两条一样是 `block_on(scope.run_until(..))`。
+    smol::block_on(scope.run_until(async {
+        let bound = async_net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 TCP 监听套接字");
+        let addr = bound.local_addr().expect("取本地地址");
+        let mut listener =
+            SmuxListener::new_(TcpTransport::new(bound), cfg, AcceptAll, scope.clone());
+
+        // ① 本次等待被取消：只结束这一次调用，listener 本身不受影响。
+        let cancelled = listener
+            .next_async()
+            .may_cancel_with(CancelledToken::new())
+            .await;
+        assert!(
+            matches!(cancelled, Result::Err(SmuxListenerError::Cancelled)),
+            "施加已取消的令牌应当只中止这一次等待"
+        );
+
+        // ② listener 仍然可用：正常交付一条连接。
+        let client = scope.spawn_local(async move {
+            let stream = async_net::TcpStream::connect(addr)
+                .await
+                .expect("客户端连接");
+            stream.set_nodelay(true).expect("设置 TCP_NODELAY");
+            let (rd, wr) = smol::io::split(stream);
+            let rx = BuffRead::<_, DefaultAllocConfig>::try_new(
+                rd,
+                K_DEFAULT_RING_CAPACITY,
+                DefaultAllocConfig,
+            )
+            .expect("客户端读环容量合法");
+            let tx = BuffWrite::<_, DefaultAllocConfig>::try_new_local(
+                wr,
+                K_DEFAULT_RING_CAPACITY,
+                DefaultAllocConfig,
+            )
+            .expect("客户端写环容量合法");
+            HandshakeAgent::new(tx, rx)
+                .invite_async(&BasicOpts::default(), AcceptAllEntries)
+                .may_cancel_with(NonCancellableToken::new())
+                .await
+        });
+
+        let (accepted, invited) = futures::join!(async { listener.next_async().await }, client);
+
+        let invited = invited.expect("客户端任务完成");
+        assert!(invited.is_ok(), "客户端握手应当成功：{:?}", invited.err());
+        let conn = accepted.expect("取消过一次之后仍应交付连接");
+        assert!(
+            TrConnection::bind_async(&conn, Dock::unspecified())
+                .await
+                .is_ok(),
+            "交付的连接应当可以认领 dock"
+        );
+
+        // ③ 优雅关闭：打断卡在 accept 上的槽位、等它们收尾，然后不再交付。
+        listener.close_async().await;
+        assert_eq!(
+            listener.active_slots_(),
+            0usize,
+            "close_async 返回时不应还有存活的接受槽位"
+        );
+        // 幂等：再关一次不会有任何副作用。
+        listener.close_async().await;
+        let after = listener.next_async().await;
+        assert!(
+            matches!(after, Result::Err(SmuxListenerError::Closed)),
+            "关闭之后应当一律回报 Closed"
+        );
+    }));
 }
 
 /// 编译期自查：`next_async` 的每一项约束在这里被单独钉住。
@@ -114,25 +201,23 @@ where
 /// 它比「在测试里用一次」更有价值：约束一旦被将来某次改动破坏，这里会精确指出**是
 /// 哪一条**不再成立，而不是只说「找不到方法 `next_async`」。
 const _: fn() = || {
-    fn assert_next_async_available_<Cfg, A, N, U, K>()
+    fn assert_next_async_available_<Cfg, A, N, U>()
     where
         Cfg: TrListenerConfig + Clone + 'static,
         A: TrInbound<ConnCfg = Cfg::Conn> + 'static,
         N: TrNegotiatorFactory + Clone + 'static,
         U: smux_v1::x_deps::abs_art::TrLocalScope + Clone + 'static,
-        K: smux_v1::x_deps::abs_cancel::TrCancellationToken + Clone + 'static,
     {
-        fn uses_next_async_<Cfg, A, N, U, K>(listener: &mut SmuxListener<Cfg, A, N, U, K>)
+        fn uses_next_async_<Cfg, A, N, U>(listener: &mut SmuxListener<Cfg, A, N, U>)
         where
             Cfg: TrListenerConfig + Clone + 'static,
             A: TrInbound<ConnCfg = Cfg::Conn> + 'static,
             N: TrNegotiatorFactory + Clone + 'static,
             U: smux_v1::x_deps::abs_art::TrLocalScope + Clone + 'static,
-            K: smux_v1::x_deps::abs_cancel::TrCancellationToken + Clone + 'static,
         {
             drop(TrAsyncIterator::next_async(listener));
         }
-        let _ = uses_next_async_::<Cfg, A, N, U, K>;
+        let _ = uses_next_async_::<Cfg, A, N, U>;
     }
 
     let _ = assert_next_async_available_::<
@@ -140,14 +225,12 @@ const _: fn() = || {
         TcpTransport,
         AcceptAll,
         abs_art_smol::LocalScope,
-        NonCancellableToken,
     >;
     let _ = assert_next_async_available_::<
         TestCfg<UdsConnCfg>,
         UdsTransport,
         AcceptAll,
         abs_art_smol::LocalScope,
-        NonCancellableToken,
     >;
 };
 
@@ -203,14 +286,15 @@ fn smol_tcp_delivers_handshaken_connection_() {
                     .await
             });
 
-            let (accepted, invited) =
-                futures::join!(async { listener.next_async().await }, client);
+            let (accepted, invited) = futures::join!(async { listener.next_async().await }, client);
 
             let invited = invited.expect("客户端任务完成");
             assert!(invited.is_ok(), "客户端握手应当成功：{:?}", invited.err());
             let conn = accepted.expect("listener 应当交付一条连接");
             assert!(
-                TrConnection::bind_async(&conn, Dock::unspecified()).await.is_ok(),
+                TrConnection::bind_async(&conn, Dock::unspecified())
+                    .await
+                    .is_ok(),
                 "交付的连接应当可以认领 dock（证明内部循环已跑起来）"
             );
         }
@@ -226,10 +310,8 @@ fn smol_uds_delivers_handshaken_connection_() {
     let rt = SmolRuntime::current();
     let scope = rt.local_scope();
 
-    let path = std::env::temp_dir().join(format!(
-        "smux-v1-listener-smol-{}.sock",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("smux-v1-listener-smol-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let connect_path = path.clone();
 
@@ -239,8 +321,7 @@ fn smol_uds_delivers_handshaken_connection_() {
     };
 
     smol::block_on(scope.run_until(async {
-        let bound =
-            async_net::unix::UnixListener::bind(&path).expect("绑定 UNIX 域监听套接字");
+        let bound = async_net::unix::UnixListener::bind(&path).expect("绑定 UNIX 域监听套接字");
         let mut listener =
             SmuxListener::new_(UdsTransport::new(bound), cfg, AcceptAll, scope.clone());
 
@@ -268,14 +349,15 @@ fn smol_uds_delivers_handshaken_connection_() {
                     .await
             });
 
-            let (accepted, invited) =
-                futures::join!(async { listener.next_async().await }, client);
+            let (accepted, invited) = futures::join!(async { listener.next_async().await }, client);
 
             let invited = invited.expect("客户端任务完成");
             assert!(invited.is_ok(), "客户端握手应当成功：{:?}", invited.err());
             let conn = accepted.expect("listener 应当交付一条连接");
             assert!(
-                TrConnection::bind_async(&conn, Dock::unspecified()).await.is_ok(),
+                TrConnection::bind_async(&conn, Dock::unspecified())
+                    .await
+                    .is_ok(),
                 "交付的连接应当可以认领 dock"
             );
         }
