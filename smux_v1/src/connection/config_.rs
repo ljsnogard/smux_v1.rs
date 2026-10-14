@@ -316,7 +316,24 @@ where
             metrics_: M::default(),
             _use_w_: PhantomData,
             _use_r_: PhantomData,
-        };        (delivery, cfg)
+        };
+        (delivery, cfg)
+    }
+
+    /// **只造配置**，不要求交出握手交付物。
+    ///
+    /// [`DefaultConnCfg::new`] / [`DefaultConnCfg::new_with_rt`] 都要一个
+    /// [`HandshakeDelivery`] 才能返回「交付物 + 配置」这一对，那是给「握手刚做完、
+    /// 马上建连」那条路用的。本入口给的是另一条路：**先把配置建好、之后再逐条连接
+    /// 复用**（`SmuxListener` 的配置就要同时服务于许多条连接，每条由它自己克隆一份）。
+    pub fn make_with_rt(policy: P, rt: Rt) -> Self {
+        DefaultConnCfg {
+            rt_: rt,
+            policy_: policy,
+            metrics_: M::default(),
+            _use_w_: PhantomData,
+            _use_r_: PhantomData,
+        }
     }
 }
 

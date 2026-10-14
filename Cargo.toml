@@ -2,6 +2,7 @@
 members = [
     "abs_smux",
     "smux_v1",
+    "smux_v1_listener",
 ]
 resolver = "3"
 
