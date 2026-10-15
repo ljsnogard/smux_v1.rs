@@ -104,9 +104,9 @@ use core::{
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use abs_buff::{
-    Demand, TrBuffWrite,
-    buffer::TrBuffSegmMut,
-    error::{TrTaggedError, WriteErrTag},
+    Demand, TrBuffRead, TrBuffTryWrite, TrBuffWrite,
+    buffer::{TrBuffSegmMut, TrConsumerState, TrProducerState},
+    error::{ReadErrTag, TrTaggedError, WriteErrTag},
 };
 use abs_cancel::{TrCancellationToken, TrMayCancel};
 use anylr::SomeOf;
@@ -121,7 +121,6 @@ use crate::{
         mux_connection::{ChannelRegistry_, ReserveErr_},
         owner_::{ChannelOwner_, TgOwner_},
         ring_::{BufferedRx, BufferedTx},
-        session_pump_::StageSealGuard_,
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteEvent_,
@@ -261,40 +260,6 @@ where
     }
 }
 
-/// 两个**外侧**泵循环共享的量（与 [`MuxLoopShared_`] 同源，少一个单帧上限）。
-#[derive(Clone)]
-pub(crate) struct ByteLoopShared_<A, M>
-where
-    A: AllocatorClone + Send + Sync,
-    M: TrMetricsSink,
-{
-    /// 注册表（失败标志与取消令牌）。
-    pub(crate) reg_: ChannelRegistry_<A>,
-
-    /// 本次连接的**指标接收方**（建连时从配置克隆的一份；见 [`MuxLoopShared_::metrics_`]）。
-    metrics_: M,
-}
-
-impl<A, M> ByteLoopShared_<A, M>
-where
-    A: AllocatorClone + Send + Sync,
-    M: TrMetricsSink,
-{
-    /// 由注册表与指标接收方构造（成员私有，构造只能走这里）。
-    pub(crate) fn new_(reg: ChannelRegistry_<A>, metrics: M) -> Self {
-        ByteLoopShared_ {
-            reg_: reg,
-            metrics_: metrics,
-        }
-    }
-
-    /// 本次连接携带的**指标接收方**（没有判空分支，理由见 [`MuxLoopShared_::metrics_`]）。
-    #[inline]
-    pub(crate) fn metrics_(&self) -> &M {
-        &self.metrics_
-    }
-}
-
 /// 循环里等一把共享锁：**被取消就退出本循环**（连接正在收尾，`()` 返回值的循环用）。
 macro_rules! lock_or_exit_ {
     ($e:expr) => {
@@ -412,7 +377,7 @@ type PendingFin_<A> = BTreeSet<(Dock, Dock), A>;
 /// 是否也已收尾。
 #[allow(clippy::too_many_arguments)]
 async fn finalize_entry_<C, K>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
@@ -646,14 +611,35 @@ where
     .await
 }
 
-/// 连接读环上还剩多少可读字节；`None` 表示**外侧读泵已结束**且环已排空。
-pub(crate) fn ring_readable_(reader: &BufferedRx) -> Option<usize> {
+/// 传输**读半边**（`C::ConnRx`）此刻的状态。
+///
+/// 旧版这里问的是「连接读环」——那是连接自己建的帧暂存环；本版没有再建环，问的
+/// 就是**传输本身**。要求传输实现 [`TrConsumerState`] 正是为了让内侧循环在
+/// **不 park** 的前提下回答「有没有字节、是不是已经到头了」。
+pub(crate) enum RxState_ {
+    /// 还有这么多字节可读（`0` 表示此刻没有，但链路还活着）。
+    Readable(usize),
+
+    /// 生产端已封口且已排空：字节流到此为止（干净 EOF）。
+    Eof,
+
+    /// 查询不可用（传输没给出状态）：交给 `read_async` 自己去回答。
+    Unknown,
+}
+
+/// 问一次传输读半边：可读多少 / 是否已经到头。
+pub(crate) fn rx_state_<R>(reader: &R) -> RxState_
+where
+    R: TrConsumerState,
+{
     match reader.consumer_state() {
-        // 生产端关闭 + 无剩余数据：字节流到此为止。
-        Option::Some((0usize, true)) => Option::None,
-        Option::Some((count, _)) => Option::Some(count),
-        // 只有切片之类的「永远有数据」的读端才会返回 `None`；环端不会。
-        Option::None => Option::None,
+        // 生产端关闭 + 无剩余数据：字节流到此为止。注意「封口但还有数据」必须先读干净，
+        // 因此它落到下面的 `Readable(count)` 分支。
+        Option::Some((0usize, true)) => RxState_::Eof,
+        Option::Some((count, _)) => RxState_::Readable(count),
+        // 默认实现返回 `None`（传输没实现这个查询）。**不能**当成 EOF——那会让连接
+        // 静默地「干净退出」；交给下面的 park 由 `read_async` 给出真正的结论。
+        Option::None => RxState_::Unknown,
     }
 }
 
@@ -683,7 +669,10 @@ pub(crate) fn took_<T, E>(outcome: SomeOf<T, E>) -> Took_<T, E> {
 }
 
 /// 连接写环上还剩多少可写空间；`None` 表示**外侧写泵已结束**（读端消失）。
-fn ring_space_(writer: &BufferedTx) -> Option<usize> {
+fn ring_space_<W>(writer: &W) -> Option<usize>
+where
+    W: TrProducerState,
+{
     writer.producer_state().map(|(free, _closed)| free)
 }
 
@@ -700,12 +689,13 @@ fn ring_space_(writer: &BufferedTx) -> Option<usize> {
 ///
 /// 写环读端消失（外侧写泵已结束）→ [`MuxError::Transport`]（方向为写）；被取消 →
 /// [`MuxError::Cancelled`]。
-async fn enqueue_frame_<K>(
-    tx_stage: &mut BufferedTx,
+async fn enqueue_frame_<W, K>(
+    tx_stage: &mut W,
     frame: &[u8],
     cancel: K,
 ) -> Result<(), MuxError>
 where
+    W: TrBuffWrite<u8>,
     K: TrCancellationToken,
 {
     let mut offset = 0usize;
@@ -778,17 +768,18 @@ where
 /// # Errors
 ///
 /// 与 [`enqueue_frame_`] 相同。
-async fn enqueue_frame_parts_<K>(
-    tx_stage: &mut BufferedTx,
+async fn enqueue_frame_parts_<W, K>(
+    tx_stage: &mut W,
     head: &[u8],
     payload: &[u8],
     cancel: K,
 ) -> Result<(), MuxError>
 where
+    W: TrBuffWrite<u8>,
     K: TrCancellationToken,
 {
-    enqueue_frame_::<_>(tx_stage, head, cancel.child_token()).await?;
-    enqueue_frame_::<_>(tx_stage, payload, cancel.child_token()).await
+    enqueue_frame_::<_, _>(tx_stage, head, cancel.child_token()).await?;
+    enqueue_frame_::<_, _>(tx_stage, payload, cancel.child_token()).await
 }
 
 /// 把**读侧**游标错误映射为连接错误。
@@ -915,7 +906,7 @@ where
 
 /// 解复用循环：从连接读环解析帧、投递载荷、推进建流状态机。
 pub(crate) async fn demux_loop_async_<C, K>(
-    mut rx_stage: BufferedRx,
+    mut rx_stage: C::ConnRx,
     shared: MuxShared_<C>,
     events: EventReceiver_<ReadEvent_<C::Alloc>>,
     events_tx: EventSender_<WriteEvent_<C::Alloc>>,
@@ -1008,23 +999,39 @@ pub(crate) async fn demux_loop_async_<C, K>(
             return;
         }
 
-        // 2. 读一个帧头。字节由外侧读泵填进连接读环；这里只在环上等待
-        //    （park 在环读端，**同时与读事件通道、取消令牌竞争**）。
-        let readable = match ring_readable_(&rx_stage) {
-            Option::Some(count) => count,
-            // 读泵结束且环已排空：字节流到此为止，本循环退出（写泵会随之收尾）。
-            Option::None => return,
+        // 2. 问一次**传输读半边**有没有字节。本版没有再建连接级读环：字节直接从
+        //    传输半边读进来（park 在这里，**同时与读事件通道、取消令牌竞争**）。
+        let readable = match rx_state_(&rx_stage) {
+            RxState_::Readable(count) => count,
+            // 生产端已封口且已排空：字节流到此为止，本循环退出（对侧会随之收尾）。
+            RxState_::Eof => return,
+            // 查询不可用：当作「此刻没读到东西」，由下面的 park 让 `read_async` 给出
+            // 结论（它要么给出段，要么给出 EOF / 错误）。
+            RxState_::Unknown => 0,
         };
         if readable == 0 {
-            // 环空：park 到「环里来了字节」/「有读事件」/「取消」三者之一。
+            // 此刻没字节：park 到「传输来了字节」/「有读事件」/「取消」三者之一。
             //
             // **必须同时等读事件通道**：`RxConsumed` 是「应用刚消费、去核对水位」的
-            // 唯一触发点，而它到来时连接读环完全可能长期为空（对端正等额度、没有新帧）。
-            // 只 park 在环上会让这条通知一直排在一条睡着的循环后面——应用读空了环却
+            // 唯一触发点，而它到来时传输完全可能长期为空（对端正等额度、没有新帧）。
+            // 只 park 在传输上会让这条通知一直排在一条睡着的循环后面——应用读空了环却
             // 没人补发额度，两端互等（本仓库流控验收用例的死锁形态）。
             match park_read_wake_::<C, _>(&cancel, &mut rx_stage, &mut *events).await {
-                // 环里有字节：回顶部交给正式的帧头解析。
+                // 传输里有字节：回顶部交给正式的帧头解析。
                 ReadWake_::Bytes => {}
+                // 生产端封口且已排空：与上面的 `RxState_::Eof` 同义。
+                ReadWake_::Eof => return,
+                // 真读错误（非「封口」）：连接不可用。
+                ReadWake_::Fatal => {
+                    fail_mux_loop_(
+                        &shared,
+                        &cancel,
+                        Option::None,
+                        &MuxError::Transport { write: false },
+                    )
+                    .await;
+                    return;
+                }
                 // 事件已由 park **取出**（`flume` 的 `recv_async` 是消费语义，丢掉它就
                 // 等于把这条 `Attach` / `Release` / `RxConsumed` 静默吞掉），因此必须
                 // 在这里就地处理，不能只回顶部等 `drain_read_events_` 再取一次。
@@ -1049,11 +1056,12 @@ pub(crate) async fn demux_loop_async_<C, K>(
         }
 
         // 3. 读到帧头。解复用一律走 `frame_parser_` 的 **sans-IO 逐字节状态机**：
-        //    它每次只向环索要 `Demand::exactly(1)`，于是 `min_len == 1` 不可能超过任何
+        //    它每次只向传输索要 `Demand::exactly(1)`，于是 `min_len == 1` 不可能超过任何
         //    合法环容量，旧入口「按字段索要 `width` 字节」在容量 < width 时拿到终态
         //    `Unsatisfiable` 而整条连接失败的路径**从构造上消失**。
-        //    帧头可能消耗环读指针，因此必须与第 2 步合起来看：环里此刻至少有一帧的
-        //    **前若干字节**，帧头解析不会因为「环空」而永久 park——外侧读泵会继续填充。
+        //    帧头可能消耗传输的读指针，因此必须与第 2 步合起来看：传输里此刻至少有一帧的
+        //    **前若干字节**，帧头解析不会因为「此刻没字节」而永久 park——喂数据的一方
+        //    （调用方的入向泵 / 对端连接）会继续填充。
         let (header, head_len) = match race_cancel_(
             &cancel,
             frame_parser_::read_header_async_::<_, _>(&mut rx_stage, cancel.child_token()),
@@ -1126,6 +1134,12 @@ pub(crate) async fn demux_loop_async_<C, K>(
             kind,
             u32::try_from(head_len + len).unwrap_or(u32::MAX),
         );
+        // 传输字节口径见 [`TrMetricsSink::on_transport_bytes`]：旧版由外侧读泵按
+        // 「线上原始字节」上报（含零头与被丢弃的帧），本版没有泵，改由解复用循环按
+        // 「已成型并搬运的帧字节」上报——与上面 `on_frame` 的口径一致。
+        shared
+            .metrics_()
+            .on_transport_bytes(FrameDir::Recv, u64::try_from(head_len + len).unwrap_or(u64::MAX));
 
         // 每次活动就地读一次连接级时钟（vDSO 读，相对本帧的解析 / 环操作可忽略）：
         // 两个时钟必须记下**活动发生的时刻**，而不是计时循环扫描的时刻。
@@ -1544,13 +1558,22 @@ fn window_update_frame_(pair: (Dock, Dock), report: WindowReport) -> ControlFram
     )
 }
 
-/// 解复用循环在「连接读环为空」时的等待结果。
+/// 解复用循环在「传输此刻没字节」时的等待结果。
 enum ReadWake_<A>
 where
     A: AllocatorClone + Send + Sync,
 {
-    /// 连接读环里来了字节（也可能是读端收尾：回顶部由 `ring_readable_` 判定）。
+    /// 传输里来了字节。
     Bytes,
+
+    /// 传输的**生产端已封口且已排空**：字节流到此为止（干净 EOF）。
+    ///
+    /// 传输的状态查询不一定能给出这一结论（例如它没实现 `TrConsumerState`），因此
+    /// 这里也把「读 `Err(Closing)`」归到本变体——两种来源同义。
+    Eof,
+
+    /// 传输读失败（不是「封口」）：连接不可用。
+    Fatal,
 
     /// 从读事件通道里**取出**了一条事件（`Attach` / `Release` / `RxConsumed`）。
     ///
@@ -1562,7 +1585,7 @@ where
     Cancelled,
 }
 
-/// 解复用循环空环时的 park：**同时**等「连接读环有字节」与「读事件通道有事件」，
+/// 解复用循环空转时的 park：**同时**等「传输有字节」与「读事件通道有事件」，
 /// 并与取消令牌竞争。
 ///
 /// # 三个 future 必须在闭包外 `pin` 好
@@ -1573,7 +1596,7 @@ where
 /// `dev-notes/flow-ctrl-20261005-0115.md` §5）。这里把三个 future 都跨 poll 持有。
 async fn park_read_wake_<C, K>(
     cancel: &K,
-    rx_stage: &mut BufferedRx,
+    rx_stage: &mut C::ConnRx,
     events: &mut EventReceiver_<ReadEvent_<C::Alloc>>,
 ) -> ReadWake_<C::Alloc>
 where
@@ -1588,12 +1611,13 @@ where
         rx_stage.read_async(&demand),
     ));
     // 读事件的生产端全部消失 = 连接核心已析构，取消令牌随即触发。此后不再 poll 事件
-    // 通道（它已 `Ready(None)` 且会立刻再次就绪），只等环与取消令牌。
+    // 通道（它已 `Ready(None)` 且会立刻再次就绪），只等传输与取消令牌。
     let mut events_closed = false;
     let mut cancelled = false;
     // 从通道里**取出**的事件：必须原样带回调用方，不能在此丢掉。
     let mut taken: Option<ReadEvent_<C::Alloc>> = Option::None;
-    let mut ring_ready = false;
+    // 传输读 future 就绪时的分类（段本身借用 `ring_fut`，因此就地判、就地 drop）。
+    let mut woke: Option<ReadWake_<C::Alloc>> = Option::None;
     poll_fn(|cx| {
         // 取消令牌优先：连接已收尾，直接退出。
         if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
@@ -1610,11 +1634,36 @@ where
                 Poll::Pending => {}
             }
         }
-        // 连接读环来了字节：回顶部交给正式的帧头解析。借出的段在此 drop（**不消费**，
-        // 已消费量为 0）。
-        if core::future::Future::poll(ring_fut.as_mut(), cx).is_ready() {
-            ring_ready = true;
-            return Poll::Ready(());
+        // 传输来了数据：回顶部交给正式的帧头解析。借出的段在此 drop（**不消费**，
+        // 已消费量为 0——字节仍留在传输自己的缓冲里）。
+        //
+        // 就绪的也可能是**收尾**而不是数据：`read_async` 在「生产端封口」时给出
+        // `Err(Closing)`。两种情形必须分开——前者回顶部继续解析，后者是本端该干净
+        // 退出的时刻；把 `Closing` 当成普通读错误会让「对端正常关闭」变成连接级失败。
+        if woke.is_none() {
+            match core::future::Future::poll(ring_fut.as_mut(), cx) {
+                Poll::Pending => {}
+                Poll::Ready(outcome) => {
+                    woke = Option::Some(match took_(outcome) {
+                        // 段不消费即释放：只为唤醒，数据留给随后的正式解析。
+                        Took_::Segm(segm) => {
+                            drop(segm);
+                            ReadWake_::Bytes
+                        }
+                        Took_::Failed(err) => {
+                            if err.err_tag() == ReadErrTag::Closing {
+                                ReadWake_::Eof
+                            } else {
+                                ReadWake_::Fatal
+                            }
+                        }
+                        // 既没有段也没有错误：当作「来了字节」回顶部重判一次
+                        // （与旧实现同义，避免在这里自旋）。
+                        Took_::Nothing => ReadWake_::Bytes,
+                    });
+                    return Poll::Ready(());
+                }
+            }
         }
         Poll::Pending
     })
@@ -1623,10 +1672,10 @@ where
         ReadWake_::Cancelled
     } else if let Option::Some(event) = taken {
         ReadWake_::Event(event)
-    } else if ring_ready {
-        ReadWake_::Bytes
+    } else if let Option::Some(woke) = woke {
+        woke
     } else {
-        // 事件通道关闭（连接核心已析构）且环与取消都没就绪：按收尾处理。
+        // 事件通道关闭（连接核心已析构）且传输与取消都没就绪：按收尾处理。
         ReadWake_::Cancelled
     }
 }
@@ -1873,7 +1922,7 @@ where
 ///
 /// 字节到网络的搬运由外侧写泵负责（见 `session_pump_`）。
 pub(crate) async fn mux_loop_async_<C, K>(
-    tx_stage: BufferedTx,
+    tx_stage: C::ConnTx,
     shared: MuxShared_<C>,
     events: EventReceiver_<WriteEvent_<C::Alloc>>,
     read_events: EventSender_<ReadEvent_<C::Alloc>>,
@@ -1883,14 +1932,16 @@ pub(crate) async fn mux_loop_async_<C, K>(
     C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
-    // 连接写环的写端也包进守卫：**退出时显式封口**。
+    // 本循环直接持有**传输的写半边**（不再有连接级写环、也没有外侧写泵）。
     //
-    // 这一步不可省：`buffex` 的环半部被 drop 不置位关闭标记，而外侧写泵 park 在
-    // 这条环的读端上、以「封口且排空」为退出条件（见
-    // `session_pump_::tx_pump_loop_async_`）。少了这次封口，写泵既看不到「到此为止」
-    // 也等不到新数据，于是**永不退出**，环里已经成帧、尚未上网的字节就地搁浅——
-    // 优雅关闭的「排空」也就名存实亡。
-    let mut tx_stage = StageSealGuard_::new_(tx_stage);
+    // 退出时它随作用域 drop。**已知缺口**：`abs_buff` 的 `TrBuffWrite` 没有「封口」
+    // 操作（`buffex::ring` 的 `RingWriter::close` 是具体类型上的固有方法，没有 trait），
+    // 因此对「调用方驱动的全被动环」这一类传输，本循环退出后**不会**唤醒 park 在环
+    // 读端上的排空方——它要么靠 drop 传输时的适配器语义（`buffex_*_adapt` 的
+    // `BuffWrite` 在 drop 里关生产端并 detach 泵），要么靠调用方自己的超时 / 取消。
+    // 旧版这里有一个 `StageSealGuard_`，它封的是**连接自己的**写环，那一步随写环一起
+    // 消失了。要在泛型层面补上，需要上游给 `TrBuffWrite` 补一个「封口」方法。
+    let mut tx_stage = tx_stage;
 
     // 表与事件队列都包进收尾守卫：**退出时显式关闭本循环持有的那些半部**。
     // 为什么必须这样做、以及为什么分成两个守卫，见 `MuxLocalGuard_` 的类型文档。
@@ -2194,7 +2245,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_write_event_<C, K>(
     event: WriteEvent_<C::Alloc>,
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     table: &mut WriteTable_<C::Alloc>,
     tg_table: &mut TgWriteTable_<C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
@@ -2413,7 +2464,7 @@ where
 ///
 /// 返回本轮成功送出的**报文条数**（仅供诊断 / 测试断言）。
 async fn flush_tg_endpoint_<C, K>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     entry: &mut TgWriteEntry_<C::Alloc>,
     local: Dock,
     shared: &MuxShared_<C>,
@@ -2468,7 +2519,7 @@ where
 ///
 /// 发送环已关闭（应用丢了发送半边）或读段失败时返回错误，调用方据此丢弃该长度记录。
 async fn send_one_datagram_<C>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     entry: &mut TgWriteEntry_<C::Alloc>,
     local: Dock,
     shared: &MuxShared_<C>,
@@ -2537,6 +2588,10 @@ where
         FrameKind::Datagram,
         u32::try_from(head_len + payload_len).unwrap_or(u32::MAX),
     );
+    shared.metrics_().on_transport_bytes(
+        FrameDir::Send,
+        u64::try_from(head_len + payload_len).unwrap_or(u64::MAX),
+    );
     Result::Ok(true)
 }
 
@@ -2561,7 +2616,7 @@ where
 ///
 /// 写环放不下整帧 / 源环被关闭 / 段借用失败时返回错误；调用方据此把该条留到下一轮。
 async fn write_frame_to_stage_<C>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     entry: &mut TgWriteEntry_<C::Alloc>,
     head: &[u8],
     payload_len: usize,
@@ -2698,10 +2753,10 @@ where
         // 「可以收尾」——两边谁先看到谁做，不会重复做什么坏事。放在这里而不是全交给
         // 计时循环，是因为延迟敏感：计时循环可能正睡在一个较远的期限上。
         if became_idle && shared.reg_().is_closing_() {
-            // 用**软收尾**：只停其它循环，把写泵留下——连接写环里可能还压着刚刚成帧、
-            // 尚未交给传输的字节，写泵会在封口排空之后自行退出（见
-            // `ChannelRegistry_::cancel_loops_keep_pump_`）。
-            shared.reg_().cancel_loops_keep_pump_();
+            // 本版没有写泵：复用循环成帧时直接写进传输，因此收尾就是「三个循环一起
+            // 取消」——连接内部没有任何还压着字节的环要排空（见
+            // `ChannelRegistry_::cancel_loops_` 的文档）。
+            shared.reg_().cancel_loops_();
         }
     }
     Result::Ok(())
@@ -2709,7 +2764,7 @@ where
 
 /// 发一条 `CLOSE`。用独立的 helper 以便在事件处理里直接 await。
 async fn control_close_via_<C, K>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     max_packet_size: usize,
     local_dock: Dock,
@@ -2732,7 +2787,7 @@ where
 
 /// 把控制帧写进写环（分块；空间不足时由写泵持续搬运腾出空间）。
 async fn write_control_blocking_<C, K>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     max_packet_size: usize,
     frame: &ControlFrame_,
@@ -2756,7 +2811,7 @@ where
     if head_len + payload.len() > max_packet_size {
         return Result::Err(MuxError::FrameTooLarge);
     }
-    enqueue_frame_parts_::<_>(tx_stage, &head[..head_len], payload, cancel.child_token()).await?;
+    enqueue_frame_parts_::<_, _>(tx_stage, &head[..head_len], payload, cancel.child_token()).await?;
     // 上报「写出一个帧」：控制帧在这里才真正**整帧**进了写环（`enqueue_frame_parts_`
     // 把头与载荷分两次入环，因此计数点必须在它之后）。
     shared.metrics_().on_frame(
@@ -2766,12 +2821,16 @@ where
         frame.kind_(),
         u32::try_from(head_len + payload.len()).unwrap_or(u32::MAX),
     );
+    shared.metrics_().on_transport_bytes(
+        FrameDir::Send,
+        u64::try_from(head_len + payload.len()).unwrap_or(u64::MAX),
+    );
     Result::Ok(())
 }
 
 /// 把某条子流发送环里已提交的数据全部写出（直到取空）。
 async fn flush_entry_<C, K>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
@@ -2803,7 +2862,7 @@ where
 /// 轮转一遍本地表，最多写出一段数据；返回是否有进展。
 #[allow(clippy::too_many_arguments)]
 async fn drain_once_<C, K>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
@@ -2849,7 +2908,7 @@ where
 /// 尝试为 `pair` 写出一段数据；返回是否写出。
 #[allow(clippy::too_many_arguments)]
 async fn drain_one_<C, K>(
-    tx_stage: &mut BufferedTx,
+    tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<C::Alloc>,
     scratch: &mut Owned<[u8], C::Alloc>,
@@ -2973,7 +3032,7 @@ where
     // **两段**写进连接写环：先帧头（栈上缓冲）、再载荷（`scratch`）。写环是单生产者，
     // 因此两段之间不会被别的帧插进来。空间在上面已经判过（保守预判 + 实际头长），
     // 因此这里**不会再**出现「字节已离开子流环、帧却没写出去」的状态。
-    if let Result::Err(err) = enqueue_frame_parts_::<_>(
+    if let Result::Err(err) = enqueue_frame_parts_::<_, _>(
         tx_stage,
         &head[..head_len],
         &scratch[..moved],
@@ -2995,6 +3054,10 @@ where
         pair.1,
         FrameKind::Data,
         u32::try_from(head_len + moved).unwrap_or(u32::MAX),
+    );
+    shared.metrics_().on_transport_bytes(
+        FrameDir::Send,
+        u64::try_from(head_len + moved).unwrap_or(u64::MAX),
     );
     Result::Ok(true)
 }

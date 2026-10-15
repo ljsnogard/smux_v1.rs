@@ -26,11 +26,12 @@ use abs_buff::{
     buffer::{TrBuffSegmRef, TrBuffSegmView},
 };
 use buffex::x_deps::abs_buff;
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 use smux_v1::connection::{Dock, MuxConnection, RecvDatagram, TrConnCfg, Sender};
 
 use crate::common::{
     OpenTelegraphClosureExt, SmokeMuxConfig, TrSmokeRt, TrSmokeScope,
-    connect_pair_, make_channel_buff_with_, make_stage_buffs_,
+    connect_pair_, make_channel_buff_with_,
 };
 
 /// 一条数据报的**发送**环容量：取 1 KiB——足够装下场景里最大的那条报文（200 字节），
@@ -111,10 +112,10 @@ pub async fn run_telegraph_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt + ScopeHost,
 {
@@ -127,15 +128,13 @@ pub async fn run_telegraph_scenario_<RA, WA, RB, WB, S, RT>(
         WB,
         S,
     >(
-        rt,
-        scope,
-        tx_a,
-        rx_a,
-        tx_b,
-        rx_b,
-        make_stage_buffs_(),
-        make_stage_buffs_(),
-    )
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
     .await;
 
     // 两端是**不同的**配置类型（各自的传输半边类型不同），因此按各自的类型驱动。

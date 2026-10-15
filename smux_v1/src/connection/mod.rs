@@ -580,7 +580,6 @@ mod mux_connection;
 mod owner_;
 pub(crate) mod ring_;
 mod session_;
-pub(crate) mod session_pump_;
 mod signal_;
 mod sync_;
 mod telegraph;
@@ -598,7 +597,9 @@ mod util_;
 pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
-pub use config_::{CurrentConnCfg, DefaultConnCfg, K_STAGE_RING_CAPACITY, TrConnCfg};
+pub use config_::{
+    CurrentConnCfg, DefaultConnCfg, K_TRANSPORT_RING_CAPACITY, TrConnCfg,
+};
 pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};

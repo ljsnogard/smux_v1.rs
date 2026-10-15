@@ -77,7 +77,7 @@ use abs_cancel::TrCancellationToken;
 use crate::{
     connection::{
         Dock, FrameKind, TrConnCfg, flags,
-        mux_connection::{K_CLOSE_NONE, K_CLOSE_TIMEOUT},
+        mux_connection::K_CLOSE_NONE,
         session_::MuxShared_,
         signal_::{ControlFrame_, EventSender_, ReadEvent_, TrEventSender_, WriteEvent_},
     },
@@ -211,15 +211,13 @@ pub(crate) async fn timer_loop_async_<C, K>(
 
         // 2. **连接级关闭动作优先**：等待关闭已经不需要再排空（活跃子流归零），或者
         //    关闭整体超时——两种情形都到此为止，本轮认领的逐子流动作已无意义。
-        //    收尾就是取消五个令牌（与「丢弃连接」同一套机制，幂等）。
+        //    收尾就是取消三个令牌（与「丢弃连接」同一套机制，幂等）。
+        //
+        //    两条路径**不再有区别**：旧版把批量成帧留在连接写环里、由写泵排空，因此
+        //    收敛路径要留写泵一条活路；本版复用循环直接写传输，连接内部没有排空阶段
+        //    （见 `ChannelRegistry_::cancel_loops_` 的文档）。
         if scan.close_action_() != K_CLOSE_NONE {
-            // 收敛路径（活跃子流归零）用**软收尾**：留下写泵把连接写环里已经成帧的
-            // 字节交给传输；超时路径一刀切（那时的语义本就是「不等了」）。
-            if scan.close_action_() == K_CLOSE_TIMEOUT {
-                shared.reg_().cancel_loops_();
-            } else {
-                shared.reg_().cancel_loops_keep_pump_();
-            }
+            shared.reg_().cancel_loops_();
             return;
         }
 

@@ -13,6 +13,7 @@
 //! 由**连接级**的 `close_async` 而不是「丢弃最后一个句柄」来收尾。
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffTryWrite, TrBuffWrite};
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 use abs_art::TrDelay;
 use abs_smux::{
     chan::TrChannelHalf,
@@ -33,7 +34,6 @@ use crate::common::{
     connect_pair_with_opts_,
     expect_eof_,
     make_channel_buff_,
-    make_stage_buffs_,
     read_channel_exact_,
     try_write_channel_,
     write_channel_all_,
@@ -85,10 +85,10 @@ pub async fn run_graceful_close_scenario_<RA, WA, RB, WB, S, RT>(
     rx_b: RB,
 ) -> bool
 where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -108,8 +108,6 @@ where
             rx_a,
             tx_b,
             rx_b,
-            make_stage_buffs_(),
-            make_stage_buffs_(),
         )
         .await;
 
@@ -231,10 +229,10 @@ pub async fn run_graceful_close_timeout_scenario_<RA, WA, RB, WB, S, RT>(
     rx_b: RB,
 ) -> bool
 where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -259,8 +257,6 @@ where
             rx_a,
             tx_b,
             rx_b,
-            make_stage_buffs_(),
-            make_stage_buffs_(),
             opts.clone(),
             opts,
         )
@@ -381,10 +377,10 @@ pub async fn run_drop_flush_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + TrBuffTryWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffTryWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -404,8 +400,6 @@ pub async fn run_drop_flush_scenario_<RA, WA, RB, WB, S, RT>(
             rx_a,
             tx_b,
             rx_b,
-            make_stage_buffs_(),
-            make_stage_buffs_(),
         )
         .await;
 

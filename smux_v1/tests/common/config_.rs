@@ -1,15 +1,21 @@
 //! 测试侧的连接配置与整个用例矩阵的**容量常量**。
 //!
-//! 两套配置刻意只差一处：冒烟用 64 KiB 连接级帧暂存；流控验收把子流环**上钳**到
+//! 两套配置刻意只差一处：流控验收把子流环**上钳**到
 //! [`K_FLOW_CTRL_RING_CAPACITY`]，以逼出「窗口用尽 → 回补」这条平时走不到的路径。
 //! 全部数字集中于此，便于审计用例的量纲。
+//!
+//! **连接级帧暂存不再是配置或调用方的事**：传输半边自带缓冲（见
+//! `MuxConnection::new` 的文档），因此两套配置都不再规定「交多大的暂存」。
 
 use core::marker::PhantomData;
-use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use buffex::x_deps::abs_buff::{
+    TrBuffRead, TrBuffWrite,
+    buffer::{TrConsumerState, TrProducerState},
+};
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use abs_smux::conf::TrMuxConfig;
 use smux_v1::{
-    connection::{Dock, K_STAGE_RING_CAPACITY, MuxConnection, TrConnCfg},
+    connection::{Dock, MuxConnection, TrConnCfg},
     flow_ctrl::DefaultPolicy,
     metrics::NoMetrics,
 };
@@ -87,7 +93,11 @@ pub const K_TOTAL_CHANNELS: usize = 1024;
 pub const K_CHANNEL_CAPACITY: usize = 4096;
 
 
-/// 网络侧主动设备环的容量（字节）。
+/// 网络侧传输环的容量（字节）。
+///
+/// 本版它同时是**连接唯一的一层缓冲**：旧版连接自己还有两条 64 KiB 的帧暂存环，
+/// 本版没有了（见 `MuxConnection::new` 的文档），因此这个值直接决定连接级吞吐与
+/// 回压行为。取值与旧版的暂存环一致，便于新旧对照。
 pub const K_NET_BUFFER_SIZE: usize = 64usize * 1024usize;
 
 
@@ -137,8 +147,8 @@ static SMOKE_POLICY: DefaultPolicy = DefaultPolicy;
 
 impl<W, R, RT> TrMuxConfig for SmokeMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
     type Dock = Dock;
@@ -146,8 +156,8 @@ where
 
 impl<W, R, RT> TrConnCfg for SmokeMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {
     type Rt = RT;
@@ -194,8 +204,8 @@ pub const K_FLOW_CTRL_PAYLOAD_LEN: usize = 64usize * 1024usize;
 /// 与 [`SmokeMuxConfig`] 逐字同构，**只把子流环容量换成
 /// [`K_FLOW_CTRL_RING_CAPACITY`]** 的连接配置。
 ///
-/// 连接级帧暂存仍走 [`make_stage_buffs_with_`] 的 64 KiB，避免把「帧暂存」这一无关
-/// 变量带进对照。
+/// 传输环仍走调用方给的 [`K_NET_BUFFER_SIZE`]，避免把「传输缓冲」这一无关变量带进
+/// 对照。
 pub struct FlowCtrlConfig<W, R, RT> {
     _use_w_: PhantomData<W>,
     _use_r_: PhantomData<R>,
@@ -228,8 +238,8 @@ impl<W, R, RT> FlowCtrlConfig<W, R, RT> {
 
 impl<W, R, RT> TrMuxConfig for FlowCtrlConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
     type Dock = Dock;
@@ -237,8 +247,8 @@ where
 
 impl<W, R, RT> TrConnCfg for FlowCtrlConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {
     type Rt = RT;

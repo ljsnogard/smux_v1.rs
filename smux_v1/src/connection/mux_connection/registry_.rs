@@ -187,11 +187,6 @@ const K_STATE_NORMAL: u8 = 0u8;
 /// 双向收尾后由循环执行收尾（取消令牌）。
 const K_STATE_WAITING_CLOSE: u8 = 1u8;
 
-/// 五个循环的取消令牌下标：`3` = 写泵（`transport ← 连接写环`）。
-///
-/// 单独提出来是因为[软收尾](ChannelRegistry_::cancel_loops_keep_pump_)要**跳过**它。
-const K_LOOP_IDX_WRITE_PUMP: usize = 3usize;
-
 /// 自动分配 dock 的第一个候选值。
 ///
 /// 仿照 UNIX 的**特权端口**约定：`0..1024` 是「约定用途」区间，只由调用方通过
@@ -767,12 +762,14 @@ where
 {
     inner_: Shared<CooperativeRwLockOwned<RegistryInner_<A>>, A>,
 
-    /// 五个循环的取消令牌：`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵、
-    /// `4` = 计时（保活 / 空闲超时）。
+    /// 三个循环的取消令牌：`0` = 解复用、`1` = 复用、`2` = 计时（保活 / 空闲超时）。
     ///
     /// **放在锁外**：构造后不再变化，因此取用与触发都无需取锁（`Drop` 路径要的
     /// 正是这一点）。
-    loops_: [CancelToken_<A>; 5],
+    ///
+    /// 旧版这里是五个：另外两个是「贴传输」的读 / 写泵，本版把它们连同连接级帧暂存
+    /// 环一起去掉了——内侧两个循环直接驱动传输的两条半边（见 `session_` 模块文档）。
+    loops_: [CancelToken_<A>; 3],
 
     /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
     mailbox_: SessionMailbox_,
@@ -853,7 +850,7 @@ where
         Result::Ok(guard.alloc_.clone())
     }
 
-    /// 建立注册表：分配根对象与四本索引，并为两个循环建好取消令牌。
+    /// 建立注册表：分配根对象与四本索引，并为三个循环建好取消令牌。
     ///
     /// # Panics
     ///
@@ -861,13 +858,9 @@ where
     /// `max_channel_count` 量级准备分配器。
     pub(crate) fn new_(opts: BasicOpts, alloc: A) -> Self {
         let loops = [
-            // 0：读泵（transport → 连接读环）
-            // 1：解复用（连接读环 → 各子流接收环）
-            // 2：复用（各子流发送环 → 连接写环）
-            // 3：写泵（连接写环 → transport）
-            // 4：计时（保活 PULSE 与空闲超时拆流）
-            CancelToken_::new_(alloc.clone()),
-            CancelToken_::new_(alloc.clone()),
+            // 0：解复用（transport Rx → 各子流接收环）
+            // 1：复用（各子流发送环 → transport Tx）
+            // 2：计时（保活 PULSE 与空闲超时拆流）
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
@@ -1929,34 +1922,25 @@ where
         })
     }
 
-    /// 取第 `idx` 个循环的取消令牌（`0` = 读循环，`1` = 写循环）。
+    /// 取第 `idx` 个循环的取消令牌（`0` = 解复用，`1` = 复用，`2` = 计时）。
     ///
     /// 令牌在锁外，因此本方法**不取锁**（构造路径与 `Drop` 路径都依赖这一点）。
     pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<A> {
         self.loops_[idx].clone()
     }
 
-    /// 触发**除写泵之外**四个循环的取消令牌（优雅关闭的**收敛路径**）。
+    /// 触发三个循环的取消令牌（连接关闭或失败时调用）。
     ///
-    /// # 为什么必须留下写泵
+    /// # 优雅关闭的收敛路径为什么不再需要「留下写泵」
     ///
-    /// 内侧复用循环把子流数据**成帧写进连接写环**之后才发 `CLOSE(FIN)`，因此
-    /// 「活跃子流归零」并不等于「字节已经上网」——连接写环里完全可能还压着已提交、
-    /// 已承诺送达的数据。写泵**不靠取消令牌判断收尾**：它在「连接写环封口且排空」
-    /// 时自行退出（封口由复用循环退出时的守卫保证）。于是留下它，就等于让连接
-    /// 把话说完再断开。
+    /// 旧版把「排空」拆成两段：内侧复用循环把字节**成帧写进连接写环**，再由外侧写泵
+    /// 搬上传输。于是「活跃子流归零」不等于「字节已经上网」，收敛路径必须留写泵一条
+    /// 活路（`cancel_loops_keep_pump_`），让它把写环排空后自行退出。
     ///
-    /// 强制路径（关闭整体超时、连接级失败）仍走 [`ChannelRegistry_::cancel_loops_`]
-    /// 一刀切——那时的语义本就是「不等了」。
-    pub(crate) fn cancel_loops_keep_pump_(&self) {
-        for (idx, token) in self.loops_.iter().enumerate() {
-            if idx != K_LOOP_IDX_WRITE_PUMP {
-                token.cancel_();
-            }
-        }
-    }
-
-    /// 触发四个循环的取消令牌（连接关闭或失败时调用）。
+    /// 本版没有连接级写环，也没有写泵：复用循环成帧时**直接写进传输半边**，因此
+    /// 「成帧写出」与「交给传输」是同一个动作，收尾时没有连接内部的排空阶段可言。
+    /// 传输里那些已经写出的字节由**调用方自己**的排空者（`buffex_*_adapt` 的自驱动
+    /// 泵 / 调用方的出向泵）负责，已不属于本连接的生命周期。
     ///
     /// 令牌在锁外，因此本方法**不取锁**。
     pub(crate) fn cancel_loops_(&self) {

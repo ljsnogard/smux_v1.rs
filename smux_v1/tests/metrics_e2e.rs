@@ -39,6 +39,7 @@ use abs_smux::{
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{Dock, TrConnCfg},
@@ -113,8 +114,8 @@ impl<W, R, RT> MetricsCfg<W, R, RT> {
 
 impl<W, R, RT> TrMuxConfig for MetricsCfg<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
     type Dock = Dock;
@@ -122,8 +123,8 @@ where
 
 impl<W, R, RT> TrConnCfg for MetricsCfg<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {
     type Rt = RT;
@@ -161,8 +162,8 @@ where
 
 impl<W, R, RT> TestConnCfg for MetricsCfg<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {
     fn new_(rt: Self::Rt) -> Self {
@@ -206,8 +207,6 @@ async fn metrics_reports_lifecycle_() {
             a_rx,
             b_tx,
             b_rx,
-            common::make_stage_buffs_(),
-            common::make_stage_buffs_(),
         )
         .await;
 

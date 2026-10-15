@@ -128,13 +128,15 @@ where
     /// 读事件发送端（接收环注册与释放）。
     r_events_: EventSender_<ReadEvent_<C::Alloc>>,
 
-    /// 五个循环的取消令牌（`0` = 读泵、`1` = 解复用、`2` = 复用、`3` = 写泵、
-    /// `4` = 计时）。
+    /// 三个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时）。
     ///
     /// 核心自己持一份克隆，**而不是在 `Drop` 里去注册表取**：注册表取锁在跨线程
     /// 争用时是阻塞等待，而 `Drop` 必须不阻塞。令牌是可克隆的共享句柄，因此这里
     /// 持有的就是循环在用的那一个。
-    loops_: [CancelToken_<C::Alloc>; 5],
+    ///
+    /// 旧版是五个：贴传输的读 / 写泵连同连接级帧暂存环一起去掉了（见 `session_`
+    /// 模块文档）。
+    loops_: [CancelToken_<C::Alloc>; 3],
 }
 
 impl<C> MuxCore<C>
@@ -143,7 +145,7 @@ where
 {
     /// 由建连路径展开后的全部量构造（成员私有，构造只能走这里）。
     ///
-    /// 参数确实多（策略 / 协商结果 / 注册表 / 建连时刻 / 两条通道 / 五个令牌）：
+    /// 参数确实多（策略 / 协商结果 / 注册表 / 建连时刻 / 两条通道 / 三个令牌）：
     /// 它们全部来自同一个建连路径，打成一个中间结构只会多一层壳而没有别的收益。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_(
@@ -153,7 +155,7 @@ where
         epoch: <C::Rt as TrClock>::Instant,
         w_events: EventSender_<WriteEvent_<C::Alloc>>,
         r_events: EventSender_<ReadEvent_<C::Alloc>>,
-        loops: [CancelToken_<C::Alloc>; 5],
+        loops: [CancelToken_<C::Alloc>; 3],
     ) -> Self {
         MuxCore {
             config_: config,
@@ -198,8 +200,7 @@ where
         &self.r_events_
     }
 
-    /// 第 `idx` 个循环的取消令牌（`0` = 读泵、`1` = 解复用、`2` = 复用、
-    /// `3` = 写泵、`4` = 计时）。
+    /// 第 `idx` 个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时）。
     pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<C::Alloc> {
         self.loops_[idx].clone()
     }

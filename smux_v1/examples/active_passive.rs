@@ -158,11 +158,9 @@ async fn active(
             DefaultPolicy,
             rt.clone(),
         );
-    let (stage_r, stage_w) = (
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc)),
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc)),
-    );
-    let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
+    // 建连**不需要**再交缓冲：传输环（上面 `passive_ring_` 造的那两条）就是连接
+    // 唯一的缓冲层，内侧两个循环直接驱动它们。
+    let conn = MuxConnection::new(delivery, cfg);
 
     let local_dock = Dock::new(0x2001);
     let remote_dock = Dock::new(1);
@@ -204,11 +202,9 @@ async fn passive(
             DefaultPolicy,
             rt.clone(),
         );
-    let (stage_r, stage_w) = (
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc)),
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc)),
-    );
-    let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
+    // 建连**不需要**再交缓冲：传输环（上面 `passive_ring_` 造的那两条）就是连接
+    // 唯一的缓冲层，内侧两个循环直接驱动它们。
+    let conn = MuxConnection::new(delivery, cfg);
 
     let local_dock = Dock::new(1);
     let mut listener = conn

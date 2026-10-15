@@ -2,6 +2,7 @@
 //! 逐条校验载荷，最后半关闭并等 EOF。
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 
 use crate::common::{K_CHANNELS_PER_DOCK, K_DOCK_COUNT, TrSmokeRt, TrSmokeScope};
 
@@ -27,10 +28,10 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB, S, RT>(
 ) where
     // 连接把 Rx / Tx 移交给 `'static` 的读写循环（`spawn_local` 要求 `'static`；
     // 本地投递不要求 `Send`）。
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {

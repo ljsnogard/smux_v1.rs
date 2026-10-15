@@ -97,8 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cfg::new_with_rt(delivery_b, DefaultPolicy, rt.clone());
 
     // ⑥ 建连：两块连接级帧暂存缓冲由**调用方当场给出**（这里各 64 KiB）。
-    let conn_a = MuxConnection::new(delivery_a, cfg_a, stage_buff_(), stage_buff_());
-    let conn_b = MuxConnection::new(delivery_b, cfg_b, stage_buff_(), stage_buff_());
+    let conn_a = MuxConnection::new(delivery_a, cfg_a);
+    let conn_b = MuxConnection::new(delivery_b, cfg_b);
     println!("已建立两个 MuxConnection（同一线程）");
 
     // ⑦ 同一条线程上跑完：A 开一条子流写数据并半关闭，B 接收并读回。
@@ -172,11 +172,6 @@ type Buf = Owned<[MaybeUninit<u8>], CoreAlloc>;
 fn passive_ring_(capacity: usize) -> (BufferedTx, BufferedRx) {
     new_buffered_channel(Buf::new_uninit_slice(capacity, CoreAlloc))
         .expect("容量应当落在 buffex 允许的区间内")
-}
-
-/// 造一块**连接级**帧暂存缓冲（`MuxConnection::new` 的两个尾参）。
-fn stage_buff_() -> MuxChanBuffOwnedBy<Buf> {
-    MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_RING_CAP, CoreAlloc))
 }
 
 /// 子流环的准备策略：`accept_async` 时按给定容量向 `CoreAlloc` 要两块内存。

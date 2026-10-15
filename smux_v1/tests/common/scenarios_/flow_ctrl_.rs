@@ -2,6 +2,7 @@
 //! 被用尽并回补；慢读（每次 [`K_FLOW_CTRL_READ_STEP`] 字节）把窗口压在阈值附近。
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 use abs_smux::{
     chan::TrChannelHalf,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
@@ -53,10 +54,10 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -68,7 +69,14 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+    >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
     .await;
 
     let listener_dock = Dock::new(1u32);
@@ -170,10 +178,10 @@ pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -187,7 +195,14 @@ pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+    >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
     .await;
 
     let dock_blocked = Dock::new(1u32);
@@ -346,10 +361,10 @@ pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -361,7 +376,14 @@ pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+    >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
     .await;
 
     let drop_dock = Dock::new(1u32);

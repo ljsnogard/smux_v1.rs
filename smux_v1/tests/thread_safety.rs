@@ -222,8 +222,6 @@ fn mux_bind_cross_thread_is_exclusive_tokio_() {
                 a_rx,
                 b_tx,
                 b_rx,
-                common::make_stage_buffs_(),
-                common::make_stage_buffs_(),
             ))
             .await;
         (a, b, scope)
@@ -325,8 +323,6 @@ fn mux_rebind_after_cross_thread_drop_tokio_() {
                 a_rx,
                 b_tx,
                 b_rx,
-                common::make_stage_buffs_(),
-                common::make_stage_buffs_(),
             ))
             .await;
         (a, b, scope)
@@ -413,8 +409,6 @@ fn mux_auto_dock_allocation_is_atomic_tokio_() {
                 a_rx,
                 b_tx,
                 b_rx,
-                common::make_stage_buffs_(),
-                common::make_stage_buffs_(),
             ))
             .await;
         (a, b, scope)
