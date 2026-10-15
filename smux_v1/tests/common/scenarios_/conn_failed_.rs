@@ -57,6 +57,8 @@ use smux_v1::{
     metrics::ConnCloseReason,
 };
 
+use buffex::x_deps::abs_buff::buffer::{TrConsumerState, TrProducerState};
+
 use crate::common::{
     SmokeMuxConfig, TrSmokeRt, TrSmokeScope, connect_pair_, make_flow_payload_,
     read_channel_exact_, write_channel_all_,
@@ -147,6 +149,23 @@ where
             broken_: self.broken_.clone(),
             _segm_: PhantomData,
         }
+    }
+}
+
+/// 故障写半边的**状态查询**：转发内层；置位后按「对端已消失」回答。
+///
+/// 本版连接直接驱动传输半边（没有写泵），`producer_state` 只用于「还放得下多少 /
+/// 能不能动手」的前置判断；真正把故障暴露给连接的是 `try_write` / `write_async`
+/// 返回的 `ProducerError::Closing`。因此这里只需保证置位时不再报告「有空间」。
+impl<H> TrProducerState for FailableTx_<H>
+where
+    H: TrProducerState,
+{
+    fn producer_state(&self) -> Option<(usize, bool)> {
+        if self.broken_.get() {
+            return Option::Some((0usize, true));
+        }
+        self.half_.producer_state()
     }
 }
 
@@ -255,10 +274,10 @@ pub async fn run_conn_failed_wakes_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + TrBuffTryWrite<u8, Err = ProducerError<usize>> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffTryWrite<u8, Err = ProducerError<usize>> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -272,7 +291,14 @@ pub async fn run_conn_failed_wakes_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+    >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
     .await;
 
     let listener_dock = Dock::new(0x7601u32);

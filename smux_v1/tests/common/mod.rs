@@ -51,14 +51,7 @@ mod pump_;
 mod socket_;
 mod scenarios_;
 
-pub use buff_::{
-    SmokeBuff,
-    SmokeStageBuff,
-    make_channel_buff_,
-    make_channel_buff_with_,
-    make_stage_buffs_,
-    make_stage_buffs_with_,
-};
+pub use buff_::{SmokeBuff, make_channel_buff_, make_channel_buff_with_};
 pub use channel_io_::{expect_eof_, read_channel_exact_, try_write_channel_, write_channel_all_};
 pub use scenarios_::{TestConnCfg, connect_pair_, connect_pair_with_opts_};
 pub use closure_::{

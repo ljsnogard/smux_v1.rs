@@ -50,7 +50,7 @@ use crate::{
     metrics::{DemoMetrics, MetricsDelta},
     payload::{PayloadSrc, digest_of},
     proto::{Envelope, K_HEADER_LEN},
-    transport::{RingPrepare, expect_eof, make_stage_buffs, read_exact, write_all},
+    transport::{RingPrepare, expect_eof, read_exact, write_all},
 };
 
 /// 一侧的载荷标识：0 = 主动侧（握手 invite），1 = 被动侧（握手 listen）。
@@ -231,8 +231,8 @@ pub async fn run_phase(
     // ② 建连接：运行时值进配置，因此连接内部的计时与作用域都取自这个后端。
     let cfg = DemoCfg::new(rt.clone(), DemoMetrics::global());
     let (delivery, cfg) = (delivery, cfg);
-    let (stage_r, stage_w) = make_stage_buffs();
-    let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
+    // 建连不需要调用方交缓冲：传输适配器（`BuffRead` / `BuffWrite`）自带缓冲。
+    let conn = MuxConnection::new(delivery, cfg);
 
     crate::trace_!("连接已建：initiate={initiate}");
 

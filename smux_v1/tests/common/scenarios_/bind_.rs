@@ -1,6 +1,7 @@
 //! 绑定与建流生命周期场景：dock 绑定的独占性，以及「发起方句柄尚未裁决就被丢弃」。
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 use abs_smux::{
     conn::{TrChannelListener, TrConnection, TrDockBinding},
     dock::TrDock,
@@ -37,10 +38,10 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -53,7 +54,14 @@ pub async fn run_bind_exclusivity_scenario_<RA, WA, RB, WB, S, RT>(
             RB,
             WB,
             S,
-        >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+        >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
         .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
@@ -122,10 +130,10 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -138,7 +146,14 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
             RB,
             WB,
             S,
-        >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+        >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
         .await;
 
     // 探测用的 dock 取值远离收发场景用的 `1..=16` 与 `0x1000..`，避免歧义。
@@ -269,10 +284,10 @@ pub async fn run_auto_dock_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -285,7 +300,14 @@ pub async fn run_auto_dock_scenario_<RA, WA, RB, WB, S, RT>(
             RB,
             WB,
             S,
-        >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+        >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
         .await;
 
     // -- B 侧：自动安排一个 dock 并在其上监听。A 必须能寻址到它，这要求自动分配是

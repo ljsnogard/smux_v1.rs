@@ -9,9 +9,9 @@
 //!
 //! 本模块因此只剩两件事：
 //!
-//! 1. **缓冲供给**——新版 `smux_v1` 把「交多大、从哪来」全部交给调用方：
-//!    连接级帧暂存由 [`make_stage_buffs`] 提供，子流环内存由 [`RingPrepare`]
-//!    在 `accept_async` 当场提供；
+//! 1. **缓冲供给**——`smux_v1` 本版只把**子流环**的内存交给调用方：
+//!    由 [`RingPrepare`] 在 `accept_async` 当场提供。连接级帧暂存已经不存在
+//!    ——连接直接驱动传输的两条半边（适配器自带缓冲）；
 //! 2. **子流半边的段级工具**——[`write_all`] / [`read_exact`] / [`expect_eof`]。
 //!
 //! # 为什么不再有手写的传输泵
@@ -24,7 +24,6 @@
 
 use core::mem::MaybeUninit;
 
-use smux_v1::connection::{K_STAGE_RING_CAPACITY, MuxChanBuffOwnedBy};
 use smux_v1::x_deps::abs_buff::{
     Demand, TrBuffRead, TrBuffWrite,
     buffer::{TrBuffSegmMut, TrBuffSegmRef, TrBuffSegmView},
@@ -37,17 +36,6 @@ use smux_v1::x_deps::{
 
 /// 环存储类型（元素 `u8` + 平台无关分配器）。
 pub type Buff = Owned<[MaybeUninit<u8>], CoreAlloc>;
-
-/// 交给 `MuxConnection::new` 的连接级帧暂存缓冲（视图 + 拥有者）。
-pub type StageBuff = MuxChanBuffOwnedBy<Buff>;
-
-/// 造一对连接级帧暂存缓冲，容量取 `smux_v1` 的既定常量。
-pub fn make_stage_buffs() -> (StageBuff, StageBuff) {
-    (
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, CoreAlloc)),
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, CoreAlloc)),
-    )
-}
 
 /// `TrPrepareRing` 的最小实现：`accept_async` 当场按容量现造两块子流环内存。
 ///

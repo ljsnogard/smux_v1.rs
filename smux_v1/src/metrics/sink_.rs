@@ -141,7 +141,7 @@ pub enum FrameDir {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnCloseReason {
-    /// 正常收尾：最后一个应用面句柄被丢弃，核心析构并触发五个循环退出。
+    /// 正常收尾：最后一个应用面句柄被丢弃，核心析构并触发三个循环退出。
     ///
     /// 「被取消令牌终止的收尾」也归入这一类：那条路径**不**在注册表上留下失败标志，
     /// 语义上就是正常关闭（见 `session_::fail_mux_loop_` 的文档）。
@@ -215,7 +215,7 @@ pub enum ChannelCloseReason {
 /// report(&NoMetrics);
 /// ```
 pub trait TrMetricsSink: Send + Sync + 'static {
-    /// 连接建立成功（复用层收口：五个循环已经投递）。
+    /// 连接建立成功（复用层收口：三个循环已经投递）。
     fn on_conn_opened(&self);
 
     /// 连接关闭。

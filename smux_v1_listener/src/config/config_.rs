@@ -9,21 +9,26 @@
 //!
 //! | 参数 | 契约 | 回答什么 |
 //! | --- | --- | --- |
-//! | `Cfg` | [`TrListenerConfig`] | 握手条件、连接用哪套资源策略、帧暂存缓冲从哪来 |
+//! | `Cfg` | [`TrListenerConfig`] | 握手条件、连接用哪套资源策略 |
 //! | `A` | [`TrInbound`] | 从哪个 socket 接受连接、怎么把它接上传输环 |
 //! | `N` | [`TrNegotiatorFactory`] | 每次握手交给谁去裁决 |
 //!
-//! 拆开的理由是它们的变化**互相独立**：换传输只换 `A`，换协商策略只换 `N`，换缓冲区
-//! 来源只动 `Cfg` 的一个方法。
+//! 拆开的理由是它们的变化**互相独立**：换传输只换 `A`，换协商策略只换 `N`，换连接
+//! 资源策略只动 `Cfg` 的一个方法。
+//!
+//! **没有「连接级帧暂存缓冲」这一项**：`smux_v1` 本版让连接直接驱动传输的两条半边
+//! （它们自带缓冲），因此 listener 也不再替连接备缓冲——`TrInbound::into_halves`
+//! 交出的两条半边就是全部。
 
-use core::mem::MaybeUninit;
-
-use abs_buff::{TrBuffRead, TrBuffWrite};
+use abs_buff::{
+    TrBuffRead, TrBuffWrite,
+    buffer::{TrConsumerState, TrProducerState},
+};
 use abs_cancel::TrCancellationToken;
 use gen_mcf2::gen_may_cancel_future;
 
 use smux_v1::{
-    connection::{MuxChanBuffOwnedBy, TrConnCfg},
+    connection::TrConnCfg,
     handshake::{
         agent::TrNegotiator,
         opts::{BasicOpts, NegotiationEntry},
@@ -31,41 +36,6 @@ use smux_v1::{
     time::TrTime,
     x_deps::{abs_buff, abs_cancel, gen_mcf2},
 };
-
-/// 连接级帧暂存缓冲的拥有者类型：一块 `MaybeUninit<u8>` 存储 + `smux_v1` 内部结构同款的
-/// 分配器。
-///
-/// 它是 [`TrListenerConfig::StageBuff`] 的**固定**取值，理由见那里的文档。
-pub type CoreAllocOwned_ = smux_v1::x_deps::mm_ptr::Owned<
-    [MaybeUninit<u8>],
-    smux_v1::x_deps::abs_mm::CoreAlloc,
->;
-
-/// 造一对连接级帧暂存缓冲的便捷函数：容量都取 `cap`，分配器取 [`CoreAllocOwned_`] 的
-/// 那一个。
-///
-/// 它是给 [`TrListenerConfig::make_stage_buffs`] 的实现者用的糖，避免每个实现都手写
-/// `Owned::new_uninit_slice`。
-///
-/// # Panics
-///
-/// 分配失败时 panic（`Owned::new_uninit_slice` 的行为）。
-pub fn make_stage_buffs(
-    cap: usize,
-) -> (
-    MuxChanBuffOwnedBy<CoreAllocOwned_>,
-    MuxChanBuffOwnedBy<CoreAllocOwned_>,
-) {
-    use smux_v1::x_deps::abs_mm::CoreAlloc;
-    (
-        MuxChanBuffOwnedBy::new(smux_v1::x_deps::mm_ptr::Owned::new_uninit_slice(
-            cap, CoreAlloc,
-        )),
-        MuxChanBuffOwnedBy::new(smux_v1::x_deps::mm_ptr::Owned::new_uninit_slice(
-            cap, CoreAlloc,
-        )),
-    )
-}
 
 /// **能接受入向连接、并把设备接上传输环**。
 ///
@@ -213,11 +183,11 @@ pub trait TrNegotiatorFactory {
 /// 处于编译期选定的后端上下文内），而是要求配置显式交出运行时值：于是同一份 listener
 /// 代码在哪个后端上跑**不再由 feature 决定**，只由配置里放的那个值决定。
 ///
-/// # 缓冲为什么由配置交工厂
+/// # 缓冲不在本 trait 里
 ///
-/// `smux_v1` 的纪律是「缓冲由调用方当场交出」。listener 看不到调用方，因此把「当场」
-/// 提前到「实现本 trait 时」：[`TrListenerConfig::make_stage_buffs`] 每条连接调用一次。
-/// 容量、分配器、是否池化都由实现决定。
+/// `smux_v1` 本版让连接直接驱动传输的两条半边（`ConnTx` / `ConnRx` 自带缓冲），因此
+/// listener **不再**替每条连接备「连接级帧暂存缓冲」：旧版的 `StageBuff` 关联类型与
+/// `make_stage_buffs` 方法随之删除。
 pub trait TrListenerConfig: 'static {
     /// **运行时值类型**：提供「现在几点」「怎么等」，以及「交出本地队列」。
     ///
@@ -227,16 +197,6 @@ pub trait TrListenerConfig: 'static {
     /// 重述一遍，写在这里则自动可用。
     type Rt: TrTime + Clone + 'static + crate::TrScopeHost;
 
-    /// 连接级帧暂存缓冲的**拥有者类型**。实现请写 [`CoreAllocOwned_`]。
-    ///
-    /// 它写成关联类型（而不是把 [`make_stage_buffs`](TrListenerConfig::make_stage_buffs)
-    /// 的返回类型直接钉死）是为了让「本 listener 用哪种缓冲」成为**契约的一部分**、在
-    /// 文档里可见。当前只支持 [`CoreAllocOwned_`]：换内存策略属于「换一整套连接设施」，
-    /// 那要走 [`MuxConnection::new`](smux_v1::connection::MuxConnection::new)。
-    type StageBuff: smux_v1::x_deps::abs_mm::res_man::TrUnique<
-        Item = [MaybeUninit<u8>],
-    > + 'static;
-
     /// 每条连接的资源策略。
     ///
     /// 它必须与 [`TrInbound::ConnCfg`] 取相等约束（见
@@ -245,13 +205,13 @@ pub trait TrListenerConfig: 'static {
     /// 要的那两条，不需要任何转换。
     ///
     /// 约束里的 `Rt: ScopeHost` 是「连接策略交出的运行时值能交出本地队列」——建连时要用
-    /// 它把五个循环投递出去。约束写在**这里**而不是
+    /// 它把三个循环投递出去。约束写在**这里**而不是
     /// [`TrListenerConfig::runtime`] 上，是因为方法返回的是
     /// `<Self::Conn as TrConnCfg>::Rt` 这个投影类型，投影上的约束不会在调用点自动展开。
     type Conn: TrConnCfg<
             Rt = Self::Rt,
-            ConnTx: TrBuffWrite<u8> + 'static,
-            ConnRx: TrBuffRead<u8> + 'static,
+            ConnTx: TrBuffWrite<u8> + TrProducerState + 'static,
+            ConnRx: TrBuffRead<u8> + TrConsumerState + 'static,
         >
         + Clone
         + 'static;
@@ -264,17 +224,6 @@ pub trait TrListenerConfig: 'static {
 
     /// 取连接资源策略。
     fn conn_cfg(&self) -> Self::Conn;
-
-    /// 造**一对**连接级帧暂存缓冲：`(读环, 写环)`；每条连接调用一次。
-    ///
-    /// 返回顺序与 [`MuxConnection::new`](smux_v1::connection::MuxConnection::new) 的
-    /// 实参顺序一致：**先读后写**。
-    fn make_stage_buffs(
-        &self,
-    ) -> (
-        MuxChanBuffOwnedBy<CoreAllocOwned_>,
-        MuxChanBuffOwnedBy<CoreAllocOwned_>,
-    );
 
     /// 同时在途的握手条数上限。
     ///

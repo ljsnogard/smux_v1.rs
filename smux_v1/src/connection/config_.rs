@@ -4,16 +4,18 @@
 //! 连接内部还需要、但上游不关心的几样东西：内部结构使用的分配器、流控策略、两条传输
 //! 半边，以及运行时值。公开类型因此只需要 `MuxConnection<C>` 一个参数。
 //!
-//! **缓冲类型不在配置里**：一条子流用哪种智能指针持有它的 ring 内存，是调用方在
-//! `accept_async` 时**当场**交出的；连接级帧暂存缓冲同理（`MuxConnection::new` 的
-//! 实参）。配置只回答「内部结构用什么分配器、跑在哪个运行时」。
+//! **没有连接级帧暂存缓冲**：握手的交付物（`Tx` / `Rx`）本身就自带缓冲，连接的内侧
+//! 两个循环直接驱动它们，因此不再需要调用方另交两块缓冲、也不再有一次搬运
+//! （见 `session_` 模块文档）。传输半边因此必须**自己带缓冲**
+//! ——这也正是 [`TrConnCfg::ConnTx`] / [`TrConnCfg::ConnRx`] 要求
+//! `TrProducerState` / `TrConsumerState` 的原因：内侧循环要能非阻塞地问出
+//! 「有多少可读 / 可写、对端是否已经封口」。
 //!
 //! # 缓冲从哪来
 //!
-//! 子流环与连接级帧暂存的缓冲都由**调用方当场交出**（前者经 `accept_async` 的
-//! `prepare`，后者是 `MuxConnection::new` 的实参），类型是任意 `TrUnique` 的智能
-//! 指针。连接把它们一律吸收成 `ring_` 模块里的类型无关句柄，内部签名里看不到具体
-//! 指针类型；分配次数与容量都由调用方决定，连接只校验容量是否可用。
+//! 子流环的缓冲仍由**调用方当场交出**（经 `accept_async` 的 `prepare`），类型是任意
+//! `TrUnique` 的智能指针。连接把它吸收成 `ring_` 模块里的类型无关句柄，内部签名里
+//! 看不到具体指针类型；分配次数与容量都由调用方决定，连接只校验容量是否可用。
 
 extern crate alloc;
 
@@ -23,7 +25,10 @@ use core::{
 };
 
 use abs_art_facade::{self, DefaultRt_, TrRtCurrent};
-use abs_buff::{TrBuffRead, TrBuffWrite};
+use abs_buff::{
+    TrBuffRead, TrBuffWrite,
+    buffer::{TrConsumerState, TrProducerState},
+};
 use abs_smux::conf::TrMuxConfig;
 use abs_mm::CoreAlloc;
 
@@ -44,18 +49,19 @@ pub trait TrMuxAllocConfig {
     type ChanOwnerAlloc: AllocatorClone;
 }
 
-/// **连接级**帧暂存环的容量常数（两块：读环、写环）。
+/// **连接的传输环容量**（推荐值）：调用方自己造传输环时可以参考它。
 ///
-/// **它不是正确性下限**：整条收发路径都是流式推进的——读侧帧头由逐字节状态机解析
-/// （`frame_parser_`）、载荷按底层实际给出的段长分次搬入（`ReadCursor::read_async_`
-/// 每次只索要 1 字节起步），写侧入环写入按空闲空间分块推进（`session_.rs` 的
-/// `enqueue_frame_`）。因此两块环都只要 ≥ 环原语的最小容量（1 字节）就能跑通；
-/// `tests/inmem_mux.rs` 的 `mux_min_stage_inmem_dual_` 就以 1 字节钉住了这一点。
+/// 与旧版的「连接级帧暂存环容量」是同一个数，但语义变了：它不再是连接**自己**
+/// 要分配的一块缓冲，而是「一条被 smux 直接驱动的传输环，取多大比较合适」的
+/// 经验值。连接只要求这块环落在 `buffex::ring` 允许区间内（最小 1 字节，见
+/// `tests/inmem_mux.rs` 的最小容量用例），大小只影响吞吐 / 时延：环越大，
+/// 外侧泵与内侧循环之间的往返越少、单次借出的段越长。
 ///
-/// 取 64 KiB 是**吞吐 / 时延**上的选择：环越大，外侧泵与内侧循环之间的往返越少、
-/// 单次借出的段越长。默认协商值是 4096 字节，实际部署建议把 `max_packet_size` 定在
-/// **64 KiB 以下**；超过此值时应由配置实现者按自己的 `max_packet_size` 放大本容量。
-pub const K_STAGE_RING_CAPACITY: usize = 64usize * 1024usize;
+/// 默认协商值是 4096 字节，实际部署建议把 `max_packet_size` 定在 **64 KiB 以下**；
+/// 超过此值时应按自己的 `max_packet_size` 放大本容量——尤其**数据报**（telegraph）
+/// 一条报文的帧长上限就是 `max_packet_size`，传输环必须放得下整帧（见
+/// `session_::write_frame_to_stage_`）。
+pub const K_TRANSPORT_RING_CAPACITY: usize = 64usize * 1024usize;
 
 /// 连接的配置类型。
 ///
@@ -86,14 +92,14 @@ where
 {
     /// **运行时值**：提供「现在几点」（[`TrClock`]）与「怎么等」（[`TrDelay`]）。
     ///
-    /// 它必须是 `TrTime`（= `TrClock + TrDelay`）且可 `Clone`——核心与五个循环各自
+    /// 它必须是 `TrTime`（= `TrClock + TrDelay`）且可 `Clone`——核心与三个循环各自
     /// 克隆一份，因此各处看到的时刻来自**同一个**时间轴。
     ///
     /// [`TrClock`]: abs_art::TrClock
     /// [`TrDelay`]: abs_art::TrDelay
     type Rt: TrTime + Clone + 'static;
 
-    /// 连接内部结构（帧暂存、注册表等）的分配器。
+    /// 连接内部结构（注册表、事件通道、载荷暂存等）的分配器。
     type Alloc: AllocatorClone + Send + Sync;
 
     /// 流控策略。
@@ -105,15 +111,29 @@ where
     /// 都是 `#[inline(always)]` 空实现；配合 [`TrConnCfg::metrics`] 返回的引用，该装配下
     /// 的上报调用点会被单态化消除。
     ///
-    /// 要求 `Clone`：五个循环**不持有核心**（见 [`crate::connection`] 模块文档 §2.2），
+    /// 要求 `Clone`：三个循环**不持有核心**（见 [`crate::connection`] 模块文档 §2.2），
     /// 建连时必须把 sink 克隆一份进内部共享量。因此这里适合放**廉价可克隆的句柄**
     /// （例如 `&'static T`，或需求方自己的共享句柄）；`crate::metrics` 的模块文档
     /// §3 说明了为什么 mux 不替需求方做 `Arc` / `dyn` 的适配。
     type Metrics: TrMetricsSink + Clone;
 
     /// 连接侧的写 / 读半边（即两条传输的缓冲类型）。
-    type ConnTx: TrBuffWrite<u8>;
-    type ConnRx: TrBuffRead<u8>;
+    ///
+    /// # 为什么还要 `TrProducerState` / `TrConsumerState`
+    ///
+    /// 连接**不再**为传输另建两条帧暂存环：内侧两个循环直接在这两条半边上
+    /// `try_read` / `try_write` / `read_async` / `write_async`。因此它们必须能
+    /// **非阻塞地回答**「此刻有多少可读 / 可写、对端是否已经封口」——这正是
+    /// `abs_buff` 的这两个状态 trait 提供的查询。
+    ///
+    /// `buffex::ring` 的两个半部（即本 crate 的 [`BufferedTx`] / [`BufferedRx`]）
+    /// 与 `buffex_*_adapt` 的 `BuffRead` / `BuffWrite` 都实现了它们，因此「全被动环」
+    /// 与「设备 + 环适配器」两种传输都能直接接上。
+    ///
+    /// [`BufferedTx`]: crate::connection::BufferedTx
+    /// [`BufferedRx`]: crate::connection::BufferedRx
+    type ConnTx: TrBuffWrite<u8> + TrProducerState;
+    type ConnRx: TrBuffRead<u8> + TrConsumerState;
 
     /// 取一个**运行时值**（克隆句柄；各处共享同一个时间轴与计时器）。
     ///
@@ -182,9 +202,7 @@ where
 pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 
 /// 默认配置：`u8` 数据、[`Dock`] dock、[`CoreAlloc`] 分配、[`DefaultPolicy`]
-/// 流控；**帧暂存与子流环都用** [`MuxChanBuffAlloc`]——一种把「环内存 + 释放它的
-/// 分配器」打包在一起的智能指针，分配器内联在值里，因此每次建缓冲都不必再为保存
-/// 分配器做一次额外堆分配。
+/// 流控。
 ///
 /// 泛型参数 `Rt` 是**运行时值**，默认取本 crate 的
 /// [`DefaultRt_`](abs_art_facade::DefaultRt_)——由 smux 自己的 `test-*-runtime`
@@ -192,25 +210,20 @@ pub const K_DEFAULT_CHANNEL_RING_CAPACITY: usize = 4096usize;
 ///
 /// # 泛型参数顺序：`<W, R, M, P, Rt>`
 ///
-/// 第三个参数 `M` 是**指标接收方**（见 [`crate::metrics`]），排在策略 `P` **之前**。
-/// 因此写 `DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>` 是错的——`DefaultPolicy` 会落到
+/// `W` / `R` 是**传输的两条半边**（握手的交付物交回来的那对）。第三个参数 `M` 是
+/// **指标接收方**（见 [`crate::metrics`]），排在策略 `P` **之前**。因此写
+/// `DefaultConnCfg<Tx, Rx, DefaultPolicy, Rt>` 是错的——`DefaultPolicy` 会落到
 /// `M` 位上、`Rt` 落到 `P` 位上。不上报时要显式写全：
 ///
 /// ```ignore
 /// type Cfg = DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>;
 /// ```
 ///
-/// # 两块缓冲为什么是同一种类型
+/// # 缓冲
 ///
-/// 连接级帧暂存与子流环都是「由外部交出、供环使用的一块内存」，因此上游
-/// [`TrMuxConfig::Buff`] 与本 trait 的 [`TrConnCfg::StageBuff`] 用同一个契约
-/// （[`TrBoxed`]）描述它们，默认实现也就用同一个 [`MuxChanBuffAlloc`]。两种用途的差别
-/// 只在**容量从哪来**：帧暂存由 [`TrConnCfg::make_stage_buffs`] 定死，子流环由调用方
-/// 在最终裁决时逐条给出。
-///
-/// 帧暂存这一路额外要求 `Send + Sync`（[`MuxConnection::new`] 会把缓冲搬进循环），
-/// 而 [`MuxChanBuffAlloc`] 内部是裸指针，因此那两条 `unsafe impl` 写在 `ring_` 模块里
-/// （附安全论证）。子流环那条路不要求这两个 auto trait。
+/// 本配置**不规定任何缓冲**：传输半边自带缓冲（见 [`TrConnCfg::ConnTx`]），子流环的
+/// 内存在最终裁决时由调用方逐条给出。连接自己只做两类分配——注册表等内部结构（走
+/// [`TrConnCfg::Alloc`]）与一次性的载荷暂存。
 ///
 /// [`MuxConnection::new`]: crate::connection::MuxConnection::new
 pub struct DefaultConnCfg<
@@ -349,8 +362,8 @@ where
 
 impl<W, R, M, P, Rt> TrConnCfg for DefaultConnCfg<W, R, M, P, Rt>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     M: TrMetricsSink + Clone,
     P: TrFlowCtrlPolicy + 'static,
     Rt: TrTime + Clone + 'static,
@@ -419,7 +432,7 @@ where
 /// // 默认（compio）装配下：连接句柄可以跨线程，代价是取时刻的线程必须在上下文内。
 /// type Cfg = CurrentConnCfg<BufferedTx, BufferedRx>;
 /// let (delivery, cfg) = CurrentConnCfg::<BufferedTx, BufferedRx>::new(delivery, DefaultPolicy);
-/// let conn = MuxConnection::new(delivery, cfg, read_stage, write_stage);
+/// let conn = MuxConnection::new(delivery, cfg);
 /// ```
 pub struct CurrentConnCfg<
     W, R,
@@ -507,8 +520,8 @@ where
 
 impl<W, R, M, P, Rt> TrConnCfg for CurrentConnCfg<W, R, M, P, Rt>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     M: TrMetricsSink + Clone,
     P: TrFlowCtrlPolicy + 'static,
     Rt: TrTime + Clone + 'static + TrRtCurrent,

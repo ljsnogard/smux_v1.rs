@@ -151,13 +151,12 @@ where
 
     let config_a = SmokeMuxConfig::<RingTx, RingRx, RT>::new(rt.clone());
     let config_b = SmokeMuxConfig::<RingTx, RingRx, RT>::new(rt.clone());
-    let (stage_ar, stage_aw) = crate::common::make_stage_buffs_();
-    let (stage_br, stage_bw) = crate::common::make_stage_buffs_();
+
     // 运行时值与作用域都由配置解决（`TrConnCfg::runtime` + `ScopeHost`）。
     let conn_a: Conn<RT> =
-        MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw);
+        MuxConnection::new(delivery_a, config_a);
     let conn_b: Conn<RT> =
-        MuxConnection::new(delivery_b, config_b, stage_br, stage_bw);
+        MuxConnection::new(delivery_b, config_b);
     (conn_a, conn_b)
 }
 

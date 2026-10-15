@@ -1,13 +1,8 @@
-use core::{
-    alloc::AllocatorClone,
-    mem::MaybeUninit,
-    task::Poll,
-};
+use core::task::Poll;
 
 use abs_art::{TrClock, TrDelay, TrJoinHandle, TrLocalScope};
 use abs_art_facade::ScopeHost;
 use abs_cancel::TrCancellationToken;
-use abs_mm::res_man::TrUnique;
 use abs_smux::{
     conf::TrMuxConfig,
     conn::TrConnection,
@@ -18,20 +13,16 @@ use mm_ptr::Shared;
 
 use crate::{
     connection::{
-        Dock, MuxChanBuffOwnedBy, MuxError, TrConnCfg,
+        Dock, MuxError, TrConnCfg,
         dock_binding::DockBinding,
-        ring_::StageRingPair_,
-        session_::{
-            ByteLoopShared_, MuxShared_, demux_loop_async_, mux_loop_async_, race_cancel_,
-        },
-        session_pump_::{rx_pump_loop_async_, tx_pump_loop_async_},
+        session_::{MuxShared_, demux_loop_async_, mux_loop_async_, race_cancel_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
         timer_::timer_loop_async_,
     },
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
     metrics::TrMetricsSink,
     time::{ConnClock_, millis_of_},
-    x_deps::{abs_art, abs_cancel, abs_mm, abs_smux, gen_mcf2, mm_ptr},
+    x_deps::{abs_art, abs_cancel, abs_smux, gen_mcf2, mm_ptr},
 };
 use super::{
     core_::MuxCore,
@@ -76,7 +67,7 @@ pub enum BindError {
 /// （见 `mux_connection::core_` 的类型文档）。
 ///
 /// 本地作用域同样**不**出现在本类型的参数上：它只在 [`MuxConnection::new`] 的
-/// 方法级泛型里出现，投递完五个循环后由循环各自持有（见
+/// 方法级泛型里出现，投递完三个循环后由循环各自持有（见
 /// [`core_`](super::core_) 模块文档「队列保活」）。
 ///
 /// 收发半边类型由 `C::ConnTx` / `C::ConnRx` 给出，不再出现在公开类型上。
@@ -106,22 +97,35 @@ where
 {
     /// 由一次成功的握手交付物、资源策略与**两块连接级缓冲**构造连接：运行时值与
     /// 本地作用域都由 `C` 交出（[`TrConnCfg::runtime`] 与各后端的
-    /// `Runtime::local_scope()`），接管 `C::ConnRx` / `C::ConnTx`，把两块缓冲建为
-    /// 连接级的两条帧暂存环，并**经作用域 `spawn_local`** 投递五个循环。
+    /// `Runtime::local_scope()`），接管 `C::ConnRx` / `C::ConnTx`，并**经作用域
+    /// `spawn_local`** 投递三个循环。
     ///
-    /// # 五个循环
+    /// # 三个循环
     ///
     /// | 令牌序号 | 循环 | 搬运方向 |
     /// | --- | --- | --- |
-    /// | 0 | 读泵 | `C::ConnRx` → 连接读环 |
-    /// | 1 | 解复用 | 连接读环 → 各子流接收环（解析帧、拉取读事件） |
-    /// | 2 | 复用 | 各子流发送环 → 连接写环（成帧、拉取写事件） |
-    /// | 3 | 写泵 | 连接写环 → `C::ConnTx` |
-    /// | 4 | 计时 | 不搬字节：保活 `PULSE` 与空闲超时拆流（见私有模块 `timer_`） |
+    /// | 0 | 解复用 | `C::ConnRx` → 各子流接收环（解析帧、拉取读事件） |
+    /// | 1 | 复用 | 各子流发送环 → `C::ConnTx`（成帧、拉取写事件） |
+    /// | 2 | 计时 | 不搬字节：保活 `PULSE` 与空闲超时拆流（见私有模块 `timer_`） |
     ///
-    /// 内侧两个循环（1 / 2）从事件队列拉取 `Attach` / `TxClosed` / `Control` 等事件，
-    /// 据此决定哪些子流此刻可搬；计时循环（4）在前两者都静默时仍然会醒来，把
+    /// 内侧两个循环（0 / 1）从事件队列拉取 `Attach` / `TxClosed` / `Control` 等事件，
+    /// 据此决定哪些子流此刻可搬；计时循环（2）在前两者都静默时仍然会醒来，把
     /// 保活与拆流的需求投进同两条事件队列。
+    ///
+    /// # 为什么不再有连接级帧暂存环
+    ///
+    /// 旧版把传输交给两条「贴传输」的泵循环，由它们把字节搬进 / 搬出**连接自己**的
+    /// 两条帧暂存环，内侧两个循环只与那两条环打交道。但那两条环是**第二次缓冲**：
+    /// 握手的交付物（`ConnTx` / `ConnRx`）本身就自带缓冲——它要么是 `buffex::ring`
+    /// 的环半部，要么是「设备 + 环」的适配器（`buffex_*_adapt` 的 `BuffWrite` /
+    /// `BuffRead`），两者都实现了 `abs_buff` 的 `TrProducerState` /
+    /// `TrConsumerState`。于是「泵 + 环」这一层只带来一次多余的搬运，本版直接去掉：
+    /// 解复用循环读 `ConnRx`、复用循环写 `ConnTx`，park 与提交都发生在传输自身之上。
+    ///
+    /// 代价是传输必须**自己带缓冲**（这正是 [`TrConnCfg::ConnTx`] /
+    /// [`TrConnCfg::ConnRx`] 上的两个状态 trait 约束的用途）：如果直接把一个
+    /// 「裸设备」当传输（例如 socket 的读写半边），内侧循环就会 park 在设备上，
+    /// 事件队列与另一方向都会被它拖住。
     ///
     /// # 运行时值与作用域都**不再由调用者指定**
     ///
@@ -138,40 +142,28 @@ where
     /// - 运行时值由 [`TrConnCfg::runtime`] 交出（`DefaultConnCfg` 里存着建连时抓住的
     ///   那一个），类型是 `C::Rt`；
     /// - 本地作用域由该运行时值的固有方法 `local_scope()` 就地取得，只作为**方法级
-    ///   泛型** `S` 出现在本函数上，投递完五个循环后由循环各自持有一份克隆来保活队列
+    ///   泛型** `S` 出现在本函数上，投递完三个循环后由循环各自持有一份克隆来保活队列
     ///   （见 [`core_`](super::core_) 模块文档）。
     ///
     /// 需要显式控制两者时走 [`MuxConnection::new_with_rt`]；只想换运行时值而不动
     /// 调用形状时，自写一个 `C` 并让它的 [`TrConnCfg::runtime`] 返回别的值即可。
     ///
-    /// # 两块帧暂存缓冲由**调用方当场给出**
-    ///
-    /// 它们的类型是任意 `P: TrUnique`（见 [`MuxChanBuffOwnedBy`]），容量也由调用方
-    /// 决定——配置不再规定缓冲类型。**零额外分配**：`P` 连同环与控制块一起被搬进
-    /// 同一次分配（见 `ring_` 模块）。
-    ///
     /// # Panics
     ///
-    /// 传入的缓冲容量不在 `buffex::ring` 允许区间内时 panic（属**配置错误**：容量
-    /// 由调用方交出的那块内存决定，建连前就定死了）。
-    ///
-    /// [`MuxChanBuffOwnedBy`]: crate::connection::MuxChanBuffOwnedBy
-    pub fn new<P>(
+    /// 本函数自身不再有 panic 点（旧版会在「调用方交出的缓冲容量非法」时 panic）；
+    /// 取默认后端运行时值失败时仍由后端 panic（见 [`TrConnCfg::runtime`]）。
+    pub fn new(
         delivery: HandshakeDelivery<C::ConnTx, C::ConnRx>,
         config: C,
-        read_stage_buff: MuxChanBuffOwnedBy<P>,
-        write_stage_buff: MuxChanBuffOwnedBy<P>,
     ) -> Self
     where
-        P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
-        P::Alloc: AllocatorClone,
         C: 'static + Clone,
         C::Alloc: 'static,
         C::Rt: ScopeHost,
     {
         let rt = config.runtime();
         let scope = ScopeHost::local_scope(&rt);
-        Self::new_with_rt_(&rt, &scope, delivery, config, read_stage_buff, write_stage_buff)
+        Self::new_with_rt_(&rt, &scope, delivery, config)
     }
 
     /// 由**调用者给定**的运行时值与作用域构造连接（「特别的需要」那条接口）。
@@ -185,42 +177,30 @@ where
     /// - 想固定某个具名后端（例如默认 compio 但本条连接要跑在 tokio 上）。
     ///
     /// 运行时值的类型就是 [`TrConnCfg::Rt`]：类型参数仍然只有 `C` 一个。
-    ///
-    /// # Panics
-    ///
-    /// 同 [`MuxConnection::new`]：连接级缓冲容量非法时 panic。
-    pub fn new_with_rt<S, P>(
+    pub fn new_with_rt<S>(
         rt: &C::Rt,
         scope: &S,
         delivery: HandshakeDelivery<C::ConnTx, C::ConnRx>,
         config: C,
-        read_stage_buff: MuxChanBuffOwnedBy<P>,
-        write_stage_buff: MuxChanBuffOwnedBy<P>,
     ) -> Self
     where
         C: 'static + Clone,
         C::Alloc: 'static,
-        P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
-        P::Alloc: AllocatorClone,
         S: TrLocalScope + Clone + 'static,
     {
-        Self::new_with_rt_(rt, scope, delivery, config, read_stage_buff, write_stage_buff)
+        Self::new_with_rt_(rt, scope, delivery, config)
     }
 
     /// 两个公开构造入口的共同实现体。
-    fn new_with_rt_<S, P>(
+    fn new_with_rt_<S>(
         rt: &C::Rt,
         scope: &S,
         delivery: HandshakeDelivery<C::ConnTx, C::ConnRx>,
         config: C,
-        read_stage_buff: MuxChanBuffOwnedBy<P>,
-        write_stage_buff: MuxChanBuffOwnedBy<P>,
     ) -> Self
     where
         C: 'static + Clone,
         C::Alloc: 'static,
-        P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
-        P::Alloc: AllocatorClone,
         S: TrLocalScope + Clone + 'static,
     {
         let HandshakeDelivery { opts, tx, rx } = delivery;
@@ -228,78 +208,37 @@ where
         let CoreBundle_ {
             core_,
             shared_,
-            byte_shared_,
             w_receiver_,
             r_receiver_,
         } = bundle;
 
-        // 两块连接级缓冲 ⇒ 两条环的四个半部；「外侧」（贴传输）与「内侧」（贴子流）
-        // 各拿一份（见 `ring_::StageRingPair_`）。
-        let read_stage_cap = read_stage_buff.capacity();
-        let write_stage_cap = write_stage_buff.capacity();
-        let stage = StageRingPair_::from_owners_(
-            read_stage_buff.into_owner_(),
-            write_stage_buff.into_owner_(),
-        )
-        .unwrap_or_else(|err| {
-            panic!(
-                "连接级帧暂存环建不起来：读环容量 {read_stage_cap}、写环容量 \
-                 {write_stage_cap}（{err}）；容量须落在 buffex::ring 允许区间内，\
-                 且块分配要成功——两者都由调用方交出的缓冲决定，属配置 / 资源错误"
-            )
-        });
-        let ((rx_stage_w_, tx_stage_r_), (rx_stage_r_, tx_stage_w_)) = stage.into_halves_();
-
-        // 投递五个循环。每一份 future 都**自带作用域的一份克隆**（`keep_queue_alive_`）
-        // ——核心不再持有作用域，队列的存活改由循环自己兑现（见 `core_` 模块文档
-        // 「队列保活」）。
-        let read_pump_fut = keep_queue_alive_(
-            scope.clone(),
-            rx_pump_loop_async_::<C, _>(
-                rx,
-                byte_shared_.clone(),
-                rx_stage_w_,
-                core_.loop_token_(0usize),
-            ),
-        );
-        scope.spawn_local(read_pump_fut).detach();
-
+        // 解复用：**直接读传输的读半边**（没有读泵，也没有连接读环）。
         let demux_fut = keep_queue_alive_(
             scope.clone(),
             demux_loop_async_::<C, _>(
-                rx_stage_r_,
+                rx,
                 shared_.clone(),
                 r_receiver_,
                 core_.w_events_().clone(),
-                core_.loop_token_(1usize),
+                core_.loop_token_(0usize),
             ),
         );
         scope.spawn_local(demux_fut).detach();
 
+        // 复用：**直接写传输的写半边**（没有写泵，也没有连接写环）。
         let mux_fut = keep_queue_alive_(
             scope.clone(),
             mux_loop_async_::<C, _>(
-                tx_stage_w_,
+                tx,
                 shared_.clone(),
                 w_receiver_,
                 core_.r_events_().clone(),
-                core_.loop_token_(2usize),
+                core_.loop_token_(1usize),
             ),
         );
         scope.spawn_local(mux_fut).detach();
 
-        let write_pump_fut = keep_queue_alive_(
-            scope.clone(),
-            tx_pump_loop_async_::<C, _>(
-                tx,
-                byte_shared_,
-                tx_stage_r_,
-                core_.loop_token_(3usize),
-            ),
-        );
-        scope.spawn_local(write_pump_fut).detach();
-
-        // 第五个循环：保活（PULSE）与空闲超时拆流。它不搬字节，只按连接级时钟算
+        // 计时循环：保活（PULSE）与空闲超时拆流。它不搬字节，只按连接级时钟算
         // 期限、把保活动作投进上面两条事件通道（见 `timer_` 模块文档）。
         let timer_fut = keep_queue_alive_(
             scope.clone(),
@@ -307,12 +246,12 @@ where
                 shared_,
                 core_.w_events_().clone(),
                 core_.r_events_().clone(),
-                core_.loop_token_(4usize),
+                core_.loop_token_(2usize),
             ),
         );
         scope.spawn_local(timer_fut).detach();
 
-        // 连接到此才算**建立成功**：五个循环都已经投递。上报点放在这里而不是 `new`
+        // 连接到此才算**建立成功**：三个循环都已经投递。上报点放在这里而不是 `new`
         // 的开头——「建立成功」的语义正是「循环已经开始跑」（见 `crate::metrics`）。
         core_.config_().metrics().on_conn_opened();
 
@@ -329,7 +268,7 @@ where
 /// 「队列保活」）。于是投递时把一份克隆 move 进 future：只要循环还在跑，队列就有
 /// 持有者，调用方提前丢弃自己那份作用域也不会让连接静默失效。
 ///
-/// 形成的 `队列 → 任务 → 队列` 引用环由取消令牌打破：核心析构触发令牌，五个循环
+/// 形成的 `队列 → 任务 → 队列` 引用环由取消令牌打破：核心析构触发令牌，三个循环
 /// 退出，环随之解开。
 ///
 /// compio 后端的 `LocalScope` 是零大小标记（队列归运行时），本函数对它没有实际
@@ -363,14 +302,13 @@ where
     }
 }
 
-/// 建连的中间产物：核心 + 内侧 / 外侧两套循环共享量 + 两条事件接收端。
+/// 建连的中间产物：核心 + 两个内侧循环的共享量 + 两条事件接收端。
 struct CoreBundle_<C>
 where
     C: TrConnCfg,
 {
     core_: Shared<MuxCore<C>, C::Alloc>,
     shared_: MuxShared_<C>,
-    byte_shared_: ByteLoopShared_<C::Alloc, C::Metrics>,
     w_receiver_: EventReceiver_<WriteEvent_<C::Alloc>>,
     r_receiver_: EventReceiver_<ReadEvent_<C::Alloc>>,
 }
@@ -392,7 +330,7 @@ where
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
 
-        // 指标接收方在**建连这一刻**从配置克隆一份：五个循环不持有核心，拿不到
+        // 指标接收方在**建连这一刻**从配置克隆一份：循环不持有核心，拿不到
         // `MuxCore`，只能像运行时值那样自持一份（见 `core_` 模块文档「队列保活」）。
         // 缺省配置交出的是零大小的 `NoMetrics`，于是整段上报在单态化后消失
         // （见 `crate::metrics` 模块文档 §4）。
@@ -408,16 +346,12 @@ where
             channel_timeout_millis,
             metrics.clone(),
         );
-        let byte_shared = ByteLoopShared_::new_(reg.clone(), metrics);
-
-        // 核心自持一份五个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
+        // 核心自持一份三个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
         // （那会阻塞，而 `Drop` 可能在任意线程上发生）。
         let loops = [
             reg.loop_token_(0usize),
             reg.loop_token_(1usize),
             reg.loop_token_(2usize),
-            reg.loop_token_(3usize),
-            reg.loop_token_(4usize),
         ];
 
         let core = Shared::new(
@@ -436,7 +370,6 @@ where
         CoreBundle_ {
             core_: core,
             shared_: shared,
-            byte_shared_: byte_shared,
             w_receiver_: w_receiver,
             r_receiver_: r_receiver,
         }
@@ -552,7 +485,7 @@ where
 ///
 /// 1. **进入「等待关闭」**（[`MuxCore::enter_waiting_close_`]）：一次 CAS，不取锁、
 ///    **不分配**（上一版要在这里把活跃子流收进一个 `Vec`），随后唤醒计时循环；
-/// 2. **等收尾发生**：判据是五个循环的取消令牌被触发——那是「连接确实收口了」的
+/// 2. **等收尾发生**：判据是三个循环的取消令牌被触发——那是「连接确实收口了」的
 ///    唯一信号，由**循环自己**在合适的时刻执行（见下）；
 /// 3. **超时或取消就强制收尾**（幂等）。
 ///
@@ -574,10 +507,16 @@ where
 /// 的超时兜底（`drop` 路径没有调用方，只有它兜得住）。调用方的取消令牌打断时同样
 /// 强制收尾并返回 `false`——本函数不得假定调用者一定会等到最后。
 ///
+/// 两个期限**数值相同、起算点不同**（计时循环从进入等待关闭那一刻起算，比本函数算
+/// 自己的期限更早），因此谁先到是时序问题，不能当作判据。收尾由计时循环强制促成时，
+/// 它会把 [`K_STATE_FORCED_CLOSE`](super::registry_::K_STATE_FORCED_CLOSE) 记在连接
+/// 状态里；本函数据此把「超时收尾」与「与对端收敛」分开。
+///
 /// # 返回值
 ///
-/// `true` = 收尾发生在**收敛之后**（最后一条子流已与对端双向收尾）；`false` = 超时、
-/// 被取消、或连接此前已经失败。
+/// `true` = 收尾发生在**收敛之后**（最后一条子流已与对端双向收尾）；`false` = 超时
+/// （包括「计时循环先于本函数自己的期限判定超时」这一情形）、被取消、或连接此前
+/// 已经失败。
 #[gen_may_cancel_future(MuxConnClose, pub, new(pub(crate)))]
 async fn mux_conn_close_async_<'f, C, K>(
     conn: &'f mut MuxConnection<C>,
@@ -642,8 +581,13 @@ where
     let mut finalized = core::pin::pin!(probe.clone().cancellation());
     loop {
         // 复检：收尾可能就发生在进入本函数之前（或上一次醒来时）。
+        //
+        // 令牌触发只说明「连接确实收口了」，**不**说明是哪种收口：与对端收敛、计时
+        // 循环的整体超时兜底、连接级失败，三者都会取消它。因此判据要把后两者排除
+        // 掉——失败看 `fail_kind_`，超时看计时循环留下的**显式**标志
+        // （`is_forced_close_`，见 `K_STATE_FORCED_CLOSE` 的文档）。
         if probe.is_cancelled() {
-            return core.reg_().fail_kind_().is_none();
+            return core.reg_().fail_kind_().is_none() && !core.reg_().is_forced_close_();
         }
         // 连接级失败：收尾是失败牵连的结果，不是「优雅完成」。
         if core.reg_().fail_kind_().is_some() {

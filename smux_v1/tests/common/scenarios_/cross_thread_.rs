@@ -48,7 +48,6 @@ use crate::common::{
     make_channel_buff_,
     make_passive_ring_,
     make_payload_,
-    make_stage_buffs_,
     read_channel_exact_,
     write_channel_all_,
 };
@@ -311,11 +310,8 @@ async fn connect_pair_ct_(
     let (delivery_a, config_a) = CrossThreadCfg::new(delivery_a, DefaultPolicy);
     let (delivery_b, config_b) = CrossThreadCfg::new(delivery_b, DefaultPolicy);
 
-    let (stage_ar, stage_aw) = make_stage_buffs_();
-    let (stage_br, stage_bw) = make_stage_buffs_();
-
     (
-        MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw),
-        MuxConnection::new(delivery_b, config_b, stage_br, stage_bw),
+        MuxConnection::new(delivery_a, config_a),
+        MuxConnection::new(delivery_b, config_b),
     )
 }

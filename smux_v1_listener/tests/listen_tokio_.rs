@@ -22,7 +22,7 @@ use abs_art_tokio::Runtime as TokioRuntime;
 use abs_async_iter::TrAsyncIterator;
 use buffex_tokio_adapt::{BuffRead, BuffWrite, DefaultAllocConfig};
 use smux_v1::{
-    connection::{Dock, K_STAGE_RING_CAPACITY, MuxChanBuffOwnedBy, TrConnCfg},
+    connection::{Dock, TrConnCfg},
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
@@ -30,14 +30,12 @@ use smux_v1::{
     x_deps::{
         abs_art::TrLocalScope,
         abs_cancel::{CancelledToken, NonCancellableToken, TrMayCancel},
-        abs_mm::CoreAlloc,
         abs_smux::conn::TrConnection,
-        mm_ptr::Owned,
     },
 };
 use smux_v1_listener::{
     SmuxListenerError,
-    config::{CoreAllocOwned_, TrInbound, TrListenerConfig, TrNegotiatorFactory},
+    config::{TrInbound, TrListenerConfig, TrNegotiatorFactory},
     listening::SmuxListener,
     runtime::{K_DEFAULT_RING_CAPACITY, TcpConnCfg, TcpTransport, UdsConnCfg, UdsTransport},
 };
@@ -72,7 +70,6 @@ where
 {
     type Rt = TokioRuntime;
     type Conn = C;
-    type StageBuff = CoreAllocOwned_;
 
     fn runtime(&self) -> Self::Rt {
         self.rt_.clone()
@@ -86,16 +83,6 @@ where
         self.conn_.clone()
     }
 
-    fn make_stage_buffs(
-        &self,
-    ) -> (
-        MuxChanBuffOwnedBy<Self::StageBuff>,
-        MuxChanBuffOwnedBy<Self::StageBuff>,
-    ) {
-        let make =
-            || MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(K_STAGE_RING_CAPACITY, CoreAlloc));
-        (make(), make())
-    }
 }
 
 /// 验收：单次等待可取消且不影响 listener；`close_async` 能打断卡在 accept 上的槽位、

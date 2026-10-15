@@ -66,12 +66,13 @@ use abs_smux::{
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 use futures::join;
 use mm_ptr::Owned;
 use smux_v1::{
     connection::{
         BufferedRx, BufferedTx, ChannelListener, ChannelRx, ChannelTx, Dock,
-        K_STAGE_RING_CAPACITY, MuxChanBuffOwnedBy, MuxConnection, TrConnCfg,
+        MuxConnection, TrConnCfg,
         new_buffered_channel,
     },
     flow_ctrl::DefaultPolicy,
@@ -218,8 +219,8 @@ static COUNT_POLICY: DefaultPolicy = DefaultPolicy;
 
 impl<W, R, RT> common::TestConnCfg for CountMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: common::TrSmokeRt,
 {
     fn new_(rt: Self::Rt) -> Self {
@@ -229,8 +230,8 @@ where
 
 impl<W, R, RT> TrMuxConfig for CountMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
     type Dock = Dock;
@@ -238,8 +239,8 @@ where
 
 impl<W, R, RT> TrConnCfg for CountMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: common::TrSmokeRt,
 {
     type Rt = RT;
@@ -396,31 +397,12 @@ where
 
     let config_a = C::new_(rt.clone());
     let config_b = C::new_(rt.clone());
-    // 两块连接级缓冲由测试自己给出（配置不再规定缓冲类型）：容量取连接级的
-    // `K_STAGE_RING_CAPACITY`，拥有者同样用注入分配器记账。
-    let (stage_ar, stage_aw) = (
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
-            K_STAGE_RING_CAPACITY,
-            config_a.allocator(),
-        )),
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
-            K_STAGE_RING_CAPACITY,
-            config_a.allocator(),
-        )),
-    );
-    let (stage_br, stage_bw) = (
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
-            K_STAGE_RING_CAPACITY,
-            config_b.allocator(),
-        )),
-        MuxChanBuffOwnedBy::new(Owned::new_uninit_slice(
-            K_STAGE_RING_CAPACITY,
-            config_b.allocator(),
-        )),
-    );
+    // 建连**不再需要**调用方交出连接级缓冲：传输半边自带缓冲（见
+    // `MuxConnection::new` 的文档）。旧版这里会为两块 64 KiB 暂存各做一次块分配，
+    // 本版因此少两次分配、也少一次字节搬运。
     (
-        MuxConnection::new(delivery_a, config_a, stage_ar, stage_aw),
-        MuxConnection::new(delivery_b, config_b, stage_br, stage_bw),
+        MuxConnection::new(delivery_a, config_a),
+        MuxConnection::new(delivery_b, config_b),
     )
 }
 

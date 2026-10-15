@@ -6,14 +6,16 @@
 //!
 //! 握手模块只产出 [`HandshakeDelivery`](crate::handshake::agent::HandshakeDelivery)
 //! ——一对 `Tx` / `Rx` 与一份 [`BasicOpts`](crate::handshake::opts::BasicOpts)。
-//! 本模块消费这份交付物：`Rx` / `Tx` 与调用方给出的**两块连接级帧暂存缓冲**在
-//! [`MuxConnection::new`] 里被移进四个 **local spawn** 出来的循环；`BasicOpts` 提供
-//! 连接级配额（`max_packet_size`、`max_channel_count`、`max_dock_chan_count`、
-//! `max_channel_timeout`）。
+//! 本模块消费这份交付物：`Rx` / `Tx` 在 [`MuxConnection::new`] 里被移进三个
+//! **local spawn** 出来的循环；`BasicOpts` 提供连接级配额（`max_packet_size`、
+//! `max_channel_count`、`max_dock_chan_count`、`max_channel_timeout`）。
 //!
-//! 建连需要调用方给出一个**本地作用域值**（`abs_art` 的 `TrLocalScope`，且它同时
-//! 承载后端的计时能力 `TrTime`）：五个循环经它 `spawn_local` 投递，调用方负责驱动它
-//! （见 §6）。
+//! **没有「连接级帧暂存缓冲」**：`Rx` / `Tx` 本身就自带缓冲（`buffex::ring` 的环半部
+//! 或 `buffex_*_adapt` 的「设备 + 环」适配器），内侧两个循环直接驱动它们，不再有
+//! 第二次缓冲与多余的一次搬运（见 §2.2 与 `session_` 模块文档）。
+//!
+//! 建连的**运行时值与本地作用域都由连接自己取**（`TrConnCfg::runtime` 与后端的
+//! `local_scope()`）：三个循环经作用域 `spawn_local` 投递，调用方负责驱动它（见 §6）。
 //!
 //! ## 1. 与 `abs_smux` 的对应关系
 //!
@@ -55,36 +57,37 @@
 //! 于是「绑定 → 监听 → 接流 → 业务」可以拆到不同函数、不同结构体里表达，
 //! 不再被生命周期参数绑成一串（`tests/layered_rpc.rs` 是这条结论的编译期探针）。
 //!
-//! ### 2.2 五个 `local spawn`，以及循环**不持有核心**
+//! ### 2.2 三个 `local spawn`，以及循环**不持有核心**
 //!
-//! 连接在**一个线程**（或 thread-local runtime）里跑五个 `TrLocalScope::spawn_local`
-//! 出来的任务。[`MuxConnection::new`] 建出**两条连接级环**（帧暂存）：
+//! 连接在**一个线程**（或 thread-local runtime）里跑三个 `TrLocalScope::spawn_local`
+//! 出来的任务，它们**直接驱动传输的两条半边**（不再有连接级环与外侧泵）：
 //!
 //! ```text
-//! 网络 Rx ──读泵──▶ 连接读环 ──解复用──▶ 各子流接收环 ──▶ 应用
-//! 应用 ──▶ 各子流发送环 ──复用──▶ 连接写环 ──写泵──▶ 网络 Tx
+//! 网络 Rx（自带缓冲）──解复用──▶ 各子流接收环 ──▶ 应用
+//! 应用 ──▶ 各子流发送环 ──复用──▶ 网络 Tx（自带缓冲）
 //! ```
 //!
-//! - **读泵**：`C::ConnRx → 连接读环`，只搬字节，不解析帧；
-//! - **解复用**：`连接读环 → 各子流接收环`，逐帧解析后按 dock 对找子流、投递载荷，
+//! - **解复用**：`C::ConnRx → 各子流接收环`，逐帧解析后按 dock 对找子流、投递载荷，
 //!   并按收到的窗口通告更新对端发送窗口（同时消费 `Attach` / `Release` 事件）；
-//! - **复用**：`各子流发送环 → 连接写环`，按对端发送窗口调度、编帧（同时消费控制帧、
+//! - **复用**：`各子流发送环 → C::ConnTx`，按对端发送窗口调度、编帧（同时消费控制帧、
 //!   水位与拆流事件）；
-//! - **写泵**：`连接写环 → C::ConnTx`，只搬字节；
 //! - **计时**：不搬字节——按连接级时钟算出「最早该醒的时刻」，发保活 `PULSE`、
 //!   并在空闲超时后拆流（见 §7.1 与 `timer_` 模块）。
 //!
-//! 把「字节流」与「帧 / 子流」分开的直接收益：内侧两个循环**永远不会 park 在传输
-//! 上**，因此「对端不读导致写阻塞」这个必然状态被限制在写泵一个任务里，不会让事件
-//! 通道被饿死；同时网络调用次数与帧数解耦。
+//! **前提是传输自己带缓冲**：`C::ConnTx` / `C::ConnRx` 因此被约束为
+//! `TrBuffWrite + TrProducerState` / `TrBuffRead + TrConsumerState`——两个循环要能在
+//! 不 park 的前提下问出「有多少可读 / 可写、对端是否已封口」。填充这条缓冲的是
+//! **另一个任务**（调用方的入向泵或适配器的自驱动泵），所以「对端不读导致写阻塞」
+//! 与「对端不发导致读等待」都落在**调用方**那一侧，不会把事件通道饿死。若把裸设备
+//! 直接当传输，这条前提就不成立（见 `session_` 模块文档）。
 //!
-//! 四个循环**只持有 `ByteLoopShared_` / `MuxLoopShared_`**（注册表句柄 + 一个标量），
+//! 三个循环**只持有 `MuxLoopShared_`**（注册表句柄 + 单帧上限 + 时钟 + 指标 sink），
 //! **不持有核心强引用**。这不是随手的选择：若循环持有核心，核心将永远无法析构，
-//! `Drop` 里的取消令牌永远不会触发，四个任务与整个连接状态会永久泄漏。现在的收尾
+//! `Drop` 里的取消令牌永远不会触发，任务与整个连接状态会永久泄漏。现在的收尾
 //! 链条是——
 //!
 //! ```text
-//! 最后一个应用面对象被丢弃 ⇒ MuxCore 析构 ⇒ Drop 取消四个令牌
+//! 最后一个应用面对象被丢弃 ⇒ MuxCore 析构 ⇒ Drop 取消三个令牌
 //!                        ⇒ 循环在下一个 await 点退出 ⇒ 传输半边被 drop、连接真正关闭
 //! ```
 //!
@@ -145,8 +148,9 @@
 //!
 //! **优雅关闭复用同一套收尾**：无论 `close_async` 还是 `drop`，最终触发的都是这里的
 //! 取消令牌（见 §7.2）——两种关闭的区别只在「有没有调用方在等」，不在「怎么收尾」。
-//! 唯一的例外是写泵：软收尾刻意**不取消**它，让它把连接写环里已经成帧的字节交给传输
-//! 之后自行退出（理由见 §7.2）。
+//! 旧版这里还有一个例外——软收尾刻意不取消写泵，好让它把连接写环里已经成帧的字节
+//! 交给传输；本版没有连接自己的写环，复用的成帧动作就是「写进传输」，因此收尾一律是
+//! 取消三个令牌（理由见 §7.2）。
 //!
 //! ## 3. 帧线格式（sans-IO）
 //!
@@ -362,30 +366,28 @@
 //!
 //! ## 5. 缓冲区
 //!
-//! 子流收发环与协议帧的收发暂存**一律使用 `buffex::ring`**（上游已用 `ring` 取代
+//! 子流收发环与连接的传输缓冲**一律使用 `buffex::ring`**（上游已用 `ring` 取代
 //! 早先的 `circular_buff`，见 dev-notes §12）：
 //!
 //! - 每条子流持有一对 `buffex` 半部（[`BufferedTx`] / [`BufferedRx`]），
 //!   因此 [`ChannelTx`] / [`ChannelRx`] 的 `try_*` 直接作用在环形缓冲上；
-//! - 连接级另有**两条帧暂存环**：连接读环（`transport → 解复用`）与连接写环
-//!   （`复用 → transport`），存储类型是 [`TrConnCfg::StageBuff`]，由
-//!   [`TrConnCfg::make_stage_buffs`] 造出**两块**缓冲、[`MuxConnection::new`]
-//!   建环并切半。
+//! - **连接级没有自己的缓冲**：握手交付物里的 `ConnTx` / `ConnRx` 就是传输的环半部
+//!   或「设备 + 环」适配器（`buffex_*_adapt` 的 `BuffWrite` / `BuffRead`），内侧两个
+//!   循环直接驱动它们（见 §2.2）。
 //!
-//! **两块帧暂存环都没有「必须装下整帧」的容量下限**：读侧帧头由逐字节状态机解析
+//! **传输缓冲也没有「必须装下整帧」的容量下限**：读侧帧头由逐字节状态机解析
 //! （`frame_parser_`，每次只要 1 字节），载荷按底层实际给出的段长分次搬入
-//! （`ReadCursor::read_async_`），写侧入环写入按空闲空间**分块**推进
+//! （`ReadCursor::read_async_`），写侧写入按空闲空间**分块**推进
 //! （`session_.rs` 的 `enqueue_frame_`）。因此容量取到环原语的下限（1 字节）也能跑通，
-//! [`K_STAGE_RING_CAPACITY`] 只是吞吐 / 时延上的选择。
+//! [`K_TRANSPORT_RING_CAPACITY`] 只是吞吐 / 时延上的选择。唯一的例外是**数据报**：
+//! 它的帧必须整条落进缓冲（`write_frame_to_stage_`），因此缓冲容量应当不小于协商的
+//! `max_packet_size`。
 //!
-//! 这两条**曾经**都是硬约束，成因值得记下来：只要某一侧的索取粒度是「正好要一整块」，
+//! 这条下限**曾经**是硬约束，成因值得记下来：只要某一侧的索取粒度是「正好要一整块」，
 //! 就会出现「外侧泵环满而 park」与「内侧还差几字节而 park」互等；写环与传输环容量互相
 //! 钳制时同理。收紧索取粒度（每次只索要 1 字节起步、按底层实际给出的段长推进）之后，
-//! 互等从构造上不再可能。`tests/inmem_mux.rs` 的 `mux_min_stage_inmem_dual_` 用 1 字节
-//! 帧暂存环钉住这一点。
-//!
-//! [`TrConnCfg::StageBuff`]: crate::connection::TrConnCfg::StageBuff
-//! [`TrConnCfg::make_stage_buffs`]: crate::connection::TrConnCfg::make_stage_buffs
+//! 互等从构造上不再可能。`tests/inmem_mux.rs` 的 `mux_min_transport_inmem_dual_` 用
+//! 1 字节**传输环**钉住这一点。
 //!
 //! 环的物理内存由**调用方注入**的分配器 `A` 分配（缺省 `buffex::CoreAlloc`），
 //! 容量策略同样由调用方注入（见 [`crate::flow_ctrl::TrFlowCtrlPolicy`] 与
@@ -405,7 +407,7 @@
 //! 「怎么等」（`TrDelay`），二者**同源**，因此虚拟时间验收只需换掉这一个值。
 //!
 //! 本地队列**不进类型参数**：它以 [`TrLocalScope`](abs_art::TrLocalScope) 的实现值
-//! 形式只出现在 [`MuxConnection::new`] 的方法级泛型上，投递完五个循环之后由循环
+//! 形式只出现在 [`MuxConnection::new`] 的方法级泛型上，投递完三个循环之后由循环
 //! 各自持有一份克隆来保活队列。于是：
 //!
 //! - **「运行时支持」与「此刻真有一条被驱动的队列」两件事都被表达出来**——后者
@@ -466,7 +468,7 @@
 //! 之后到达的在途帧按墓碑静默丢弃。
 //! ### 7.1 保活：只用一种 `PULSE` 帧
 
-//! `max_channel_timeout` 的**空闲超时由连接内部的第五个循环（计时循环）用
+//! `max_channel_timeout` 的**空闲超时由连接内部的第三个循环（计时循环）用
 //! `abs_art` 的 `TrTime` 维持**——时刻与计时器都来自**同一个运行时值**，
 //! 因此虚拟时间下不会出现「睡在虚拟时钟、读在墙上时钟」的错配；不要求调用方
 //! 代为计时。接近超时时
@@ -509,19 +511,22 @@
 //!
 //! **`drop` 与 `close_async` 是同一套流程**，区别只在「有没有调用方在等」：前者在
 //! `MuxCore::drop` 里进入 `WaitingClose` 就返回（收尾交给循环，超时由计时循环兜底），
-//! 后者会一直等到收尾发生（判据是五个循环的取消令牌被触发）或超时。
+//! 后者会一直等到收尾发生（判据是三个循环的取消令牌被触发）或超时。
 //!
 //! # 三个容易写错的判据
 //!
 //! - **排空的判据不是「子流从注册表消失」**：本端的空闲超时拆流与连接级失败都会让子流
 //!   消失。因此等待关闭时计时循环**不再做空闲拆流**，只做「排空 + `FIN`」；
-//! - **收尾必须留下写泵**：内侧循环把数据**成帧写进连接写环**之后才发 `FIN`，所以
-//!   「子流收口」不等于「字节已经上网」。收尾走软路径（`cancel_loops_keep_pump_`）——
-//!   写泵以「连接写环封口且排空」为退出条件，自行把最后一段路走完。这条曾经漏掉，
-//!   后果是「drop 之后数据静默消失」（见
+//! - **收尾必须让已经成帧的字节先进入传输**：内侧循环把数据**成帧写进传输半边**之后
+//!   才发 `FIN`，因此「子流收口」在复用循环里就等于「字节已经交给传输」；这是旧版
+//!   「留下写泵把连接写环排空」那条纪律在本版的对应物——连接内部不再有待排空的环
+//!   （见 `ChannelRegistry_::cancel_loops_` 的文档）。这条曾经漏掉，后果是
+//!   「drop 之后数据静默消失」（见
 //!   [`dev-notes/graceful-close-2-20261014-2300.md`](../../dev-notes/graceful-close-2-20261014-2300.md) §3）；
-//! - **复用循环退出时必须显式封口连接写环**：`buffex` 的环半部被 drop 不置位关闭标记，
-//!   只 drop 会让写泵永远等不到「封口」这一半退出条件（`session_pump_::StageSealGuard_`）。
+//! - **写半边退出时只是 drop**：本版没有连接自己的写环可封口，而 `TrBuffWrite` 也没有
+//!   「封口」操作。对自驱动适配器足够（它的 `Drop` 会关生产端并 detach 泵），对
+//!   「调用方驱动的全被动环」则要靠调用方自己的超时 / 取消（已知缺口，见
+//!   `session_` 模块文档末节）。
 //!
 //! 协议里**没有**连接级关闭帧，因此「关闭」在线上表现为：全部子流各收尾一次，随后传输
 //! 半边被 drop、对端读到 EOF。超时上限借用协商项 `max_channel_timeout`；判定与实现细节
@@ -555,8 +560,7 @@
 //! | `types_` / `util_` | 公开类型别名 / 控制面小工具 | — |
 //! | `test_support_` | 测试专用：无循环连接、空作用域、测试策略（`#[cfg(test)]`） | — |
 //! | `session_` | 内侧两个循环（解复用 / 复用）+ 连接级环写入（本地表也是 `BTreeMap`） | —（内部） |
-//! | `session_pump_` | 外侧两个泵循环（`transport ↔ 连接级环`，只搬字节） | —（内部） |
-//! | `timer_` | 第五个循环：保活 `PULSE` 与空闲超时拆流决策 | —（内部） |
+//! | `timer_` | 第三个循环：保活 `PULSE` 与空闲超时拆流决策 | —（内部） |
 //! | `mux_connection::registry_` | 统一身份表（channel / telegraph / listener / 宽限态）+ 反向索引；每条 channel 记录持有它的共享状态句柄 | —（内部） |
 //! | `sync_` / `owner_` | 通用共享单元（取消令牌 / 内联通知槽 / 注册表锁）/ **身份节点**与其类型化句柄（节点内部零堆分配） | —（内部） |
 //! | `signal_` / `frame_` / `ring_` / `error_` | 控制帧队列 / 线格式 / 环别名 / 错误 | —（内部） |
@@ -580,7 +584,6 @@ mod mux_connection;
 mod owner_;
 pub(crate) mod ring_;
 mod session_;
-pub(crate) mod session_pump_;
 mod signal_;
 mod sync_;
 mod telegraph;
@@ -598,7 +601,9 @@ mod util_;
 pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
-pub use config_::{CurrentConnCfg, DefaultConnCfg, K_STAGE_RING_CAPACITY, TrConnCfg};
+pub use config_::{
+    CurrentConnCfg, DefaultConnCfg, K_TRANSPORT_RING_CAPACITY, TrConnCfg,
+};
 pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};

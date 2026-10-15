@@ -35,6 +35,7 @@
 use crate::common::AcceptAsyncClosureExt;
 use abs_smux::conn::{TrChannelListener, TrConnection, TrDockBinding};
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 use futures::{
     future::{Either, select},
     join,
@@ -117,10 +118,10 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -132,7 +133,14 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
         RB,
         WB,
         S,
-    >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+    >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
     .await;
 
     // B 侧只绑一个监听 dock：两条入向子流都建在它上面（对端的临时 dock 区分身份）。

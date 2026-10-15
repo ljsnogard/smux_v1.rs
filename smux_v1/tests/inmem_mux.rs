@@ -34,7 +34,6 @@ mod common;
 use crate::common::AcceptAsyncClosureExt;
 use core::{
     cell::Cell,
-    marker::PhantomData,
 };
 use std::rc::Rc;
 
@@ -67,7 +66,6 @@ use abs_art::TrLocalScope;
 // 真正支持计时的后端上；`LocalScope` 只能由运行时值经 `local_scope()` 交出。
 use abs_art_facade::Runtime;
 use abs_smux::{
-    conf::TrMuxConfig,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use buffex::x_deps::{
@@ -75,13 +73,13 @@ use buffex::x_deps::{
     abs_cancel,
     anylr::SomeOf,
 };
+use buffex::x_deps::abs_buff::buffer::{TrConsumerState, TrProducerState};
 use smux_v1::{
-    connection::{Dock, MuxConnection, TrConnCfg},
+    connection::{Dock, MuxConnection},
     handshake::{
         agent::{AcceptAllEntries, HandshakeAgent},
         opts::BasicOpts,
     },
-    metrics::NoMetrics,
     single_runtime_test_,
 };
 
@@ -545,6 +543,17 @@ where
     }
 }
 
+/// 析构探针的**状态查询**转发：本版连接直接驱动传输半边，内侧循环要靠它回答
+/// 「还有多少可读 / 生产端是否已经封口」，因此替身必须把内层的答案原样转出去。
+impl<H> TrConsumerState for DropProbeRx_<H>
+where
+    H: TrConsumerState,
+{
+    fn consumer_state(&self) -> Option<(usize, bool)> {
+        self.half_.consumer_state()
+    }
+}
+
 impl<H> Drop for DropProbeRx_<H> {
     fn drop(&mut self) {
         self.dropped_.set(true);
@@ -605,6 +614,16 @@ where
     }
 }
 
+/// 析构探针的**状态查询**转发（与 [`DropProbeRx_`] 对称）。
+impl<H> TrProducerState for DropProbeTx_<H>
+where
+    H: TrProducerState,
+{
+    fn producer_state(&self) -> Option<(usize, bool)> {
+        self.half_.producer_state()
+    }
+}
+
 impl<H> Drop for DropProbeTx_<H> {
     fn drop(&mut self) {
         self.dropped_.set(true);
@@ -655,20 +674,15 @@ where
         let (invited, accepted) =
             futures::join!(async { invite_fut.await }, async { listen_fut.await });
 
-        let (a_stage_r, a_stage_w) = common::make_stage_buffs_();
-        let (b_stage_r, b_stage_w) = common::make_stage_buffs_();
-        // 配置由运行时值构造（运行时值进配置，`TrConnCfg::Rt`）。
+        // 配置由运行时值构造（运行时值进配置，`TrConnCfg::Rt`）。建连**不需要**
+        // 调用方再交出任何缓冲：传输半边自带缓冲（见 `MuxConnection::new` 的文档）。
         let conn_a = MuxConnection::new(
             invited.expect("发起方握手应当成功"),
             common::SmokeMuxConfig::<_, _, _>::new(rt.clone()),
-            a_stage_r,
-            a_stage_w,
         );
         let conn_b = MuxConnection::new(
             accepted.expect("等待方握手应当成功"),
             common::SmokeMuxConfig::<_, _, _>::new(rt.clone()),
-            b_stage_r,
-            b_stage_w,
         );
         // 会话句柄也持有一份连接克隆：逐个丢弃，最后一个消失时核心才析构。
         let binding = conn_a
@@ -747,20 +761,15 @@ where
         let (invited, accepted) =
             futures::join!(async { invite_fut.await }, async { listen_fut.await });
 
-        let (a_stage_r, a_stage_w) = common::make_stage_buffs_();
-        let (b_stage_r, b_stage_w) = common::make_stage_buffs_();
-        // 配置由运行时值构造（运行时值进配置，`TrConnCfg::Rt`）。
+        // 配置由运行时值构造（运行时值进配置，`TrConnCfg::Rt`）。建连**不需要**
+        // 调用方再交出任何缓冲：传输半边自带缓冲（见 `MuxConnection::new` 的文档）。
         let conn_a = MuxConnection::new(
             invited.expect("发起方握手应当成功"),
             common::SmokeMuxConfig::<_, _, _>::new(rt.clone()),
-            a_stage_r,
-            a_stage_w,
         );
         let conn_b = MuxConnection::new(
             accepted.expect("等待方握手应当成功"),
             common::SmokeMuxConfig::<_, _, _>::new(rt.clone()),
-            b_stage_r,
-            b_stage_w,
         );
 
         // 只丢 A：B 仍然活着、空闲，其写循环不会关掉 A 的接收环。
@@ -812,147 +821,61 @@ single_runtime_test_!(mux_ring_rejected_dual_);
 // 极小帧暂存容量：钉住「逐字节异步解析」这条要求
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-/// 本用例用的连接级帧暂存容量：取环原语允许的**最小值**（1 字节）。
+/// 本用例用的**传输环**容量：取环原语允许的**最小值**（1 字节）。
 ///
 /// `buffex::ring` 的下限是 1 字节（位置编码用回绕位区分空 / 满，1 格可以表达），而一个
-/// 满帧（头 + `max_packet_size` 载荷）远大于它。本用例钉住的正是「帧暂存容量与帧长
-/// 无关」：**取到环原语的下限也照样跑通**——入向与出向都是流式推进的（帧头逐字节解析、
-/// 载荷按底层实际给出的段长分次搬入、出向写入按空闲空间分块），没有任何一步要求环里
-/// 先攒够一整帧。
-const K_MIN_STAGE_CAPACITY_: usize = 1usize;
-
-/// 与 [`common::SmokeMuxConfig`] 同构，**只把连接级帧暂存的容量换成本用例的最小值**。
+/// 满帧（头 + `max_packet_size` 载荷）远大于它。本用例钉住的正是「传输缓冲容量与帧长
+/// 无关」：**取到环原语的下限也照样跑通**——两侧都是流式推进的（帧头逐字节解析、
+/// 载荷按底层实际给出的段长分次搬入、出向写入按空闲空间分块），没有任何一步要求
+/// 缓冲里先攒够一整帧。
 ///
-/// 除 `make_stage_buffs` 之外与冒烟配置逐项一致：子流环仍然是 4096 字节的
-/// `SmokeBuff`，分配器、策略、传输类型都不变。这样对照实验里唯一的自变量就是
-/// 「连接读环 / 连接写环的容量」。
-///
-/// `Clone` / `Copy` / `Default` **手写**：结构里只有 `PhantomData`，不该给 `W` / `R`
-/// 加上这些约束（环端既不 `Clone` 也不 `Default`）。
-struct MinStageConfig_<W, R, RT> {
-    _mark_: PhantomData<fn() -> (W, R)>,
-    /// 运行时值（`TrConnCfg::runtime` 要交出建连时抓住的那一个）。
-    rt_: RT,
-}
+/// 旧版这条用例钉的是**连接自己的**帧暂存环（连接另外还有一层 64 KiB 的传输环）；
+/// 本版连接不再自己建环，缓冲只剩传输这一层，于是「最小容量」直接落在传输环上——
+/// 性质不变，自变量少了一层。
+const K_MIN_TRANSPORT_CAPACITY_: usize = 1usize;
 
-impl<W, R, RT: Clone> Clone for MinStageConfig_<W, R, RT> {
-    fn clone(&self) -> Self {
-        MinStageConfig_ {
-            _mark_: PhantomData,
-            rt_: self.rt_.clone(),
-        }
-    }
-}
-
-impl<W, R, RT: Copy> Copy for MinStageConfig_<W, R, RT> {}
-
-impl<W, R, RT> MinStageConfig_<W, R, RT> {
-    /// 由运行时值构造。
-    pub fn new_(rt: RT) -> Self {
-        MinStageConfig_ {
-            _mark_: PhantomData,
-            rt_: rt,
-        }
-    }
-}
-
-impl<W, R, RT> common::TestConnCfg for MinStageConfig_<W, R, RT>
-where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
-    RT: common::TrSmokeRt,
-{
-    fn new_(rt: Self::Rt) -> Self {
-        MinStageConfig_::new_(rt)
-    }
-}
-
-impl<W, R, RT> TrMuxConfig for MinStageConfig_<W, R, RT>
-where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
-{
-    type Data = u8;
-    type Dock = smux_v1::connection::Dock;
-}
-
-/// [`DefaultPolicy`](smux_v1::flow_ctrl::DefaultPolicy) 是 ZST；取静态引用即可。
-static TINY_POLICY_: smux_v1::flow_ctrl::DefaultPolicy =
-    smux_v1::flow_ctrl::DefaultPolicy;
-
-impl<W, R, RT> TrConnCfg for MinStageConfig_<W, R, RT>
-where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
-    RT: common::TrSmokeRt,
-{
-    type Rt = RT;
-    type Alloc = mm_ptr::x_deps::abs_mm::CoreAlloc;
-    type Policy = smux_v1::flow_ctrl::DefaultPolicy;
-    type ConnTx = W;
-    type ConnRx = R;
-    type Metrics = NoMetrics;
-
-    fn runtime(&self) -> Self::Rt {
-        self.rt_.clone()
-    }
-
-    fn allocator(&self) -> Self::Alloc {
-        mm_ptr::x_deps::abs_mm::CoreAlloc
-    }
-
-    fn policy(&self) -> &Self::Policy {
-        &TINY_POLICY_
-    }
-
-    /// 本配置不上报；带 sink 的端到端用例见 `tests/metrics_e2e.rs`。
-    fn metrics(&self) -> &Self::Metrics {
-        &NoMetrics
-    }
-}
-
-/// 测试目标：**连接级帧暂存环取环原语允许的最小容量（[`K_MIN_STAGE_CAPACITY_`] = 1
+/// 测试目标：**传输环取环原语允许的最小容量（[`K_MIN_TRANSPORT_CAPACITY_`] = 1
 /// 字节）时，双向收发与半关闭仍然全部成功**。
 ///
-/// 这条用例钉住的是「整条收发路径都不许要求环里先攒够一整帧」，而不是某一种实现：
-/// 帧头逐字节解析、载荷按底层段长分次搬入、出向按空闲空间分块写入，因此帧暂存容量的
-/// 下限由**环原语**决定（见 [`K_MIN_STAGE_CAPACITY_`]），与帧长无关，更不需要能装下整帧。
+/// 这条用例钉住的是「整条收发路径都不许要求缓冲里先攒够一整帧」，而不是某一种实现：
+/// 帧头逐字节解析、载荷按底层段长分次搬入、出向按空闲空间分块写入，因此缓冲容量的
+/// 下限由**环原语**决定（见 [`K_MIN_TRANSPORT_CAPACITY_`]），与帧长无关，更不需要能
+/// 装下整帧。
 ///
-/// - 手段：两条 64 KiB 内存环直连两个端点，用 [`MinStageConfig_`] 建连
-///   （`make_stage_buffs` 返回两块 1 字节缓冲，其余与冒烟配置一致）；在同一个 dock
-///   上并发跑一对 open / accept，双向各发一段 64 字节（首 4 字节是 `(dock, index)`
+/// - 手段：两条**各 1 字节**的内存环直连两个端点（其余配置与冒烟用例一致）；在同一个
+///   dock 上并发跑一对 open / accept，双向各发一段 64 字节（首 4 字节是 `(dock, index)`
 ///   编码的 tag，其余按 tag 生成），逐字节比对后丢弃发送半边、在对端等 EOF。
 /// - 判断：open / accept 均成功；两端收到的载荷与对端发出的**逐字节相等**；半关闭后
-///   读到 `Closing`（EOF）。任一不满足即 panic；实现若要求「读环能装下整帧」，本用例
+///   读到 `Closing`（EOF）。任一不满足即 panic；实现若要求「缓冲能装下整帧」，本用例
 ///   会在等第一帧时互等（超时）而不是通过。
-async fn mux_min_stage_inmem_dual_<S, RT>(rt: &RT, scope: &S)
+async fn mux_min_transport_inmem_dual_<S, RT>(rt: &RT, scope: &S)
 where
     S: common::TrSmokeScope + Clone + 'static,
     RT: common::TrSmokeRt,
 {
-    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
-    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (a_tx, b_rx) = common::make_passive_ring_(K_MIN_TRANSPORT_CAPACITY_);
+    let (b_tx, a_rx) = common::make_passive_ring_(K_MIN_TRANSPORT_CAPACITY_);
 
-    let scenario = drive_min_stage_(rt, scope, a_tx, a_rx, b_tx, b_rx);
+    let scenario = drive_min_transport_(rt, scope, a_tx, a_rx, b_tx, b_rx);
     scope.run_until(scenario).await;
 }
 
-/// 见 [`mux_min_stage_inmem_dual_`] 说明：本函数只是给当前 feature 选中的运行时值 /
+/// 见 [`mux_min_transport_inmem_dual_`] 说明：本函数只是给当前 feature 选中的运行时值 /
 /// 作用域类型做一次实例化。
 ///
 /// **本用例曾经必须 `#[ignore]`**：载荷一次性读取（`Demand::exactly(payload_len)`）在
 /// 1 字节环上直接拿到终态的 `Unsatisfiable`，整条连接失败且等待建流的 future 不再返回
 /// ——表现为**无声挂死**。载荷改为按底层段长流式搬入之后（`ReadCursor::read_async_`），
 /// 它已如设计所愿地通过，因此去掉 ignore 并取环原语的最小容量。
-async fn mux_min_stage_inmem_body_tokio_() {
+async fn mux_min_transport_inmem_body_tokio_() {
     let rt = current_rt_();
     let scope = rt.local_scope();
-    mux_min_stage_inmem_dual_(&rt, &scope).await;
+    mux_min_transport_inmem_dual_(&rt, &scope).await;
 }
-single_runtime_test_!(mux_min_stage_inmem_body_tokio_);
+single_runtime_test_!(mux_min_transport_inmem_body_tokio_);
 
-/// 最小帧暂存场景的执行体：建连 + 一对子流的双向收发与半关闭。
-async fn drive_min_stage_<RA, WA, RB, WB, S, RT>(
+/// 最小传输环场景的执行体：建连 + 一对子流的双向收发与半关闭。
+async fn drive_min_transport_<RA, WA, RB, WB, S, RT>(
     rt: &RT,
     scope: &S,
     tx_a: WA,
@@ -960,31 +883,29 @@ async fn drive_min_stage_<RA, WA, RB, WB, S, RT>(
     tx_b: WB,
     rx_b: RB,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: common::TrSmokeScope + Clone + 'static,
     RT: common::TrSmokeRt,
 {
     let (conn_a, conn_b) = common::connect_pair_::<
-        MinStageConfig_<WA, RA, RT>,
-        MinStageConfig_<WB, RB, RT>,
+        common::SmokeMuxConfig<WA, RA, RT>,
+        common::SmokeMuxConfig<WB, RB, RT>,
         RA,
         WA,
         RB,
         WB,
         S,
     >(
-        rt,
-        scope,
-        tx_a,
-        rx_a,
-        tx_b,
-        rx_b,
-        common::make_stage_buffs_with_(K_MIN_STAGE_CAPACITY_),
-        common::make_stage_buffs_with_(K_MIN_STAGE_CAPACITY_),
-    )
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
     .await;
 
     let dock_b = Dock::new(1u32);

@@ -6,8 +6,8 @@ mod config_;
 mod error_;
 
 pub use config_::{
-    AcceptOutput, CoreAllocOwned_, K_DEFAULT_MAX_INFLIGHT, TrInbound,
-    TrListenerConfig, TrNegotiatorFactory, make_stage_buffs,
+    AcceptOutput, K_DEFAULT_MAX_INFLIGHT, TrInbound,
+    TrListenerConfig, TrNegotiatorFactory,
 };
 pub use error_::InboundError;
 

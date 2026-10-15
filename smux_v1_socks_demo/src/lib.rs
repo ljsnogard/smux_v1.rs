@@ -66,7 +66,7 @@ pub use metrics::{DemoMetrics, MetricsDelta, MetricsSnapshot};
 pub use proto::{Envelope, K_HEADER_LEN, K_KIND_DATA, K_KIND_RECEIPT, ProtoError};
 pub use report::{PeerResult, print_ready_event};
 pub use scenario::{PhaseParams, PhaseReport, run_phase};
-pub use transport::{Buff, StageBuff, expect_eof, read_exact, write_all};
+pub use transport::{Buff, expect_eof, read_exact, write_all};
 
 use std::net::SocketAddr;
 

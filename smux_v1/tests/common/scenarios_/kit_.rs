@@ -1,6 +1,7 @@
 //! 场景公共件：多个场景共用的「驱动一端」「单条子流收发校验 + 半关闭」以及\n//! 「建连接 → 跑一个场景」的骨架。它们不构成对外接口，只在 `scenarios_` 内部复用。
 
 use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
+use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
 use abs_smux::{
     chan::TrChannelHalf,
     conf::TrMuxConfig,
@@ -40,10 +41,10 @@ pub(super) async fn run_mux_scenario_<RA, WA, RB, WB, S, RT>(
     dock_count: u32,
     per_dock: usize,
 ) where
-    RA: TrBuffRead<u8> + 'static,
-    WA: TrBuffWrite<u8> + 'static,
-    RB: TrBuffRead<u8> + 'static,
-    WB: TrBuffWrite<u8> + 'static,
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt + abs_art_facade::ScopeHost,
 {
@@ -56,7 +57,14 @@ pub(super) async fn run_mux_scenario_<RA, WA, RB, WB, S, RT>(
             RB,
             WB,
             S,
-        >(rt, scope, tx_a, rx_a, tx_b, rx_b, crate::common::make_stage_buffs_(), crate::common::make_stage_buffs_())
+        >(
+            rt,
+            scope,
+            tx_a,
+            rx_a,
+            tx_b,
+            rx_b,
+        )
         .await;
 
     futures::join!(
