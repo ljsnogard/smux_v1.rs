@@ -83,9 +83,9 @@ default = ["test-compio-runtime"]
 # `ReadAsInput` / `WriteAsOutput`（设备 trait 取 `futures-lite`，即 `smol::io` 的正身），
 # 环层 `BuffRead` / `BuffWrite`，**按需驱动、不 spawn**，因此这里的装配与 tokio 侧
 # 逐字同构。
-buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_compio_adapt.git" }
-buffex_smol_adapt = { git = "https://gitee.com/lino_snsalias/buffex_smol_adapt.git" }
-buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt.git" }
+buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
+buffex_smol_adapt = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
+buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 
 # 连接层经 `abs_art` 的**值化本地作用域**（`TrLocalScope`）投递读 / 写循环，
 # 并从一个**运行时值**（`abs_art::TrTime`：计时 + 时刻）取时间能力。因此测试要给出
