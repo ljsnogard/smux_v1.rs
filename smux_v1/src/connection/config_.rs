@@ -6,7 +6,7 @@
 //!
 //! **没有连接级帧暂存缓冲**：握手的交付物（`Tx` / `Rx`）本身就自带缓冲，连接的内侧
 //! 两个循环直接驱动它们，因此不再需要调用方另交两块缓冲、也不再有一次搬运
-//! （见 `session_` 与 `session_pump_` 的模块文档）。传输半边因此必须**自己带缓冲**
+//! （见 `session_` 模块文档）。传输半边因此必须**自己带缓冲**
 //! ——这也正是 [`TrConnCfg::ConnTx`] / [`TrConnCfg::ConnRx`] 要求
 //! `TrProducerState` / `TrConsumerState` 的原因：内侧循环要能非阻塞地问出
 //! 「有多少可读 / 可写、对端是否已经封口」。
@@ -92,7 +92,7 @@ where
 {
     /// **运行时值**：提供「现在几点」（[`TrClock`]）与「怎么等」（[`TrDelay`]）。
     ///
-    /// 它必须是 `TrTime`（= `TrClock + TrDelay`）且可 `Clone`——核心与五个循环各自
+    /// 它必须是 `TrTime`（= `TrClock + TrDelay`）且可 `Clone`——核心与三个循环各自
     /// 克隆一份，因此各处看到的时刻来自**同一个**时间轴。
     ///
     /// [`TrClock`]: abs_art::TrClock
@@ -111,7 +111,7 @@ where
     /// 都是 `#[inline(always)]` 空实现；配合 [`TrConnCfg::metrics`] 返回的引用，该装配下
     /// 的上报调用点会被单态化消除。
     ///
-    /// 要求 `Clone`：五个循环**不持有核心**（见 [`crate::connection`] 模块文档 §2.2），
+    /// 要求 `Clone`：三个循环**不持有核心**（见 [`crate::connection`] 模块文档 §2.2），
     /// 建连时必须把 sink 克隆一份进内部共享量。因此这里适合放**廉价可克隆的句柄**
     /// （例如 `&'static T`，或需求方自己的共享句柄）；`crate::metrics` 的模块文档
     /// §3 说明了为什么 mux 不替需求方做 `Arc` / `dyn` 的适配。

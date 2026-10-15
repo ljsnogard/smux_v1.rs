@@ -110,15 +110,15 @@ macro_rules! multi_art_test_ {
 /// # 与 `multi_art_test_!` 的分工
 ///
 /// `multi_art_test_!` 生成**三个**变体（tokio + compio + smol），前提是用例本身与
-/// 运行时无关。但连接的第五个循环（保活 / 空闲超时）要**真正等一段时间**，而计时与
+/// 运行时无关。但连接的计时循环（保活 / 空闲超时）要**真正等一段时间**，而计时与
 /// 时刻来自**运行时值**（`abs_art::TrTime`）：三个后端的运行时值是三份不同类型
 /// （作用域亦然），同一个用例体不可能同时是三者。于是这类用例改用本宏：**每个
 /// feature 组合只生成一个变体**，用例体按同一个 feature 选运行时值与作用域
 /// （见 `tests/inmem_mux.rs` 顶部的选择）。
 ///
 /// 反例（本宏诞生的直接原因）：`tests/inmem_mux.rs` 原先一律用 tokio 的 `LocalScope`
-/// 再套 `multi_art_test_!`。前四个循环不碰计时器，所以那种写法一直「看起来能跑」
-/// （tokio 的 `LocalSet::run_until` 在 compio 运行时里也能驱动任务）；第五个循环一落地
+/// 再套 `multi_art_test_!`。两个搬运循环不碰计时器，所以那种写法一直「看起来能跑」
+/// （tokio 的 `LocalSet::run_until` 在 compio 运行时里也能驱动任务）；计时循环一落地
 /// 就会在 compio 运行时里调 `tokio::time::sleep`，直接 panic「no reactor running」。
 ///
 /// # 三个 feature **互斥三选一**
