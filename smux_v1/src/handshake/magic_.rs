@@ -2,7 +2,7 @@
 //!
 //! 四种握手帧各有一条固定的 4 字节 magic（见 [`crate::handshake`] 模块文档 §5）。
 
-const MAGIC_FIELD_SIZE: usize = 4;
+pub(crate) const MAGIC_FIELD_SIZE: usize = 4;
 pub(crate) type MagicField = [u8; MAGIC_FIELD_SIZE];
 
 /// `INVITE` 帧的 magic：`5F 1B 01 69`。

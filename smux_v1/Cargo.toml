@@ -24,9 +24,7 @@ abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", bran
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
 atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch = "dev/0.3.0" }
 
-# 复用子流与协议帧的缓冲区一律使用 `buffex::circular_buff`，因此它是正式依赖
-# 而非测试专用依赖（`no_std` 成立；缺省分配器由 `buffex` 重导出）。
-buffex = { git = "https://gitee.com/lino_snsalias/buffex.git", branch = "dev/0.3.0" }
+buffex = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
 
 crc = { version = "3.4.*" }

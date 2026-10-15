@@ -28,15 +28,16 @@
 //! 一个字段「在途」；5 个基础键各有一个定长槽位。因此内存占用是 O(1)。
 
 use crate::handshake::{
-    MagicField,
+    MagicField, MAGIC_FIELD_SIZE,
     codec_::{
-        CrcDigest, HandshakeChecksum, basic_key_, decode_checksum_, decode_value_,
+        CrcDigest, HandshakeChecksum,
+        basic_key_, decode_checksum_, decode_value_,
     },
-    opts::{K_BASIC_KEY_COUNT, NegotiationBasicEntry, NegotiationKey, NegotiationValType},
+    opts::{
+        K_BASIC_KEY_COUNT,
+        NegotiationBasicEntry, NegotiationKey, NegotiationValType,
+    },
 };
-
-/// `magic` 的字节数。
-const K_MAGIC_LEN: usize = 4;
 
 /// 单条目值缓冲上限：基础项最宽是 `BeU64`。
 const K_VALUE_BUF_LEN: usize = 8;
@@ -154,7 +155,7 @@ impl HandshakeParser {
     pub(crate) fn new_() -> Self {
         HandshakeParser {
             state_: State_::Magic { got: 0 },
-            magic_: [0u8; K_MAGIC_LEN],
+            magic_: [0u8; MAGIC_FIELD_SIZE],
             alg_hdr_: 0u8,
             checksum_len_: 0usize,
             crc_: Option::None,
@@ -215,7 +216,7 @@ impl HandshakeParser {
 
             State_::Magic { got } => {
                 self.magic_[got] = byte;
-                self.state_ = if got + 1 == K_MAGIC_LEN {
+                self.state_ = if got + 1 == MAGIC_FIELD_SIZE {
                     State_::Alg
                 } else {
                     State_::Magic { got: got + 1 }

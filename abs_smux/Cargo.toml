@@ -11,5 +11,5 @@ categories = ["no-std"]
 license = "MIT/Apache-2.0"
 
 [dependencies]
-abs_buff = { git = "https://gitee.com/lino_snsalias/abs_buff.git", branch = "dev/0.3.0" }
+abs_buff = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 abs_mm = { git = "https://gitee.com/lino_snsalias/abs_mm.git", branch = "dev/0.3.0" }

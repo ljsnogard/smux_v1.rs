@@ -86,7 +86,7 @@ use core::mem::MaybeUninit;
 use abs_buff::{Demand, buffer::TrBuffSegmRef};
 use abs_cancel::{TrCancellationToken, TrMayCancel};
 use abs_mm::CoreAlloc;
-use abs_sync::preludes::TrAsyncRwLock;
+use abs_sync::async_rwlock::TrAsyncRwLock;
 use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
 use buffex::ring::{ConsumerError, Ring, RingReader, RingWriter};
 use mm_ptr::Owned;

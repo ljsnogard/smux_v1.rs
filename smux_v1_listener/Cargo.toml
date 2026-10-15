@@ -7,32 +7,32 @@ description = "流复用协议第一版：跨运行时 listener"
 
 [dependencies]
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
-smux_v1 = { path = "../smux_v1", default-features = false }
-
-thiserror = { version = "2.0.*", default-features = false }
-futures = { version = "0.3.*", default-features = false, features = ["async-await", "std"] }
-
-# 三个运行时的 socket ↔ 环适配器：**可选**，由 `rt-*` feature 逐一点亮。
-# git spec 与 `smux_v1` 的 `dev-dependencies` 写**完全相同**的一份，否则同名的
-# crate 会被 Cargo 当成两个 source 检出两份代码。
-buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_compio_adapt.git", optional = true }
-buffex_smol_adapt = { git = "https://gitee.com/lino_snsalias/buffex_smol_adapt.git", optional = true }
-buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt.git", optional = true }
-
 # 三个运行时的**具名 crate**：`Runtime::local_scope()` 是固有方法，listener 要经
 # `TrScopeHost` 拿它（见 `src/scope_/`）。git spec 与 `smux_v1` 依赖图上的一致。
 abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", optional = true }
 abs_art-smol = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", optional = true }
 abs_art-tokio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", optional = true }
+# 三个运行时的 socket ↔ 环适配器：**可选**，由 `rt-*` feature 逐一点亮。
+# git spec 与 `smux_v1` 的 `dev-dependencies` 写**完全相同**的一份，否则同名的
+# crate 会被 Cargo 当成两个 source 检出两份代码。
+buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex.rs.git", optional = true }
+buffex_smol_adapt   = { git = "https://gitee.com/lino_snsalias/buffex.rs.git", optional = true }
+buffex_tokio_adapt  = { git = "https://gitee.com/lino_snsalias/buffex.rs.git", optional = true }
+
+smux_v1 = { path = "../smux_v1", default-features = false }
 
 # 三个运行时的 socket 类型（`TcpListener` / `UnixListener` 及其流）。版本与 feature
 # 同样与 `smux_v1` 的 `dev-dependencies` 对齐：版本一旦不同，`compio::net::TcpStream`
 # 就会出现两个互不相容的实例。
 compio = { version = "0.19.*", features = ["macros", "net", "runtime"], optional = true }
 smol = { version = "2", optional = true }
+
 async-net = { version = "2", optional = true }
 futures-lite = { version = "2", optional = true }
 tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread"], optional = true }
+
+thiserror = { version = "2.0.*", default-features = false }
+futures = { version = "0.3.*", default-features = false, features = ["async-await", "std"] }
 
 [features]
 # 缺省 = compio，与 `smux_v1` 自己的缺省一致，这样裸 `cargo build` 也能编出一个后端。
@@ -41,9 +41,9 @@ tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-threa
 # 但只有被点到的那几套设备适配会进编译单元。
 default = ["rt-compio"]
 
-rt-tokio = ["dep:abs_art-tokio", "dep:buffex_tokio_adapt", "dep:tokio"]
+rt-tokio  = ["dep:abs_art-tokio",  "dep:buffex_tokio_adapt", "dep:tokio"]
 rt-compio = ["dep:abs_art-compio", "dep:buffex_compio_adapt", "dep:compio"]
-rt-smol = ["dep:abs_art-smol", "dep:async-net", "dep:buffex_smol_adapt", "dep:futures-lite", "dep:smol"]
+rt-smol   = ["dep:abs_art-smol",   "dep:async-net", "dep:buffex_smol_adapt", "dep:futures-lite", "dep:smol"]
 
 [dev-dependencies]
 # 单元测试用的中立执行器：`queue_` 的「多生产者 / 背压 / 取消」三条路径都要在

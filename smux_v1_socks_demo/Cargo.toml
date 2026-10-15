@@ -30,9 +30,9 @@ smux_v1 = { path = "../smux_v1", default-features = false }
 # 到 gitee；走 git 依赖只会拿到旧 commit，demo 会在握手阶段就静止。三者必须与
 # `buffex` / `mm_ptr` / `abs_art` 同源同分支（见上面的说明）。
 
-buffex_tokio_adapt  = { git = "https://gitee.com/lino_snsalias/buffex_tokio_adapt.git" }
-buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex_compio_adapt.git" }
-buffex_smol_adapt   = { git = "https://gitee.com/lino_snsalias/buffex_smol_adapt.git" }
+buffex_tokio_adapt  = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
+buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
+buffex_smol_adapt   = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 
 # buffex_tokio_adapt  = { path = "../buffex_tokio_adapt" }
 # buffex_compio_adapt = { path = "../buffex_compio_adapt" }

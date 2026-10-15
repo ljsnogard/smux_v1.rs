@@ -163,10 +163,10 @@ where
         write_stage_buff: MuxChanBuffOwnedBy<P>,
     ) -> Self
     where
-        C: 'static + Clone,
-        C::Alloc: 'static,
         P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
         P::Alloc: AllocatorClone,
+        C: 'static + Clone,
+        C::Alloc: 'static,
         C::Rt: ScopeHost,
     {
         let rt = config.runtime();

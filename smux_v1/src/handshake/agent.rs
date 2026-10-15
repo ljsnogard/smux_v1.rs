@@ -427,7 +427,8 @@ where
     }
 
     // 1. 等待 INVITE，并**边收边判**。
-    let mut reader = FrameReader::begin_async_(&mut rx, cancel.child_token())
+    let mut reader = FrameReader
+        ::begin_async_(&mut rx, cancel.child_token())
         .await
         .map_err(from_read_frame_err_)?;
     if reader.magic_() != K_INVITE_MAGIC {
