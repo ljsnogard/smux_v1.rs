@@ -28,10 +28,12 @@ cargo run --example active_passive
 | 段 | 做什么 | 要自己准备运行时吗 |
 | --- | --- | --- |
 | **握手** | `HandshakeAgent` 在两条半边上来回协商，产出 `HandshakeDelivery`（协商结果 + 归还的收发通道） | **不要**——它不投递任何任务 |
-| **建连接** | 交付物 + 资源策略 + 帧暂存 → `MuxConnection`，五个循环投递到本地队列 | **不要**——运行时值与本地作用域都由连接自己取 |
+| **建连接** | 交付物 + 资源策略 → `MuxConnection`，三个循环投递到本地队列 | **不要**——运行时值与本地作用域都由连接自己取 |
 
 `rx` / `tx` 是**已经接成 [`abs_buff`](../abs_buff) 两条半边**的传输——即实现
 `TrBuffRead<u8>` / `TrBuffWrite<u8>` 的一对读写端，怎么从 socket 接出来见 §3。
+它们还必须**自带缓冲**（`TrConsumerState` / `TrProducerState`）：连接不再为传输另建
+帧暂存环，内侧两个循环直接驱动这两条半边。
 
 **运行时值与本地作用域都不再是入参**：后端由集成方在 `Cargo.toml` 里经
 `abs_art-bridge` 选定（本仓缺省 **compio**），连接建连时取该后端的运行时值、再由它
@@ -86,9 +88,10 @@ rx.read_exact(&mut buf).await?; // 对端 drop(tx) 之后就到这里
 ```
 
 握手的协商条目、拒绝策略、取消都由 `HandshakeAgent` 的参数控制，需要时直接改；
-`MuxConnection::from_delivery` 只是「默认配置 + 建帧暂存 + `MuxConnection::new`」三步的
-省事写法（**同步**方法），要自选分配器 / 流控 / 环存储 / 暂存容量就走
-[`MuxConnection::new`](src/connection/mux_connection/conn_.rs)。`accept_async_default` 是
+`MuxConnection::from_delivery` 只是「默认配置 + `MuxConnection::new`」两步的省事写法
+（**同步**方法），要自选分配器 / 流控 / 环存储就走
+[`MuxConnection::new`](src/connection/mux_connection/conn_.rs)。**不再需要交缓冲**：
+传输半边自带缓冲，连接只负责把三个循环投递出去。`accept_async_default` 是
 「空欢迎消息 + 缺省环容量」，`write_all` / `read_exact` 是段级循环之上的省事封装。
 
 ### 2.1 想自己挑后端：显式传入运行时值
@@ -108,8 +111,7 @@ type Cfg = DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, Rt>;
 
 let rt = <Rt>::current();                   // 在 tokio 上下文内取
 let (delivery, cfg) = <Cfg>::new_with_rt(delivery, DefaultPolicy, rt);
-let (stage_r, stage_w) = cfg.make_stage_buffs(cfg.allocator())?;
-let conn = MuxConnection::new(delivery, cfg, stage_r, stage_w);
+let conn = MuxConnection::new(delivery, cfg);   // 不需要再交帧暂存缓冲
 ```
 
 **smux 本身不直接依赖任何后端 crate**：`Runtime` / `LocalScope` / `current` 都从
@@ -187,9 +189,9 @@ just test                                    # 全量：两套冒烟 + 文档测
    - 两条路都遵守同一条纪律：**关闭之后不要再写**。收尾在发出 `FIN` 时会关掉该子流发送环
      的消费端，此后写入会立刻拿到「发送方向已关闭」，而不是把字节丢进一条再没有读者的
      环里。
-   - 收尾的最后一步刻意**留下写泵**：内侧循环把数据**成帧写进连接写环**之后才发 `FIN`，
-     所以「子流收口」不等于「字节已经上网」；写泵在写环封口且排空后自行退出，把这段路
-     走完。决策链见
+   - 收尾的最后一步是**把已经成帧的字节写进传输**：复用循环成帧时直接写传输半边，
+     所以「子流收口」与「字节已经交给传输」是同一个动作；传输里那些字节由**调用方
+     那一侧**的排空者负责（适配器的自驱动泵 / 调用方的出向泵）。决策链见
      [`dev-notes/graceful-close-2-20261014-2231.md`](dev-notes/graceful-close-2-20261014-2231.md)。
 4. **内存由调用方说了算**：每一处堆分配都走注入的分配器（`allocator_api`），不用全局
    分配器，也不靠 `Vec` 之类的临时堆结构绕开设计。
