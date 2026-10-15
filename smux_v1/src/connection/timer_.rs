@@ -77,7 +77,7 @@ use abs_cancel::TrCancellationToken;
 use crate::{
     connection::{
         Dock, FrameKind, TrConnCfg, flags,
-        mux_connection::K_CLOSE_NONE,
+        mux_connection::{K_CLOSE_NONE, K_CLOSE_TIMEOUT},
         session_::MuxShared_,
         signal_::{ControlFrame_, EventSender_, ReadEvent_, TrEventSender_, WriteEvent_},
     },
@@ -217,6 +217,11 @@ pub(crate) async fn timer_loop_async_<C, K>(
         //    收敛路径要留写泵一条活路；本版复用循环直接写传输，连接内部没有排空阶段
         //    （见 `ChannelRegistry_::cancel_loops_` 的文档）。
         if scan.close_action_() != K_CLOSE_NONE {
+            // 超时兜底要**留下显式事实**：`close_async` 的返回值靠它区分「与对端收敛」
+            // 与「超时收尾」——两者都会取消令牌（见 `K_STATE_FORCED_CLOSE`）。
+            if scan.close_action_() == K_CLOSE_TIMEOUT {
+                shared.reg_().mark_forced_close_();
+            }
             shared.reg_().cancel_loops_();
             return;
         }

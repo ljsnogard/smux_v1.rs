@@ -507,10 +507,16 @@ where
 /// 的超时兜底（`drop` 路径没有调用方，只有它兜得住）。调用方的取消令牌打断时同样
 /// 强制收尾并返回 `false`——本函数不得假定调用者一定会等到最后。
 ///
+/// 两个期限**数值相同、起算点不同**（计时循环从进入等待关闭那一刻起算，比本函数算
+/// 自己的期限更早），因此谁先到是时序问题，不能当作判据。收尾由计时循环强制促成时，
+/// 它会把 [`K_STATE_FORCED_CLOSE`](super::registry_::K_STATE_FORCED_CLOSE) 记在连接
+/// 状态里；本函数据此把「超时收尾」与「与对端收敛」分开。
+///
 /// # 返回值
 ///
-/// `true` = 收尾发生在**收敛之后**（最后一条子流已与对端双向收尾）；`false` = 超时、
-/// 被取消、或连接此前已经失败。
+/// `true` = 收尾发生在**收敛之后**（最后一条子流已与对端双向收尾）；`false` = 超时
+/// （包括「计时循环先于本函数自己的期限判定超时」这一情形）、被取消、或连接此前
+/// 已经失败。
 #[gen_may_cancel_future(MuxConnClose, pub, new(pub(crate)))]
 async fn mux_conn_close_async_<'f, C, K>(
     conn: &'f mut MuxConnection<C>,
@@ -575,8 +581,13 @@ where
     let mut finalized = core::pin::pin!(probe.clone().cancellation());
     loop {
         // 复检：收尾可能就发生在进入本函数之前（或上一次醒来时）。
+        //
+        // 令牌触发只说明「连接确实收口了」，**不**说明是哪种收口：与对端收敛、计时
+        // 循环的整体超时兜底、连接级失败，三者都会取消它。因此判据要把后两者排除
+        // 掉——失败看 `fail_kind_`，超时看计时循环留下的**显式**标志
+        // （`is_forced_close_`，见 `K_STATE_FORCED_CLOSE` 的文档）。
         if probe.is_cancelled() {
-            return core.reg_().fail_kind_().is_none();
+            return core.reg_().fail_kind_().is_none() && !core.reg_().is_forced_close_();
         }
         // 连接级失败：收尾是失败牵连的结果，不是「优雅完成」。
         if core.reg_().fail_kind_().is_some() {

@@ -16,4 +16,4 @@ mod core_;
 mod registry_;
 
 pub use conn_::{BindError, MuxConnection};
-pub(crate) use registry_::{ChannelRegistry_, K_CLOSE_NONE, ReserveErr_};
+pub(crate) use registry_::{ChannelRegistry_, K_CLOSE_NONE, K_CLOSE_TIMEOUT, ReserveErr_};

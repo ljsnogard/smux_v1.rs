@@ -187,6 +187,22 @@ const K_STATE_NORMAL: u8 = 0u8;
 /// 双向收尾后由循环执行收尾（取消令牌）。
 const K_STATE_WAITING_CLOSE: u8 = 1u8;
 
+/// [`ChannelRegistry_::state_`] 的取值：等待关闭**已经超过整体超时**，计时循环执行了
+/// 强制收尾。
+///
+/// 它与 [`K_STATE_WAITING_CLOSE`] 的差别只有一个，但对调用方是语义性的：
+/// [`TrConnection::close_async`](abs_smux::conn::TrConnection::close_async) 的返回值
+/// 要区分「收尾发生在与对端收敛之后」与「超时兜底收尾」——**两者都会取消循环令牌**
+/// （那是「连接确实收口了」的唯一信号），只凭令牌无法分辨。旧版只在「调用方自己的
+/// 期限先到」时给出 `false`，于是两个同为 `max_channel_timeout` 的期限谁先到成了
+/// 时序竞争：计时循环的期限早于调用方（它从 `enter_waiting_close_` 起算，而调用方
+/// 在那之后才算自己的期限），只是旧版的任务调度恰好让调用方先醒。本状态把这个判据
+/// 变成**显式事实**，`close_async` 因此不再依赖谁先被调度。
+///
+/// 它同时仍是「关闭中」：各 `reserve_*` 与 [`ChannelRegistry_::is_closing_`] 对两个
+/// 关闭态一视同仁。
+const K_STATE_FORCED_CLOSE: u8 = 2u8;
+
 /// 自动分配 dock 的第一个候选值。
 ///
 /// 仿照 UNIX 的**特权端口**约定：`0..1024` 是「约定用途」区间，只由调用方通过
@@ -922,7 +938,28 @@ where
     /// 「关闭中」的语义有两条：**不再接受任何新身份**；已登记的子流由连接自己推进
     /// 「排空 + 发 `FIN`」，并在最后一条与对端双向收尾时执行收尾。
     pub(crate) fn is_closing_(&self) -> bool {
-        self.state_.load(Ordering::Acquire) == K_STATE_WAITING_CLOSE
+        matches!(
+            self.state_.load(Ordering::Acquire),
+            K_STATE_WAITING_CLOSE | K_STATE_FORCED_CLOSE
+        )
+    }
+
+    /// 记下「本次关闭是**超时强制收尾**」这一事实（幂等、锁外原子写）。
+    ///
+    /// 由计时循环在认领 [`K_CLOSE_TIMEOUT`] 时调用；只写不读回，因此不会与
+    /// `enter_waiting_close_` 的 CAS 相争（后者只从 `K_STATE_NORMAL` 迁移）。
+    pub(crate) fn mark_forced_close_(&self) {
+        let _ = self.state_.compare_exchange(
+            K_STATE_WAITING_CLOSE,
+            K_STATE_FORCED_CLOSE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// 本次关闭是否由**整体超时**强制收尾（见 [`K_STATE_FORCED_CLOSE`]）。
+    pub(crate) fn is_forced_close_(&self) -> bool {
+        self.state_.load(Ordering::Acquire) == K_STATE_FORCED_CLOSE
     }
 
     /// **进入「等待关闭」**（幂等、不取锁、不阻塞），返回本次是否**首次**进入。

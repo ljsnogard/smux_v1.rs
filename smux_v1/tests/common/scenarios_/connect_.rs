@@ -119,6 +119,7 @@ where
 ///
 /// 两个协商项分别给发起方（`invite_opts`）与等待方（`listen_opts`）：本仓的用例总是
 /// 传同一份值，但形状上不合并——两端本来就可以各自提出自己的偏好。
+#[allow(clippy::too_many_arguments)] // 四条传输半边 + 两个协商项，无法再合并
 pub async fn connect_pair_with_opts_<CA, CB, RA, WA, RB, WB, S>(
     rt: &CA::Rt,
     scope: &S,
