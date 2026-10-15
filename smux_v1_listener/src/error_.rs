@@ -13,11 +13,9 @@
 ///
 /// # 为什么没有「配置侧失败」变体
 ///
-/// [`TrListenerConfig`](crate::config::TrListenerConfig) 的两个取用入口都被约定为
-/// **不会失败**：握手条件与连接策略是预存的数据，而帧暂存缓冲的供给由
-/// [`make_stage_buffs`](crate::config::TrListenerConfig::make_stage_buffs) 当场完成
-/// （分配失败在 `smux_v1` 里是 panic 而不是 `Result`）。将来若某个配置真的需要交出错
-/// 误，再加变体也不影响现有匹配。
+/// [`TrListenerConfig`](crate::config::TrListenerConfig) 的取用入口都被约定为
+/// **不会失败**：握手条件与连接策略都是预存的数据（建连本身也不再需要调用方交缓冲，
+/// 见那个 trait 的文档）。将来若某个配置真的需要交出错误，再加变体也不影响现有匹配。
 #[derive(Debug, thiserror::Error)]
 pub enum SmuxListenerError<AE> {
     /// **本次**等待被取消。

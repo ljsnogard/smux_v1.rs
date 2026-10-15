@@ -834,21 +834,13 @@ async fn serve_async_<Cfg, A, N>(
         return;
     };
 
-    // 2. 建连接：两块帧暂存缓冲由配置当场交出；运行时值也由配置交出，因此建连点
-    //    **不需要**处于任何「编译期选定的后端」上下文内。
-    let (read_stage, write_stage) = cfg.make_stage_buffs();
+    // 2. 建连接：**不需要**帧暂存缓冲——传输的两条半边自带缓冲（`ConnTx` / `ConnRx`）。
+    //    运行时值由配置交出，因此建连点不需要处于任何「编译期选定的后端」上下文内。
     let rt = cfg.runtime();
     // 作用域就地取自运行时值：语义与 `MuxConnection::new` 完全一致，只是本 crate 用
     // 自己的 `TrScopeHost`（见 `crate::scope_` 的说明）。
     let scope = crate::TrScopeHost::local_scope(&rt);
-    let conn = MuxConnection::<Cfg::Conn>::new_with_rt(
-        &rt,
-        &scope,
-        delivery,
-        cfg.conn_cfg(),
-        read_stage,
-        write_stage,
-    );
+    let conn = MuxConnection::<Cfg::Conn>::new_with_rt(&rt, &scope, delivery, cfg.conn_cfg());
 
     // 3. 投递。失败只可能是「等待被取消（listener 正在收尾）」或「消费端已消失」——
     //    那时放弃这条连接。
