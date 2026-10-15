@@ -7,19 +7,21 @@
 //! 1. **sink 句柄可见**：`DefaultConnCfg` 经 `M::default()` 造 sink，本 demo 的
 //!    [`DemoMetrics::default`](crate::DemoMetrics) 正好返回进程级句柄，够用；但显式持有
 //!    一份句柄更直白，也不依赖 `Default` 的约定；
-//! 2. **缓冲由调用方控制**：新版 `smux_v1` 的配置里**没有**缓冲类型——连接级帧暂存
-//!    与子流环内存都由调用方当场交出，本 demo 在 `transport.rs` 里按 `--ring-cap`
-//!    与 `K_STAGE_RING_CAPACITY` 分配。
+//! 2. **子流环缓冲由调用方控制**：`smux_v1` 的配置里**没有**缓冲类型——子流环内存由
+//!    调用方当场交出，本 demo 在 `transport.rs` 里按 `--ring-cap` 与 `CoreAlloc`
+//!    分配。连接级帧暂存本版已经不存在（连接直接驱动传输适配器，适配器自带缓冲）。
 //!
 //! 形状与测试侧逐项对应：`Data = u8`、`Dock = Dock`、`Policy = DefaultPolicy`、
-//! `Alloc = CoreAlloc`。**缓冲类型不在配置里**：连接级帧暂存由调用方在
-//! `MuxConnection::new` 当场交出，子流环内存由调用方在 `accept_async` 当场交出
-//! （见 `transport.rs` 的两个构造助手）。
+//! `Alloc = CoreAlloc`。**缓冲类型不在配置里**：子流环内存由调用方在 `accept_async`
+//! 当场交出（见 `transport.rs` 的 `RingPrepare`）；传输两条半边自带缓冲。
 
 use core::marker::PhantomData;
 
 use abs_art::TrTime;
-use abs_buff::{TrBuffRead, TrBuffWrite};
+use abs_buff::{
+    TrBuffRead, TrBuffWrite,
+    buffer::{TrConsumerState, TrProducerState},
+};
 use abs_mm::CoreAlloc;
 use abs_smux::conf::TrMuxConfig;
 use mm_ptr::x_deps::abs_mm;
@@ -71,8 +73,8 @@ impl<W, R> DemoCfg<W, R> {
 
 impl<W, R> TrMuxConfig for DemoCfg<W, R>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
     type Dock = Dock;
@@ -80,8 +82,8 @@ where
 
 impl<W, R> TrConnCfg for DemoCfg<W, R>
 where
-    W: TrBuffWrite<u8> + 'static,
-    R: TrBuffRead<u8> + 'static,
+    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    R: TrBuffRead<u8> + TrConsumerState + 'static,
     Rt: TrTime + Clone + 'static,
 {
     type Rt = Rt;
