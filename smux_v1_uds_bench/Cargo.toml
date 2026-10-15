@@ -1,0 +1,90 @@
+# smux_v1 的 UNIX domain socket（UDS）**性能测试**项目。
+#
+# # 这是一个**独立 workspace**
+#
+# 理由与 `smux_v1_socks_demo` 相同（见它的 `Cargo.toml` 注释）：
+#
+# 1. `smux_v1` 的三个运行时 feature（`test-tokio-runtime` / `test-compio-runtime` /
+#    `test-smol-runtime`）是**互斥三选一**——它们各自把 `abs_art-facade` 的默认后端
+#    压成不同的值。本 crate 的三个 `rt-*` feature 与之一一对应，一旦被并进主
+#    workspace，`cargo test`（整个 workspace）会把这些 feature 取**并集**，于是
+#    「哪个后端是默认」没有唯一解，直接撞上 `abs_art-facade` 的守护。
+# 2. 本 crate 要同时依赖三个 `buffex_*_adapt`（按 feature 各进一个），并入主
+#    workspace 会污染那里的 feature 图与依赖解析。
+#
+# # 三个运行时 feature 也是互斥的
+#
+# 缺省 = compio（与 `smux_v1` 自己的缺省一致）。换运行时必须
+# `--no-default-features --features rt-<名字>`；同时点亮两个会在编译期被
+# `src/lib.rs` 的 `compile_error!` 拦下。
+[package]
+name = "smux_v1_uds_bench"
+version = "0.1.0"
+edition = "2024"
+description = "smux_v1 在真实 UNIX domain socket 上的性能测试：compio / smol / tokio 三后端下，raw 多客户端 UDS 与 smux 复用 channel 两条路径的并发带宽与任务时间方差对照。"
+license = "MIT/Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+# `smux_v1` 的三个运行时 feature 与 `abs_art-facade` 的后端选择由本 crate 的 `rt-*`
+# feature 转发，因此这里必须关掉它的缺省（compio）后端。
+smux_v1 = { path = "../smux_v1", default-features = false }
+
+# 三个运行时的 socket ↔ 环适配器。**必须与 `smux_v1` 依赖图上那份 git spec 逐字相同**
+# （同 URL、同 branch/缺省分支）：否则 Cargo 会把同名的 crate 当成两个 source 各检出
+# 一份代码，`abs_buff` 的段类型随之出现「同名不同源」，编译期直接对不上。
+# 三者都是**可选**依赖：一次构建只接通一个后端，另两个不进编译单元（也因此不需要
+# 为了它们的存在而妥协 feature 组合）。
+buffex_compio_adapt = { git = "https://gitee.com/lino_snsalias/buffex.rs.git", optional = true }
+buffex_smol_adapt   = { git = "https://gitee.com/lino_snsalias/buffex.rs.git", optional = true }
+buffex_tokio_adapt  = { git = "https://gitee.com/lino_snsalias/buffex.rs.git", optional = true }
+
+# 场景并发一律用与运行时无关的组合子（`join_all` / `join!` / `select!`）：compio 的
+# socket 半边是 `!Send`，`spawn` 不可用。
+#
+# `executor` 只给单元测试用（`block_on` 驱动一个「栅栏已失败」的 future）。
+futures = { version = "0.3.*", features = ["executor"] }
+
+# 单格超时用的定时器。它自带一个独立定时线程，**不依赖任何运行时**——因此三个后端
+# 共用一份超时实现，不必各写一份。
+futures-timer = "3.0.*"
+
+# 三个运行时都设为**可选**：bin 由同一份源码按 feature 各编译一次，每个构建只把被选中的
+# 那个运行时的代码与适配器拉进编译单元。
+compio = { version = "0.19.*", features = ["macros", "net", "runtime", "time"], optional = true }
+# smol 自身不导出 UNIX 域套接字（`smol::net` 就是 `async-net` 的再导出），因此显式依赖
+# `async-net`——与 `smux_v1_listener` 的 smol 装配用同一个 crate、同一个写法。
+async-net = { version = "2", optional = true }
+smol = { version = "2", optional = true }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"], optional = true }
+
+[features]
+default = ["rt-compio"]
+
+# 每个 feature 恰好接通「一个运行时 + 它那一个适配器 + smux_v1 的对应后端」。
+# 不打开 `smux_v1/metrics`：本 bench 用零开销的 `NoMetrics`，让两条被测路径不被
+# 采集开销污染（理由见 `src/cfg.rs` 的模块文档）。
+rt-tokio  = ["dep:tokio", "dep:buffex_tokio_adapt", "smux_v1/test-tokio-runtime"]
+rt-compio = ["dep:compio", "dep:buffex_compio_adapt", "smux_v1/test-compio-runtime"]
+rt-smol   = ["dep:async-net", "dep:smol", "dep:buffex_smol_adapt", "smux_v1/test-smol-runtime"]
+
+# crate 名与 bin 名都是下划线形式，nightly cargo 的 kebab-case 命名 lint 在这里纯属噪音。
+[lints.cargo]
+non_kebab_case_bins = "allow"
+
+[[bin]]
+name = "bench_tokio"
+path = "src/bin/bench_tokio.rs"
+required-features = ["rt-tokio"]
+
+[[bin]]
+name = "bench_compio"
+path = "src/bin/bench_compio.rs"
+required-features = ["rt-compio"]
+
+[[bin]]
+name = "bench_smol"
+path = "src/bin/bench_smol.rs"
+required-features = ["rt-smol"]

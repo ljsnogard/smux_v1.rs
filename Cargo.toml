@@ -1,4 +1,8 @@
 [workspace]
+# 注意：`smux_v1_socks_demo` 与 `smux_v1_uds_bench` 都是**独立 workspace**，故意不在这里。
+# 两者都要按「三个运行时后端三选一」各编译一次；并进本 workspace 会让 `cargo test`
+# 把 `smux_v1` 的 `test-*-runtime` feature 取**并集**——那时 `abs_art-facade` 的
+# 「默认后端」没有唯一解，直接编译失败。单独构建的方法见各自的 README / justfile。
 members = [
     "abs_smux",
     "smux_v1",

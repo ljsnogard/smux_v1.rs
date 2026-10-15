@@ -1,0 +1,77 @@
+# smux_v1_uds_bench 的配方。
+#
+# 超时纪律（根 AGENTS.md §12）：单元测试不超过 1 分钟；全量压测按 5 分钟量级安排。
+# 本 bench 的「全量」是 3 后端 × 2 环境（单跑器 / 4 跑器）× 4 并发度 × 2 轮，
+# 实测单格最长的 smux N=16（1 GiB）约 16 s，一整趟约 4–6 分钟。
+set shell := ["bash", "-uc"]
+
+bench := justfile_directory()
+# 需要离线（本机 cargo 缓存只读 / 断网）时：`BENCH_CARGO_OFFLINE=--offline just bench`
+offline := env('BENCH_CARGO_OFFLINE', '')
+
+# 正式压测用的参数（可用环境变量覆盖）
+cases   := env('BENCH_CASES', '2,4,8,16')
+bytes   := env('BENCH_BYTES', '64M')
+chunk   := env('BENCH_CHUNK', '64K')
+repeat  := env('BENCH_REPEAT', '2')
+timeout := env('BENCH_TIMEOUT', '120')
+
+default:
+    @just --list
+
+# 三格各编一次（三个运行时 feature 互斥，必须分开编）
+build:
+    cargo build --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-compio --bin bench_compio
+    cargo build --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-tokio --bin bench_tokio
+    cargo build --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-smol --bin bench_smol
+
+# release 三格
+build-release:
+    cargo build --manifest-path {{bench}}/Cargo.toml {{offline}} --release --no-default-features --features rt-compio --bin bench_compio
+    cargo build --manifest-path {{bench}}/Cargo.toml {{offline}} --release --no-default-features --features rt-tokio --bin bench_tokio
+    cargo build --manifest-path {{bench}}/Cargo.toml {{offline}} --release --no-default-features --features rt-smol --bin bench_smol
+
+# 单元测试（三个后端各跑一遍，60 秒上限）
+test:
+    timeout 60 cargo test --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-compio --lib
+    timeout 60 cargo test --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-tokio --lib
+    timeout 60 cargo test --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-smol --lib
+
+# 静态检查（三个后端各一遍，警告即失败）
+clippy:
+    cargo clippy --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-compio --all-targets -- -D warnings
+    cargo clippy --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-tokio --all-targets -- -D warnings
+    cargo clippy --manifest-path {{bench}}/Cargo.toml {{offline}} --no-default-features --features rt-smol --all-targets -- -D warnings
+
+# 冒烟：每后端 × 两环境，小载荷（30 秒上限的量级）
+smoke:
+    timeout 120 python3 {{bench}}/scripts/run_matrix.py --release --bytes 4M --repeat 1 --timeout 30 --label smoke
+
+# 全量压测：3 后端 × {单跑器, 4 跑器} × 并发度序列 × 轮数
+bench:
+    timeout 900 python3 {{bench}}/scripts/run_matrix.py --release \
+        --cases {{cases}} --bytes {{bytes}} --chunk {{chunk}} \
+        --repeat {{repeat}} --timeout {{timeout}} --runners 1,4 --label full
+
+# 只跑一个后端：`just one tokio`
+one backend:
+    timeout 300 python3 {{bench}}/scripts/run_matrix.py --release --only {{backend}} \
+        --cases {{cases}} --bytes {{bytes}} --repeat {{repeat}} --runners 1,4 --label one
+
+# 只跑单线程环境
+single:
+    timeout 600 python3 {{bench}}/scripts/run_matrix.py --release --runners 1 \
+        --cases {{cases}} --bytes {{bytes}} --repeat {{repeat}} --label single
+
+# 只跑多线程环境
+multi:
+    timeout 600 python3 {{bench}}/scripts/run_matrix.py --release --runners 4 \
+        --cases {{cases}} --bytes {{bytes}} --repeat {{repeat}} --label multi
+
+# 打印某后端的用例矩阵（不执行）：`just dry tokio`
+dry backend:
+    ./target/release/bench_{{backend}} --cases {{cases}} --bytes {{bytes}} --dry-run
+
+# 合并各格结果为一张总表：`just merge`（读 results/*/，写 results/summary.md）
+merge:
+    python3 {{bench}}/scripts/merge_results.py

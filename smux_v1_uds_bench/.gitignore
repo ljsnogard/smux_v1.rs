@@ -1,0 +1,8 @@
+# 构建产物
+/target
+**/__pycache__/
+*.pyc
+# 逐格压测结果（JSONL / CSV / 每格 summary.md 都能重新生成）
+# 只保留合并后的总表 results/summary.md
+/results/*/
+/.tmp
