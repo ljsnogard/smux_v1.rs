@@ -33,12 +33,12 @@ use crate::{
     flow_ctrl::DefaultPolicy,
     handshake::agent::HandshakeDelivery,
     metrics::NoMetrics,
-    x_deps::abs_buff,
+    x_deps::abs_buff::{self, TrBuffFlush},
 };
 
 impl<Tx, Rx> MuxConnection<DefaultConnCfg<Tx, Rx, NoMetrics, DefaultPolicy, DefaultRt_>>
 where
-    Tx: TrBuffWrite<u8> + TrProducerState + 'static,
+    Tx: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     Rx: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     /// 用**默认配置**把一次成功的握手交付物接成连接。

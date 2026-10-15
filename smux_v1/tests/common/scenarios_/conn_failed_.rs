@@ -43,7 +43,7 @@ use abs_smux::{
 use buffex::{
     ring::ProducerError,
     x_deps::{
-        abs_buff::{Demand, TrBuffRead, TrBuffTryWrite, TrBuffWrite},
+        abs_buff::{Demand, TrBuffFlush, TrBuffRead, TrBuffTryFlush, TrBuffTryWrite, TrBuffWrite},
         abs_cancel,
         anylr::SomeOf,
     },
@@ -149,6 +149,52 @@ where
             broken_: self.broken_.clone(),
             _segm_: PhantomData,
         }
+    }
+}
+
+/// 故障写半边的**收尾契约**：转发内层；注入失败后按「对端已消失」回答。
+///
+/// Forward the flush contract to the inner write half, turning it into
+/// `Closing` while the fault flag is set.
+impl<H> TrBuffTryFlush<u8> for FailableTx_<H>
+where
+    H: TrBuffTryFlush<u8, Err = ProducerError<usize>>,
+{
+    fn try_flush(&mut self) -> Result<(), ProducerError<usize>> {
+        if self.broken_.get() {
+            return Result::Err(ProducerError::Closing);
+        }
+        self.half_.try_flush()
+    }
+
+    fn close(&mut self) -> Result<(), ProducerError<usize>> {
+        if self.broken_.get() {
+            return Result::Err(ProducerError::Closing);
+        }
+        self.half_.close()
+    }
+}
+
+impl<H> TrBuffFlush<u8> for FailableTx_<H>
+where
+    H: TrBuffFlush<u8, Err = ProducerError<usize>>,
+{
+    type FlushAsync<'f>
+        = H::FlushAsync<'f>
+    where
+        Self: 'f;
+
+    fn flush_async(&mut self) -> Self::FlushAsync<'_> {
+        self.half_.flush_async()
+    }
+
+    type CloseAsync<'f>
+        = H::CloseAsync<'f>
+    where
+        Self: 'f;
+
+    fn close_async(&mut self) -> Self::CloseAsync<'_> {
+        self.half_.close_async()
     }
 }
 
@@ -275,9 +321,13 @@ pub async fn run_conn_failed_wakes_scenario_<RA, WA, RB, WB, S, RT>(
     rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrBuffTryWrite<u8, Err = ProducerError<usize>> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8>
+        + TrBuffFlush<u8>
+        + TrBuffTryWrite<u8, Err = ProducerError<usize>>
+        + TrProducerState
+        + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {

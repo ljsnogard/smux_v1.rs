@@ -113,8 +113,12 @@ python3 scripts/merge_results.py                   # 写 results/summary.md
 - **tokio**：`LocalSet` 必须在**运行时上下文内**取。
   - 每格用例由 [`Drive::drive`](src/lib.rs) 建一个 current_thread 运行时 + 一个 `LocalSet`，
     连接的三个循环与写侧自驱动泵都投在它上面；
-  - **写侧必须用 `try_new_local`（自驱动）**：按需形态下没人推「环 → 设备」，握手帧会
-    永远留在环里（对端永久等 INVITE）。
+  - **写侧可以用 `try_new_local`（自驱动）**：它把「环 → 设备」的泵投到本线程队列上，
+    由上面的作用域持续驱动。
+    （历史：本 bench 立项时**必须**用它——那时 `smux_v1` 从不替传输收尾，按需形态
+    `try_new` 下握手帧会永远留在环里、对端永久等 INVITE。`2026-10` 起 `smux_v1` 按
+    `abs_buff::TrBuffFlush` 自己收尾：握手每帧后 `flush_async`、连接退出时 `close`，
+    因此 `try_new` 也成立；本 bench 仍保留自驱动形态，因为它少一次显式收尾。）
 - **smol**：本地队列在本线程 `thread_local!` 里，必须由调用方驱动；
   `smol::block_on(scope.run_until(..))` 同时驱动队列与用例。
 - **compio**：`CURRENT_RUNTIME` 是 thread-local，**取运行时值之前必须先有它**；

@@ -1,8 +1,10 @@
 //! 冒烟主场景：`K_DOCK_COUNT` 个 dock × 各 `K_CHANNELS_PER_DOCK` 条子流双向并发收发，
 //! 逐条校验载荷，最后半关闭并等 EOF。
 
-use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
+use buffex::x_deps::abs_buff::{
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
+    buffer::{TrProducerState, TrConsumerState},
+};
 
 use crate::common::{K_CHANNELS_PER_DOCK, K_DOCK_COUNT, TrSmokeRt, TrSmokeScope};
 
@@ -29,9 +31,9 @@ pub async fn run_smoke_scenario_<RA, WA, RB, WB, S, RT>(
     // 连接把 Rx / Tx 移交给 `'static` 的读写循环（`spawn_local` 要求 `'static`；
     // 本地投递不要求 `Send`）。
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {

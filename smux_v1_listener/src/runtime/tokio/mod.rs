@@ -14,13 +14,16 @@
 //! # 写半边为什么用**自驱动**形态
 //!
 //! `buffex_tokio_adapt::BuffWrite` 的「环 → 设备」有两种驱动方式（见该 crate 文档）：
-//! 按需（谁记得谁调 `flush_async`）与自驱动（构造时把泵投到本线程 `LocalSet`）。这里取
-//! **自驱动**：`MuxConnection` 只把适配器当 `TrBuffWrite` 用，从不调 `flush_async`，
-//! 按需形态下最后一段会永远留在环里。
+//! 按需（由调用方在收尾入口顺带推）与自驱动（构造时把泵投到本线程 `LocalSet`）。这里取
+//! **自驱动**，理由是"少一次显式收尾、少一处可能忘记的调用"：
 //!
-//! 代价是构造 `BuffWrite` 的调用点必须落在
-//! [`TrLocalScope::run_until`](smux_v1::x_deps::abs_art::TrLocalScope::run_until) 之类的
-//! 本地驱动栈内。`SmuxListener` 满足这一点：建环就发生在接受槽位里。
+//! * 自驱动形态下「提交进环」就等于「迟早送达设备」，**不需要**任何人记得收尾；
+//! * 按需形态**也能**工作——`smux_v1` 自 `2026-10` 起按 `abs_buff::TrBuffFlush` 收尾
+//!   （握手每帧后 `flush_async`、连接退出时 `close`）；取自驱动的代价是构造点必须落在
+//!   [`TrLocalScope::run_until`](smux_v1::x_deps::abs_art::TrLocalScope::run_until) 之类的
+//!   本地驱动栈内（`SmuxListener` 满足这一点：建环就发生在接受槽位里）。
+//!
+//! 结论：这里的形态是**性能/简洁选择**，不再是正确性前提。
 
 mod shared_;
 mod tcp_;

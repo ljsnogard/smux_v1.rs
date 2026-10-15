@@ -70,6 +70,10 @@ pub type BufferedRx = RingReader<ErasedRing_, MuxChanBuff_, u8>;
 /// 一条子流收发环的两个半部：`(写端, 读端)`，共享同一条 [`Ring`]。
 pub type BufferedChannel = (BufferedTx, BufferedRx);
 
+// 说明：全被动环（[`BufferedTx`]）的 `TrBuffTryFlush` / `TrBuffFlush` 由**上游**
+// `buffex` 为 `RingWriter` 实现（对纯内存环：`try_flush` 恒等成功、`close` 转发
+// `RingWriter::close`，从而唤醒 park 在环读端上的排空方）。trait 定义在 `abs_buff`，
+// 本 crate 无法为外部类型实现外部 trait（孤儿规则），因此这里不再重复实现。
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 环的存储：一块缓冲区视图 + 释放其拥有者 P 的擦除 vtable

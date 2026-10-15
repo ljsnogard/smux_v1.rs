@@ -22,11 +22,10 @@ use abs_smux::{
     telegraph::{TrDatagramRecver, TrDatagramSender, TrRecvDatagram, TrTelegraph},
 };
 use abs_buff::{
-    Demand, TrBuffRead, TrBuffWrite,
+    Demand, TrBuffFlush, TrBuffRead, TrBuffWrite,
     buffer::{TrBuffSegmRef, TrBuffSegmView},
 };
-use buffex::x_deps::abs_buff;
-use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
+use buffex::x_deps::abs_buff::{self, buffer::{TrConsumerState, TrProducerState}};
 use smux_v1::connection::{Dock, MuxConnection, RecvDatagram, TrConnCfg, Sender};
 
 use crate::common::{
@@ -113,9 +112,9 @@ pub async fn run_telegraph_scenario_<RA, WA, RB, WB, S, RT>(
     rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt + ScopeHost,
 {

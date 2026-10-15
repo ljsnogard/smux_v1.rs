@@ -18,7 +18,7 @@ use core::marker::PhantomData;
 
 use abs_art::TrTime;
 use abs_buff::{
-    TrBuffRead, TrBuffWrite,
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
     buffer::{TrConsumerState, TrProducerState},
 };
 use abs_mm::CoreAlloc;
@@ -73,7 +73,7 @@ impl<W, R> BenchCfg<W, R> {
 
 impl<W, R> TrMuxConfig for BenchCfg<W, R>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
@@ -82,7 +82,7 @@ where
 
 impl<W, R> TrConnCfg for BenchCfg<W, R>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     Rt: TrTime + Clone + 'static,
 {

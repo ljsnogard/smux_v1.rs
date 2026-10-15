@@ -65,8 +65,10 @@ use abs_smux::{
     conf::TrMuxConfig,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
-use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
+use buffex::x_deps::abs_buff::{
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
+    buffer::{TrProducerState, TrConsumerState},
+};
 use futures::join;
 use mm_ptr::Owned;
 use smux_v1::{
@@ -219,7 +221,7 @@ static COUNT_POLICY: DefaultPolicy = DefaultPolicy;
 
 impl<W, R, RT> common::TestConnCfg for CountMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: common::TrSmokeRt,
 {
@@ -230,7 +232,7 @@ where
 
 impl<W, R, RT> TrMuxConfig for CountMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
@@ -239,7 +241,7 @@ where
 
 impl<W, R, RT> TrConnCfg for CountMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: common::TrSmokeRt,
 {

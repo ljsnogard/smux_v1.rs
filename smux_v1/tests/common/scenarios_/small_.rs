@@ -1,8 +1,10 @@
 //! 小规模场景：2 个 dock × 各 2 条子流。需要真实 socket 但不需规模的验收走它，
 //! 跑得快、便于定位。
 
-use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
+use buffex::x_deps::abs_buff::{
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
+    buffer::{TrProducerState, TrConsumerState},
+};
 
 use crate::common::{
     K_SMALL_CHANNELS_PER_DOCK, K_SMALL_DOCK_COUNT, TrSmokeRt, TrSmokeScope,
@@ -33,9 +35,9 @@ pub async fn run_small_mux_scenario_<RA, WA, RB, WB, S, RT>(
     rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {

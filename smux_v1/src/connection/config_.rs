@@ -26,7 +26,7 @@ use core::{
 
 use abs_art_facade::{self, DefaultRt_, TrRtCurrent};
 use abs_buff::{
-    TrBuffRead, TrBuffWrite,
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
     buffer::{TrConsumerState, TrProducerState},
 };
 use abs_smux::conf::TrMuxConfig;
@@ -130,9 +130,27 @@ where
     /// 与 `buffex_*_adapt` 的 `BuffRead` / `BuffWrite` 都实现了它们，因此「全被动环」
     /// 与「设备 + 环适配器」两种传输都能直接接上。
     ///
+    /// # 为什么写半边还必须 `TrBuffFlush`
+    ///
+    /// 复用循环只把传输当"环"用：把成帧的字节提交进去就继续干别的，**从不**替传输推
+    /// "环 → 设备"那一跳。对"设备 + 环适配器"这类传输，那一跳必须有主：
+    ///
+    /// * 自驱动形态（`try_new_local`）由适配器内部的后台泵承担，提交即迟早送达；
+    /// * 按需形态（`try_new`）**没有人**承担——字节会一直留在环里，对端永久等待，
+    ///   而且没有任何错误可报（静默挂起）。
+    ///
+    /// 要求 `TrBuffFlush` 把这件事变成**可检查的契约**：写半边必须能回答"已提交字节
+    /// 是否都交出去了"（[`TrBuffTryFlush::try_flush`]），并在连接收尾时接受"封口"
+    /// （[`TrBuffTryFlush::close`]，唤醒下游排空方/泵）。于是 `smux_v1` 不必再在文档里
+    /// 要求使用者"必须选自驱动形态"，也不必假设调用方会替传输推泵。
+    ///
+    /// 全被动环（[`BufferedTx`]）由本 crate 自己实现该 trait：`try_flush` 恒等成功，
+    /// `close` 转发 [`RingWriter::close`]，正是旧版缺失的那次唤醒。
+    ///
     /// [`BufferedTx`]: crate::connection::BufferedTx
     /// [`BufferedRx`]: crate::connection::BufferedRx
-    type ConnTx: TrBuffWrite<u8> + TrProducerState;
+    /// [`RingWriter::close`]: buffex::ring::RingWriter::close
+    type ConnTx: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState;
     type ConnRx: TrBuffRead<u8> + TrConsumerState;
 
     /// 取一个**运行时值**（克隆句柄；各处共享同一个时间轴与计时器）。
@@ -362,7 +380,7 @@ where
 
 impl<W, R, M, P, Rt> TrConnCfg for DefaultConnCfg<W, R, M, P, Rt>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     M: TrMetricsSink + Clone,
     P: TrFlowCtrlPolicy + 'static,
@@ -520,7 +538,7 @@ where
 
 impl<W, R, M, P, Rt> TrConnCfg for CurrentConnCfg<W, R, M, P, Rt>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     M: TrMetricsSink + Clone,
     P: TrFlowCtrlPolicy + 'static,

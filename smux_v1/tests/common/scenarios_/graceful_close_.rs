@@ -12,8 +12,10 @@
 //! 场景与传输、运行时都无关：两个端点用两条内存环直连（同 `small_`），只是这里
 //! 由**连接级**的 `close_async` 而不是「丢弃最后一个句柄」来收尾。
 
-use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffTryWrite, TrBuffWrite};
-use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
+use buffex::x_deps::abs_buff::{
+    TrBuffFlush, TrBuffRead, TrBuffTryWrite, TrBuffWrite,
+    buffer::{TrProducerState, TrConsumerState},
+};
 use abs_art::TrDelay;
 use abs_smux::{
     chan::TrChannelHalf,
@@ -86,9 +88,9 @@ pub async fn run_graceful_close_scenario_<RA, WA, RB, WB, S, RT>(
 ) -> bool
 where
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -230,9 +232,9 @@ pub async fn run_graceful_close_timeout_scenario_<RA, WA, RB, WB, S, RT>(
 ) -> bool
 where
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {
@@ -378,9 +380,9 @@ pub async fn run_drop_flush_scenario_<RA, WA, RB, WB, S, RT>(
     rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrBuffTryWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrBuffTryWrite<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     RT: TrSmokeRt,
 {

@@ -119,12 +119,13 @@ use core::{
     future::poll_fn,
     mem::MaybeUninit,
     ops::Bound,
+    ptr::NonNull,
     task::{Context, Poll},
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use abs_buff::{
-    Demand, TrBuffRead, TrBuffTryWrite, TrBuffWrite,
+    Demand, TrBuffRead, TrBuffTryFlush, TrBuffTryWrite, TrBuffWrite,
     buffer::{TrBuffSegmMut, TrConsumerState, TrProducerState},
     error::{ReadErrTag, TrTaggedError, WriteErrTag},
 };
@@ -1941,10 +1942,62 @@ where
     }
 }
 
+/// 传输写半边的**收尾守卫**：本循环退出时封口（[`TrBuffTryFlush::close`]）。
+///
+/// # 为什么用守卫、而不是在循环末尾手写一次
+///
+/// 复用循环有多条退出路径（取消、事件轮询被取消、处理事件/发数据/finalize 出错……），
+/// 它们分散在几十行里，靠"记得每处都补一次 close"极不可靠。守卫把这件事绑到**作用域
+/// 退出**这一个事件上：无论走哪条路径，都会封口一次。
+///
+/// # 为什么用同步的 `close` 而不是 await `flush_async` + `close_async`
+///
+/// [`TrBuffTryFlush::close`] 的契约是"**不再有新数据**并唤醒下游排空方"；而"把已提交
+/// 的字节真正交给设备"由**下游**自己完成（全被动环由调用方的排空泵、自驱动适配器由
+/// 后台泵、按需适配器由下一次 `flush_async`）。因此退出时**不需要**在本循环里 await：
+///
+/// * 本循环已经把所有帧提交进传输；
+/// * 封口之后，"排空 + 设备 `shutdown` + 等泵退出"是下游的事，由调用方或适配器承担。
+///
+/// 这也让守卫能安全地只依赖同步入口——`Drop` 里不能 await。
+///
+/// # 为什么不直接持有 `&'a mut W`
+///
+/// 循环体在几十处把 `&mut tx_stage` 交给辅助函数；守卫若长期借用它，那些调用点全部
+/// 变成"二次可变借用"。守卫因此只存一个指向该栈上局部量的指针——它**只为 `Drop` 而
+/// 存在**：构造后不再被读、写或移动，声明点在 `tx_stage` 之后，因此 `tx_stage` 一定活
+/// 得比守卫久。
+struct TxSealGuard_<W>
+where
+    W: TrBuffTryFlush<u8>,
+{
+    /// 指向被守卫的传输写半边（借用关系见类型文档末节的说明）。
+    tx_: NonNull<W>,
+}
+
+impl<W> Drop for TxSealGuard_<W>
+where
+    W: TrBuffTryFlush<u8>,
+{
+    fn drop(&mut self) {
+        // SAFETY: 构造点只由 `NonNull::from(&mut tx_stage)` 得到，其声明点在该局部量
+        // 之后，且本守卫是栈上值：它一定在 `tx_stage` 之前析构。守卫只存指针、不派生
+        // 任何别名；`Drop` 期间循环体对 `tx_stage` 的借用都已结束，因此这里 `as_mut`
+        // 不会与任何活跃借用重叠。
+        let tx = unsafe { self.tx_.as_mut() };
+        // 先尽量把已提交的数据推出去（对全被动环与按需适配器都可能立刻有进展），
+        // 再封口。两者的失败都不改变"必须封口"这件事，因此忽略返回值——
+        // 真正的设备错误会经由传输自己的错误槽（`take_error`）交给调用方。
+        let _ = tx.try_flush();
+        let _ = tx.close();
+    }
+}
+
 /// 复用循环：按对端发送窗口调度各子流的发送环，把成帧写进**传输的写半边**。
 ///
 /// 本循环是这条写半边**唯一**的写入者，因此成帧的「头 + 载荷」两段之间不会被别的帧
 /// 插进来；字节到网络的最后一跳由调用方那一侧负责（入向 / 出向泵或适配器的自驱动泵）。
+/// 循环退出时经 [`TxSealGuard_`] 封口，从而唤醒那一侧的排空者。
 pub(crate) async fn mux_loop_async_<C, K>(
     tx_stage: C::ConnTx,
     shared: MuxShared_<C>,
@@ -1958,14 +2011,29 @@ pub(crate) async fn mux_loop_async_<C, K>(
 {
     // 本循环直接持有**传输的写半边**（不再有连接级写环、也没有外侧写泵）。
     //
-    // 退出时它随作用域 drop。**已知缺口**：`abs_buff` 的 `TrBuffWrite` 没有「封口」
-    // 操作（`buffex::ring` 的 `RingWriter::close` 是具体类型上的固有方法，没有 trait），
-    // 因此对「调用方驱动的全被动环」这一类传输，本循环退出后**不会**唤醒 park 在环
-    // 读端上的排空方——它要么靠 drop 传输时的适配器语义（`buffex_*_adapt` 的
-    // `BuffWrite` 在 drop 里关生产端并 detach 泵），要么靠调用方自己的超时 / 取消。
-    // 旧版这里有一个 `StageSealGuard_`，它封的是**连接自己的**写环，那一步随写环一起
-    // 消失了。要在泛型层面补上，需要上游给 `TrBuffWrite` 补一个「封口」方法。
+    // # 退出时怎么收尾：封口交给守卫，不依赖 drop
+    //
+    // 旧版这里只能"随作用域 drop"，于是对**调用方驱动的全被动环**（`buffex::ring` 的
+    // `RingWriter`）不会唤醒 park 在环读端上的排空方——那一半的关闭权只属于持有者，
+    // 而 `TrBuffWrite` 里没有"封口"这一步。
+    //
+    // 现在写半边必须实现 `TrBuffFlush`（见 `TrConnCfg::ConnTx`），本循环据此在退出时
+    // **显式封口**：
+    //
+    // * 全被动环：置 `PRODUCER_CLOSED` 并唤醒调用方的排空泵（它负责把尾巴交给设备）；
+    // * 按需适配器（`try_new`）：同样置位，唤醒/放行下游；
+    // * 自驱动适配器（`try_new_local` / compio）：置位后其后台泵把剩余数据送完并
+    //   `shutdown` 设备。
+    //
+    // 守卫在作用域**最后**析构，因此"封口"晚于本循环自己那些表 / 事件队列的关闭，
+    // 不会与它们的唤醒语义打架。
     let mut tx_stage = tx_stage;
+
+    // 传输写半边的收尾守卫（见 `TxSealGuard_` 的类型文档）。
+    #[allow(dead_code, reason = "只为其 Drop 而存在；构造后不再被读写")]
+    let _tx_seal: TxSealGuard_<C::ConnTx> = TxSealGuard_ {
+        tx_: NonNull::from(&mut tx_stage),
+    };
 
     // 表与事件队列都包进收尾守卫：**退出时显式关闭本循环持有的那些半部**。
     // 为什么必须这样做、以及为什么分成两个守卫，见 `MuxLocalGuard_` 的类型文档。

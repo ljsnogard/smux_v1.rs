@@ -13,8 +13,9 @@
 //!
 //! # 写半边为什么用**自驱动**形态
 //!
-//! 理由与 tokio 侧逐字相同：`MuxConnection` 只把适配器当 `TrBuffWrite` 用，从不调
-//! `flush_async`，按需形态下最后一段会永远留在环里。`try_new_local` 把泵投到本线程的
+//! 理由与 tokio 侧逐字相同：取自驱动是为了"少一次显式收尾"，而**不再**是正确性前提
+//! ——`smux_v1` 自 `2026-10` 起按 `abs_buff::TrBuffFlush` 在握手每帧后与连接退出时
+//! 自己收尾，按需形态同样成立。`try_new_local` 把泵投到本线程的
 //! [`TrLocalScope`](smux_v1::x_deps::abs_art::TrLocalScope)，因此构造点必须落在
 //! `scope.run_until(..)` 之类的本地驱动栈内。
 //!

@@ -69,7 +69,7 @@ use abs_smux::{
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use buffex::x_deps::{
-    abs_buff::{Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite},
+    abs_buff::{Demand, TrBuffFlush, TrBuffRead, TrBuffTryFlush, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite},
     abs_cancel,
     anylr::SomeOf,
 };
@@ -614,6 +614,45 @@ where
     }
 }
 
+/// 析构探针的**收尾契约**转发：把 `try_flush` / `close` 原样交给内层写半边。
+///
+/// Forward the flush contract to the wrapped write half.
+impl<H> TrBuffTryFlush<u8> for DropProbeTx_<H>
+where
+    H: TrBuffTryFlush<u8>,
+{
+    fn try_flush(&mut self) -> Result<(), Self::Err> {
+        self.half_.try_flush()
+    }
+
+    fn close(&mut self) -> Result<(), Self::Err> {
+        self.half_.close()
+    }
+}
+
+impl<H> TrBuffFlush<u8> for DropProbeTx_<H>
+where
+    H: TrBuffFlush<u8>,
+{
+    type FlushAsync<'f>
+        = H::FlushAsync<'f>
+    where
+        Self: 'f;
+
+    fn flush_async(&mut self) -> Self::FlushAsync<'_> {
+        self.half_.flush_async()
+    }
+
+    type CloseAsync<'f>
+        = H::CloseAsync<'f>
+    where
+        Self: 'f;
+
+    fn close_async(&mut self) -> Self::CloseAsync<'_> {
+        self.half_.close_async()
+    }
+}
+
 /// 析构探针的**状态查询**转发（与 [`DropProbeRx_`] 对称）。
 impl<H> TrProducerState for DropProbeTx_<H>
 where
@@ -884,9 +923,9 @@ async fn drive_min_transport_<RA, WA, RB, WB, S, RT>(
     rx_b: RB,
 ) where
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: common::TrSmokeScope + Clone + 'static,
     RT: common::TrSmokeRt,
 {

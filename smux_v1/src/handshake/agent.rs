@@ -34,7 +34,7 @@
 use core::marker::PhantomData;
 
 use abs_async_iter::TrAsyncIterator;
-use abs_buff::{TrBuffRead, TrBuffWrite};
+use abs_buff::{TrBuffFlush, TrBuffRead, TrBuffWrite};
 use abs_cancel::{TrCancellationToken, TrMayCancel};
 use gen_mcf2::gen_may_cancel_future;
 
@@ -47,7 +47,7 @@ use crate::{
             complete_invite_, complete_values_, confirm_matches_,
             values_to_basic_, write_frame_,
         },
-        error::{HandshakeError, from_read_frame_err_, from_write_frame_err_},
+        error::{HandshakeError, from_read_frame_err_, from_write_frame_err_, map_write_err_},
         opts::{
             K_BASIC_KEY_COUNT,
             BasicOpts, HandshakeOpts, NegotiationEntry, NegotiationKey,
@@ -182,7 +182,7 @@ pub struct HandshakeAgent<Tx, Rx> {
 
 impl<Tx, Rx> HandshakeAgent<Tx, Rx>
 where
-    Tx: TrBuffWrite<u8>,
+    Tx: TrBuffWrite<u8> + TrBuffFlush<u8>,
     Rx: TrBuffRead<u8>,
 {
     /// 用收发通道构造。
@@ -273,6 +273,36 @@ where
         .await
 }
 
+/// 把**刚才写出的握手帧**真的推出去（推完才继续下一步）。
+///
+/// # 为什么握手必须自己 flush
+///
+/// 写半边只需要 "能借段"，但"提交进环"不等于"字节已经上网"：
+///
+/// * 自驱动适配器（`try_new_local` / compio）背后有后台泵，本调用只是等它追上；
+/// * **按需适配器（`try_new`）背后没有人**——`write_async` 只在等空间的过程中顺带推
+///   上一轮的数据，因此**最后一段永远留在环里**。握手是"写完就等对端回执"的形态，
+///   一旦不 flush，`INVITE` 会永久停在环里，双方各自 park 在自己的读上（静默挂起）。
+///
+/// 本函数把这件事收进协议层：调用方因此可以自由选择 `try_new` 或 `try_new_local`，
+/// 不必为了"让握手帧出去"而被迫装配自驱动泵。
+///
+/// Flush out the handshake frame just written before awaiting the peer's reply;
+/// without this the last segment stays in the ring for caller-driven adapters.
+async fn flush_frame_async_<W, RE, K>(
+    tx: &mut W,
+    cancel: K,
+) -> Result<(), HandshakeError<RE, W::Err>>
+where
+    W: TrBuffFlush<u8>,
+    K: TrCancellationToken,
+{
+    tx.flush_async()
+        .may_cancel_with(cancel.child_token())
+        .await
+        .map_err(map_write_err_)
+}
+
 /// 编码并写出一个握手帧（默认 CRC-16/XMODEM）。
 ///
 /// 写侧逐字段推进、边写边算校验，**不预成形整帧**。
@@ -303,7 +333,7 @@ async fn handshake_invite_async_<'f, W, R, I, D, K>(
 ) -> Result<HandshakeDelivery<W, R>, HandshakeError<R::Err, W::Err>>
 where
     R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + 'f,
     I: IntoIterator<Item = NegotiationEntry<'f>> + 'f,
     D: for<'x> TrNegotiator<Entry<'x> = NegotiationEntry<'x>> + 'f,
     K: TrCancellationToken,
@@ -334,6 +364,7 @@ where
         &proposed,
         cancel.child_token(),
     ).await?;
+    flush_frame_async_::<W, R::Err, _>(&mut tx, cancel.child_token()).await?;
 
     // 2. 等待 ACCEPT：先判 magic，再**边收边判**条目。
     let mut reader = FrameReader::
@@ -378,6 +409,7 @@ where
 
     // 4. 回显同一组数值作为 CONFIRM；下面还要读 CONFRM，故只交出子令牌。
     write_frame_async_(&mut tx, K_CONFRM_MAGIC, &accepted_values, cancel.child_token()).await?;
+    flush_frame_async_::<W, R::Err, _>(&mut tx, cancel.child_token()).await?;
 
     // 5. 等待等待方的空 CONFRM。
     let mut done = FrameReader::begin_async_(&mut rx, cancel.child_token())
@@ -409,7 +441,7 @@ async fn listen_handshake_async_<'f, W, R, D, K>(
 ) -> Result<HandshakeDelivery<W, R>, HandshakeError<R::Err, W::Err>>
 where
     R: TrBuffRead<u8> + 'f,
-    W: TrBuffWrite<u8> + 'f,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + 'f,
     D: for<'x> TrNegotiator<Entry<'x> = NegotiationEntry<'x>> + 'f,
     K: TrCancellationToken,
 {
@@ -454,6 +486,7 @@ where
 
     // 3. 发送 ACCEPT；后面还要继续读 CONFIRM，故只交出子令牌。
     write_frame_async_(&mut tx, K_ACCEPT_MAGIC, &values, cancel.child_token()).await?;
+    flush_frame_async_::<W, R::Err, _>(&mut tx, cancel.child_token()).await?;
 
     // 4. 等待并校验 CONFIRM（协议层逐值比较，不再走协商器）。
     let mut confirm = FrameReader::begin_async_(&mut rx, cancel.child_token())
@@ -470,7 +503,8 @@ where
     }
 
     // 5. 发送空 CONFRM。
-    write_frame_async_(&mut tx, K_CONFRM_MAGIC, &empty, cancel).await?;
+    write_frame_async_(&mut tx, K_CONFRM_MAGIC, &empty, cancel.child_token()).await?;
+    flush_frame_async_::<W, R::Err, _>(&mut tx, cancel).await?;
     Result::Ok(HandshakeDelivery {
         opts: HandshakeOpts { basic_opts: result },
         tx,
@@ -543,8 +577,8 @@ mod tests_ {
     async fn make_pair_(
         buff_size: usize,
     ) -> (
-        HandshakeAgent<impl TrBuffWrite<u8>, impl TrBuffRead<u8>>,
-        HandshakeAgent<impl TrBuffWrite<u8>, impl TrBuffRead<u8>>,
+        HandshakeAgent<impl TrBuffFlush<u8>, impl TrBuffRead<u8>>,
+        HandshakeAgent<impl TrBuffFlush<u8>, impl TrBuffRead<u8>>,
     ) {
         let (a_tx, b_rx) = make_test_channel_(buff_size);
         let (b_tx, a_rx) = make_test_channel_(buff_size);

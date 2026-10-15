@@ -38,8 +38,10 @@ use abs_smux::{
     conf::TrMuxConfig,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
-use buffex::x_deps::abs_buff::{TrBuffRead, TrBuffWrite};
-use buffex::x_deps::abs_buff::buffer::{TrProducerState, TrConsumerState};
+use buffex::x_deps::abs_buff::{
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
+    buffer::{TrProducerState, TrConsumerState},
+};
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{Dock, TrConnCfg},
@@ -114,7 +116,7 @@ impl<W, R, RT> MetricsCfg<W, R, RT> {
 
 impl<W, R, RT> TrMuxConfig for MetricsCfg<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
@@ -123,7 +125,7 @@ where
 
 impl<W, R, RT> TrConnCfg for MetricsCfg<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {
@@ -162,7 +164,7 @@ where
 
 impl<W, R, RT> TestConnCfg for MetricsCfg<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {

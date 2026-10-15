@@ -9,7 +9,7 @@
 
 use core::marker::PhantomData;
 use buffex::x_deps::abs_buff::{
-    TrBuffRead, TrBuffWrite,
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
     buffer::{TrConsumerState, TrProducerState},
 };
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
@@ -147,7 +147,7 @@ static SMOKE_POLICY: DefaultPolicy = DefaultPolicy;
 
 impl<W, R, RT> TrMuxConfig for SmokeMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
@@ -156,7 +156,7 @@ where
 
 impl<W, R, RT> TrConnCfg for SmokeMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {
@@ -238,7 +238,7 @@ impl<W, R, RT> FlowCtrlConfig<W, R, RT> {
 
 impl<W, R, RT> TrMuxConfig for FlowCtrlConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
 {
     type Data = u8;
@@ -247,7 +247,7 @@ where
 
 impl<W, R, RT> TrConnCfg for FlowCtrlConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {

@@ -1,7 +1,7 @@
 //! 握手建连：A 端发起、B 端等待，并由交付物建出两个 `MuxConnection`。
 
 use buffex::x_deps::abs_buff::{
-    TrBuffRead, TrBuffWrite,
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
     buffer::{TrConsumerState, TrProducerState},
 };
 use mm_ptr::x_deps::abs_mm::CoreAlloc;
@@ -27,7 +27,7 @@ pub trait TestConnCfg: TrConnCfg {
 
 impl<W, R, RT> TestConnCfg for crate::common::SmokeMuxConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {
@@ -38,7 +38,7 @@ where
 
 impl<W, R, RT> TestConnCfg for crate::common::FlowCtrlConfig<W, R, RT>
 where
-    W: TrBuffWrite<u8> + TrProducerState + 'static,
+    W: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     R: TrBuffRead<u8> + TrConsumerState + 'static,
     RT: TrSmokeRt,
 {
@@ -82,9 +82,9 @@ where
     // 内侧两个循环直接驱动它们，要靠这两个查询非阻塞地问出「有多少可读 / 可写、
     // 对端是否已经封口」。
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     // 两端的连接配置各自泛化：默认用例两侧都是 [`SmokeMuxConfig`]，流控用例换成
     // [`crate::common::FlowCtrlConfig`]——其余策略完全一致，避免把「容量」以外的差异
@@ -132,9 +132,9 @@ pub async fn connect_pair_with_opts_<CA, CB, RA, WA, RB, WB, S>(
 ) -> (MuxConnection<CA>, MuxConnection<CB>)
 where
     RA: TrBuffRead<u8> + TrConsumerState + 'static,
-    WA: TrBuffWrite<u8> + TrProducerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
-    WB: TrBuffWrite<u8> + TrProducerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
     CA: TrConnCfg<ConnRx = RA, ConnTx = WA, Alloc = CoreAlloc> + TestConnCfg + Clone + 'static,
     CB: TrConnCfg<ConnRx = RB, ConnTx = WB, Alloc = CoreAlloc> + TestConnCfg + Clone + 'static,
