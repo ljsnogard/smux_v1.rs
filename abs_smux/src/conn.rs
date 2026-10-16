@@ -2,7 +2,7 @@ use abs_buff::TrBuffRead;
 use abs_cancel::TrMayCancel;
 
 use crate::{
-    chan::{TrChannelHandle, TrChannelRx, TrChannelTx},
+    chan::TrChannelHandle,
     conf::TrMuxConfig,
     x_deps::abs_cancel,
 };
@@ -90,9 +90,6 @@ where
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
     // Channel definition and open_channel_async
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-    type Tx: TrChannelTx<C>;
-    type Rx: TrChannelRx<C>;
 
     type OpenChannelAsync<'f, R>: TrMayCancel<'f, MayCancelOutput =
         Result<Self::ChannelHandle, Self::Err>>

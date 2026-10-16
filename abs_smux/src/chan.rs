@@ -4,7 +4,10 @@ use core::{
     mem::MaybeUninit,
 };
 
-use abs_buff::{TrBuffRead, TrBuffWrite};
+use abs_buff::{
+    TrBuffFlush, TrBuffRead, TrBuffWrite,
+    buffer::{TrConsumerState, TrProducerState},
+};
 use abs_cancel::TrMayCancel;
 use abs_mm::res_man::TrUnique;
 
@@ -86,14 +89,21 @@ where
 pub trait TrChannelTx<C>
 where
     C: TrMuxConfig,
-    Self: TrBuffWrite<C::Data> + TrChannelHalf<C>,
+    Self: TrBuffFlush<C::Data> + TrProducerState + TrChannelHalf<C>,
 {}
 
 pub trait TrChannelRx<C>
 where
     C: TrMuxConfig,
-    Self: TrBuffRead<C::Data> + TrChannelHalf<C>,
-{}
+    Self: TrBuffRead<C::Data> + TrConsumerState + TrChannelHalf<C>,
+{
+    type CloseAsync<'f>: TrMayCancel<'f, MayCancelOutput =
+        Result<(), Self::Err>>
+    where
+        Self: 'f;
+
+    fn close_async(&mut self) -> Self::CloseAsync<'_>;
+}
 
 /// **一条双向 ring 通道**的两块内存（各自用一个智能指针 `B` 持有）。
 ///

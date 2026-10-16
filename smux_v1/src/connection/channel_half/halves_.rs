@@ -32,7 +32,10 @@
 //! 的类型，见 `dev-notes` §16.2 F5）。
 
 use abs_buff::{
-    Demand, TrBuffRead, TrBuffTryRead, TrBuffTryWrite, TrBuffWrite,
+    Demand,
+    TrBuffFlush, TrBuffTryFlush,
+    TrBuffRead, TrBuffTryRead,
+    TrBuffWrite, TrBuffTryWrite,
     buffer::{TrConsumerState, TrProducerState},
 };
 use abs_smux::chan::{TrChannelHalf, TrChannelRx, TrChannelTx};
@@ -289,8 +292,7 @@ impl<C> TrBuffTryWrite<u8> for ChannelTx<C>
 where
     C: TrConnCfg,
 {
-    type SegmMut<'f>
-        = <BufferedTx as TrBuffTryWrite<u8>>::SegmMut<'f>
+    type SegmMut<'f> = <BufferedTx as TrBuffTryWrite<u8>>::SegmMut<'f>
     where
         Self: 'f;
 
@@ -344,11 +346,6 @@ where
     }
 }
 
-impl<C> TrChannelTx<C> for ChannelTx<C>
-where
-    C: TrConnCfg,
-{}
-
 impl<C> TrProducerState for ChannelTx<C>
 where
     C: TrConnCfg,
@@ -358,6 +355,41 @@ where
         self.ring_.producer_state()
     }
 }
+
+impl<C> TrBuffTryFlush<u8> for ChannelTx<C>
+where
+    C: TrConnCfg,
+{
+    #[inline]
+    fn try_flush(&mut self) -> Result<(), Self::Err> {
+        self.ring_.try_flush()
+    }
+
+    #[inline]
+    fn close(&mut self) -> Result<(), Self::Err> {
+        self.ring_.close()
+    }
+}
+
+impl<C> TrBuffFlush<u8> for ChannelTx<C>
+where
+    C: TrConnCfg,
+{
+    #[inline]
+    fn flush_async(&mut self) -> Self::FlushAsync<'_> {
+        self.ring_.flush_async()
+    }
+
+    #[inline]
+    fn close_async(&mut self) -> Self::CloseAsync<'_> {
+        self.ring_.close_async()
+    }
+}
+
+impl<C> TrChannelTx<C> for ChannelTx<C>
+where
+    C: TrConnCfg,
+{}
 
 /// 子流接收半边（应用侧**消费端**）。
 ///
@@ -587,17 +619,21 @@ where
     }
 }
 
-impl<C> TrChannelRx<C> for ChannelRx<C>
-where
-    C: TrConnCfg,
-{}
-
 impl<C> TrConsumerState for ChannelRx<C>
 where
     C: TrConnCfg,
 {
     fn consumer_state(&self) -> Option<(usize, bool)> {
         self.ring_.consumer_state()
+    }
+}
+
+impl<C> TrChannelRx for ChannelRx<C>
+where
+    C: TrConnCfg,
+{
+    fn close_async(&mut self) -> Self::CloseAsync<'_> {
+        todo!()
     }
 }
 

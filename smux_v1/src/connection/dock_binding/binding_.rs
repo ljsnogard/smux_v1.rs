@@ -9,7 +9,6 @@ use gen_mcf2::gen_may_cancel_future;
 use crate::{
     connection::{
         ChannelHandle, Dock, MuxError, MuxConnection, ReserveErr_, TrConnCfg,
-        channel_half::{ChannelRx, ChannelTx},
         channel_listener::ChannelListener,
         signal_::SessionEvent_,
         util_::read_available_into_vec_,
@@ -171,9 +170,6 @@ where
     type Listener = ChannelListener<C>;
 
     type ListenAsync<'f> = MuxListenAsync<'f, 'f, C> where Self: 'f;
-
-    type Tx = ChannelTx<C>;
-    type Rx = ChannelRx<C>;
 
     type OpenChannelAsync<'f, M> = MuxOpenChannelAsync<'f, 'f, C, M>
     where
