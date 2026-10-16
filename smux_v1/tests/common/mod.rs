@@ -93,6 +93,7 @@ pub use scenarios_::{
     K_CROSS_THREAD_DOCK,
     run_auto_dock_scenario_,
     run_bind_exclusivity_scenario_,
+    run_channel_close_scenario_,
     run_closed_ring_spin_scenario_,
     run_conn_failed_wakes_scenario_,
     run_flow_ctrl_isolation_scenario_,

@@ -1734,6 +1734,11 @@ where
                             ctx.rec_.publish_notice_(ChannelNotice::ConnFailed(kind));
                         }
                         ctx.rec_.notify_establish_();
+                        // 2. 再叫醒**收尾等待者**（`TrBuffFlush` / `close_async`）：
+                        //    连接已经不可用，它们等的那件事（排空 / `FIN`/`RESET` 上线）
+                        //    永远不会发生，必须醒来按连接级失败返回。顺序同上——先让
+                        //    原因可见，再唤醒。
+                        ctx.rec_.notify_both_progress_();
                     }
                     _ => {}
                 }

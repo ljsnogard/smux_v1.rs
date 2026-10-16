@@ -1,8 +1,8 @@
-//! 子流的两个应用侧半部：[`ChannelTx`] / [`ChannelRx`]，以及它们的内部包装
-//! [`TxRing_`] / [`RxRing_`]。
+//! 子流的两个应用侧半部：[`ChannelTx`] / [`ChannelRx`]。
 //!
 //! 对应 `abs_smux` 的 `TrChannelTx` / `TrChannelRx` / `TrChannelHalf`；数据面则
-//! 直接实现 `abs_buff` 的 `TrBuffWrite` / `TrBuffRead`。
+//! 直接实现 `abs_buff` 的 `TrBuffTryWrite` / `TrBuffWrite` / `TrBuffRead`（发送半边
+//! 还实现 `TrBuffFlush`）。
 //!
 //! # 关闭态：直接读环的两个端
 //!
@@ -22,9 +22,24 @@
 //! 代价是这四个方法只在真正的 `buffex` 半部上成立，因此 `TrChannelHalf` 的 impl
 //! 落在具体类型上（而不是泛型 `H`）。
 //!
-//! 因此两个半部**各自就是那个具名类型**（`ChannelTx<C, S, RE, WE>` /
-//! `ChannelRx<C, S, RE, WE>`），可以直接写进下游的结构体字段——旧模型下内层包装
-//! 未导出，下游连「把半部存进具名字段」都做不到（见 `dev-notes` §16.2 F5）。
+//! # 收尾：可等待的显式入口
+//!
+//! 除「丢弃半边 = 半关闭」之外，两个方向都有可等待的显式收尾，完成点见
+//! `crate::connection` 模块文档 §7：
+//!
+//! | 入口 | 完成点 |
+//! | --- | --- |
+//! | [`TrBuffFlush::flush_async`](abs_buff::TrBuffFlush::flush_async) | 发送环已排空 |
+//! | [`TrBuffFlush::close_async`](abs_buff::TrBuffFlush::close_async) | 封口且 `CLOSE(FIN)` 已上线 |
+//! | [`TrChannelRx::close_async`](abs_smux::chan::TrChannelRx::close_async) | 接收方向已关且 `CLOSE(RESET)` 已上线 |
+//!
+//! 等待**不额外分配**：每条子流的共享状态里内联两个通知槽（发送 / 接收各一个），
+//! 由写循环与终局路径在事实发生变化时唤醒（见 `owner_::ChannelState_`）。`drop` 与
+//! 显式 `close` 走**同一套**收尾实现（幂等），因此两者的语义不可能漂移。
+//!
+//! 因此两个半部**各自就是那个具名类型**（`ChannelTx<C>` / `ChannelRx<C>`），可以
+//! 直接写进下游的结构体字段——旧模型下内层包装未导出，下游连「把半部存进具名字段」
+//! 都做不到（见 `dev-notes` §16.2 F5）。
 
 mod halves_;
 

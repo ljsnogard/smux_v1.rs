@@ -77,19 +77,18 @@
 //! 文件的 [`ChanTx`] / [`ChanRx`] 就是**可直接写出的具名别名**，也可以作为结构体
 //! 字段类型。
 //!
-//! ## F6 ⛔ `abs_smux` 的 channel trait 只承诺 **try** 语义
+//! ## F6 ✅ 异步读写与显式收尾都在 `abs_smux` 的契约里
 //!
-//! `TrChannelTx` 的 supertrait 是 `TrBuffTryWrite<Self::Data> + TrChannelHalf`
-//! ——**不含**异步的 `TrBuffWrite`。本 crate 的 `ChannelTx` 确实实现了
-//! `TrBuffWrite`，但那条信息不在 `TrChannelTx` 的契约里。后果：
+//! `TrChannelTx` 的 supertrait 是 `TrBuffFlush<C::Data> + TrProducerState +
+//! TrChannelHalf`，而 `TrBuffFlush: TrBuffWrite: TrBuffTryWrite`——因此**异步写**与
+//! 「冲 / 封口」都在契约里；`TrChannelRx` 是 `TrBuffRead + TrConsumerState +
+//! TrChannelHalf`，并自带 `close_async`（关闭接收方向并等 `CLOSE(RESET)` 上线）。
+//! 用 `impl TrChannelTx<…>` 出层的半部，调用方可以直接 `write_async` / `read_async`
+//! / `flush_async` / `close_async`，不必再补写 `+ TrBuffWrite<u8>`。
 //!
-//! - 用 `impl TrChannelTx<…>` 出层的半部，调用方**无法** `.await` 读写，只能
-//!   `try_read` / `try_write` 自行处理 `Stuffed` / `Drained`；
-//! - 想按异步方式用，就得在签名里自己补 `+ TrBuffWrite<u8>`，也就是让业务层同时
-//!   依赖 `abs_buff`。
-//!
-//! 对 RPC 框架而言这不是缺陷（自建就绪循环本来就要处理背压），但它意味着
-//! **「按 trait 编程」并不能让上层完全不依赖 `abs_buff`**。
+//! 仍**不在**契约里的是收尾接口的**错误类型**：它们来自 `abs_buff`
+//! （`ProducerError` / `ConsumerError`）。业务层若在签名里点名这些类型，仍会依赖
+//! `abs_buff`——这是「错误类型属于缓冲抽象」的直接后果，本轮未变。
 //!
 //! ## F7 ⚠️ 建流帧的「开场消息 / 欢迎信息 / 拒绝理由」当前无处可取
 //!
@@ -98,26 +97,23 @@
 //! 载荷发出。所以 RPC 框架**无法把第一个请求搭在建流帧上**，必须等 channel 建立
 //! 后再走一次数据往返（本文件的 [`client_call_`] 正是如此）。
 //!
-//! ## F8 ⛔ 关闭顺序是个陷阱：先 drop 接收半边会吃掉尚未发出的数据
+//! ## F8 ✅ 关闭顺序不再是陷阱（2026-10 起）
 //!
-//! 两个半部的 drop 顺序**有语义**，而且写反了不会有任何编译错误。丢弃
-//! `ChannelRx` 时，`session_` 的 `RxClosed` 分支会依次做三件事：
+//! 早先的实现在丢弃 `ChannelRx` 时，`session_` 的 `RxClosed` 分支会顺手
+//! `table.remove(&pair)`：写循环丢掉发送环读端，于是**同一子流已提交但尚未发出的
+//! 字节被一起丢掉**；同一步还会提前摘掉读侧表项，把对端在收到我们 `RESET` 之前发出
+//! 的帧判成「未知子流」→ `MalformedFrame` → 整条连接被杀。当时的规避写法是「先丢
+//! 发送半边 → 等对端 `FIN` → 最后丢接收半边」（见 [`close_gracefully_`]）。
 //!
-//! 1. `table.remove(&pair)` —— 写循环丢掉发送环读端，**环里尚未发出的数据一起
-//!    被丢弃**；
-//! 2. 向读循环发 `ReadEvent_::Release` —— 摘掉读表项，于是对端在收到我们 `RESET`
-//!    之前发出的帧变成「未知子流」（该 dock 对在注册表里仍是活跃 `Channel`，
-//!    **不在** `WaitClose` 宽限态）→ `MalformedFrame` → 整条连接被杀；
-//! 3. 回 `CLOSE(RESET)`。
+//! 现在这条路径**绝不**摘写侧表项、也不提前丢读侧表项（理由写在 `session_` 的
+//! `RxClosed` 分支注释里）：丢掉接收半边只影响接收方向，已承诺的发送方向照常排空并
+//! 发 `FIN`，其余在途帧被静默丢弃。丢弃顺序因此不再是正确性条件。
 //!
-//! 丢弃 `ChannelTx` 则相反：`TxClosed` 分支是「先把环内数据 flush 完，再发 `FIN`」。
-//! 因此**正确的收尾顺序是「先丢发送半边 → 等对端 `FIN` → 最后丢接收半边」**
-//! （见 [`close_gracefully_`]）。
-//!
-//! 本文件第一版按函数参数的逆序自然析构（`rx` 先于 `tx`），于是服务端刚写好的响应
-//! 被自己吃掉，客户端只读到 `Closing`——这条摩擦是实测撞出来的，不是读代码猜的。
-//! 对一个 RPC 框架来说它很要命：handler 正常 `return` 就可能踩中，症状是「响应偶尔
-//! 丢失 / 连接偶发断开」，很难归因。**本轮明确不修**（人类裁决），仍按规避写法收尾。
+//! 此外两个方向都有了**可等待的显式收尾**：`TrBuffFlush::close_async` 等到
+//! `CLOSE(FIN)` 上线、`TrChannelRx::close_async` 等到 `CLOSE(RESET)` 上线。收尾意图
+//! 不必再靠「按特定顺序丢弃半边」表达。本文件仍按「先收发送方向、再收接收方向」写，
+//! 那只是因为协议上的半关闭本来就是两个独立事件（端到端验收见
+//! `tests/common/scenarios_/channel_close_.rs`）。
 //!
 //! # 传输层为什么用内存环而不是 socket
 //!

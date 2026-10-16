@@ -429,6 +429,29 @@ async fn mux_drop_flush_dual_() {
 }
 single_runtime_test_!(mux_drop_flush_dual_);
 
+/// 测试目标（**子流级显式收尾**）：`TrBuffFlush::close_async` 的完成点是
+/// `CLOSE(FIN)` 真正上线，`TrChannelRx::close_async` 的完成点是 `CLOSE(RESET)`
+/// 真正上线——两者都**不得**在动作只被投递时就返回。
+///
+/// - 手段：两条内存环直连两个端点并完成握手，交给
+///   [`common::run_channel_close_scenario_`]：A 在子流 1 上写入 512 字节后调
+///   `close_async`（**首次推进必须挂起**，此刻对端还没读走任何字节）；B 读全载荷
+///   并等 EOF。随后 B 在子流 2 上关闭接收半边（同样要求首次推进挂起），A 继续写入
+///   并封口。场景由 `scope.run_until` 驱动。
+/// - 判断：两个 `close_async` 的首次推进都挂起（把「投递」当「完成」的实现在此失败）；
+///   B 读到的载荷逐字节相等且随后读到 EOF；B 关闭接收方向之后再读得到 `Closing`；
+///   全程连接不进入失败态（否则后续动作会以传输错误收场）。
+async fn mux_channel_close_dual_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = common::run_channel_close_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+single_runtime_test_!(mux_channel_close_dual_);
+
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 收尾：丢弃连接 ⇒ 两个循环退出并把传输交还
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----

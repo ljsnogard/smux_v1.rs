@@ -25,8 +25,8 @@
 //! | [`TrDockBinding`](abs_smux::conn::TrDockBinding) | [`DockBinding`] | **一个业务逻辑持有的会话**：可 listen / open_telegraph / open_channel |
 //! | [`TrChannelListener`](abs_smux::conn::TrChannelListener) | [`ChannelListener`] | 某 dock 上的类 `TcpListener`；`income_async()` 取下一个入向请求 |
 //! | [`TrChannelHandle`](abs_smux::chan::TrChannelHandle) | [`ChannelHandle`] | 入向请求的待决句柄；`accept_async` / `reject_async` |
-//! | [`TrChannelTx`](abs_smux::chan::TrChannelTx) | [`ChannelTx`] | 子流发送半边，包一个 `buffex` 生产端（`TrBuffTryWrite`） |
-//! | [`TrChannelRx`](abs_smux::chan::TrChannelRx) | [`ChannelRx`] | 子流接收半边，包一个 `buffex` 消费端（`TrBuffTryRead`） |
+//! | [`TrChannelTx`](abs_smux::chan::TrChannelTx) | [`ChannelTx`] | 子流发送半边，包一个 `buffex` 生产端（`TrBuffFlush`：异步写 + 冲 / 封口） |
+//! | [`TrChannelRx`](abs_smux::chan::TrChannelRx) | [`ChannelRx`] | 子流接收半边，包一个 `buffex` 消费端（`TrBuffRead` + 异步关闭） |
 //! | [`TrTelegraph`](abs_smux::telegraph::TrTelegraph) | [`Telegraph`] | 数据报端点工厂；`split` 出 [`Sender`] / [`Receiver`] |
 //! | [`TrDock`](abs_smux::dock::TrDock) | [`Dock`] | dock 的具体类型（见 §4） |
 //!
@@ -448,6 +448,29 @@
 //! 分别反映；对端关闭一半只影响对应方向。这两个标志**不额外维护**：它们直接读
 //! `buffex` 环两端各自的关闭位，映射与理由见私有模块 `channel_half` 的「关闭态」
 //! 一节。
+//!
+//! 除「丢弃半边 = 半关闭」之外，两个方向都提供**可等待的显式收尾**（2026-10 起）：
+//!
+//! | 入口 | 完成点（`await` 返回时保证） |
+//! | --- | --- |
+//! | `TrBuffFlush::flush_async`（发送半边） | 发送环**已排空**：应用提交的字节全部交给了传输 |
+//! | `TrBuffFlush::close_async`（发送半边） | 封口并等 `CLOSE(FIN)` **真正写进传输** |
+//! | `TrChannelRx::close_async`（接收半边） | 关闭接收方向并等 `CLOSE(RESET)` **真正写进传输** |
+//!
+//! 同步形态 `TrBuffTryFlush::try_flush` / `close` 只表达**意图**（`try_flush` 提醒写
+//! 循环、`close` 立刻封口），不等结果——它们给「不能 `await` 的上下文」用（如连接
+//! 写半边的退出守卫）。
+//!
+//! 「真正上线」的判据落在每条子流的**共享状态字**上：`FIN` 复用既有的
+//! `LOCAL_FIN_SENT`（它只在发送环排空之后置位），`RESET` 用新增的
+//! `LOCAL_RESET_FLUSHED`（与「认领这次发送」的 `LOCAL_RESET_SENT` 分开）。等待本身
+//! 用两个**零分配**的内联通知槽（发送 / 接收各一个，见 `owner_::ChannelState_`）；
+//! 连接级失败、空闲超时、对端 `RESET` / `FIN`、身份释放、写循环每取走一段数据，都在
+//! 相应时刻唤醒它们，因此等待**不会**因为连接收尾而永久挂起。
+//!
+//! `drop` 与显式 `close` **复用同一套收尾**（幂等，见 `channel_half::halves_`），
+//! 因此「丢弃半边」与「显式关闭」不可能漂移出两套语义；重复调用也不会重复投递
+//! 拆流事件。
 //!
 //! ### 7.0 `FIN` 与 `RESET` 是两个正交方向（2026-10 起）
 //!

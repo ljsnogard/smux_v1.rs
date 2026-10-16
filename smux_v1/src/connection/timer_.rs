@@ -374,6 +374,11 @@ where
             if let Option::Some(owner) = owner {
                 owner.set_local_fin_sent_();
                 let _ = owner.claim_local_reset_();
+                // 两个方向就此收尾（`FIN` / `RESET` 均已投递）：叫醒应用侧的收尾
+                // 等待者，让 `flush_async` / `close_async` 按「空闲超时」的终局返回，
+                // 而不是继续 park 在一条再也不会被排空的环上。原因（`IdleTimeout`）
+                // 已由计时循环在认领动作时发布，因此这里顺序无关。
+                owner.notify_both_progress_();
                 // 上报子流关闭（空闲超时）。这条路径**不经过** `maybe_release_`——它
                 // 直接释放身份，因此关闭回调只能在这里发（见 [`crate::metrics`] 模块
                 // 文档的插入点说明）。

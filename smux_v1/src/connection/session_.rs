@@ -101,14 +101,15 @@
 //! 复用循环 park 到刚通知的那条环，用环自身的提交唤醒补上。残留漏洞（两条环都通知
 //! 且都不提交时，先通知的那条可能永远不被轮询）见 dev-notes §5.1，属**已知限制**。
 //!
-//! # 写半边的收尾（已知缺口）
+//! # 写半边的收尾（已由 `TrBuffTryFlush` 补上）
 //!
-//! 复用循环退出时**只是 drop** 传输的写半边。对「自驱动」的适配器（`BuffWrite`）这
-//! 已经足够——它自己的 `Drop` 会关生产端并 detach 泵；但对「调用方驱动的全被动环」，
-//! `buffex::ring` 的 `RingWriter::close` 才是唤醒 park 中的排空方的那一步，而它在
-//! `TrBuffWrite` 里**没有对应方法**（只有具体类型上的固有方法）。旧版连接封的是**它
-//! 自己的**写环（`session_pump_` 的 `StageSealGuard_`），那一步随写环一起消失。
-//! 要在泛型层面补上，需要上游给 `TrBuffWrite` 加一个「封口」操作。
+//! 复用循环退出时经 [`TxSealGuard_`] 对传输写半边**封口**：
+//! [`TrBuffTryFlush::try_flush`] 尽量推一轮、[`TrBuffTryFlush::close`] 置生产端关闭
+//! 并唤醒 park 中的排空方。对「自驱动」的适配器（`BuffWrite`）这两步是幂等的；对
+//! 「调用方驱动的全被动环」`close` 才是唤醒排空方的那一步。旧版在 `TrBuffWrite` 里
+//! **没有**对应方法，只能靠具体类型上的固有方法，因此循环退出时只是 drop——唤醒就此
+//! 丢失。上游补上收尾契约之后，这件事在泛型层面成立，循环不必知道传输的具体形态。
+//! 语义与取舍见 [`TxSealGuard_`] 以及 `dev-notes/flush-contract-20261015-2340.md`。
 //!
 //! # 拆流
 //!
@@ -412,6 +413,15 @@ where
     C::Rt: TrTime + Clone,
     K: TrCancellationToken,
 {
+    // 0. 表里已经没有这条子流：它已经被别的路径收掉了（对端 `RESET`、本端主动拆流、
+    //    连接收尾）。此时**不能**把它登记进「欠一条 `FIN`」的集合——没有表项就永远
+    //    排不了空、也永远发不出 `FIN`，那会留下一个每轮扫描都要探测一次的僵尸条目。
+    //    应用在收到对端 `RESET` 之后再丢弃（或显式封口）发送半边正是这条路径。
+    if !table.contains_key(&pair) {
+        pending_fin.remove(&pair);
+        return Result::Ok(false);
+    }
+
     // 1. 先尽力把环里剩下的字节送出去（额度用尽时 `drain_one_` 静默返回 `false`）。
     flush_entry_::<C, _>(tx_stage, shared, table, scratch, pair, cancel).await?;
 
@@ -421,6 +431,10 @@ where
     //    `false` 就返回了，若这里不登记，「下轮再来」根本没有触发者——那条子流的
     //    `FIN` 会一直欠着，它也会长期留在本地表里。登记是安全方向：主循环每轮只做
     //    一次非阻塞的探测，推送不动就下一轮再试。
+    //
+    //    注意 `has_writable_` 的 `None` **不**包含「表里没有这条子流」那一档：上面
+    //    第 0 步已经把它挡在外面，因此这里的 `None` 一定是「环给不出结论」（它内部
+    //    用 `table.get_mut` 的 `?` 表达前者，这个前提必须在调用点保证）。
     match has_writable_::<C>(table, pair) {
         Option::None => {
             #[cfg(feature = "test-loop-probe")]
@@ -464,6 +478,8 @@ where
         // 方向已关闭」，而不是把字节留在一条再没有读者的环里静默丢掉。
         // 手法与 `WriteEvent_::LocalAbort` 相同。
         entry.reader_.close();
+        // `FIN` 已上线：应用侧的 `close_async` 等待者由此醒来并复检成功。
+        entry.owner_.notify_tx_progress_();
     }
     pending_fin.remove(&pair);
     maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
@@ -1321,6 +1337,9 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         // 且已经写进本端接收环的数据一起丢掉（旧实现正是如此，实测
                         // 少一个窗口，见 `dev-notes/flow-ctrl…` §3.3）。
                         entry.owner_.set_peer_reset_();
+                        // 发送方向到此不必再等：等待中的 `flush_async` / `close_async`
+                        // 应当醒来读到「对端不再接收」这个终局。
+                        entry.owner_.notify_tx_progress_();
                         // 上报「对端发来 RESET」。
                         shared.metrics_().on_reset(local, remote, true);
                     } else {
@@ -1328,6 +1347,8 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         // 之后读到 EOF。
                         entry.writer_.close();
                         entry.owner_.set_peer_fin_();
+                        // 接收方向到此自然收尾：`close_async` 的等待者由此醒来。
+                        entry.owner_.notify_rx_progress_();
                     }
                     entry.owner_.mark_data_(now_millis);
                     // 拆流记账（移除写侧表项、释放身份）交给复用循环的统一入口。
@@ -2432,7 +2453,10 @@ where
                 }
             };
             if let Option::Some(owner) = owner {
-                owner.set_app_rx_closed_();
+                let _ = owner.set_app_rx_closed_();
+                // 接收方向的收尾**已经启动**：即使下面的 `claim_local_reset_` 没抢到
+                // （别的路径已经在发那一条帧），等待者也应当醒来复检一次。
+                owner.notify_rx_progress_();
                 // 向对端宣告「我不再接收」：这条通知与发送方向无关，`RESET` 只关对端
                 // 的发送方向（见 `connection` 模块文档 §7 的半关闭映射）。
                 if owner.claim_local_reset_() {
@@ -2446,7 +2470,10 @@ where
                         cancel.child_token(),
                     )
                     .await?;
-                    // 本端发出的 `RESET` 到此才真正上线，因此上报点放在发送成功之后。
+                    // 本端发出的 `RESET` 到此才真正上线，因此「已上线」位与上报点
+                    // 都放在发送成功之后。
+                    owner.set_local_reset_flushed_();
+                    owner.notify_rx_progress_();
                     shared.metrics_().on_reset(local_dock, remote_dock, false);
                 }
             }
@@ -2475,8 +2502,14 @@ where
             let pair = (local_dock, remote_dock);
             // 本端主动拆流（空闲超时）：显式关闭发送环的消费端——没有别的执行者会替
             // 这条路径关它，而应用必须立刻看到发送方向已关闭。理由见事件类型文档。
+            //
+            // 顺带叫醒两侧的等待者：这条路径是**终局**（子流被拆掉），park 在
+            // `ABORT` 上的 `flush_async` / `close_async` 必须醒来按终局返回，而不是
+            // 永远等一条再也不会有进展的环。叫醒放在 `reader_.close()` 之后——判据里
+            // 「消费端已关闭」正是一次有效的事实变化。
             if let Option::Some(entry) = table.get_mut(&pair) {
                 entry.reader_.close();
+                entry.owner_.notify_both_progress_();
             }
             table.remove(&pair);
             pending_fin.remove(&pair);
@@ -2828,6 +2861,11 @@ where
             local_dock: pair.0,
             remote_dock: pair.1,
         });
+        // 身份已释放：两个方向都不会再有新的进展，等待中的 `TrBuffFlush` /
+        // `close_async` 必须醒来并**按终局复检**（否则它们会永远 park 在一条已经
+        // 从注册表消失的子流上）。放在投递 `Release` 之后：先让读循环有机会摘表项，
+        // 再叫醒应用——顺序反了只是多一次无谓唤醒，不会有正确性问题。
+        owner.notify_both_progress_();
         // 上报子流关闭（正常协议收尾）。`claim_release_` 是一次性的 CAS，因此这里
         // **恰好上报一次**；超时与建流超时两条路径不经过本函数，各自在 `timer_` 里上报。
         shared.metrics_().on_channel_closed(
@@ -3137,6 +3175,10 @@ where
         return Result::Err(err);
     }
     owner.mark_data_(shared.conn_clock_().now_millis_());
+    // 这一段已交给传输：发送环可能刚好被取空，等待中的 `flush_async` 由此醒来复检
+    // 「环已排空」。每次取走都通知是有意的——排空是**渐进**发生的，没有别的时刻能
+    // 精确覆盖「最后一段离开环」那一瞬。
+    owner.notify_tx_progress_();
     // 上报「写出一个数据帧」：帧总长 = 帧头的**实际**长度 + 载荷长度。计数点必须在
     // `enqueue_frame_parts_` **之后**——它把头与载荷分两次入环，在那之前计数会把一个
     // 帧算成半个（见该函数的说明）。

@@ -121,6 +121,33 @@ let conn = MuxConnection::new(delivery, cfg);   // 不需要再交帧暂存缓�
 连接内部**读取「现在」的时刻来源**就是配置里的这个值，因此「时刻」与「计时器」必然
 同源——换成 `abs_art_mock_clock::ManualTime` 就能把整条连接跑在虚拟时间上。
 
+### 2.2 显式收尾：`flush_async` 与 `close_async`
+
+`drop(tx)` / `drop(rx)` 表达「这一边不再用了」，但**不等待**结果。需要确认收尾已经
+上线时，用 `abs_smux` 契约里的可等待入口（`smux_v1` 全部实现）：
+
+```rust,ignore
+use abs_smux::chan::TrChannelRx;
+use buffex::x_deps::abs_buff::{TrBuffFlush, TrBuffRead};
+
+// 发送方向：先确认已提交字节都交给了传输，再封口并等 CLOSE(FIN) 上线。
+tx.flush_async().await?;   // 完成点 = 发送环已排空
+tx.close_async().await?;   // 完成点 = CLOSE(FIN) 已写进传输
+
+// 接收方向：我不再接收，等 CLOSE(RESET) 上线。
+rx.close_async().await?;   // 完成点 = CLOSE(RESET) 已写进传输
+```
+
+完成点都是**可观察事实**（环排空 / `FIN` 上线 / `RESET` 上线），而不是「意图已投递」：
+连接级失败、空闲超时、对端 `RESET` / `FIN`、身份释放都会把等待者唤醒，并按终局返回
+（写方向终局是 `Err(ProducerError::Closing)`、读方向是 `Err(ConsumerError::Closing)`）。
+等待可以被取消令牌打断（`may_cancel_with`），取消只结束这次**等待**——已经完成的封口
+不回滚。同步形态 `try_flush()` / `close()` 只表达意图、不等结果，给不能 `await` 的
+上下文用；它们与 `drop` 复用同一套收尾，重复调用幂等。
+
+端到端验收（含「投递 ≠ 完成」的反证）见
+[`tests/common/scenarios_/channel_close_.rs`](tests/common/scenarios_/channel_close_.rs)。
+
 ## 3. 唯一还要自己接的：传输
 
 `MuxConnection` 只吃 `abs_buff` 的两条半边，**不认识具体的 socket 类型**（tokio 与
@@ -136,8 +163,8 @@ socket 读半边 --(入向泵)--> 全被动环 ──> Rx 交给 smux
 `passive_ring_` / `pump_input_` / `pump_output_` 三个函数即可（约 80 行；那个示例用
 **缺省后端 compio** 的 socket 与适配，因此 `cargo run --example active_passive`
 不需要任何 feature）。
-**为什么必须自己驱动泵**（三处实测阻塞点：compio 半边 `!Send`、`TrBuffWrite` 没有
-flush 钩子、`buffex` 主动泵只做单次 poll）写在
+**为什么必须自己驱动泵**（实测阻塞点：compio 半边 `!Send`、`buffex` 主动泵只做单次
+poll；「写侧最后一跳没人收尾」这一条已由上游的 `TrBuffFlush` 契约消解）写在
 [`tests/common/mod.rs`](tests/common/mod.rs) 模块文档里。
 
 ## 4. 怎么快速验证
@@ -170,7 +197,8 @@ just test                                    # 全量：两套冒烟 + 文档测
    发起侧要为每条并发子流分配**互不相同**的临时 `local_dock`（类比 TCP 临时端口），
    否则第二次 `open` 会被 `BindingError::Duplicate` 拒绝。
 2. **半关闭是协议义务**：`drop(tx)` 只是「不再写」，已写入的数据仍会被搬运出去，
-   对端读空之后才拿到 `Closing`。`drop(tx)` 本身**不等待**送达。
+   对端读空之后才拿到 `Closing`。`drop(tx)` 本身**不等待**送达——要等结果就用
+   `flush_async` / `close_async`（见 §2.2）。
    两个方向正交：`drop(rx)` 发 `CLOSE(RESET)`（「我不再接收」），只让对端停止**发送**，
    不影响本端仍在排空的发送方向；反过来，本端收到对端的 `RESET` 时**允许直接放弃**
    发送环里还没上网的字节——那是唯一一处「已提交的字节可以不送达」的例外。

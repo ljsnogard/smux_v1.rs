@@ -6,6 +6,7 @@
 
 mod bind_;
 mod buffers_;
+mod channel_close_;
 mod closed_ring_spin_;
 mod conn_failed_;
 mod connect_;
@@ -23,6 +24,7 @@ pub use bind_::{
     run_auto_dock_scenario_, run_bind_exclusivity_scenario_, run_unsettled_handle_scenario_,
 };
 pub use buffers_::{run_per_channel_alloc_scenario_, run_ring_rejected_scenario_};
+pub use channel_close_::run_channel_close_scenario_;
 pub use closed_ring_spin_::run_closed_ring_spin_scenario_;
 pub use conn_failed_::run_conn_failed_wakes_scenario_;
 pub use connect_::{TestConnCfg, connect_pair_, connect_pair_with_opts_};

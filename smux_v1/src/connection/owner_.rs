@@ -138,6 +138,14 @@ const GRACEFUL_FIN_REQUESTED: usize = 1usize << 14usize;
 /// - **已裁决** ⇒ 活跃子流空闲超时：`CLOSE(FIN)` + `CLOSE(RESET)` 拆流。
 const ESTABLISH_SETTLED: usize = 1usize << 13usize;
 
+/// 本端发出的 `CLOSE(RESET)` **已经写进传输**。
+///
+/// 与 [`LOCAL_RESET_SENT`] 的区别是「认领」与「完成」：后者只表示**由谁**去发那一条
+/// 帧（去重用），置位时刻在帧写出**之前**；本位由写循环在 `control_close_via_`
+/// 成功返回之后置位，因此它是
+/// [`TrChannelRx::close_async`](abs_smux::chan::TrChannelRx::close_async) 的完成判据。
+const LOCAL_RESET_FLUSHED: usize = 1usize << 15usize;
+
 /// 测试某个位。
 fn has_flag_(value: usize, flag: usize) -> bool {
     value & flag != 0usize
@@ -408,6 +416,21 @@ pub(crate) struct ChannelState_ {
     /// - **任何线程都写得进**：连接级失败由循环侧发布，不经过注册表锁（`mark_failed_`
     ///   虽然持锁，但发布本身只是原子 CAS）。
     notice_: AtomicU32,
+
+    /// **发送方向的进展通知**：应用侧 `TrBuffFlush` 的等待者（`flush_async` /
+    /// `close_async`）park 在它上面。
+    ///
+    /// 每一次改变「发送方向是否已收尾」的事实都经它唤醒等待者：发送环被写循环取空、
+    /// `FIN` 上线、对端 `RESET`、空闲超时 / 连接级失败、身份释放。它只存**一个**
+    /// waker——发送半边是**独占**的（`ChannelTx` 既非 `Clone`，等待又取 `&mut self`），
+    /// 因此至多一个等待者，与 [`NotifySlot_`] 的前提一致。
+    tx_progress_: NotifySlot_,
+
+    /// **接收方向的进展通知**：`TrChannelRx::close_async` 的等待者 park 在它上面。
+    ///
+    /// 语义与 [`ChannelState_::tx_progress_`] 对称：本端 `RESET` 上线、对端 `FIN`、
+    /// 连接级终局都会经它唤醒。接收半边同样独占。
+    rx_progress_: NotifySlot_,
 }
 
 impl ChannelState_ {
@@ -426,6 +449,8 @@ impl ChannelState_ {
             data_millis_: AtomicU64::new(0u64),
             abort_: AtomicU8::new(AbortCode_::NONE),
             notice_: AtomicU32::new(K_NOTICE_NONE),
+            tx_progress_: NotifySlot_::new_(),
+            rx_progress_: NotifySlot_::new_(),
         }
     }
 
@@ -667,11 +692,19 @@ impl ChannelState_ {
 
     //-- ---- 收尾位 ----
 
-    /// 记录「应用已丢弃发送半边」。
-    pub(crate) fn set_app_tx_closed_(&self) {
-        let _ = self
-            .flags_
-            .try_spin_compare_exchange_weak(|_| true, |value| value | APP_TX_CLOSED);
+    /// 记录「应用已丢弃发送半边」；返回**本次是否首次置位**。
+    ///
+    /// 返回值给应用侧半部做**幂等去重**：`drop` 与显式
+    /// [`close`](abs_buff::TrBuffTryFlush::close) 都会走到这里，而「排空 + 发 `FIN`」
+    /// 的收尾事件只能投递一次——若第二条事件在表项已被摘掉之后到达，写循环会把它
+    /// 重新登记进「欠一条 `FIN`」的集合，留下一个永远查不到表项的僵尸条目。
+    pub(crate) fn set_app_tx_closed_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| !has_flag_(value, APP_TX_CLOSED),
+                |value| value | APP_TX_CLOSED,
+            )
+            .is_succ()
     }
 
     /// 认领「连接（优雅关闭）请求这条子流**排空并收尾**」：首次调用返回 `true`。
@@ -698,11 +731,15 @@ impl ChannelState_ {
             .is_succ()
     }
 
-    /// 记录「应用已丢弃接收半边」。
-    pub(crate) fn set_app_rx_closed_(&self) {
-        let _ = self
-            .flags_
-            .try_spin_compare_exchange_weak(|_| true, |value| value | APP_RX_CLOSED);
+    /// 记录「应用已丢弃接收半边」；返回**本次是否首次置位**（去重理由同
+    /// [`ChannelState_::set_app_tx_closed_`]）。
+    pub(crate) fn set_app_rx_closed_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| !has_flag_(value, APP_RX_CLOSED),
+                |value| value | APP_RX_CLOSED,
+            )
+            .is_succ()
     }
 
     /// 应用是否已丢弃接收半边。
@@ -743,6 +780,67 @@ impl ChannelState_ {
         let _ = self
             .flags_
             .try_spin_compare_exchange_weak(|_| true, |value| value | PEER_RESET);
+    }
+
+    /// 记录「本端发出的 `CLOSE(RESET)` 已上线」（写循环在写出成功后调用）。
+    pub(crate) fn set_local_reset_flushed_(&self) {
+        let _ = self
+            .flags_
+            .try_spin_compare_exchange_weak(|_| true, |value| value | LOCAL_RESET_FLUSHED);
+    }
+
+    //-- ---- 收尾位查询（应用侧等待判据） ----
+
+    /// 本端 `CLOSE(FIN)` 是否已发出（意味着发送环当时已排空）。
+    pub(crate) fn is_local_fin_sent_(&self) -> bool {
+        has_flag_(self.flags_.value(), LOCAL_FIN_SENT)
+    }
+
+    /// 本端 `CLOSE(RESET)` 是否已**上线**（不只是认领了这次发送）。
+    pub(crate) fn is_local_reset_flushed_(&self) -> bool {
+        has_flag_(self.flags_.value(), LOCAL_RESET_FLUSHED)
+    }
+
+    /// 对端是否已声明不再发送（收到 `CLOSE(FIN)`）。
+    pub(crate) fn is_peer_fin_(&self) -> bool {
+        has_flag_(self.flags_.value(), PEER_FIN)
+    }
+
+    /// 对端是否已声明不再接收（收到 `CLOSE(RESET)`）。
+    pub(crate) fn is_peer_reset_(&self) -> bool {
+        has_flag_(self.flags_.value(), PEER_RESET)
+    }
+
+    //-- ---- 应用侧等待（`TrBuffFlush` / `TrChannelRx::close_async`） ----
+
+    /// 报告「发送方向可能有进展」（排空 / `FIN` 上线 / 终局）。
+    ///
+    /// 幂等、不阻塞、零分配、任何线程可调：写循环在每一次改变发送方向收尾状态的事实
+    /// 之后调用它，等待者醒来后**自行复检**（判据见应用侧半部的 `tx_*_ready_`）。
+    pub(crate) fn notify_tx_progress_(&self) {
+        self.tx_progress_.notify_();
+    }
+
+    /// 等发送方向的下一次进展；被通知后仍需复检条件（见 [`NotifySlot_::poll_wait_`]）。
+    pub(crate) fn tx_progress_poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.tx_progress_.poll_wait_(cx)
+    }
+
+    /// 报告「接收方向可能有进展」（本端 `RESET` 上线 / 对端 `FIN` / 终局）。
+    pub(crate) fn notify_rx_progress_(&self) {
+        self.rx_progress_.notify_();
+    }
+
+    /// 等接收方向的下一次进展；语义同 [`ChannelState_::tx_progress_poll_wait_`]。
+    pub(crate) fn rx_progress_poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.rx_progress_.poll_wait_(cx)
+    }
+
+    /// 报告「两个方向都可能有进展」：终局路径（连接级失败、身份释放、主动拆流）用它
+    /// 一次叫醒两边的等待者，避免等待者因为「等错了方向」而永久挂起。
+    pub(crate) fn notify_both_progress_(&self) {
+        self.notify_tx_progress_();
+        self.notify_rx_progress_();
     }
 
     /// 两个方向是否都已经在**协议层**收尾，可以释放注册表身份。

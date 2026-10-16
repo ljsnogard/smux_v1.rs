@@ -1,7 +1,9 @@
 //! 子流的两个应用侧半部：[`ChannelTx`] / [`ChannelRx`]。
 //!
 //! 对应 `abs_smux` 的 `TrChannelTx` / `TrChannelRx` / `TrChannelHalf`；数据面则
-//! 直接实现 `abs_buff` 的 `TrBuffWrite` / `TrBuffRead`。
+//! 直接实现 `abs_buff` 的 `TrBuffTryWrite` / `TrBuffWrite` / `TrBuffRead`，发送半边
+//! 另外实现 `TrBuffFlush`（冲 / 封口的可等待形态）。收尾的完成点与唤醒来源见
+//! `crate::connection` 模块文档 §7 与 `owner_::ChannelState_`。
 //!
 //! # 关闭态：直接读环的两个端
 //!
@@ -31,6 +33,11 @@
 //! 结构体字段的具体类型**（旧模型下内层包装未导出，下游根本写不出已建立 channel
 //! 的类型，见 `dev-notes` §16.2 F5）。
 
+use core::{
+    future::poll_fn,
+    task::{Context, Poll},
+};
+
 use abs_buff::{
     Demand,
     TrBuffFlush, TrBuffTryFlush,
@@ -38,19 +45,22 @@ use abs_buff::{
     TrBuffWrite, TrBuffTryWrite,
     buffer::{TrConsumerState, TrProducerState},
 };
+use abs_cancel::TrCancellationToken;
 use abs_smux::chan::{TrChannelHalf, TrChannelRx, TrChannelTx};
 use anylr::SomeOf;
 use buffex::ring::{ConsumerError, ProducerError};
+use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
         BufferedRx, BufferedTx, Dock, MuxConnection, MuxError, TrConnCfg,
         // config_::TrMuxAllocConfig,
         owner_::ChannelOwner_,
+        session_::race_cancel_,
         signal_::{ReadEvent_, TrEventSender_, WriteEvent_},
     },
     flow_ctrl::Credit,
-    x_deps::{abs_buff, abs_smux, anylr, buffex},
+    x_deps::{abs_buff, abs_cancel, abs_smux, anylr, buffex, gen_mcf2},
 };
 
 /// 子流发送半边（应用侧**生产端**）。
@@ -71,6 +81,16 @@ use crate::{
 /// 半部 drop 时置位本端关闭标志）；其 `Drop` 同时通知写循环「排空后发
 /// `CLOSE(FIN)`」。两个方向互不影响，关闭态直接取自环本身（见模块文档
 /// 「关闭态」一节）。
+///
+/// 也可以**显式**收尾（`abs_smux` 的契约）：
+///
+/// - [`TrBuffTryFlush::try_flush`]：提醒写循环去取数据（同步，不等结果）；
+/// - [`TrBuffTryFlush::close`]：立刻封口（就是 `drop` 做的那件事，幂等）；
+/// - [`TrBuffFlush::flush_async`]：等到发送环**排空**（已提交字节全部交给传输）；
+/// - [`TrBuffFlush::close_async`]：封口并等到 `CLOSE(FIN)` **上线**。
+///
+/// `drop` 与显式 `close` 复用**同一套**收尾（[`ChannelTx::seal_tx_`]），因此两者
+/// 语义一致，重复调用也不会重复投递拆流事件。
 pub struct ChannelTx<C>
 where
     C: TrConnCfg<Data = u8>,
@@ -265,26 +285,101 @@ where
     pub fn abort_reason(&self) -> Option<MuxError> {
         self.owner_.abort_reason_()
     }
+
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // 收尾：封口与等待判据
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    /// **封口发送方向**：关掉发送环的生产端，并（仅首次）通知写循环「排空后发
+    /// `CLOSE(FIN)`」。
+    ///
+    /// # 为什么 `close` 与 `drop` 共用它
+    ///
+    /// 两者在协议上是**同一件事**：应用不再写。差别只在调用方是否还在等结果——
+    /// [`close_async`](TrBuffFlush::close_async) 等到 `FIN` 上线，`drop` 不等。把收尾
+    /// 收敛到一个函数，是为了让「丢弃发送半边」与「显式关闭」不可能漂移出两套语义。
+    ///
+    /// # 幂等
+    ///
+    /// [`BufferedTx`] 的 `close` 本身幂等；协议侧那一次「排空 + 发 `FIN`」的**投递**
+    /// 用 `ChannelState_::set_app_tx_closed_` 的首次置位去重。少了这层去重，第二条
+    /// `TxClosed` 会在写循环的表项已被摘掉之后重新登记一个「欠一条 `FIN`」的僵尸条目
+    /// （`pending_fin` 里永远查不到表项的那一条）。
+    fn seal_tx_(&mut self) {
+        self.ring_.close();
+        if self.owner_.set_app_tx_closed_() {
+            let _ = self
+                .conn_
+                .core_()
+                .w_events_()
+                .try_send_event_(WriteEvent_::TxClosed {
+                    local_dock: self.local_dock_,
+                    remote_dock: self.remote_dock_});
+        }
+    }
+
+    /// 发送环是否已经**排空**（应用提交的字节全部被写循环取走）。
+    ///
+    /// 判据取环内积压为 0，而**不是**「`FIN` 已发」：`flush_async` 的语义是「已提交
+    /// 的字节都交给了下游」，它比封口更早成立。
+    fn tx_drained_(&self) -> bool {
+        self.ring_.ring_state().data_size() == 0usize
+    }
+
+    /// 发送方向是否已经**不可能再前进**：对端宣告不再接收、本端被拆流 / 空闲超时 /
+    /// 连接级失败，或发送环的消费端（写循环）已经关闭。
+    ///
+    /// 它是两个等待判据的**共同终局**：走到这里，`flush_async` 与 `close_async` 都
+    /// 必须返回，而不是继续 park 在一条不会有进展的环上。
+    fn tx_terminated_(&self) -> bool {
+        self.owner_.is_peer_reset_()
+            || self.owner_.abort_reason_().is_some()
+            || self.ring_.ring_state().is_consumer_closed()
+    }
+
+    /// `flush_async` 的就绪判据；`None` = 还要等。
+    ///
+    /// - 环已排空 ⇒ `Ok`：已提交的字节都交给了下游；
+    /// - 环不空、但发送方向已终止 ⇒ `Err(Closing)`：这些字节再也不会被送出去
+    ///   （对端 `RESET` 授权放弃已提交字节，拆流 / 连接级失败同理）。
+    fn tx_flush_ready_(&self) -> Option<Result<(), ProducerError<usize>>> {
+        if self.tx_drained_() {
+            return Option::Some(Result::Ok(()));
+        }
+        if self.tx_terminated_() {
+            return Option::Some(Result::Err(ProducerError::Closing));
+        }
+        Option::None
+    }
+
+    /// `close_async` 的就绪判据；`None` = 还要等。
+    ///
+    /// - `FIN` 已上线 ⇒ `Ok`：封口已送达对端（它蕴含发送环当时已排空）；
+    /// - 对端宣告不再接收 ⇒ `Ok`：无论这条 `FIN` 发不发，对端都已不再收数据，封口的
+    ///   目的已经达成；
+    /// - 发送方向已终止而 `FIN` 没能发出 ⇒ `Err(Closing)`。
+    fn tx_close_ready_(&self) -> Option<Result<(), ProducerError<usize>>> {
+        if self.owner_.is_local_fin_sent_() || self.owner_.is_peer_reset_() {
+            return Option::Some(Result::Ok(()));
+        }
+        if self.owner_.abort_reason_().is_some() || self.ring_.ring_state().is_consumer_closed() {
+            return Option::Some(Result::Err(ProducerError::Closing));
+        }
+        Option::None
+    }
 }
 
 impl<C> Drop for ChannelTx<C>
 where
     C: TrConnCfg,
 {
-    /// 丢弃发送半边 = 半关闭：显式关闭环的生产端，并通知写循环排空后发 `FIN`。
+    /// 丢弃发送半边 = 半关闭：与显式 `close` / `close_async` **同一套**收尾
+    /// （[`ChannelTx::seal_tx_`]）——既关发送环的生产端，也通知写循环排空后发 `FIN`。
     ///
-    /// 先在**原子状态字**上记下「应用已丢弃发送半边」（无锁、同步）：循环侧的收尾
-    /// 判据据此起算，不依赖事件何时被处理。
+    /// 应用侧的收尾只在**原子状态字**上记一次（无锁、同步）：循环侧的收尾判据据此
+    /// 起算，不依赖事件何时被处理，也不依赖 `drop` 与显式关闭谁先到。
     fn drop(&mut self) {
-        self.owner_.set_app_tx_closed_();
-        self.ring_.close();
-        let _ = self
-            .conn_
-            .core_()
-            .w_events_()
-            .try_send_event_(WriteEvent_::TxClosed {
-                local_dock: self.local_dock_,
-                remote_dock: self.remote_dock_});
+        self.seal_tx_();
     }
 }
 
@@ -360,14 +455,24 @@ impl<C> TrBuffTryFlush<u8> for ChannelTx<C>
 where
     C: TrConnCfg,
 {
+    /// **尽力推一轮**：`ChannelTx` 的下游是连接的写循环，而这是一个同步入口——
+    /// 能做的只有把「发送环里可能有数据」提醒给写循环（`TxReady`）。真正的排空用
+    /// [`flush_async`](TrBuffFlush::flush_async) 等。
+    ///
+    /// 返回恒为 `Ok`：这里没有任何会发生 IO 失败的动作，环本身也不会失败（与
+    /// `buffex::ring::RingWriter` 对纯内存环的实现同款）。
     #[inline]
     fn try_flush(&mut self) -> Result<(), Self::Err> {
-        self.ring_.try_flush()
+        self.notify_tx_ready_();
+        Result::Ok(())
     }
 
+    /// **同步封口**：等价于 [`ChannelTx::seal_tx_`]（关生产端 + 首次投递 `TxClosed`）。
+    /// 幂等，因此调用者不必区分「已经 `drop` 过」还是「第一次 `close`」。
     #[inline]
     fn close(&mut self) -> Result<(), Self::Err> {
-        self.ring_.close()
+        self.seal_tx_();
+        Result::Ok(())
     }
 }
 
@@ -375,14 +480,24 @@ impl<C> TrBuffFlush<u8> for ChannelTx<C>
 where
     C: TrConnCfg,
 {
+    type FlushAsync<'f> = ChannelTxFlushAsync<'f, 'f, C> where Self: 'f;
+
+    /// 等**发送环排空**（应用提交的字节全部被写循环取走）：
+    /// [`channel_tx_flush_async_`]。
     #[inline]
     fn flush_async(&mut self) -> Self::FlushAsync<'_> {
-        self.ring_.flush_async()
+        ChannelTxFlushAsync::new(self)
     }
 
+    type CloseAsync<'f>
+        = ChannelTxCloseAsync<'f, 'f, C>
+    where
+        Self: 'f;
+
+    /// 封口并等 **`CLOSE(FIN)` 上线**：[`channel_tx_close_async_`]。
     #[inline]
     fn close_async(&mut self) -> Self::CloseAsync<'_> {
-        self.ring_.close_async()
+        ChannelTxCloseAsync::new(self)
     }
 }
 
@@ -404,6 +519,10 @@ where
 ///
 /// 丢弃本类型即关闭接收方向；写端关闭后先把残留数据读走，再 `try_read` 才会
 /// 报 `Closing`（EOF 语义，见模块文档「关闭态」一节）。
+///
+/// 也可以**显式**关闭：[`TrChannelRx::close_async`] 关闭接收方向并等到
+/// `CLOSE(RESET)` **上线**；它与 `drop` 复用同一套收尾（[`ChannelRx::seal_rx_`]），
+/// 因此返回之后本端不再接收，而对端在收到那条 `RESET` 之前发出的帧被静默丢弃。
 pub struct ChannelRx<C>
 where
     C: TrConnCfg,
@@ -538,26 +657,61 @@ where
     pub fn abort_reason(&self) -> Option<MuxError> {
         self.owner_.abort_reason_()
     }
+
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // 收尾：封口与等待判据
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    /// **关闭接收方向**：关掉接收环的消费端，并（仅首次）通知写循环发
+    /// `CLOSE(RESET)`。
+    ///
+    /// 与 [`ChannelTx::seal_tx_`] 对称：`drop` 与显式
+    /// [`close_async`](TrChannelRx::close_async) 走**同一套**收尾，幂等由环的关闭位与
+    /// `ChannelState_::set_app_rx_closed_` 的首次置位共同保证。
+    fn seal_rx_(&mut self) {
+        self.ring_.close();
+        if self.owner_.set_app_rx_closed_() {
+            let _ = self
+                .conn_
+                .core_()
+                .w_events_()
+                .try_send_event_(WriteEvent_::RxClosed {
+                    local_dock: self.local_dock_,
+                    remote_dock: self.remote_dock_});
+        }
+    }
+
+    /// [`close_async`](TrChannelRx::close_async) 的就绪判据；`None` = 还要等。
+    ///
+    /// - 本端 `RESET` 已**上线** ⇒ `Ok`：对端已被明确告知本端不再接收；
+    /// - 对端宣告不再发送（`FIN`），或接收环的写端已经关闭 ⇒ `Ok`：接收方向本来就
+    ///   到头了，不存在「还要通知对端停止发送」这件事；
+    /// - 连接级失败 / 拆流 / 空闲超时 ⇒ `Err(Closing)`：这条 `RESET` 不可能再送达。
+    fn rx_close_ready_(&self) -> Option<Result<(), ConsumerError<usize>>> {
+        if self.owner_.is_local_reset_flushed_() || self.owner_.is_peer_fin_() {
+            return Option::Some(Result::Ok(()));
+        }
+        if self.owner_.abort_reason_().is_some() {
+            return Option::Some(Result::Err(ConsumerError::Closing));
+        }
+        if self.ring_.ring_state().is_producer_closed() {
+            return Option::Some(Result::Ok(()));
+        }
+        Option::None
+    }
 }
 
 impl<C> Drop for ChannelRx<C>
 where
     C: TrConnCfg,
 {
-    /// 丢弃接收半边：关掉环的消费端，并通知写循环发 `RESET` 拆掉该方向。
+    /// 丢弃接收半边：与显式 [`close_async`](TrChannelRx::close_async) **同一套**收尾
+    /// （[`ChannelRx::seal_rx_`]）——既关接收环的消费端，也通知写循环发 `RESET`。
     ///
-    /// 先在**原子状态字**上记下「应用已丢弃接收半边」（无锁、同步）：解复用循环据此
-    /// 把在途数据静默丢弃，而不是写进一条消费端已关闭的环、把连接判成传输错误。
+    /// 应用侧的收尾只在**原子状态字**上记一次（无锁、同步）：解复用循环据此把在途
+    /// 数据静默丢弃，而不是写进一条消费端已关闭的环、把连接判成传输错误。
     fn drop(&mut self) {
-        self.owner_.set_app_rx_closed_();
-        self.ring_.close();
-        let _ = self
-            .conn_
-            .core_()
-            .w_events_()
-            .try_send_event_(WriteEvent_::RxClosed {
-                local_dock: self.local_dock_,
-                remote_dock: self.remote_dock_});
+        self.seal_rx_();
     }
 }
 
@@ -628,28 +782,179 @@ where
     }
 }
 
-impl<C> TrChannelRx for ChannelRx<C>
+impl<C> TrChannelRx<C> for ChannelRx<C>
 where
     C: TrConnCfg,
 {
+    type CloseAsync<'f> = ChannelRxCloseAsync<'f, 'f, C> where Self: 'f;
+
+    /// 关闭接收方向并等 `CLOSE(RESET)` 上线：[`channel_rx_close_async_`]。
+    #[inline]
     fn close_async(&mut self) -> Self::CloseAsync<'_> {
-        todo!()
+        ChannelRxCloseAsync::new(self)
+    }
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 收尾等待的 step 函数
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// [`TrBuffFlush::flush_async`] 的 step 函数：等「发送环已排空」。
+///
+/// # 完成判据
+///
+/// 环内积压归零（[`ChannelTx::tx_drained_`]），或发送方向进入终局
+/// （[`ChannelTx::tx_terminated_`]）——后者按 `Err(Closing)` 返回，因为那时剩余的
+/// 字节已经不可能再被送出去。
+///
+/// # 取消
+///
+/// 等待期间可在任意 `await` 点被取消令牌打断，返回
+/// [`ProducerError::Cancelled`]。取消**不**回滚已经封口 / 已经排空的部分：本函数
+/// 只观察进度，不改协议状态。
+#[gen_may_cancel_future(ChannelTxFlush, pub, new(pub(super)))]
+async fn channel_tx_flush_async_<'f, C, K>(
+    tx: &'f mut ChannelTx<C>,
+    cancel: K,
+) -> Result<(), ProducerError<usize>>
+where
+    C: TrConnCfg + 'f,
+    K: TrCancellationToken,
+{
+    // 先补一次「发送环可能有数据」的提醒：本函数**不写入任何字节**，而写循环完全
+    // 可能正 park 在事件通道上（应用上一次提交之后它已经排空并睡下）。
+    tx.notify_tx_ready_();
+    wait_tx_progress_(tx, &cancel, ChannelTx::<C>::tx_flush_ready_).await
+}
+
+/// [`TrBuffFlush::close_async`] 的 step 函数：封口并等 `CLOSE(FIN)` 上线。
+///
+/// 封口动作本身是同步且幂等的（[`ChannelTx::seal_tx_`]），因此它与 `drop` 走的是
+/// 完全相同的一步；本函数额外的价值只有一个——**等到那条 `FIN` 真的写进传输**
+/// （或等到它不可能再上线）。
+///
+/// # 取消
+///
+/// 等待期间被取消时返回 [`ProducerError::Cancelled`]；**封口本身已经完成**，不会
+/// 因为调用方取消而撤销（这与「丢弃 future 即取消一次读 / 写」不同：封口是状态迁移，
+/// 不是一次可回滚的提交）。
+#[gen_may_cancel_future(ChannelTxClose, pub, new(pub(super)))]
+async fn channel_tx_close_async_<'f, C, K>(
+    tx: &'f mut ChannelTx<C>,
+    cancel: K,
+) -> Result<(), ProducerError<usize>>
+where
+    C: TrConnCfg + 'f,
+    K: TrCancellationToken,
+{
+    tx.seal_tx_();
+    wait_tx_progress_(tx, &cancel, ChannelTx::<C>::tx_close_ready_).await
+}
+
+/// [`TrChannelRx::close_async`] 的 step 函数：关闭接收方向并等 `CLOSE(RESET)` 上线。
+///
+/// # 完成判据
+///
+/// 本端 `RESET` 已写进传输（`ChannelState_::is_local_reset_flushed_`）、对端已
+/// 宣告不再发送、或接收环写端已经关闭；连接级终局按 `Err(Closing)` 返回。
+///
+/// # 取消
+///
+/// 与 [`channel_tx_close_async_`] 同款：关闭动作已经完成，取消只影响这次**等待**。
+#[gen_may_cancel_future(ChannelRxClose, pub, new(pub(crate)))]
+async fn channel_rx_close_async_<'f, C, K>(
+    rx: &'f mut ChannelRx<C>,
+    cancel: K,
+) -> Result<(), ConsumerError<usize>>
+where
+    C: TrConnCfg + 'f,
+    K: TrCancellationToken,
+{
+    rx.seal_rx_();
+    wait_rx_progress_(rx, &cancel, ChannelRx::<C>::rx_close_ready_).await
+}
+
+/// 等发送方向的下一次进展，直到 `ready` 给出结论。
+///
+/// # 为什么用 `poll_fn` 而不是「先查状态、再 await」
+///
+/// 「查状态」与「登记等待」之间必须没有缝：通知可能恰好**落在这两者之间**。等待槽
+/// 的 `pending_` 位是**持久**的（`ChannelState_::tx_progress_poll_wait_` 先消费
+/// 它、再登记、登记后复检），因此循环写成「复检 → 登记 → 复检」就不会丢唤醒。
+///
+/// # 取消
+///
+/// 每一次挂起都与调用方的取消令牌竞争（[`race_cancel_`]）：调用方取消时返回
+/// [`ProducerError::Cancelled`]，而不是把等待留在槽里。
+async fn wait_tx_progress_<C, K, F>(
+    tx: &ChannelTx<C>,
+    cancel: &K,
+    ready: F,
+) -> Result<(), ProducerError<usize>>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+    F: Fn(&ChannelTx<C>) -> Option<Result<(), ProducerError<usize>>>,
+{
+    let wait = poll_fn(|cx: &mut Context<'_>| loop {
+        if let Option::Some(result) = ready(tx) {
+            return Poll::Ready(result);
+        }
+        match tx.owner_.tx_progress_poll_wait_(cx) {
+            // 有进展：回到循环顶部按最新状态复检。
+            Poll::Ready(()) => continue,
+            Poll::Pending => return Poll::Pending,
+        }
+    });
+    match race_cancel_(cancel, wait).await {
+        Option::Some(result) => result,
+        Option::None => Result::Err(ProducerError::Cancelled),
+    }
+}
+
+/// 等接收方向的下一次进展；语义与 [`wait_tx_progress_`] 完全对称。
+async fn wait_rx_progress_<C, K, F>(
+    rx: &ChannelRx<C>,
+    cancel: &K,
+    ready: F,
+) -> Result<(), ConsumerError<usize>>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+    F: Fn(&ChannelRx<C>) -> Option<Result<(), ConsumerError<usize>>>,
+{
+    let wait = poll_fn(|cx: &mut Context<'_>| loop {
+        if let Option::Some(result) = ready(rx) {
+            return Poll::Ready(result);
+        }
+        match rx.owner_.rx_progress_poll_wait_(cx) {
+            Poll::Ready(()) => continue,
+            Poll::Pending => return Poll::Pending,
+        }
+    });
+    match race_cancel_(cancel, wait).await {
+        Option::Some(result) => result,
+        Option::None => Result::Err(ConsumerError::Cancelled),
     }
 }
 
 #[cfg(test)]
 mod tests_ {
-    use core::mem::MaybeUninit;
+    use core::{
+        mem::MaybeUninit,
+        task::{Context, Poll, Waker},
+    };
 
     use abs_buff::{
         Demand,
         buffer::{TrBuffSegmMut, TrBuffSegmRef}};
+    use abs_cancel::{CancelledToken, TrMayCancel};
     use buffex::ring::ConsumerError;
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
     use crate::{
         connection::{
-            owner_::new_owner_,
+            owner_::{AbortCode_, new_owner_},
             ring_::test_support_::make_test_channel_,
             test_support_::{TestMuxConfig_, make_test_conn_},
         },
@@ -841,4 +1146,223 @@ mod tests_ {
         );
     }
     multi_art_test_!(send_close_keeps_buffered_data_then_eof);
+
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // 收尾等待语义（`TrBuffFlush` / `TrChannelRx::close_async`）
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    /// 用**空 waker** 轮询一次给定 future；`None` 表示仍然挂起。
+    ///
+    /// 手工 `poll` 是**故意**的：这些用例验的是等待槽的「登记 → 复检 → 唤醒」协议
+    /// 本身，而不是某个运行时的调度行为。
+    fn poll_once_<F>(fut: core::pin::Pin<&mut F>) -> Option<F::Output>
+    where
+        F: core::future::Future,
+    {
+        let mut cx = Context::from_waker(Waker::noop());
+        match fut.poll(&mut cx) {
+            Poll::Ready(out) => Option::Some(out),
+            Poll::Pending => Option::None,
+        }
+    }
+
+    /// 测试目标：`flush_async` 的完成点是**发送环排空**，而不是「已经封口」。
+    /// - 手段：在内存环上建一对半部，写入 3 字节后开始 `flush_async` 并轮询一次；
+    ///   随后用接收半边把这 3 字节读走，再模拟写循环报告一次「发送方向有进展」，
+    ///   最后再轮询一次。
+    /// - 判断：第一次轮询为挂起（环里还有数据、且没有任何执行者会取走它）；读空并
+    ///   通知之后得到 `Ok(())`——若实现把完成点写成「`FIN` 已发」，第一次轮询就会
+    ///   错误地就绪，或第二次轮询仍挂起，两种情况都会让本用例失败。
+    async fn tx_flush_async_waits_for_ring_to_drain() {
+        let (mut tx, mut rx) = make_halves_();
+        let payload = [1u8, 2, 3];
+        try_write_all_(&mut tx, &payload)
+            .await
+            .expect("写入内存环应当成功");
+
+        let mut flush = core::pin::pin!(core::future::IntoFuture::into_future(TrBuffFlush::flush_async(&mut tx)));
+        assert!(
+            poll_once_(flush.as_mut()).is_none(),
+            "发送环未排空时 flush_async 不应就绪"
+        );
+
+        let mut got = [0u8; 3];
+        try_read_exact_(&mut rx, &mut got)
+            .await
+            .expect("把发送环读空应当成功");
+        assert_eq!(got, payload);
+        // 模拟写循环：取走数据之后报告一次进展（生产代码里由 `drain_one_` 调用）。
+        rx.owner_.notify_tx_progress_();
+
+        match poll_once_(flush.as_mut()) {
+            Option::Some(Result::Ok(())) => {}
+            other => panic!("排空之后 flush_async 应当就绪，实际 {other:?}"),
+        }
+    }
+    multi_art_test_!(tx_flush_async_waits_for_ring_to_drain);
+
+    /// 测试目标：对端宣告不再接收（`RESET`）之后，未排空的发送方向必须让
+    /// `flush_async` **报错返回**，而不是永久挂起。
+    /// - 手段：写入 1 字节（无人取走），开始 `flush_async` 并轮询一次；随后在共享
+    ///   状态上置 `PEER_RESET` 并唤醒发送方向的等待者，再轮询一次。
+    /// - 判断：第一次挂起；置位并唤醒之后得到 `Err(Closing)`——这些字节已经被对端
+    ///   授权放弃，报「关闭」是与协议一致的终局。
+    async fn tx_flush_async_fails_after_peer_reset() {
+        let (mut tx, rx) = make_halves_();
+        try_write_all_(&mut tx, &[7u8])
+            .await
+            .expect("写入内存环应当成功");
+
+        let mut flush = core::pin::pin!(core::future::IntoFuture::into_future(TrBuffFlush::flush_async(&mut tx)));
+        assert!(poll_once_(flush.as_mut()).is_none(), "初始应当挂起");
+
+        rx.owner_.set_peer_reset_();
+        rx.owner_.notify_tx_progress_();
+
+        match poll_once_(flush.as_mut()) {
+            Option::Some(Result::Err(ProducerError::Closing)) => {}
+            other => panic!("对端 RESET 之后 flush_async 应当报 Closing，实际 {other:?}"),
+        }
+    }
+    multi_art_test_!(tx_flush_async_fails_after_peer_reset);
+
+    /// 测试目标：`close_async` 先**同步封口**，再等 `FIN` 上线。
+    /// - 手段：开始 `close_async` 并轮询一次；断言此时发送环的生产端已经关闭；
+    ///   随后置「本端 `FIN` 已发」位并唤醒等待者，再轮询一次。
+    /// - 判断：第一次挂起但**封口动作已经生效**（`is_tx_closed` 为真）；置位并唤醒
+    ///   之后得到 `Ok(())`。
+    async fn tx_close_async_seals_then_waits_for_fin() {
+        let (mut tx, rx) = make_halves_();
+
+        let mut close = core::pin::pin!(core::future::IntoFuture::into_future(TrBuffFlush::close_async(&mut tx)));
+        assert!(
+            poll_once_(close.as_mut()).is_none(),
+            "FIN 未上线时 close_async 不应就绪"
+        );
+        assert!(
+            rx.is_tx_closed(),
+            "close_async 的首次推进就应当关掉发送环的生产端"
+        );
+
+        rx.owner_.set_local_fin_sent_();
+        rx.owner_.notify_tx_progress_();
+
+        match poll_once_(close.as_mut()) {
+            Option::Some(Result::Ok(())) => {}
+            other => panic!("FIN 上线之后 close_async 应当就绪，实际 {other:?}"),
+        }
+    }
+    multi_art_test_!(tx_close_async_seals_then_waits_for_fin);
+
+    /// 测试目标：封口**幂等**——`close` 与 `drop` 复用同一套收尾时不会重复生效。
+    /// - 手段：先调同步 `close`，读出状态字里的首置位（应当已经置上）；再调一次
+    ///   `close`，最后丢弃发送半边。
+    /// - 判断：第二次读首置位为 `false`（说明第一次已经置位、且不会重复投递
+    ///   `TxClosed`）；重复 `close` 与随后的 `drop` 都不失败。
+    async fn tx_close_is_idempotent_across_drop() {
+        let (mut tx, _rx) = make_halves_();
+
+        TrBuffTryFlush::close(&mut tx).expect("首次封口不应失败");
+        assert!(
+            !tx.owner_.set_app_tx_closed_(),
+            "封口位应当已经由首次 close 置上"
+        );
+        TrBuffTryFlush::close(&mut tx).expect("重复封口应当幂等成功");
+        // `drop` 走同一套收尾：这里只需不 panic，且不再产生第二条 `TxClosed`。
+        drop(tx);
+    }
+    multi_art_test_!(tx_close_is_idempotent_across_drop);
+
+    /// 测试目标：`TrChannelRx::close_async` 等的是**本端 `RESET` 上线**。
+    /// - 手段：开始 `close_async` 并轮询一次；断言接收环的消费端已经关闭；随后置
+    ///   「`RESET` 已上线」位并唤醒接收方向的等待者，再轮询一次。
+    /// - 判断：第一次挂起且接收方向已关闭（`is_rx_closed` 为真）；置位并唤醒之后
+    ///   得到 `Ok(())`。
+    async fn rx_close_async_waits_for_reset_to_flush() {
+        let (tx, mut rx) = make_halves_();
+
+        let mut close = core::pin::pin!(core::future::IntoFuture::into_future(TrChannelRx::close_async(&mut rx)));
+        assert!(
+            poll_once_(close.as_mut()).is_none(),
+            "RESET 未上线时 close_async 不应就绪"
+        );
+        assert!(
+            tx.is_rx_closed(),
+            "close_async 的首次推进就应当关掉接收环的消费端"
+        );
+
+        tx.owner_.set_local_reset_flushed_();
+        tx.owner_.notify_rx_progress_();
+
+        match poll_once_(close.as_mut()) {
+            Option::Some(Result::Ok(())) => {}
+            other => panic!("RESET 上线之后 close_async 应当就绪，实际 {other:?}"),
+        }
+    }
+    multi_art_test_!(rx_close_async_waits_for_reset_to_flush);
+
+    /// 测试目标：对端已经宣告不再发送（`FIN`）时，关闭接收方向无需再等 `RESET`。
+    /// - 手段：先在共享状态上置 `PEER_FIN`，再开始 `close_async` 并轮询。
+    /// - 判断：首次轮询即得到 `Ok(())`——接收方向本来就到头了，不存在「还要通知
+    ///   对端停止发送」这件事。
+    async fn rx_close_async_completes_when_peer_fin() {
+        let (tx, mut rx) = make_halves_();
+        tx.owner_.set_peer_fin_();
+        tx.owner_.notify_rx_progress_();
+
+        let mut close = core::pin::pin!(core::future::IntoFuture::into_future(TrChannelRx::close_async(&mut rx)));
+        match poll_once_(close.as_mut()) {
+            Option::Some(Result::Ok(())) => {}
+            other => panic!("对端 FIN 之后 close_async 应当立即就绪，实际 {other:?}"),
+        }
+    }
+    multi_art_test_!(rx_close_async_completes_when_peer_fin);
+
+    /// 测试目标：连接级终局（空闲超时）之下，`close_async` 必须**报错返回**。
+    /// - 手段：开始 `close_async` 并轮询一次确认挂起；随后认领一次 `IdleTimeout`
+    ///   中止（它会发布不可忽略通知）并唤醒两侧等待者，再轮询一次。
+    /// - 判断：第一次挂起；中止之后得到 `Err(Closing)`——那条 `RESET` 不可能再送达。
+    async fn rx_close_async_fails_on_abort() {
+        let (_tx, mut rx) = make_halves_();
+        // future 借走 `rx`，因此先克隆共享状态句柄：中止与唤醒都作用在它上面。
+        let owner = rx.owner_.clone();
+
+        let mut close = core::pin::pin!(core::future::IntoFuture::into_future(TrChannelRx::close_async(&mut rx)));
+        assert!(poll_once_(close.as_mut()).is_none(), "初始应当挂起");
+
+        assert!(
+            owner.claim_abort_(AbortCode_::IdleTimeout),
+            "首次认领中止应当成功"
+        );
+        owner.notify_both_progress_();
+
+        match poll_once_(close.as_mut()) {
+            Option::Some(Result::Err(ConsumerError::Closing)) => {}
+            other => panic!("空闲超时之后 close_async 应当报 Closing，实际 {other:?}"),
+        }
+    }
+    multi_art_test_!(rx_close_async_fails_on_abort);
+
+    /// 测试目标：等待可以被调用方的取消令牌打断，且**已经完成的封口不回滚**。
+    /// - 手段：用一个**已取消**的令牌包住发送半边的 `close_async` 并 await。
+    /// - 判断：得到 `Err(Cancelled)`；同时发送环的生产端已经关闭（封口是状态迁移，
+    ///   不是一次可回滚的提交）。
+    async fn close_async_cancels_but_keeps_seal() {
+        let (mut tx, _rx) = make_halves_();
+
+        let out = TrMayCancel::may_cancel_with(
+            TrBuffFlush::close_async(&mut tx),
+            CancelledToken::new(),
+        )
+        .await;
+        match out {
+            Result::Err(ProducerError::Cancelled) => {}
+            other => panic!("取消之后应当报 Cancelled，实际 {other:?}"),
+        }
+        assert!(
+            tx.is_tx_closed(),
+            "取消只结束这次等待，封口本身已经完成"
+        );
+    }
+    multi_art_test_!(close_async_cancels_but_keeps_seal);
 }
