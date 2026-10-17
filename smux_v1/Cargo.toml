@@ -22,7 +22,7 @@ abs_art-facade = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch =
 # 里（孤儿规则）。因此这里开一个可选依赖 + 测试 feature，生产依赖图里不出现它。
 abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", optional = true }
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
-atomic_sync = { git = "https://gitee.com/lino_snsalias/atomic_sync.git", branch = "dev/0.3.0" }
+atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }
 
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
