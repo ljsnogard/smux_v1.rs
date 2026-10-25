@@ -4,6 +4,7 @@ name = "smux_v1"
 version = "0.1.0"
 
 description = "流复用协议第一版"
+license.workspace = true
 
 [dependencies]
 abs_smux = { path = "../abs_smux" }
@@ -26,6 +27,7 @@ atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }
 
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
+mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs" }
 
 crc = { version = "3.4.*" }
 flume = { version = "0.12.*" }

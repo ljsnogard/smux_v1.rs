@@ -4,6 +4,7 @@ name = "smux_v1_listener"
 version = "0.1.0"
 
 description = "流复用协议第一版：跨运行时 listener"
+license.workspace = true
 
 [dependencies]
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }

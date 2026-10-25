@@ -8,7 +8,7 @@ name = "smux_v1_sock_demo"
 version = "0.1.0"
 edition = "2024"
 description = "smux_v1 在真实 TCP socket 上、两进程前后交替主动/被动、跨 tokio/compio/smol 互通的正确性与 metrics demo。"
-license = "MIT/Apache-2.0"
+license = "AGPL-3.0-or-later"
 publish = false
 
 [workspace]

@@ -22,7 +22,7 @@ name = "smux_v1_uds_bench"
 version = "0.1.0"
 edition = "2024"
 description = "smux_v1 在真实 UNIX domain socket 上的性能测试：compio / smol / tokio 三后端下，raw 多客户端 UDS 与 smux 复用 channel 两条路径的并发带宽与任务时间方差对照。"
-license = "MIT/Apache-2.0"
+license = "AGPL-3.0-or-later"
 publish = false
 
 [workspace]

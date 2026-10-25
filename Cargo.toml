@@ -12,7 +12,7 @@ resolver = "3"
 
 [workspace.package]
 authors = ["lino <lino_snsalias@outlook.com>"]
-license = "MIT/Apache-2.0"
+license = "AGPL-3.0-or-later"
 
 # ⚠️ 开发期临时补丁（**上游推送后删除本节**）
 #

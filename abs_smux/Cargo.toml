@@ -8,7 +8,7 @@ description = "Abstraction of stream multiplexing."
 repository = "https://github.com/ljsnogard/abs_smux"
 keywords = ["traits"]
 categories = ["no-std"]
-license = "MIT/Apache-2.0"
+license.workspace = true
 
 [dependencies]
 abs_buff = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
