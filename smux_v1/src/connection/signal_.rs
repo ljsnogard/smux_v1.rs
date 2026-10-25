@@ -486,12 +486,17 @@ impl<E> Overflow_<E> {
 
     /// 取得并清除标志；返回此前是否置位。
     fn take_(&self) -> bool {
-        self.flag_.swap(false, Ordering::AcqRel)
+        let taken = self.flag_.swap(false, Ordering::AcqRel);
+        #[cfg(feature = "test-loop-probe")]
+        if taken {
+            crate::connection::loop_probe_::event_rescan_();
+        }
+        taken
     }
 
     /// 等待标志置位；已置位时立刻就绪并顺手消费通知槽的持久位。
     fn poll_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.flag_.swap(false, Ordering::AcqRel) {
+        if self.take_() {
             // 清掉通知槽的持久位，避免下一轮因残留 pending 空转。
             let _ = self.wake_.poll_wait_(cx);
             return Poll::Ready(());
@@ -580,9 +585,15 @@ impl<E: Send + 'static> EventSender_<E> {
             Result::Err(TrySendError::Full(event)) => {
                 self.overflow_.push_durable_(event);
                 self.overflow_.mark_();
+                #[cfg(feature = "test-loop-probe")]
+                crate::connection::loop_probe_::event_durable_stashed_();
                 true
             }
-            Result::Err(_) => false,
+            Result::Err(_) => {
+                #[cfg(feature = "test-loop-probe")]
+                crate::connection::loop_probe_::event_durable_closed_();
+                false
+            }
         }
     }
 }
@@ -624,6 +635,8 @@ impl<E: Send + 'static> TrEventSender_<E> for EventSender_<E> {
             // 环满（或生产者方向锁被慢写者占用）：丢弃并置全扫标志。
             Result::Err(TrySendError::Full(_)) => {
                 self.overflow_.mark_();
+                #[cfg(feature = "test-loop-probe")]
+                crate::connection::loop_probe_::event_full_recoverable_();
                 false
             }
             // 消费者已消失（连接正在收尾）：按「没送出去」处理。

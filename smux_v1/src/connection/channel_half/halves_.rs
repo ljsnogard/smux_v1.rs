@@ -181,16 +181,29 @@ where
         let edge = congested != self.backlogged_;
         // 空环也通知：见上方文档（丢唤醒）。
         if congested || edge || queued == 0u64 {
+            #[cfg(feature = "test-loop-probe")]
+            crate::connection::loop_probe_::event_tx_ready_attempt_(
+                queued == 0u64,
+                congested,
+                edge,
+            );
             self.backlogged_ = congested;
             let fresh = self.owner_.mark_tx_queued_();
             if fresh {
-                let _ = self
+                let sent = self
                     .conn_
                     .core_()
                     .w_events_()
                     .try_send_event_(WriteEvent_::TxReady {
                         local_dock: self.local_dock_,
                         remote_dock: self.remote_dock_});
+                #[cfg(feature = "test-loop-probe")]
+                crate::connection::loop_probe_::event_tx_ready_result_(sent);
+                #[cfg(not(feature = "test-loop-probe"))]
+                let _ = sent;
+            } else {
+                #[cfg(feature = "test-loop-probe")]
+                crate::connection::loop_probe_::event_tx_ready_dedup_();
             }
         }
     }
@@ -584,16 +597,24 @@ where
     /// 再读环内积压**（见 [`ChannelOwner_::clear_rx_consumed_`]），这样清位之后发生的
     /// 消费会重新置位并投递，不会丢。
     fn notify_consumed_(&mut self) {
+        #[cfg(feature = "test-loop-probe")]
+        crate::connection::loop_probe_::event_rx_consumed_attempt_();
         if !self.owner_.mark_rx_consumed_() {
+            #[cfg(feature = "test-loop-probe")]
+            crate::connection::loop_probe_::event_rx_consumed_dedup_();
             return;
         }
-        let _ = self
+        let sent = self
             .conn_
             .core_()
             .r_events_()
             .try_send_event_(ReadEvent_::RxConsumed {
                 local_dock: self.local_dock_,
                 remote_dock: self.remote_dock_});
+        #[cfg(feature = "test-loop-probe")]
+        crate::connection::loop_probe_::event_rx_consumed_result_(sent);
+        #[cfg(not(feature = "test-loop-probe"))]
+        let _ = sent;
     }
 
     /// 从接收环读满 `out`。
