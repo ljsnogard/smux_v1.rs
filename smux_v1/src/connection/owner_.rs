@@ -912,16 +912,21 @@ impl ChannelState_ {
 
     /// 读循环核对接收水位**之前**清去重位（同步路径，不取锁）。
     ///
+    /// 返回**本次是否真的清掉了位**：全扫兜底据此判断「`RxConsumed` 是否可能丢了」
+    /// ——置位即意味着应用消费过、水位需要重算。
+    ///
     /// # 顺序不可反
     ///
     /// 必须**先清位、再读环内积压**：这样「清位之后发生的消费」会重新置位并投递一条
     /// 新通知，而「清位之前的消费」已经体现在随后读到的积压量里。反过来（先读积压、
     /// 后清位）会丢掉清位与读之间那一次消费的唤醒。
-    pub(crate) fn clear_rx_consumed_(&self) {
-        let _ = self.flags_.try_spin_compare_exchange_weak(
-            |value| has_flag_(value, RX_CONSUMED),
-            |value| value & !RX_CONSUMED,
-        );
+    pub(crate) fn clear_rx_consumed_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| has_flag_(value, RX_CONSUMED),
+                |value| value & !RX_CONSUMED,
+            )
+            .is_succ()
     }
 
     //-- ---- 流控便捷入口（窗口内部各自一把自旋锁，见 `flow_ctrl`） ----

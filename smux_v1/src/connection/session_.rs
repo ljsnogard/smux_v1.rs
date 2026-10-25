@@ -144,8 +144,8 @@ use crate::{
         owner_::{ChannelOwner_, TgOwner_},
         ring_::{BufferedRx, BufferedTx},
         signal_::{
-            ControlFrame_, EventReceiver_, EventSender_, ReadEvent_, TrEventReceiver_,
-            TrEventSender_, WriteEvent_,
+            ControlFrame_, EventReceiver_, EventSender_, EventTake_, ReadEvent_,
+            TrEventReceiver_, TrEventSender_, WriteEvent_,
         },
         telegraph::TgRecvCtx_,
     },
@@ -926,7 +926,12 @@ where
     fn drop(&mut self) {
         let failed = self.shared.reg_.fail_kind_();
         let now_millis = self.shared.conn_clock_().now_millis_();
-        while let Option::Some(event) = self.events.try_take_event_() {
+        loop {
+            let event = match self.events.try_take_event_() {
+                EventTake_::Event(event) => event,
+                // Drop 阶段不再做全扫：其余半部由循环退出时的守卫统一关闭。
+                EventTake_::Rescan | EventTake_::Empty | EventTake_::Closed => break,
+            };
             if let ReadEvent_::Attach {
                 local_dock,
                 remote_dock,
@@ -1072,9 +1077,9 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     .await;
                     return;
                 }
-                // 事件已由 park **取出**（`flume` 的 `recv_async` 是消费语义，丢掉它就
-                // 等于把这条 `Attach` / `Release` / `RxConsumed` 静默吞掉），因此必须
-                // 在这里就地处理，不能只回顶部等 `drain_read_events_` 再取一次。
+                // 事件已由 park **取出**（异步接收是消费语义，丢掉它就等于把这条
+                // `Attach` / `Release` / `RxConsumed` 静默吞掉），因此必须在这里就地
+                // 处理，不能只回顶部等 `drain_read_events_` 再取一次。
                 ReadWake_::Event(event) => {
                     if let Result::Err(err) = handle_read_event_::<C, _>(
                         event,
@@ -1082,6 +1087,20 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         &mut *tg_table,
                         table.shared.conn_clock_().now_millis_(),
                         &events_tx,
+                        &cancel,
+                    )
+                    .await
+                    {
+                        fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                        return;
+                    }
+                }
+                // 有可重建事件被丢弃：全扫读表（水位与释放提示都在状态位里）。
+                ReadWake_::Rescan => {
+                    if let Result::Err(err) = rescan_read_::<C, _>(
+                        &mut table.table,
+                        &events_tx,
+                        table.shared.conn_clock_().now_millis_(),
                         &cancel,
                     )
                     .await
@@ -1238,7 +1257,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 // **临界区**，临界区每变必报）。
                 let imminent = entry.owner_.recv_take_report_();
                 if let Option::Some(report) = imminent {
-                    let _ = events_tx.try_send_event_(WriteEvent_::Control {
+                    let _ = events_tx.try_send_durable_event_(WriteEvent_::Control {
                         frame_: window_update_frame_(pair, report),
                     });
                 }
@@ -1301,7 +1320,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         Result::Err(ReserveErr_::Cancelled) => return,
                         Result::Err(_) => {
                             // 配额 / 重复：回 `REJECT`，理由载荷留空。
-                            let _ = events_tx.try_send_event_(WriteEvent_::Control {
+                            let _ = events_tx.try_send_durable_event_(WriteEvent_::Control {
                                 frame_: ControlFrame_::with_window_(
                                     FrameKind::Reject,
                                     0u8,
@@ -1352,7 +1371,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     }
                     entry.owner_.mark_data_(now_millis);
                     // 拆流记账（移除写侧表项、释放身份）交给复用循环的统一入口。
-                    let _ = events_tx.try_send_event_(WriteEvent_::PeerClosed {
+                    let _ = events_tx.try_send_durable_event_(WriteEvent_::PeerClosed {
                         local_dock: local,
                         remote_dock: remote,
                         reset_: reset,
@@ -1461,19 +1480,83 @@ where
 {
     const K_EVENT_BATCH: usize = 32usize;
     for _ in 0..K_EVENT_BATCH {
-        let Option::Some(event) = events.try_take_event_() else {
-            break;
-        };
-        handle_read_event_::<C, _>(event, table, tg_table, now_millis, events_tx, cancel).await?;
+        match events.try_take_event_() {
+            EventTake_::Event(event) => {
+                handle_read_event_::<C, _>(event, table, tg_table, now_millis, events_tx, cancel)
+                    .await?;
+            }
+            // 有可重建事件被丢弃：按各子流的状态位全扫一次，然后让主循环继续。
+            EventTake_::Rescan => {
+                rescan_read_::<C, _>(table, events_tx, now_millis, cancel).await?;
+                break;
+            }
+            EventTake_::Empty | EventTake_::Closed => break,
+        }
     }
     Result::Ok(())
 }
 
+/// 定容读事件通道的**全扫兜底**：重建被丢弃的可重建事件。
+///
+/// 读事件里只有 `RxConsumed` 是可重建的：位在 [`ChannelState_`] 上；清位时若真的
+/// 置着，就按「环内实际积压」重算一次窗口通告。
+///
+/// `Attach` 携带环半部句柄、`Release` 是身份释放的一次性通知，二者都**不可重建**，
+/// 生产者走 [`EventSender_::try_send_durable_event_`]，不会丢。
+async fn rescan_read_<C, K>(
+    table: &mut ReadTable_<C::Alloc>,
+    events_tx: &EventSender_<WriteEvent_<C::Alloc>>,
+    now_millis: u64,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let mut cursor: Option<(Dock, Dock)> = Option::None;
+    loop {
+        let next = match cursor {
+            Option::None => table.keys().next().copied(),
+            Option::Some(last) => table
+                .range((Bound::Excluded(last), Bound::Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        };
+        let Option::Some(pair) = next else {
+            return Result::Ok(());
+        };
+        cursor = Option::Some(pair);
+
+        // 先取快照再 awaits：`entry` 的借用不能跨 `await`。
+        let Option::Some((owner, buffered)) = table.get(&pair).map(|entry| {
+            (
+                entry.owner_.clone(),
+                entry.writer_.ring_state().data_size(),
+            )
+        }) else {
+            continue;
+        };
+
+        if owner.clear_rx_consumed_() {
+            recheck_recv_level_::<C, _>(
+                &owner,
+                buffered,
+                now_millis,
+                events_tx,
+                pair,
+                cancel,
+            )
+            .await?;
+        }
+    }
+}
+
+///
 /// 处理**单条**读事件。
 ///
 /// 单独成函数是因为同一种事件有**两个**来源：`drain_read_events_` 从队列成批取出的，
-/// 以及循环 park 时从队列里**取出**的那一条。后者不可省——`flume` 的异步接收是
-/// **消费**语义，park 拿到手又丢掉就等于把这条 `Attach` 静默吞掉（本仓库的
+/// 以及循环 park 时从队列里**取出**的那一条。后者不可省——异步接收是**消费**语义，
+/// park 拿到手又丢掉就等于把这条 `Attach` 静默吞掉（本仓库的
 /// `mux_min_stage_inmem` 用例正是这么挂死的：附加事件被 park 吃掉，随后到达的数据帧
 /// 在本地表里找不到表项，读循环掉进「未知子流」分支并卡在注册表锁上）。
 async fn handle_read_event_<C, K>(
@@ -1580,7 +1663,7 @@ where
     let buffered = Credit::try_from(buffered).unwrap_or(Credit::MAX);
     let report = owner.recv_recheck_(buffered, now_millis);
     if let Option::Some(report) = report {
-        let _ = events_tx.try_send_event_(WriteEvent_::Control {
+        let _ = events_tx.try_send_durable_event_(WriteEvent_::Control {
             frame_: window_update_frame_(pair, report),
         });
     }
@@ -1622,9 +1705,11 @@ where
 
     /// 从读事件通道里**取出**了一条事件（`Attach` / `Release` / `RxConsumed`）。
     ///
-    /// 必须由调用方处理：`flume` 的异步接收是**消费**语义，丢掉它就等于静默吞掉
-    /// 这条事件。
+    /// 必须由调用方处理：异步接收是**消费**语义，丢掉它就等于静默吞掉这条事件。
     Event(ReadEvent_<A>),
+
+    /// 有可重建事件被丢弃：调用方应全扫读表，把水位/释放提示重建出来。
+    Rescan,
 
     /// 取消令牌触发：连接正在收尾，本循环退出。
     Cancelled,
@@ -1661,6 +1746,8 @@ where
     let mut cancelled = false;
     // 从通道里**取出**的事件：必须原样带回调用方，不能在此丢掉。
     let mut taken: Option<ReadEvent_<C::Alloc>> = Option::None;
+    // 有可重建事件被丢弃：把「全扫」带回调用方（读表在调用方手里）。
+    let mut need_rescan = false;
     // 传输读 future 就绪时的分类（段本身借用 `ring_fut`，因此就地判、就地 drop）。
     let mut woke: Option<ReadWake_<C::Alloc>> = Option::None;
     poll_fn(|cx| {
@@ -1671,11 +1758,17 @@ where
         }
         if !events_closed {
             match core::future::Future::poll(event_fut.as_mut(), cx) {
-                Poll::Ready(Option::Some(event)) => {
+                Poll::Ready(EventTake_::Event(event)) => {
                     taken = Option::Some(event);
                     return Poll::Ready(());
                 }
-                Poll::Ready(Option::None) => events_closed = true,
+                Poll::Ready(EventTake_::Rescan) => {
+                    need_rescan = true;
+                    return Poll::Ready(());
+                }
+                Poll::Ready(EventTake_::Closed) => events_closed = true,
+                // `take_event_async_` 不会返回 `Empty`；保守地当作「稍后再试」。
+                Poll::Ready(EventTake_::Empty) => {}
                 Poll::Pending => {}
             }
         }
@@ -1715,6 +1808,8 @@ where
     .await;
     if cancelled {
         ReadWake_::Cancelled
+    } else if need_rescan {
+        ReadWake_::Rescan
     } else if let Option::Some(event) = taken {
         ReadWake_::Event(event)
     } else if let Option::Some(woke) = woke {
@@ -1946,7 +2041,12 @@ where
     fn drop(&mut self) {
         let failed = self.shared.reg_.fail_kind_();
         let now_millis = self.shared.conn_clock_().now_millis_();
-        while let Option::Some(event) = self.events.try_take_event_() {
+        loop {
+            let event = match self.events.try_take_event_() {
+                EventTake_::Event(event) => event,
+                // Drop 阶段不再做全扫：其余半部由循环退出时的守卫统一关闭。
+                EventTake_::Rescan | EventTake_::Empty | EventTake_::Closed => break,
+            };
             if let WriteEvent_::Attach {
                 local_dock,
                 remote_dock,
@@ -2116,8 +2216,13 @@ pub(crate) async fn mux_loop_async_<C, K>(
         // 排空。
         const K_EVENT_BATCH: usize = 32usize;
         for _ in 0..K_EVENT_BATCH {
-            let Option::Some(event) = events.try_take_event_() else {
-                break;
+            let event = match events.try_take_event_() {
+                EventTake_::Event(event) => event,
+                // 有可重建事件（`TxReady` / `TgReady`）被丢弃：直接进入本轮的排空段。
+                // 写循环的排空本来就是**全表**扫描（`drain_once_` 与 2.7 段），因此
+                // 不需要额外的状态位全扫——这一轮必定会把可写的数据取走。
+                EventTake_::Rescan => break,
+                EventTake_::Empty | EventTake_::Closed => break,
             };
             match race_cancel_(
                 &cancel,
@@ -2254,6 +2359,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
         //    不轮询传输写半边则「腾出空间」这条唤醒会丢（下游排空方把字节搬走之后没有
         //    任何人通知复用循环，若这里不同时 park 在它上面，drain 就再也不会被触发）。
         let mut taken: Option<WriteEvent_<C::Alloc>> = Option::None;
+        let mut need_rescan = false;
         let mut ring_ready = false;
         let alive = {
             let cancel_fut = cancel.child_token().cancellation();
@@ -2268,14 +2374,21 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     return Poll::Ready(false);
                 }
                 match core::future::Future::poll(event_fut.as_mut(), cx) {
-                    Poll::Ready(Option::Some(event)) => {
+                    Poll::Ready(EventTake_::Event(event)) => {
                         taken = Option::Some(event);
                         return Poll::Ready(true);
                     }
+                    // 有可重建事件被丢弃：醒来做全扫（状态位都在各子流上）。
+                    Poll::Ready(EventTake_::Rescan) => {
+                        need_rescan = true;
+                        return Poll::Ready(true);
+                    }
                     // 所有生产者都没了：连接正在收尾，退出。
-                    Poll::Ready(Option::None) => {
+                    Poll::Ready(EventTake_::Closed) => {
                         return Poll::Ready(false);
                     }
+                    // `take_event_async_` 不会返回 `Empty`；保守地当作「稍后再试」。
+                    Poll::Ready(EventTake_::Empty) => {}
                     Poll::Pending => {}
                 }
                 // 子流发送环有新数据：回到顶部由 `drain_once_` 正式取走。
@@ -2317,6 +2430,11 @@ pub(crate) async fn mux_loop_async_<C, K>(
         };
         if !alive {
             return;
+        }
+        if need_rescan {
+            // 有可重建事件（`TxReady` / `TgReady`）被丢弃：回顶部，本轮排空段本来
+            // 就是全表扫描，足以把可写数据取走。
+            continue;
         }
         if let Option::Some(event) = taken {
             match race_cancel_(
@@ -2857,7 +2975,7 @@ where
                 .await,
             Result::Ok(true)
         );
-        let _ = read_events.try_send_event_(ReadEvent_::Release {
+        let _ = read_events.try_send_durable_event_(ReadEvent_::Release {
             local_dock: pair.0,
             remote_dock: pair.1,
         });

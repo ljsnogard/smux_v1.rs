@@ -35,25 +35,24 @@
 //!
 //! [`CancelToken_`] 的入口全是同步的（`is_cancelled` 可从任意线程调用、
 //! `cancellation()` 的等待在 `poll` 中登记），套锁解决不了等待问题：它用
-//! `AtomicBool` + **持久通知通道**实现，取消状态是原子读，唤醒是 `recv_async`。
+//! `AtomicBool` + **零分配通知槽**实现，取消状态是原子读，唤醒是 `NotifySlot_`。
 //!
-//! # 唤醒：按**实例数**选落点
+//! # 唤醒：零分配的单等待者槽
 //!
-//! 「某件事发生了」有两种落点，选择依据是这条通知**每多少实例一个**：
+//! [`NotifySlot_`]（一个原子位 + 一个 waker 槽，**零堆分配** + 每实例一次 `Shared`）
+//! 同时用于**建流等待者**、[`CancelToken_`] 与 listener 的入向等待：它们都只需要
+//! 「先通知、后等待不丢」这一条语义，不需要队列。它要手写 `poll`，因此「登记 →
+//! 复检」的协议与「至多一个等待者」的前提都写在 [`NotifySlot_`] 的文档里，并有用例
+//! 钉住。
 //!
-//! - **持久通知通道**（`flume` 容量 1）用于 [`CancelToken_`] 与 listener 的入向等待：
-//!   它们每**连接**（或每 dock）一个，通道那一次全局分配可以接受；通道持久意味着
-//!   「先通知、后等待」不会丢唤醒，而且等待方在 async 上下文里只要「先查状态、再
-//!   `recv_async().await`」即可——不需要 `cx`，没有手写的 `poll`；
-//! - [`NotifySlot_`]（一个原子位 + 一个 waker 槽，**零堆分配**）用于**建流等待者**：
-//!   它是**每条子流**一个的，通道那一次全局分配正是待整改项
-//!   （`dev-notes/audit-heap-alloc-20261004-1122.md` §3.1 #7）。它要手写 `poll`，因此
-//!   「登记 → 复检」的协议与「至多一个等待者」的前提都写在 [`NotifySlot_`] 的文档里，
-//!   并有用例钉住。
+//! 取消令牌曾经用容量 1 的 `flume` 通道（后改 `mpmc_chan` 容量 2）。实测发现它是
+//! **每个循环每轮 park 都新建一次 `recv_async`** 的热点：`mpmc_chan` 的慢路径每次都要
+//! 取消费方向写锁，1024 子流的 smoke 场景因此从 13 s 退化到 39 s。改用本模块已有的
+//! `NotifySlot_` 后回到 13 s（见 `dev-notes/mpmc-chan-20261026-0046.md` §6.2）。
 //!
 //! 早先这里删过一版 waker 槽（`WakerSlot_`），理由是「改用通道就不必手写 `poll`」；
-//! 本轮因为**每条子流一次的全局分配**把它按上述协议重新引入——推翻的是当时那个
-//! 选择，不是当时对丢唤醒的警惕。
+//! 后来因为**每条子流一次的全局分配**把它按上述协议重新引入——推翻的是当时那个
+//! 选择，不是当时对丢唤醒的警惕。本轮又把它用于取消令牌，依据是同一份实测数据。
 //!
 //! # 分配
 //!
@@ -66,8 +65,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
-
-use flume::{Receiver, Sender};
 
 use abs_cancel::{TrCancellationToken, TrMayCancel};
 use abs_sync::may_break::TrMayBreak;
@@ -142,8 +139,6 @@ where
     }
 }
 
-
-
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 可触发的取消令牌
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -159,18 +154,19 @@ where
 /// 令牌的入口全是**同步**的：[`TrCancellationToken::is_cancelled`] 可以从任意线程
 /// 调用，[`TrCancellationToken::cancellation`] 的 future 在 `poll` 里登记等待——
 /// 同步入口里没有 `await`，套一把「可异步获取」的锁也解决不了等待问题。因此这里
-/// 用「原子标志 + 通知通道」：
+/// 用「原子标志 + 零分配通知槽」：
 ///
 /// - 取消状态是一个 `AtomicBool`，`is_cancelled()` 就是一次原子读（循环热路径不取锁）；
-/// - 唤醒走一条 `flume` 通知通道：`cancel_` 置位后投一条，等待方 `recv_async().await`。
+/// - 唤醒走 [`NotifySlot_`]：`cancel_` 置位后 `notify_`，等待方在 `poll` 里
+///   「先查原子标志、再登记 waker」。
 ///
-/// 通道是**持久**的，因此「先取消、后登记」不会丢唤醒：等待 future 每次 poll 先查
+/// 槽是**持久**的，因此「先取消、后登记」不会丢唤醒：等待 future 每次 poll 先查
 /// 原子标志，已取消就直接就绪。
 ///
 /// # 单等待者
 ///
-/// 通知只投一条，因此假定**同一个令牌在同一时刻至多一个等待者**（本 crate 的用法：
-/// 每个循环一个令牌，一次只 `await` 一处）。这与旧实现的单 waker 槽是同一条契约。
+/// 通知槽只保存一个 waker，因此假定**同一个令牌在同一时刻至多一个等待者**（本 crate
+/// 的用法：每个循环一个令牌，一次只 `await` 一处）。这与 [`NotifySlot_`] 的前提一致。
 pub(crate) struct CancelToken_<A>
 where
     A: AllocatorClone,
@@ -178,11 +174,13 @@ where
     /// 取消标志（走原子，读侧无锁）。
     cancelled_: Shared<AtomicBool, A>,
 
-    /// 通知生产端；`cancel_` 投一条。
-    notify_tx_: Sender<()>,
-
-    /// 通知消费端；`cancellation()` 的 future 收一条。
-    notify_rx_: Receiver<()>,
+    /// 持久通知槽：`cancel_` 置位并唤醒，`cancellation()` 在它上面 park。
+    ///
+    /// 取消信号只需要「持久 + 单等待者」这一条语义，不需要队列。用零分配的自旋槽
+    /// （[`NotifySlot_`]）比容量 1/2 的通道更轻：`cancel_` 只是一次原子置位 + 唤醒，
+    /// 等待侧也不必每次 park 都进入通道的慢路径。`Shared` 的这一次分配与
+    /// `cancelled_` 同源、每令牌一次。
+    notify_: Shared<NotifySlot_, A>,
 }
 
 impl<A> Clone for CancelToken_<A>
@@ -192,8 +190,7 @@ where
     fn clone(&self) -> Self {
         CancelToken_ {
             cancelled_: self.cancelled_.clone(),
-            notify_tx_: self.notify_tx_.clone(),
-            notify_rx_: self.notify_rx_.clone(),
+            notify_: self.notify_.clone(),
         }
     }
 }
@@ -204,12 +201,9 @@ where
 {
     /// 用调用方注入的分配器建立令牌（未取消）。
     pub(crate) fn new_(alloc: A) -> Self {
-        // 容量 1：通知是幂等的「已取消」信号，重复投递没有意义。
-        let (notify_tx_, notify_rx_) = flume::bounded(1usize);
         CancelToken_ {
-            cancelled_: Shared::new(AtomicBool::new(false), alloc),
-            notify_tx_,
-            notify_rx_,
+            cancelled_: Shared::new(AtomicBool::new(false), alloc.clone()),
+            notify_: Shared::new(NotifySlot_::new_(), alloc),
         }
     }
 
@@ -218,8 +212,8 @@ where
     /// 只有**第一次**置位者投通知，因此重复取消不会在通道里堆积消息。
     pub(crate) fn cancel_(&self) {
         if !self.cancelled_.swap(true, Ordering::AcqRel) {
-            // 通道已满（已有一条待取通知）时投递失败是无害的：等待方会先查原子标志。
-            let _ = self.notify_tx_.try_send(());
+            // 通知槽是**持久**的：「先取消、后登记」不会丢（见 `NotifySlot_` 协议）。
+            self.notify_.notify_();
         }
     }
 }
@@ -254,9 +248,16 @@ where
             if self.is_cancelled() {
                 return;
             }
-            // 通道是持久的：上面的原子检查与这里的登记之间发生的取消，通知已经排在
-            // 队列里，因此不会丢。
-            let _ = self.notify_rx_.recv_async().await;
+            // 通知槽是持久的：上面的原子检查与这里的登记之间发生的取消，`pending_`
+            // 已经置位，`poll_wait_` 会立即就绪；登记之后发生的取消会走 waker 唤醒。
+            // 每一轮 poll 都先复检原子标志，因此不依赖「消息恰好被这一条 future 取到」。
+            core::future::poll_fn(|cx| {
+                if self.is_cancelled() {
+                    return Poll::Ready(());
+                }
+                self.notify_.poll_wait_(cx)
+            })
+            .await;
         }
     }
 }

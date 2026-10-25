@@ -27,10 +27,14 @@ atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }
 
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
-mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs" }
+# 通道实现二选一（见 `signal_` / `sync_` 模块文档）：
+# - 默认：`mpmc_chan`（定容 + 全扫兜底）；
+# - `chan-flume` feature：切回旧的 `flume` 实现，用于 A/B 对比。
+# 包名是 `mpmc-chan`，依赖名取 `mpmc_chan` 以便源码里写 `mpmc_chan::...`。
+mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs", package = "mpmc-chan", optional = true }
 
 crc = { version = "3.4.*" }
-flume = { version = "0.12.*" }
+flume = { version = "0.12.*", optional = true }
 thiserror = { version = "2.0.*", default-features = false }
 
 [features]
@@ -44,18 +48,18 @@ thiserror = { version = "2.0.*", default-features = false }
 # 注意：门面的缺省 `rt-compio` 始终在线（本 crate 依赖它也带默认），因此非缺省装配下
 # compio 仍会被链接——这是"可选优化"而非"正确性要求"，想省掉可在决定点写
 # `default-features = false`。
-test-tokio-runtime = ["abs_art-facade/rt-tokio", "test-mock-clock", "test-loop-probe"]
+test-tokio-runtime = ["chan-mpmc", "abs_art-facade/rt-tokio", "test-mock-clock", "test-loop-probe"]
 # compio 侧：缺省的默认后端（`default = ["test-compio-runtime"]`）。共享文件按
 # 「tokio / smol feature 是否打开」分派设备类型，因此 `cargo test --all-targets`
 # 不带任何参数跑的就是这一格。
-test-compio-runtime = ["abs_art-facade/rt-compio", "test-mock-clock", "test-loop-probe"]
+test-compio-runtime = ["chan-mpmc", "abs_art-facade/rt-compio", "test-mock-clock", "test-loop-probe"]
 # smol 侧：与上面两个 feature 构成**互斥三选一**（共享文件按「smol feature 是否打开」
 # 分派设备类型与传输装配）。
 #
 # 与 tokio 的差别只在「谁驱动本地队列」：smol 没有隐式运行时上下文，作用域是本线程
 # `thread_local!` 里的 `Rc<LocalExecutor<'static>>`，因此测试壳用
 # `smol::block_on(scope.run_until(..))` 驱动（见 `tests/smoke_smol.rs`）。
-test-smol-runtime = ["abs_art-facade/rt-smol", "test-mock-clock", "test-loop-probe"]
+test-smol-runtime = ["chan-mpmc", "abs_art-facade/rt-smol", "test-mock-clock", "test-loop-probe"]
 # 虚拟时钟（`abs_art_mock_clock`）只在这些测试 feature 下被拉进来。
 test-mock-clock = ["dep:abs_art-mock_clock", "abs_art-facade/mock-clock"]
 # 循环活动探针（诊断挂起类问题）：给连接加一个只增的「解复用循环跑了几轮」计数，
@@ -67,7 +71,20 @@ test-loop-probe = []
 # 上报调用点被消除为零指令——缺省 sink 是零大小的 `NoMetrics`，每个方法都是
 # `#[inline(always)]` 空实现。本 feature **不引入任何依赖**。
 metrics = []
-default = ["test-compio-runtime"]
+# **通道实现 A/B 开关**：`chan-mpmc`（默认）走 `mpmc_chan` 的定容 + 全扫/暂存
+# 兜底；`chan-flume` 切回旧的 `flume` 无界实现（`signal_` 里按 `cfg` 分派）。
+# `CancelToken_` 两种后端都使用零分配 `NotifySlot_`，不受本开关影响。它只影响内部
+# 实现，不改变任何对外 API。
+#
+# A/B 时显式选 flume：
+#   cargo test -p smux_v1 --no-default-features \
+#     --features test-tokio-runtime,chan-flume
+# 注意 `test-*` feature 会顺带启用 `chan-mpmc`（否则 `--no-default-features` 下
+# 默认通道分支没有依赖），因此两个实现都会被编译，但 `signal_` 按 `chan-flume`
+# 选择 flume 分支。
+chan-mpmc = ["dep:mpmc_chan"]
+chan-flume = ["dep:flume"]
+default = ["test-compio-runtime", "chan-mpmc"]
 
 [dev-dependencies]
 # 测试在 compio 上运行（目标 3），因此内存分配器只在 dev-dependencies 中出现

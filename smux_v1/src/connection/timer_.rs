@@ -79,7 +79,7 @@ use crate::{
         Dock, FrameKind, TrConnCfg, flags,
         mux_connection::{K_CLOSE_NONE, K_CLOSE_TIMEOUT},
         session_::MuxShared_,
-        signal_::{ControlFrame_, EventSender_, ReadEvent_, TrEventSender_, WriteEvent_},
+        signal_::{ControlFrame_, EventSender_, ReadEvent_, WriteEvent_},
     },
     flow_ctrl::WindowReport,
     metrics::{ChannelCloseReason, TrMetricsSink},
@@ -88,9 +88,9 @@ use crate::{
 
 /// 每轮最多认领 / 投递多少条保活动作。
 ///
-/// 它是**限频**：每条 `PULSE` 或拆流都要经 `flume` 投一条事件（一次全局分配），
-/// 因此在册子流很多时不能一轮全投。写满即提前返回并**立刻**再扫一轮
-/// （`TimerScan_::is_full_`），动作不会丢，只是分轮完成。
+/// 它是**限频**：每条 `PULSE` 或拆流都要经事件通道投一条事件，因此在册子流很多时
+/// 不能一轮全投。写满即提前返回并**立刻**再扫一轮（`TimerScan_::is_full_`），动作
+/// 不会丢，只是分轮完成。
 pub(crate) const K_TIMER_ACTION_BATCH: usize = 64usize;
 
 /// 计时循环每轮认领的一个动作。
@@ -305,7 +305,7 @@ where
             // 复用**既有的**「应用丢弃发送半边」路径：复用循环收到它以后会
             // `set_app_tx_closed_` 并在发送环排空之后补 `CLOSE(FIN)`。这里因此
             // 不需要新事件类型，也不需要复制任何排空逻辑。
-            w_events.try_send_event_(WriteEvent_::TxClosed {
+            w_events.try_send_durable_event_(WriteEvent_::TxClosed {
                 local_dock: *local_dock,
                 remote_dock: *remote_dock,
             })
@@ -330,7 +330,7 @@ where
                 Option::Some((report.recv_total(), report.window())),
                 Vec::new(),
             );
-            w_events.try_send_event_(WriteEvent_::Control { frame_: frame })
+            w_events.try_send_durable_event_(WriteEvent_::Control { frame_: frame })
         }
 
         TimerAction_::Abort {
@@ -394,24 +394,24 @@ where
             // 4. 尽力告诉对端：两个方向都收尾。`FIN` 关掉对端的接收方向、`RESET` 关掉
             //    对端的发送方向，一条帧只能表达一个方向，因此发两条。
             let fin = ControlFrame_::plain_(FrameKind::Close, flags::K_FIN, local, remote);
-            if !w_events.try_send_event_(WriteEvent_::Control { frame_: fin }) {
+            if !w_events.try_send_durable_event_(WriteEvent_::Control { frame_: fin }) {
                 return false;
             }
             let reset = ControlFrame_::plain_(FrameKind::Close, flags::K_RESET, local, remote);
-            if !w_events.try_send_event_(WriteEvent_::Control { frame_: reset }) {
+            if !w_events.try_send_durable_event_(WriteEvent_::Control { frame_: reset }) {
                 return false;
             }
 
             // 5. 本地两个循环各自摘掉本地表项：复用循环放弃这条子流（含「欠一条
             //    FIN」的登记）、并**显式关闭发送环的消费端**（应用随即看到发送方向
             //    已关闭），解复用循环丢掉接收环写端（应用随即读到 EOF）。
-            if !w_events.try_send_event_(WriteEvent_::LocalAbort {
+            if !w_events.try_send_durable_event_(WriteEvent_::LocalAbort {
                 local_dock: local,
                 remote_dock: remote,
             }) {
                 return false;
             }
-            let _ = r_events.try_send_event_(ReadEvent_::Release {
+            let _ = r_events.try_send_durable_event_(ReadEvent_::Release {
                 local_dock: local,
                 remote_dock: remote,
             });
@@ -438,7 +438,7 @@ where
             //    因此必须明确回一条 `REJECT` 把它放走——这正是本条与 `Abort` 的分界：
             //    后者关掉的是一条对端早已在传数据的子流，对端不在等建流结果。
             let reject = ControlFrame_::plain_(FrameKind::Reject, 0u8, local, remote);
-            if !w_events.try_send_event_(WriteEvent_::Control { frame_: reject }) {
+            if !w_events.try_send_durable_event_(WriteEvent_::Control { frame_: reject }) {
                 return false;
             }
 

@@ -312,7 +312,7 @@ where
                 .conn_
                 .core_()
                 .w_events_()
-                .try_send_event_(WriteEvent_::TxClosed {
+                .try_send_durable_event_(WriteEvent_::TxClosed {
                     local_dock: self.local_dock_,
                     remote_dock: self.remote_dock_});
         }
@@ -675,7 +675,7 @@ where
                 .conn_
                 .core_()
                 .w_events_()
-                .try_send_event_(WriteEvent_::RxClosed {
+                .try_send_durable_event_(WriteEvent_::RxClosed {
                     local_dock: self.local_dock_,
                     remote_dock: self.remote_dock_});
         }

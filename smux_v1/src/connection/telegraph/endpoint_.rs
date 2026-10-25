@@ -62,7 +62,7 @@ use crate::{
         dock_binding::map_reserve_err_,
         owner_::TgOwner_,
         ring_::{BufferedRx, BufferedTx, RingBuildErr, new_buffered_channel},
-        signal_::{ReadEvent_, SessionEvent_, TrEventSender_, WriteEvent_},
+        signal_::{ReadEvent_, SessionEvent_, WriteEvent_},
     },
     x_deps::{abs_cancel, abs_mm, gen_mcf2},
 };
@@ -341,7 +341,7 @@ where
     let attached = conn
         .core_()
         .w_events_()
-        .try_send_event_(WriteEvent_::TgAttach {
+        .try_send_durable_event_(WriteEvent_::TgAttach {
             local_dock: local,
             owner: rec.clone(),
             reader_: tx_r,
@@ -349,7 +349,7 @@ where
         && conn
             .core_()
             .r_events_()
-            .try_send_event_(ReadEvent_::TgAttach {
+            .try_send_durable_event_(ReadEvent_::TgAttach {
                 local_dock: local,
                 owner: rec.clone(),
                 writer_: rx_w,

@@ -770,8 +770,8 @@ impl TimerScan_ {
 ///
 /// 已知例外：外层锁 `CooperativeRwLockOwned` 内部用全局 `Arc` 持有同步核心
 /// （`atomic_sync` 尚未支持 `allocator_api`），即**每次连接一次**的全局分配；
-/// 释放邮箱走 `flume`，同样是全局分配（已有例外）。后续引入 `TrMaxAllocConfig`
-/// 时会连同这两处一起记账。
+/// 释放邮箱走定容通道（`mpmc_chan`，满时进入自旋锁暂存），同样是全局分配
+/// （已有例外）。后续引入 `TrMaxAllocConfig` 时会连同这两处一起记账。
 pub(crate) struct ChannelRegistry_<A>
 where
     A: AllocatorClone,

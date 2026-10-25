@@ -126,7 +126,7 @@ where
             .mux_conn_
             .core_()
             .w_events_()
-            .try_send_event_(WriteEvent_::TgTxClosed {
+            .try_send_durable_event_(WriteEvent_::TgTxClosed {
                 local_dock: self.local_dock_,
             });
     }

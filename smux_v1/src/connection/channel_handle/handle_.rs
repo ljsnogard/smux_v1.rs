@@ -17,7 +17,7 @@ use crate::{
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
         ring_::{RingBuildErr, new_buffered_channel},
-        signal_::{ControlFrame_, ReadEvent_, SessionEvent_, TrEventSender_, WriteEvent_},
+        signal_::{ControlFrame_, ReadEvent_, SessionEvent_, WriteEvent_},
         util_::read_available_into_vec_,
     },
     flow_ctrl::{
@@ -184,7 +184,7 @@ fn abort_pending_<C>(
         });
         return;
     }
-    let _ = core.w_events_().try_send_event_(WriteEvent_::Control {
+    let _ = core.w_events_().try_send_durable_event_(WriteEvent_::Control {
         frame_: ControlFrame_::with_window_(
             FrameKind::Reject,
             0u8,
@@ -462,7 +462,7 @@ where
         let _ = conn
             .core_()
             .w_events_()
-            .try_send_event_(WriteEvent_::Control {
+            .try_send_durable_event_(WriteEvent_::Control {
                 frame_: ControlFrame_::with_window_(
                     FrameKind::Accept,
                     0u8,
@@ -551,12 +551,12 @@ where
     // 绝不能把应用侧那半部交出去：它的对端会随失败的事件一起被丢弃，而 `buffex` 的环
     // 半部 **drop 不置关闭位、也不唤醒对端**，应用一用就永久 park。如实报连接级失败
     // （原因优先取共享状态上的通知槽；它没来得及写时退到锁外快照；都没有就按已关闭）。
-    let attached = core.w_events_().try_send_event_(WriteEvent_::Attach {
+    let attached = core.w_events_().try_send_durable_event_(WriteEvent_::Attach {
         local_dock: local,
         remote_dock: remote,
         owner: owner.clone(),
         reader_: tx_r,
-    }) && core.r_events_().try_send_event_(ReadEvent_::Attach {
+    }) && core.r_events_().try_send_durable_event_(ReadEvent_::Attach {
         local_dock: local,
         remote_dock: remote,
         owner: owner.clone(),
@@ -606,7 +606,7 @@ fn send_open_<C>(
     let _ = conn
         .core_()
         .w_events_()
-        .try_send_event_(WriteEvent_::Control {
+        .try_send_durable_event_(WriteEvent_::Control {
             frame_: ControlFrame_::with_window_(
                 FrameKind::Open,
                 0u8,
@@ -670,7 +670,7 @@ where
         let _ = conn
             .core_()
             .w_events_()
-            .try_send_event_(WriteEvent_::Control {
+            .try_send_durable_event_(WriteEvent_::Control {
                 frame_: ControlFrame_::with_window_(
                     FrameKind::Reject,
                     0u8,
@@ -703,7 +703,7 @@ where
     C: TrConnCfg,
 {
     let core = conn.core_();
-    let _ = core.w_events_().try_send_event_(WriteEvent_::Control {
+    let _ = core.w_events_().try_send_durable_event_(WriteEvent_::Control {
         frame_: ControlFrame_::with_window_(
             FrameKind::Reject,
             0u8,
