@@ -586,6 +586,9 @@
 //! | `mux_connection::registry_` | 统一身份表（channel / telegraph / listener / 宽限态）+ 反向索引；每条 channel 记录持有它的共享状态句柄 | —（内部） |
 //! | `sync_` / `owner_` | 通用共享单元（取消令牌 / 内联通知槽 / 注册表锁）/ **身份节点**与其类型化句柄（节点内部零堆分配） | —（内部） |
 //! | `signal_` / `frame_` / `ring_` / `error_` | 控制帧队列 / 线格式 / 环别名 / 错误 | —（内部） |
+//! | `tcs_` | 请求完成源 `Tcs_`（`Pending` / `Done` / `Taken` / `Abandoned`） | —（内部，P0 已落、未接线） |
+//! | `public_channel_` | 公共子流的 chunked 读写原语（`PublicChunkIo_` / `ChunkReadState_`） | —（内部，P0 已落、未接线） |
+//! | `pending_msg_` | 建流期 message ring（`PendingMsgApp_` / `PendingMsgMain_`） | —（内部，P0 已落、未接线） |
 //!
 //! 纪律：**任何 struct / enum 成员都不得带 `pub(crate)`**；跨模块访问一律经
 //! `pub(crate)` 关联函数。同一个 `impl` 内按「`pub` → `pub(crate)` → 私有」集中排列。
@@ -605,11 +608,14 @@ mod frame_;
 mod frame_parser_;
 mod mux_connection;
 mod owner_;
+mod pending_msg_;
+mod public_channel_;
 pub(crate) mod ring_;
 mod session_;
 mod signal_;
 mod slot_;
 mod sync_;
+mod tcs_;
 mod telegraph;
 mod timer_;
 #[cfg(test)]

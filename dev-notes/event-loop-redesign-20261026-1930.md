@@ -4,7 +4,8 @@
 - 基线提交：`abae4ee`
 - 工作区提醒：`smux_v1/src/connection/slot_.rs` 有未提交改动；按项目纪律，实施前应先把
   该文件定稿或暂存，再开始本文的重构。本文引用的是该文件的当前形状。
-- 状态：**设计稿，待评审**。不是实施记录；文末列出必须拍板的公开 API / 协议语义。
+- 状态：**设计稿，已通过评审（20261026）；实施中（P0 已完成，见 §17）**。
+  Q1–Q16 均按 §15.2 的推荐值采纳；公开 API 变更已获团队同意。
 - 相关：`session_` / `signal_` / `slot_` / `owner_` / `registry_` / `timer_` / `ctl_` /
   `channel_half` / `channel_handle` / `channel_listener` / `telegraph`
 - 前序：
@@ -70,7 +71,7 @@
 | 1 | `WriteEvent_` / `ReadEvent_` 各 256 容量，混装 `Control` / `TxReady` / `LocalAbort` / `Tg*` | 容量按“并发子流数 × 常数”被吃满；可重建与不可重建混在一起，满时只能走 `Overflow_` | 删除两条通道；一次性控制帧走公共子流 ring 的 chunk，可重建状态只置位 |
 | 2 | `Overflow_::durable_`：`SpinningMutexOwned<VecDeque<E>>` | 无界堆增长，与“减少分配”正面冲突 | 删除；公共子流 ring 是定容背压 |
 | 3 | `SessionMailbox_`：mpmc 256 + `MailboxOverflow_` 无界 `VecDeque` | `Drop` 路径唯一还能无界增长的地方 | 删除；身份释放位化到身份节点 + `HINT_MAIN_RETIRED` |
-| 4 | `ControlFrame_::payload_: Vec<u8>`、`ChannelHandle::message_: Vec<u8>`、`read_available_into_vec_` | 每次 OPEN / ACCEPT / REJECT 一次临时堆分配；`message_` 还要跨 open→accept 保存 | `OPEN` message / `ACCEPT` welcome / `REJECT` reason 走建流期 message ring；控制帧头在公共子流 ring 内组装；`message_` 删除 |
+| 4 | `ControlFrame_::payload_: Vec<u8>`、`ChannelHandle::message_: Vec<u8>`、`read_available_into_vec_` | 每次 OPEN / ACCEPT / REJECT 一次临时堆分配；`message_` 还要跨 open→accept 保存 | `OPEN` message / `ACCEPT` welcome / `REJECT` reason 走建流期 message ring；控制帧头在公共子流 ring 内组装；`message_` 删除。**注：`CtrlCell_` 在基线提交中已不存在**（前一阶段已删除），这里只保留历史对比 |
 | 5 | `InlineQueue_::free_waiters_: SpinningMutexOwned<Vec<Waker>>` | 背压等待者按需堆增长 | 换成定容 `WakerSlots_<N>`；超限返回 `Busy` |
 | 6 | `mux_loop` / `demux_loop` 内直接处理建流、窗口、拆流、释放，并 `await` 注册表锁 / 等排空 | 数据循环被业务阻塞；一条路径多种交付方式 | 数据循环只搬字节 + 合法性初审 + 置位；协议决策全部归 `main_loop` |
 
@@ -1315,7 +1316,7 @@ main_loop：
 | `SessionMailbox_` + `MailboxOverflow_` | 256 × 16 B + 无界 `VecDeque` | 0 |
 | `ControlFrame_::payload_` | 每次控制帧一次 `Vec` | 0（ring chunk 内组帧） |
 | `ChannelHandle::message_` | 每次发起 open 一次 `Vec` | 0（pending message ring） |
-| `CtrlCell_` | 每个控制请求 ~4 KiB 定长载荷 | 0（pending message ring） |
+| `CtrlCell_` | 基线已不存在（前一阶段删除） | 0（无需动作） |
 | `InlineQueue_::free_waiters_` | 按需 `Vec<Waker>` | 定容 `WakerSlots_` |
 | `PendingFin_` | `BTreeSet` 节点 | owner 位 + 本地表扫描 |
 | `HintSlot_` | 死代码 | 0 |
@@ -1781,7 +1782,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | 待做 |
+| T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | P0 原语完成（`PublicChunkIo_`，未接线） |
 | T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | 待做 |
 | T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 待做 |
 
@@ -1789,16 +1790,16 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | 待做 |
-| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 待做 |
+| T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | P0 完成 |
+| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | `WakerSlots_` 完成；请求队列待 P1 |
 | T11 | `MainReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | 待做 |
 
 ### D. 建流期 message ring
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | 待做 |
-| T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 待做 |
+| T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | P0 原语完成（未接线） |
+| T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 默认常量完成；配置方法待 P3 |
 | T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | 待做 |
 | T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | 待拍板 Q12/Q11 |
 
@@ -1817,7 +1818,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | 待做 |
+| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `WakerSlots_` 原语完成；替换待 P5 |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | 待做 |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 

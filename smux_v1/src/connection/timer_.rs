@@ -67,7 +67,8 @@
 
 use core::{
     future::poll_fn,
-    task::Poll,
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -83,6 +84,7 @@ use crate::{
             ControlFrame_, EventSender_, HINT_R_RELEASE, HINT_W_TX_CLOSED, ReadEvent_,
             WriteEvent_,
         },
+        sync_::NotifySlot_,
     },
     flow_ctrl::WindowReport,
     metrics::{ChannelCloseReason, TrMetricsSink},
@@ -488,5 +490,152 @@ where
             }
             true
         }
+    }
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 计时信号：main <-> timer
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// `main_loop` 与 `timer_loop` 之间的最小耦合面。
+///
+/// `main_loop` 每次 `tick_` 结束后写 `next_millis_` 并 `notify_`；`timer_loop` 的 park
+/// 同时 poll `timer_wake_`、`delay(next - now)` 与取消令牌，到期后只
+/// `raise_main_hint_(HINT_MAIN_TIMER)`。它不含身份表、不组帧、不直接发协议动作。
+///
+/// `0` 表示「当前没有期限」：timer 于是只等 `timer_wake_` / 取消令牌。
+#[allow(dead_code)]
+pub(crate) struct TimerSignal_ {
+    /// 下一次必须醒来的连接内毫秒；`0` = 当前没有期限。
+    next_millis_: AtomicU64,
+
+    /// main -> timer：期限变了，重算 delay。
+    timer_wake_: NotifySlot_,
+}
+
+#[allow(dead_code)]
+impl TimerSignal_ {
+    /// 空信号：没有期限、没有等待者。
+    pub(crate) fn new_() -> Self {
+        TimerSignal_ {
+            next_millis_: AtomicU64::new(0u64),
+            timer_wake_: NotifySlot_::new_(),
+        }
+    }
+
+    /// 发布新的最早期限并唤醒 timer；`0` 表示没有期限。
+    ///
+    /// 幂等：同一期限重复发布只会多一次唤醒，timer 复读后按同一值重算。
+    pub(crate) fn publish_(&self, next_millis: u64) {
+        self.next_millis_.store(next_millis, Ordering::Release);
+        self.timer_wake_.notify_();
+    }
+
+    /// 当前最早期限（连接内毫秒；`0` 表示没有）。
+    pub(crate) fn next_millis_(&self) -> u64 {
+        self.next_millis_.load(Ordering::Acquire)
+    }
+
+    /// timer 侧等待「期限变了」。
+    pub(crate) fn poll_wake_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.timer_wake_.poll_wait_(cx)
+    }
+
+    /// 清掉期限（连接收尾时由 main 发布）。
+    pub(crate) fn clear_(&self) {
+        self.publish_(0u64);
+    }
+}
+
+#[cfg(test)]
+mod timer_signal_tests_ {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Wake,
+    };
+
+    use super::*;
+
+    /// 计数唤醒器：统计 `wake` 次数。
+    struct CountingWake_ {
+        count_: AtomicUsize,
+    }
+
+    impl Wake for CountingWake_ {
+        fn wake(self: Arc<Self>) {
+            self.count_.fetch_add(1usize, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.count_.fetch_add(1usize, Ordering::SeqCst);
+        }
+    }
+
+    /// 造一个计数 waker 与它的计数句柄。
+    fn counting_waker_() -> (core::task::Waker, Arc<CountingWake_>) {
+        let probe = Arc::new(CountingWake_ {
+            count_: AtomicUsize::new(0usize),
+        });
+        (core::task::Waker::from(probe.clone()), probe)
+    }
+
+    /// 测试发布期限后 timer 立刻可被唤醒，并能读到期限。
+    /// - 手段：`publish_(123)` 后 poll `poll_wake_`。
+    /// - 判断：poll 为 `Ready`；`next_millis_()==123`；再 poll 一次为 `Pending`
+    ///   （持久位已被消费）。
+    ///
+    /// Test goal: publishing a deadline wakes the timer and exposes the value.
+    /// Method: `publish_(123)` then poll `poll_wake_`.
+    /// Assertion: first poll is `Ready`; `next_millis_()==123`; second poll is
+    /// `Pending` (the persistent bit was consumed).
+    #[test]
+    fn timer_signal_publish_wakes_and_exposes_deadline_() {
+        let signal = TimerSignal_::new_();
+        let (waker, _probe) = counting_waker_();
+        let mut cx = Context::from_waker(&waker);
+
+        signal.publish_(123u64);
+        assert!(signal.poll_wake_(&mut cx).is_ready());
+        assert_eq!(signal.next_millis_(), 123u64);
+        assert!(signal.poll_wake_(&mut cx).is_pending());
+    }
+
+    /// 测试等待中的 timer 会被新的期限唤醒。
+    /// - 手段：先 poll 一次（无期限，应 `Pending` 并登记 waker），再 `publish_(7)`。
+    /// - 判断：首次 `Pending`；发布后唤醒计数为 1。
+    ///
+    /// Test goal: a parked timer is woken by a new deadline.
+    /// Method: poll once with no deadline (expect `Pending`, registering the waker),
+    /// then `publish_(7)`.
+    /// Assertion: first poll is `Pending`; publishing increments the wake count.
+    #[test]
+    fn timer_signal_publish_wakes_parked_timer_() {
+        let signal = TimerSignal_::new_();
+        let (waker, probe) = counting_waker_();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(signal.poll_wake_(&mut cx).is_pending());
+        assert_eq!(probe.count_.load(Ordering::SeqCst), 0usize);
+        signal.publish_(7u64);
+        assert_eq!(probe.count_.load(Ordering::SeqCst), 1usize);
+    }
+
+    /// 测试 `clear_` 把期限复位为「没有」。
+    /// - 手段：发布 9 后 `clear_()`。
+    /// - 判断：`next_millis_()==0`。
+    ///
+    /// Test goal: `clear_` resets the deadline to "none".
+    /// Method: publish 9, then `clear_()`.
+    /// Assertion: `next_millis_()==0`.
+    #[test]
+    fn timer_signal_clear_resets_deadline_() {
+        let signal = TimerSignal_::new_();
+        signal.publish_(9u64);
+        assert_eq!(signal.next_millis_(), 9u64);
+        signal.clear_();
+        assert_eq!(signal.next_millis_(), 0u64);
     }
 }

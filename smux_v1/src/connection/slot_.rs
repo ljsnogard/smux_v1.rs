@@ -1,4 +1,4 @@
-//! 连接内部两条**零堆分配**的投递原语：每子流定容内联队列与连接级合并提示。
+//! 连接内部**零堆分配**的投递原语：每子流定容内联队列、连接级合并提示与定容等待者槽。
 //!
 //! 它们替代「所有子流共享一条大容量事件队列」的两个角落（设计见
 //! `dev-notes/mpmc-chan-20261026-0046.md` 之后的收敛方案）：
@@ -7,6 +7,8 @@
 //!   是协议状态机给出的常数上界，共享容量不会被并发子流数打满；槽满时生产者走
 //!   [`InlineQueue_::push_async_`] 等待消费者取走（背压），而不是像旧的
 //!   `Overflow_::durable_` 那样把事件推进无界 `VecDeque`。
+//! - [`WakerSlots_`]：定容的等待者槽，替换 `InlineQueue_::free_waiters_` 的
+//!   `Vec<Waker>`。等待者集合因此有确定上界；占满时调用方返回 `Busy`。
 //! - [`HintSlot_`]：把一个方向上的多种「可能变了」合并成一个 64 位掩码。多个生产者
 //!   只置位、消费者一次取走全部，因此**容量恒为 1**，不存在「满」这回事。
 //!
@@ -344,6 +346,78 @@ impl<T, const N: usize> InlineQueue_<T, N> {
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 定容等待者槽
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 定容的等待者槽：替代 `InlineQueue_::free_waiters_` 的 `Vec<Waker>`。
+///
+/// `N` 与队列容量同阶（默认 16）：多生产者背压的等待者集合因此有确定上界，不再随
+/// 并发建流数增长。占满且没有同一 waker 时 [`Self::register_`] 返回 `false`，调用方
+/// 把它翻译成 [`PushErr_::Busy`]。
+///
+/// 去重按 [`Waker::will_wake`]：同一个 future 反复 poll 不会占多个槽。唤醒时先在
+/// 锁内取走全部槽位、再在锁外逐个 `wake`，因此不会在持锁时回调。
+pub(crate) struct WakerSlots_<const N: usize> {
+    /// 已登记的等待者；只在自旋锁内访问。
+    slots_: SpinningMutexOwned<[Option<Waker>; N]>,
+}
+
+impl<const N: usize> WakerSlots_<N> {
+    /// 空槽。
+    pub(crate) fn new_() -> Self {
+        WakerSlots_ {
+            slots_: SpinningMutexOwned::new_owned(core::array::from_fn(|_| Option::None)),
+        }
+    }
+
+    /// 登记等待者；已存在同一 waker 时直接成功，占满且无同一 waker 时返回 `false`。
+    pub(crate) fn register_(&self, cx: &mut Context<'_>) -> bool {
+        let mut session = self.slots_.lock_session();
+        let mut guard = session
+            .lock()
+            .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
+        for slot in guard.iter() {
+            if let Option::Some(old) = slot
+                && old.will_wake(cx.waker())
+            {
+                return true;
+            }
+        }
+        for slot in guard.iter_mut() {
+            if slot.is_none() {
+                *slot = Option::Some(cx.waker().clone());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 取走全部等待者，锁外逐个唤醒。
+    pub(crate) fn wake_all_(&self) {
+        let wakers = {
+            let mut session = self.slots_.lock_session();
+            let mut guard = session
+                .lock()
+                .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
+            core::mem::replace(&mut *guard, core::array::from_fn(|_| Option::None))
+        };
+        for waker in wakers.into_iter().flatten() {
+            waker.wake();
+        }
+    }
+
+    /// 当前已登记的等待者数（诊断 / 测试用）。
+    #[cfg(test)]
+    pub(crate) fn len_(&self) -> usize {
+        let mut session = self.slots_.lock_session();
+        let guard = session
+            .lock()
+            .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
+        guard.iter().filter(|slot| slot.is_some()).count()
+    }
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 连接级合并提示
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
@@ -626,4 +700,58 @@ mod tests_ {
         assert_eq!(slot.poll_wait_(&mut context), Poll::Ready(0b11u64));
     }
     multi_art_test_!(hint_slot_wakes_waiter);
+
+    /// 测试定容等待者槽去重并在占满时拒绝新等待者。
+    /// - 手段：容量 2 的槽依次登记 waker1（两次）、waker2、waker3。
+    /// - 判断：前三次登记成功（waker1 第二次是去重）、第四次返回 `false`；
+    ///   `len_()` 为 2。
+    ///
+    /// Test goal: the fixed-capacity waker slots de-duplicate and reject when full.
+    /// Method: on a 2-slot set register waker1 twice, then waker2, then waker3.
+    /// Assertion: the first three succeed (the second is a duplicate); the fourth
+    /// returns `false`; `len_()` is 2.
+    #[test]
+    fn waker_slots_dedups_and_reports_full_() {
+        let slots = WakerSlots_::<2>::new_();
+        let (waker1, _probe1) = counting_waker_();
+        let (waker2, _probe2) = counting_waker_();
+        let (waker3, _probe3) = counting_waker_();
+        let mut cx1 = Context::from_waker(&waker1);
+        let mut cx2 = Context::from_waker(&waker2);
+        let mut cx3 = Context::from_waker(&waker3);
+
+        assert!(slots.register_(&mut cx1));
+        assert!(slots.register_(&mut cx1));
+        assert!(slots.register_(&mut cx2));
+        assert!(!slots.register_(&mut cx3));
+        assert_eq!(slots.len_(), 2usize);
+    }
+
+    /// 测试 `wake_all_` 唤醒全部等待者并清空槽位。
+    /// - 手段：登记两个 waker，调用 `wake_all_()` 一次。
+    /// - 判断：两个唤醒计数都变为 1；`len_()` 归零；再次 `wake_all_()` 不再唤醒。
+    ///
+    /// Test goal: `wake_all_` wakes every waiter and empties the slots.
+    /// Method: register two wakers, call `wake_all_()` once.
+    /// Assertion: both wake counts become 1; `len_()` is 0; a second `wake_all_()`
+    /// wakes nobody.
+    #[test]
+    fn waker_slots_wake_all_clears_() {
+        let slots = WakerSlots_::<4>::new_();
+        let (waker1, probe1) = counting_waker_();
+        let (waker2, probe2) = counting_waker_();
+        let mut cx1 = Context::from_waker(&waker1);
+        let mut cx2 = Context::from_waker(&waker2);
+
+        assert!(slots.register_(&mut cx1));
+        assert!(slots.register_(&mut cx2));
+        slots.wake_all_();
+        assert_eq!(probe1.count_.load(Ordering::SeqCst), 1usize);
+        assert_eq!(probe2.count_.load(Ordering::SeqCst), 1usize);
+        assert_eq!(slots.len_(), 0usize);
+
+        slots.wake_all_();
+        assert_eq!(probe1.count_.load(Ordering::SeqCst), 1usize);
+        assert_eq!(probe2.count_.load(Ordering::SeqCst), 1usize);
+    }
 }
