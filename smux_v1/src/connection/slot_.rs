@@ -30,11 +30,12 @@
 // 过渡：两个原语在阶段 2 / 3 接入 `session_` 与 `owner_`；接入完成后删除本行。
 #![allow(dead_code)]
 
+use alloc::vec::Vec;
 use core::{
     future::{Future, poll_fn},
     pin::pin,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use crate::{
@@ -149,8 +150,11 @@ pub(crate) struct InlineQueue_<T, const N: usize> {
     /// 「可能有条目可出队」的持久通知（消费者）。
     ready_: NotifySlot_,
 
-    /// 「可能腾出了空位」的持久通知（生产者背压）。
-    free_: NotifySlot_,
+    /// 等待空位的生产者 waker（**多生产者**：建流可以并发）。
+    ///
+    /// 这里不能用 [`NotifySlot_`]：它只保存一个 waker，而 `Attach` inbox 的等待者是
+    /// N 个并发建流任务；单槽会让除最后一个以外的等待者永久睡下去。
+    free_waiters_: SpinningMutexOwned<Vec<Waker>>,
 
     /// 消费者已消失：此后入队一律失败。
     closed_: AtomicBool,
@@ -163,7 +167,7 @@ impl<T, const N: usize> InlineQueue_<T, N> {
             slots_: SpinningMutexOwned::new_owned(SlotRing_::new_()),
             len_hint_: AtomicUsize::new(0usize),
             ready_: NotifySlot_::new_(),
-            free_: NotifySlot_::new_(),
+            free_waiters_: SpinningMutexOwned::new_owned(Vec::new()),
             closed_: AtomicBool::new(false),
         }
     }
@@ -210,7 +214,7 @@ impl<T, const N: usize> InlineQueue_<T, N> {
         let popped = self.with_ring_(SlotRing_::pop_);
         if popped.is_some() {
             self.len_hint_.fetch_sub(1usize, Ordering::Release);
-            self.free_.notify_();
+            self.wake_free_waiters_();
         }
         popped
     }
@@ -260,23 +264,64 @@ impl<T, const N: usize> InlineQueue_<T, N> {
             if self.closed_.load(Ordering::Acquire) {
                 return Result::Err(PushErr_::Closed(pending));
             }
-            let woke = poll_fn(|cx| {
+            // 等空位：登记 waker → 复检「近似长度 < N」→ 再试。`len_hint_` 在消费者
+            // `pop` 之后自减，因此登记与复检之间发生的腾位不会丢。
+            let retry = poll_fn(|cx| {
                 if cancel.is_cancelled() {
                     return Poll::Ready(false);
                 }
-                if self.free_.poll_wait_(cx).is_ready() {
+                if self.closed_.load(Ordering::Acquire) {
+                    return Poll::Ready(false);
+                }
+                self.register_free_waker_(cx);
+                if self.len_hint_.load(Ordering::Acquire) < N {
                     return Poll::Ready(true);
                 }
+                // 取消也要能打断等待（不能用「外层 future 被丢弃」来代替：本函数
+                // 直接接收取消令牌，必须自己登记取消 waker）。
                 if Future::poll(cancelled.as_mut(), cx).is_ready() {
                     return Poll::Ready(false);
                 }
                 Poll::Pending
             })
             .await;
-            if !woke {
+            if !retry {
+                if self.closed_.load(Ordering::Acquire) {
+                    return Result::Err(PushErr_::Closed(pending));
+                }
                 return Result::Err(PushErr_::Cancelled(pending));
             }
         }
+    }
+
+    /// 登记一个等待空位的生产者 waker（同一个 waker 不重复）。
+    fn register_free_waker_(&self, cx: &mut Context<'_>) {
+        let mut session = self.free_waiters_.lock_session();
+        let mut guard = session
+            .lock()
+            .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
+        if !guard.iter().any(|old| old.will_wake(cx.waker())) {
+            guard.push(cx.waker().clone());
+        }
+    }
+
+    /// 广播「可能腾出了空位」：取走全部等待者并在锁外逐个 `wake`。
+    fn wake_free_waiters_(&self) {
+        let wakers = {
+            let mut session = self.free_waiters_.lock_session();
+            let mut guard = session
+                .lock()
+                .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
+            core::mem::take(&mut *guard)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// 消费者是否已消失（此后入队一律失败）。
+    pub(crate) fn is_closed_(&self) -> bool {
+        self.closed_.load(Ordering::Acquire)
     }
 
     /// 消费者消失：唤醒两侧等待者，丢弃槽内元素，此后入队一律失败。
@@ -288,7 +333,7 @@ impl<T, const N: usize> InlineQueue_<T, N> {
             self.len_hint_.store(0usize, Ordering::Release);
         }
         self.ready_.notify_();
-        self.free_.notify_();
+        self.wake_free_waiters_();
     }
 
     /// 当前近似占用数（诊断 / 断言用）。

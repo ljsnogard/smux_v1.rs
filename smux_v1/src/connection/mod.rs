@@ -598,6 +598,7 @@ mod channel_half;
 mod channel_listener;
 mod config_;
 mod connect_;
+mod ctl_;
 mod dock_binding;
 mod error_;
 mod frame_;

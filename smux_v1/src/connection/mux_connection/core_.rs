@@ -136,7 +136,7 @@ where
     ///
     /// 旧版是五个：贴传输的读 / 写泵连同连接级帧暂存环一起去掉了（见 `session_`
     /// 模块文档）。
-    loops_: [CancelToken_<C::Alloc>; 3],
+    loops_: [CancelToken_<C::Alloc>; 4],
 }
 
 impl<C> MuxCore<C>
@@ -155,7 +155,7 @@ where
         epoch: <C::Rt as TrClock>::Instant,
         w_events: EventSender_<WriteEvent_<C::Alloc>>,
         r_events: EventSender_<ReadEvent_<C::Alloc>>,
-        loops: [CancelToken_<C::Alloc>; 3],
+        loops: [CancelToken_<C::Alloc>; 4],
     ) -> Self {
         MuxCore {
             config_: config,

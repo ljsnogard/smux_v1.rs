@@ -7,11 +7,13 @@
 //! 本模块在早先的「上行窗口通知」（见 `connection-20260919-1631.md` §11.4）基础
 //! 上扩展成两条**带类型负载**的事件通道：
 //!
-//! - [`WriteEvent_`] → **写循环**：会话侧发送环读端上线（
-//!   [`WriteEvent_::Attach`]）、待写出的控制帧（[`WriteEvent_::Control`]）、
+//! - **`Attach` 不走这两条通道**：会话侧环半部经内联 inbox（[`WriteAttach_`] /
+//!   [`ReadAttach_`]）交给对应循环——每连接一条、容量固定，不受「子流变多 ⇒ 事件
+//!   队列被打满」的影响；
+//! - [`WriteEvent_`] → **写循环**：待写出的控制帧（[`WriteEvent_::Control`]）、
 //!   「某条子流发送环有数据」（[`WriteEvent_::TxReady`]）、拆流（`LocalAbort`）；
-//! - [`ReadEvent_`] → **读循环**：会话侧接收环写端上线（[`ReadEvent_::Attach`]）、
-//!   「应用取走了数据，去看看接收水位」（[`ReadEvent_::RxConsumed`]）。
+//! - [`ReadEvent_`] → **读循环**：「应用取走了数据，去看看接收水位」
+//!   （[`ReadEvent_::RxConsumed`]）。
 //!
 //! # 两条水位通知的方向**刻意不同**
 //!
@@ -173,23 +175,83 @@ impl ControlFrame_ {
     }
 }
 
-/// 送给**写循环**的事件。
+/// 写循环的 `Attach` 负载：`(dock 对, 身份节点, 发送环读端)`。
+///
+/// 它不再走事件通道，而是经**内联 inbox**（每连接一条，容量固定）交给写循环：
+/// 环半部是 move 语义的一次性资源，放在共享槽里比塞进通用事件枚举更直接，也不受
+/// 「子流变多 ⇒ 队列被打满」的影响。
+pub(crate) struct WriteAttach_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 本端 / 对端 dock。
+    pair_: (Dock, Dock),
+
+    /// 该子流的共享状态。
+    owner_: ChannelOwner_<A>,
+
+    /// 会话侧发送环读端（应用写、写循环读）。
+    reader_: BufferedRx,
+}
+
+impl<A> WriteAttach_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 造一条写侧 `Attach`。
+    pub(crate) fn new_(pair: (Dock, Dock), owner_: ChannelOwner_<A>, reader_: BufferedRx) -> Self {
+        WriteAttach_ {
+            pair_: pair,
+            owner_,
+            reader_,
+        }
+    }
+
+    /// 拆成 `(dock 对, 身份节点, 发送环读端)`。
+    pub(crate) fn into_parts_(self) -> ((Dock, Dock), ChannelOwner_<A>, BufferedRx) {
+        (self.pair_, self.owner_, self.reader_)
+    }
+}
+
+/// 读循环的 `Attach` 负载：`(dock 对, 身份节点, 接收环写端)`。
+pub(crate) struct ReadAttach_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 本端 / 对端 dock。
+    pair_: (Dock, Dock),
+
+    /// 该子流的共享状态。
+    owner_: ChannelOwner_<A>,
+
+    /// 会话侧接收环写端（读循环写、应用读）。
+    writer_: BufferedTx,
+}
+
+impl<A> ReadAttach_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 造一条读侧 `Attach`。
+    pub(crate) fn new_(pair: (Dock, Dock), owner_: ChannelOwner_<A>, writer_: BufferedTx) -> Self {
+        ReadAttach_ {
+            pair_: pair,
+            owner_,
+            writer_,
+        }
+    }
+
+    /// 拆成 `(dock 对, 身份节点, 接收环写端)`。
+    pub(crate) fn into_parts_(self) -> ((Dock, Dock), ChannelOwner_<A>, BufferedTx) {
+        (self.pair_, self.owner_, self.writer_)
+    }
+}
+
+/// 送到**写循环**的事件。
 pub(crate) enum WriteEvent_<A>
 where
     A: AllocatorClone + Send + Sync,
 {
-    /// 会话侧发送环读端上线：写循环把它存进本地表，此后按 dock 对索引。
-    Attach {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-        /// 该子流的共享状态。
-        owner: ChannelOwner_<A>,
-        /// 会话侧发送环读端（应用写、本循环读）。
-        reader_: BufferedRx,
-    },
-
     /// 一条待写出的控制帧。
     Control {
         /// 待写出的帧。
@@ -225,7 +287,8 @@ where
     /// 一条 telegraph 的**发送环读端**上线：复用循环把它存进本地表，此后按
     /// `local_dock` 索引。
     ///
-    /// 与 [`WriteEvent_::Attach`] 同形，但键只有 `local_dock`——telegraph **独占**
+    /// 与 channel 的 `Attach` 同形（telegraph 的环半部仍走事件通道），但键只有
+    /// `local_dock`——telegraph **独占**
     /// 该 dock，没有 `remote_dock` 这一维（对端地址是协议里的**地址**而非**身份**，
     /// 见 `crate::connection` 模块文档 §4）。
     TgAttach {
@@ -261,18 +324,6 @@ pub(crate) enum ReadEvent_<A>
 where
     A: AllocatorClone + Send + Sync,
 {
-    /// 会话侧接收环写端上线：读循环把它存进本地表。
-    Attach {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-        /// 该子流的共享状态。
-        owner: ChannelOwner_<A>,
-        /// 会话侧接收环写端（本循环写、应用读）。
-        writer_: BufferedTx,
-    },
-
     /// 应用从接收环取走了数据：**接收窗口的账面水位可能变了**。
     ///
     /// 这是**裸通知**，刻意不带增量。增量必须由**持有接收环写端**的解复用循环按

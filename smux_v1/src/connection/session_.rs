@@ -146,8 +146,8 @@ use crate::{
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, EventTake_,
             HINT_R_RELEASE, HINT_W_PEER_CLOSED, HINT_W_RX_CLOSED,
-            HINT_W_TX_CLOSED, ReadEvent_, TrEventReceiver_, TrEventSender_,
-            WriteEvent_,
+            HINT_W_TX_CLOSED, ReadAttach_, ReadEvent_, TrEventReceiver_,
+            TrEventSender_, WriteAttach_, WriteEvent_,
         },
         telegraph::TgRecvCtx_,
     },
@@ -395,6 +395,60 @@ type TgWriteTable_<A> = BTreeMap<Dock, TgWriteEntry_<A>, A>;
 /// 用全局分配器会让「丢半边 + 额度为 0」这条收尾路径隐式落到全局堆上
 /// （`dev-notes/audit-heap-alloc-20261004-1122.md` N1）。
 type PendingFin_<A> = BTreeSet<(Dock, Dock), A>;
+
+/// 处理写循环收到的一条 `Attach`：插入本地写表，并补查那些可能早于 `Attach` 到达的
+/// 一次性事实（应用封口 / 关接收、对端 `CLOSE`）。
+fn handle_write_attach_<C>(
+    attach: WriteAttach_<C::Alloc>,
+    table: &mut WriteTable_<C::Alloc>,
+    pending_fin: &mut PendingFin_<C::Alloc>,
+    shared: &MuxShared_<C>,
+) where
+    C: TrConnCfg,
+{
+    let (pair, owner, reader_) = attach.into_parts_();
+    let tx_closed = owner.is_app_tx_closed_();
+    let rx_closed = owner.is_app_rx_closed_();
+    let peer_closed = owner.is_peer_fin_() || owner.is_peer_reset_();
+    if tx_closed {
+        pending_fin.insert(pair);
+    }
+    table.insert(
+        pair,
+        WriteEntry_ {
+            owner_: owner,
+            reader_,
+            peer_fin_handled_: false,
+            fin_sent_: false,
+        },
+    );
+    if rx_closed {
+        shared.reg_().raise_write_hint_(HINT_W_RX_CLOSED);
+    }
+    if peer_closed {
+        shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
+    }
+}
+
+/// 处理读循环收到的一条 `Attach`：插入本地读表；身份已经释放时直接关掉写端。
+fn handle_read_attach_<C>(attach: ReadAttach_<C::Alloc>, table: &mut ReadTable_<C::Alloc>)
+where
+    C: TrConnCfg,
+{
+    let (pair, owner, writer_) = attach.into_parts_();
+    if owner.is_released_() {
+        let mut writer_ = writer_;
+        writer_.close();
+        return;
+    }
+    table.insert(
+        pair,
+        ReadEntry_ {
+            owner_: owner,
+            writer_,
+        },
+    );
+}
 
 /// 把「应用已丢弃发送半边」的条目登记进待收尾集合。
 ///
@@ -1080,6 +1134,12 @@ where
                 report_conn_failed_::<C>(self.shared, &entry.owner_, pair.0, pair.1, now_millis);
             }
         }
+        // `Attach` inbox 里还没取走的环半部：显式关闭，别让应用侧永久 park。
+        while let Option::Some(attach) = self.shared.reg_.take_read_attach_() {
+            let (_, _, mut writer_) = attach.into_parts_();
+            writer_.close();
+        }
+        self.shared.reg_.close_read_inbox_();
     }
 }
 
@@ -1120,25 +1180,17 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        let failed = self.shared.reg_.fail_kind_();
-        let now_millis = self.shared.conn_clock_().now_millis_();
+        // 共享面保留给后续 telegraph 失败上报；本轮 `TgAttach` 只需关闭环半部。
+        let _ = self.shared;
         loop {
             let event = match self.events.try_take_event_() {
                 EventTake_::Event(event) => event,
                 // Drop 阶段不再做全扫：其余半部由循环退出时的守卫统一关闭。
                 EventTake_::Rescan | EventTake_::Empty | EventTake_::Closed => break,
             };
-            if let ReadEvent_::Attach {
-                local_dock,
-                remote_dock,
-                owner,
-                mut writer_,
-            } = event
-            {
+            // 通道 `Attach` 已经改走 inbox；事件里只剩 telegraph 的环半部需要显式关闭。
+            if let ReadEvent_::TgAttach { mut writer_, .. } = event {
                 writer_.close();
-                if failed.is_some() {
-                    report_conn_failed_::<C>(self.shared, &owner, local_dock, remote_dock, now_millis);
-                }
             }
         }
     }
@@ -1205,6 +1257,28 @@ pub(crate) async fn demux_loop_async_<C, K>(
         let read_hints = shared.reg_().take_read_hint_();
         if read_hints & HINT_R_RELEASE != 0u64 {
             scan_released_::<C>(&mut *table);
+        }
+        // 0.06 `Attach` inbox：接收环写端从这里进入本地读表。
+        //
+        // 先前的 `RxConsumed` 事件可能比 `Attach` 更早被取出（两者不再共享同一条 FIFO）；
+        // 那时表里还没有这一对，事件被丢弃、但 `RX_CONSUMED` 位仍留着。因此每插入一条
+        // 新的读表项，就按位重算一次水位，把那条通知补回来。
+        let mut attached_new = false;
+        while let Option::Some(attach) = shared.reg_().take_read_attach_() {
+            handle_read_attach_::<C>(attach, &mut *table);
+            attached_new = true;
+        }
+        if attached_new
+            && let Result::Err(err) = rescan_read_::<C, _>(
+                &mut *table,
+                &events_tx,
+                shared.conn_clock_().now_millis_(),
+                &cancel,
+            )
+            .await
+        {
+            fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+            return;
         }
 
         // 0.1 telegraph 自查：本地表里哪些端点**已经不在身份表里**了（tx / rx 两个半边
@@ -1311,6 +1385,10 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                         return;
                     }
+                }
+                // `Attach` inbox：插入本地读表（已释放则直接关写端）。
+                ReadWake_::Attach(attach) => {
+                    handle_read_attach_::<C>(attach, &mut table.table);
                 }
                 // 合并提示（身份释放）：按 `RELEASED` 位摘读表并关接收环写端。
                 ReadWake_::Hint(bits) => {
@@ -1664,7 +1742,7 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
     }
 }
 
-/// 非阻塞排空读事件（`Attach` / `Release` / `RxConsumed`），返回连接级错误。
+/// 非阻塞排空读事件（`RxConsumed` / `TgAttach`），返回连接级错误。
 ///
 /// 与本模块的复用循环同理：**每轮的批有上限**。事件是持续到来的（应用每读一次就会
 /// 投一条 `RxConsumed`），若「处理完为止」而不设上限，事件队列始终非空时本循环就
@@ -1779,30 +1857,6 @@ where
     K: TrCancellationToken,
 {
     match event {
-        ReadEvent_::Attach {
-            local_dock,
-            remote_dock,
-            owner,
-            writer_,
-        } => {
-            // 身份可能在本循环处理 `Attach` **之前**就已经释放（`Release` 现在只置位 +
-            // 唤醒，不再排在同一个队列里保证先后）。已释放就不插表：直接关掉接收环
-            // 写端，让应用读到 EOF；后续到达的帧按注册表的宽限态静默丢弃。
-            if owner.is_released_() {
-                let mut writer_ = writer_;
-                writer_.close();
-                return Result::Ok(());
-            }
-            // 节点分配由表自己的分配器承担（`new_in` 时已注入），这里不再需要
-            // 手工构造 `Owned`。重复 `Attach` 直接覆盖，不会留下陈旧条目。
-            table.insert(
-                (local_dock, remote_dock),
-                ReadEntry_ {
-                    owner_: owner,
-                    writer_,
-                },
-            );
-        }
         ReadEvent_::RxConsumed {
             local_dock,
             remote_dock,
@@ -1917,6 +1971,9 @@ where
     /// 合并提示（身份释放等）：把掩码带回调用方，按状态位推进本地表。
     Hint(u64),
 
+    /// `Attach` inbox 里来了一条新的接收环写端。
+    Attach(ReadAttach_<A>),
+
     /// 取消令牌触发：连接正在收尾，本循环退出。
     Cancelled,
 }
@@ -1959,6 +2016,8 @@ where
     let mut woke: Option<ReadWake_<C::Alloc>> = Option::None;
     // 合并提示（身份释放）：把掩码带回调用方。
     let mut hint_bits = 0u64;
+    // `Attach` inbox 里取出的一条。
+    let mut taken_attach: Option<ReadAttach_<C::Alloc>> = Option::None;
     poll_fn(|cx| {
         // 取消令牌优先：连接已收尾，直接退出。
         if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
@@ -2017,6 +2076,14 @@ where
             hint_bits = bits;
             return Poll::Ready(());
         }
+        match shared.reg_().poll_read_attach_(cx) {
+            Poll::Ready(Option::Some(attach)) => {
+                taken_attach = Option::Some(attach);
+                return Poll::Ready(());
+            }
+            Poll::Ready(Option::None) => {}
+            Poll::Pending => {}
+        }
         Poll::Pending
     })
     .await;
@@ -2026,6 +2093,8 @@ where
         ReadWake_::Rescan
     } else if hint_bits != 0u64 {
         ReadWake_::Hint(hint_bits)
+    } else if let Option::Some(attach) = taken_attach {
+        ReadWake_::Attach(attach)
     } else if let Option::Some(event) = taken {
         ReadWake_::Event(event)
     } else if let Option::Some(woke) = woke {
@@ -2168,6 +2237,12 @@ where
                 report_conn_failed_::<C>(self.shared, &entry.owner_, pair.0, pair.1, now_millis);
             }
         }
+        // `Attach` inbox 里还没取走的环半部：显式关闭，别让应用侧永久 park。
+        while let Option::Some(attach) = self.shared.reg_.take_write_attach_() {
+            let (_, _, mut reader_) = attach.into_parts_();
+            reader_.close();
+        }
+        self.shared.reg_.close_write_inbox_();
     }
 }
 
@@ -2255,25 +2330,17 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        let failed = self.shared.reg_.fail_kind_();
-        let now_millis = self.shared.conn_clock_().now_millis_();
+        // 共享面保留给后续 telegraph 失败上报；本轮 `TgAttach` 只需关闭环半部。
+        let _ = self.shared;
         loop {
             let event = match self.events.try_take_event_() {
                 EventTake_::Event(event) => event,
                 // Drop 阶段不再做全扫：其余半部由循环退出时的守卫统一关闭。
                 EventTake_::Rescan | EventTake_::Empty | EventTake_::Closed => break,
             };
-            if let WriteEvent_::Attach {
-                local_dock,
-                remote_dock,
-                owner,
-                mut reader_,
-            } = event
-            {
+            // 通道 `Attach` 已经改走 inbox；事件里只剩 telegraph 的环半部需要显式关闭。
+            if let WriteEvent_::TgAttach { mut reader_, .. } = event {
                 reader_.close();
-                if failed.is_some() {
-                    report_conn_failed_::<C>(self.shared, &owner, local_dock, remote_dock, now_millis);
-                }
             }
         }
     }
@@ -2418,6 +2485,11 @@ pub(crate) async fn mux_loop_async_<C, K>(
         lock_or_exit_!(shared
             .reg_
             .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token()));
+
+        // 0.05 `Attach` inbox：环半部从这里进入本地写表（不再走事件通道）。
+        while let Option::Some(attach) = shared.reg_().take_write_attach_() {
+            handle_write_attach_::<C>(attach, &mut *table, &mut pending_fin, &shared);
+        }
 
         // 0.1 合并提示：应用侧封口 / 关接收只置位 + 唤醒，不再逐条投事件。
         //
@@ -2630,6 +2702,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
         let mut need_rescan = false;
         let mut ring_ready = false;
         let mut hint_ready = false;
+        let mut taken_attach: Option<WriteAttach_<C::Alloc>> = Option::None;
         let alive = {
             let cancel_fut = cancel.child_token().cancellation();
             let mut event_fut = core::pin::pin!(events.take_event_async_());
@@ -2699,6 +2772,16 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     hint_ready = true;
                     return Poll::Ready(true);
                 }
+                // `Attach` inbox：有新的环半部要交给本地写表。
+                match shared.reg_().poll_write_attach_(cx) {
+                    Poll::Ready(Option::Some(attach)) => {
+                        taken_attach = Option::Some(attach);
+                        return Poll::Ready(true);
+                    }
+                    // 写循环自己在退出时才会关闭 inbox；运行期不应看到。
+                    Poll::Ready(Option::None) => return Poll::Ready(false),
+                    Poll::Pending => {}
+                }
                 Poll::Pending
             })
             .await
@@ -2709,6 +2792,10 @@ pub(crate) async fn mux_loop_async_<C, K>(
         if need_rescan {
             // 有可重建事件（`TxReady` / `TgReady`）被丢弃：回顶部，本轮排空段本来
             // 就是全表扫描，足以把可写数据取走。
+            continue;
+        }
+        if let Option::Some(attach) = taken_attach {
+            handle_write_attach_::<C>(attach, &mut *table, &mut pending_fin, &shared);
             continue;
         }
         if let Option::Some(event) = taken {
@@ -2770,41 +2857,6 @@ where
     K: TrCancellationToken,
 {
     match event {
-        WriteEvent_::Attach {
-            local_dock,
-            remote_dock,
-            owner,
-            reader_,
-        } => {
-            let pair = (local_dock, remote_dock);
-            // 插入之前先看状态字：应用侧完全可能在 `Attach` 被处理之前就已经封口 /
-            // 关接收（`accept_async` 返回后立刻 drop 半部）。提示位只保证「有一次
-            // 唤醒」，若它在本表还没有这一对时被消费，扫描会漏掉——因此这里在插入
-            // 之后补登记 / 补提示。
-            let tx_closed = owner.is_app_tx_closed_();
-            let rx_closed = owner.is_app_rx_closed_();
-            // 对端 `CLOSE` 也可能先于本表项到达（读循环处理帧比写循环处理事件快）。
-            let peer_closed = owner.is_peer_fin_() || owner.is_peer_reset_();
-            if tx_closed {
-                pending_fin.insert(pair);
-            }
-            // 节点分配由表自己的分配器承担（`new_in` 时已注入）。
-            table.insert(
-                pair,
-                WriteEntry_ {
-                    owner_: owner,
-                    reader_,
-                    peer_fin_handled_: false,
-                    fin_sent_: false,
-                },
-            );
-            if rx_closed {
-                shared.reg_().raise_write_hint_(HINT_W_RX_CLOSED);
-            }
-            if peer_closed {
-                shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
-            }
-        }
         WriteEvent_::Control { frame_ } => {
             // 控制帧也必须整帧进入写环；装不下时先 park 在写环上，再重试同一帧。
             write_control_blocking_::<C, _>(

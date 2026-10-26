@@ -240,6 +240,17 @@ where
 
         // 计时循环：保活（PULSE）与空闲超时拆流。它不搬字节，只按连接级时钟算
         // 期限、把保活动作投进上面两条事件通道（见 `timer_` 模块文档）。
+        //
+        // 控制面循环先拿一份共享面克隆：计时循环随后按值接管 `shared_`。
+        let ctl_fut = keep_queue_alive_(
+            scope.clone(),
+            crate::connection::ctl_::ctl_loop_async_::<C, _>(
+                shared_.clone(),
+                core_.loop_token_(3usize),
+            ),
+        );
+        scope.spawn_local(ctl_fut).detach();
+
         let timer_fut = keep_queue_alive_(
             scope.clone(),
             timer_loop_async_::<C, _>(
@@ -352,6 +363,7 @@ where
             reg.loop_token_(0usize),
             reg.loop_token_(1usize),
             reg.loop_token_(2usize),
+            reg.loop_token_(3usize),
         ];
 
         let core = Shared::new(

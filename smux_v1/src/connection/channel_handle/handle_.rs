@@ -17,7 +17,8 @@ use crate::{
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
         ring_::{RingBuildErr, new_buffered_channel},
-        signal_::{ControlFrame_, ReadEvent_, SessionEvent_, WriteEvent_},
+        signal_::{ControlFrame_, ReadAttach_, SessionEvent_, WriteAttach_, WriteEvent_},
+        slot_::PushErr_,
         util_::read_available_into_vec_,
     },
     flow_ctrl::{
@@ -64,6 +65,12 @@ pub enum HandleError {
 ///
 /// **不借用连接**：自己持有一份 [`MuxConnection`] 克隆，因此生命周期参数从公开
 /// 类型上消失，可以存进结构体、可以从函数返回。
+/// 建流时因 inbox 满而待补投的两侧 `Attach`。
+type PendingAttach_<C> = (
+    Option<WriteAttach_<<C as TrConnCfg>::Alloc>>,
+    Option<ReadAttach_<<C as TrConnCfg>::Alloc>>,
+);
+
 pub struct ChannelHandle<C>
 where
     C: TrConnCfg,
@@ -95,6 +102,10 @@ where
 
     /// 是否已经裁决完毕（接受 / 拒绝 / 已拆）。
     settled_: bool,
+
+    /// 建环时因 inbox 满而**未能投递**的 `Attach`；由 `accept_async` 在异步上下文里
+    /// 补投（背压）。两边都为 `None` 是正常路径。
+    pending_attach_: Option<PendingAttach_<C>>,
 }
 
 impl<C> ChannelHandle<C>
@@ -118,6 +129,7 @@ where
             accepted_owner_: owner,
             accepted_initial_window_: 0u32 as Credit,
             settled_: false,
+            pending_attach_: Option::None,
         }
     }
 
@@ -138,6 +150,7 @@ where
             accepted_owner_: owner,
             accepted_initial_window_: 0u32 as Credit,
             settled_: false,
+            pending_attach_: Option::None,
         }
     }
 }
@@ -232,10 +245,20 @@ where
         let RingBuffAlloc { tx_buff, rx_buff, .. } = buffs;
 
         // 建环 + 安装窗口参数（纯本地；注册表登记在身份登记时已经完成）。
-        let (tx, rx, initial) =
-            install_channel_::<C, B>(&conn, local, remote, self.accepted_owner_.clone(), tx_buff, rx_buff)?;
-        self.accepted_initial_window_ = initial;
-        Result::Ok((tx, rx))
+        let outcome = install_channel_::<C, B>(
+            &conn,
+            local,
+            remote,
+            self.accepted_owner_.clone(),
+            tx_buff,
+            rx_buff,
+        )?;
+        self.accepted_initial_window_ = outcome.initial_;
+        self.pending_attach_ = match (outcome.pending_w_, outcome.pending_r_) {
+            (Option::None, Option::None) => Option::None,
+            (w, r) => Option::Some((w, r)),
+        };
+        Result::Ok((outcome.tx_, outcome.rx_))
     }
 
     /// 本条子流**为什么停下来**（若它不是被对端正常关闭的）。
@@ -352,6 +375,16 @@ where
 
     // 环已经建好（同步、不取锁）；下面**取注册表锁的两步都在可取消的异步上下文里**。
     let (tx, rx) = accepted?;
+    // 建环时若 inbox 满，`Attach` 被带回到 `pending_attach_`；这里在异步上下文里补投
+    // （背压）。补投失败只可能是连接正在收尾或调用方取消。
+    if let Option::Some((pending_w, pending_r)) = handle.pending_attach_.take()
+        && let Result::Err(err) =
+            attach_channel_async_(&conn, pending_w, pending_r, cancel.child_token()).await
+    {
+        handle.settled_ = true;
+        abort_pending_(&conn, local, remote, handle.is_initiator_);
+        return Result::Err(err);
+    }
     // 共享状态在登记身份时就建立了，句柄一直在本对象手里；不再有「挂 owner」这一步。
     let owner = handle.accepted_owner_.clone();
 
@@ -482,11 +515,25 @@ type AcceptOutcomeProj_<C> = Result<(ChannelTx<C>, ChannelRx<C>), HandleError>;
 
 
 /// 建流最终裁决的产物。
-type InstallOutcome_<C> = (
-    ChannelTx<C>,
-    ChannelRx<C>,
-    Credit,
-);
+struct InstallOutcome_<C>
+where
+    C: TrConnCfg,
+{
+    /// 应用侧发送半边。
+    tx_: ChannelTx<C>,
+
+    /// 应用侧接收半边。
+    rx_: ChannelRx<C>,
+
+    /// 本端要通告的初始接收窗口。
+    initial_: Credit,
+
+    /// 因写侧 inbox 满而待补投的 `Attach`。
+    pending_w_: Option<WriteAttach_<C::Alloc>>,
+
+    /// 因读侧 inbox 满而待补投的 `Attach`。
+    pending_r_: Option<ReadAttach_<C::Alloc>>,
+}
 
 /// 建流最终裁决的公共部分：按调用方给的缓冲建两条环、把会话侧半部交给两个循环，
 /// 并把**登记身份时建立的共享状态**安装上窗口参数。
@@ -547,50 +594,133 @@ where
         }
     };
 
-    // **半部交给循环这一步可能失败**（对应的循环已经不在 = 连接正在收尾）。失败时
-    // 绝不能把应用侧那半部交出去：它的对端会随失败的事件一起被丢弃，而 `buffex` 的环
-    // 半部 **drop 不置关闭位、也不唤醒对端**，应用一用就永久 park。如实报连接级失败
-    // （原因优先取共享状态上的通知槽；它没来得及写时退到锁外快照；都没有就按已关闭）。
-    let attached = core.w_events_().try_send_durable_event_(WriteEvent_::Attach {
-        local_dock: local,
-        remote_dock: remote,
-        owner: owner.clone(),
-        reader_: tx_r,
-    }) && core.r_events_().try_send_durable_event_(ReadEvent_::Attach {
-        local_dock: local,
-        remote_dock: remote,
-        owner: owner.clone(),
-        writer_: rx_w,
-    });
-    // 唯一的例外是**单元测试专用的无循环连接**（`MuxConnection::new_test_`：只建核心与
-    // 两条事件通道，接收端随即被丢弃）：那里的「投递失败」是构造方式使然，不是连接出了
-    // 问题，照旧把半部交出去，别把测试专用的构造变成错误路径。
-    if !attached && !cfg!(test) {
-        // 原因按**代价从低到高**取，全是同步、锁外读（安装路径是同步的，不能为报原因
-        // 去 `await` 注册表锁）：子流通知槽 → 连接失败类别快照 → 已关闭。
-        let reason = match owner.abort_reason_() {
-            Option::Some(reason) => reason,
-            Option::None => match core.reg_().fail_kind_() {
-                Option::Some(kind) => MuxError::ConnFailed(kind),
-                Option::None => MuxError::Closed,
-            },
-        };
-        return Result::Err(HandleError::Mux(reason));
-    }
+    // **半部交给循环**：写 / 读各一条内联 inbox。inbox 满时把 `Attach` 带回去，
+    // 由 `accept_async` 的异步阶段补投（背压）；inbox 已关闭（循环退出）才报错。
+    let reg = core.reg_();
+    let pair = (local, remote);
+    let pending_w_ = match reg.try_push_write_attach_(WriteAttach_::new_(
+        pair,
+        owner.clone(),
+        tx_r,
+    )) {
+        Result::Ok(()) => Option::None,
+        Result::Err(attach) => {
+            if reg.is_write_inbox_closed_() {
+                let (_, _, mut reader_) = attach.into_parts_();
+                reader_.close();
+                return Result::Err(HandleError::Mux(attach_closed_reason_(&owner, conn)));
+            }
+            // 单元测试专用的无循环连接：没有消费者，直接放弃投递（旧行为）。
+            if cfg!(test) {
+                Option::None
+            } else {
+                Option::Some(attach)
+            }
+        }
+    };
+    let pending_r_ = match reg.try_push_read_attach_(ReadAttach_::new_(
+        pair,
+        owner.clone(),
+        rx_w,
+    )) {
+        Result::Ok(()) => Option::None,
+        Result::Err(attach) => {
+            if reg.is_read_inbox_closed_() {
+                let (_, _, mut writer_) = attach.into_parts_();
+                writer_.close();
+                return Result::Err(HandleError::Mux(attach_closed_reason_(&owner, conn)));
+            }
+            if cfg!(test) {
+                Option::None
+            } else {
+                Option::Some(attach)
+            }
+        }
+    };
 
-    // 子流到这里才算**建成**：两条环已建好、两侧半部已交给循环。上报点必须在这里，
-    // 而不是登记身份时——登记时既没有环，也还没有任何线上痕迹（见 [`crate::connection`]
-    // 模块文档 §4.2「最终裁决是唯一的提交点」）。
+    // 子流到这里才算**建成**：两条环已建好、两侧半部已交给（或待补投给）循环。上报点
+    // 必须在这里，而不是登记身份时——登记时既没有环，也还没有任何线上痕迹（见
+    // [`crate::connection`] 模块文档 §4.2「最终裁决是唯一的提交点」）。
     conn.core_()
         .config_()
         .metrics()
         .on_channel_opened(local, remote);
 
-    Result::Ok((
-        ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote, backlog),
-        ChannelRx::new_(rx_r, owner, conn.clone(), local, remote),
-        initial,
-    ))
+    Result::Ok(InstallOutcome_ {
+        tx_: ChannelTx::new_(tx_w, owner.clone(), conn.clone(), local, remote, backlog),
+        rx_: ChannelRx::new_(rx_r, owner, conn.clone(), local, remote),
+        initial_: initial,
+        pending_w_,
+        pending_r_,
+    })
+}
+
+/// `Attach` 投递失败（inbox 已关闭）时的连接级原因。
+fn attach_closed_reason_<C>(
+    owner: &ChannelOwner_<C::Alloc>,
+    conn: &MuxConnection<C>,
+) -> MuxError
+where
+    C: TrConnCfg,
+{
+    match owner.abort_reason_() {
+        Option::Some(reason) => reason,
+        Option::None => match conn.core_().reg_().fail_kind_() {
+            Option::Some(kind) => MuxError::ConnFailed(kind),
+            Option::None => MuxError::Closed,
+        },
+    }
+}
+
+/// 把建流时因 inbox 满而带回来的 `Attach` 补投出去（背压、可取消）。
+async fn attach_channel_async_<C, K>(
+    conn: &MuxConnection<C>,
+    pending_w: Option<WriteAttach_<C::Alloc>>,
+    pending_r: Option<ReadAttach_<C::Alloc>>,
+    cancel: K,
+) -> Result<(), HandleError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let reg = conn.core_().reg_();
+    if let Option::Some(attach) = pending_w {
+        match reg
+            .push_write_attach_async_(attach, cancel.child_token())
+            .await
+        {
+            Result::Ok(()) => {}
+            Result::Err(PushErr_::Closed(attach)) => {
+                let (_, _, mut reader_) = attach.into_parts_();
+                reader_.close();
+                return Result::Err(HandleError::Mux(MuxError::Closed));
+            }
+            Result::Err(PushErr_::Cancelled(attach)) => {
+                let (_, _, mut reader_) = attach.into_parts_();
+                reader_.close();
+                return Result::Err(HandleError::Cancelled);
+            }
+        }
+    }
+    if let Option::Some(attach) = pending_r {
+        match reg
+            .push_read_attach_async_(attach, cancel.child_token())
+            .await
+        {
+            Result::Ok(()) => {}
+            Result::Err(PushErr_::Closed(attach)) => {
+                let (_, _, mut writer_) = attach.into_parts_();
+                writer_.close();
+                return Result::Err(HandleError::Mux(MuxError::Closed));
+            }
+            Result::Err(PushErr_::Cancelled(attach)) => {
+                let (_, _, mut writer_) = attach.into_parts_();
+                writer_.close();
+                return Result::Err(HandleError::Cancelled);
+            }
+        }
+    }
+    Result::Ok(())
 }
 
 /// 把 `OPEN` 投给写循环。

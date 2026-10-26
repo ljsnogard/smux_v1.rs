@@ -281,6 +281,37 @@ by_local_: BTreeMap<Dock, BTreeMap<Dock, ChannelOwner_<A>>>,
 验证：三后端 `--all-targets` 全通过；`--doc` 12；`cargo clippy --lib` 无新告警；
 `format_use_imports.py --check` 合规。
 
+### 6.5 阶段 2a/2b：控制面循环骨架 + `Attach` 迁移（2026-10-26 晚）
+
+**2a：第 4 个循环。** 取消令牌数组从 3 扩到 4，`MuxConnection::new_with_rt_` 多
+`spawn_local` 一个 `ctl_loop_async_`（`ctl_.rs`，当前只等取消），`MuxCore` 的收尾判据
+随之覆盖 4 个令牌。
+
+**2b：`Attach` 改走内联 inbox。** `WriteAttach_` / `ReadAttach_`（dock 对 + 身份节点 +
+环半部）不再进事件通道，而是放进 `RegistryRoot_` 的两条 `InlineQueue_`（容量 64）。
+- `install_channel_` 先 `try_push`；满则把 `Attach` 带回 `ChannelHandle::pending_attach_`，
+  由 `accept_async` 的异步阶段补投（真正的背压）；
+- 写 / 读循环每轮顶部 drain inbox，park 时同时 poll inbox；
+- 循环退出时守卫 drain 未取走的 `Attach` 并 `close()` 环半部，然后关闭 inbox；
+- `WriteEvent_::Attach` / `ReadEvent_::Attach` 删除。
+
+**修复 1（256 并发建流的死锁）**：`InlineQueue_` 的「等空位」原来用 `NotifySlot_`，
+而它是**单等待者**槽；`cross_thread_*` 的 256 个并发建流任务里只有一个能留下 waker，
+其余永久睡死（20 s 看门狗）。改为 `Vec<Waker>` 广播（`free_waiters_`），并在登记后
+复检 `len_hint_ < N`，避免「腾位与登记之间」丢唤醒。取消也必须自己登记 waker
+（`cancelled` future 与空位一起等），否则「取消后不唤醒」会卡住补投方。
+
+**修复 2（流控超时）**：`RxConsumed` 仍在事件通道，`Attach` 已改走 inbox，两者不再共享
+FIFO。若 `RxConsumed` 先被取出（此时读表还没有该对），事件被丢弃、`RX_CONSUMED` 位却
+留着。修法：每插入一条新的读表项，就调一次 `rescan_read_` 按位重算水位。`smoke_compio`
+的 `flow_ctrl_socket_` 从 20 s 超时回到 0.3 s。
+
+验证：compio / tokio / smol `--all-targets` 全通过（343 lib + 全部集成；inmem 仍约 1 s
+（compio/smol）/ 15 s（tokio），smoke 11–16 s）。
+
+剩余：ctl 尚未承担 Listener registry 与拆流事务（2c）；`EVENT_CHAN_CAP` 仍是 1024，
+等 `Control` / `TgAttach` 也迁走后再降（2d）。
+
 ### 6.1 阶段 0 的接口
 
 `slot_.rs` 提供：

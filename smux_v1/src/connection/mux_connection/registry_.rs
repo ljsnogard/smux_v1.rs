@@ -154,7 +154,8 @@ use crate::{
             AbortCode_, ChannelNotice, ChannelOwner_, LsnOwner_, TgOwner_,
             new_listener_owner_, new_owner_, new_telegraph_owner_,
         },
-        signal_::{SessionEvent_, SessionMailbox_},
+        signal_::{ReadAttach_, SessionEvent_, SessionMailbox_, WriteAttach_},
+        slot_::{InlineQueue_, PushErr_},
         sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
         timer_::TimerAction_,
     },
@@ -1038,18 +1039,27 @@ impl RegistryShared_ {
 /// 只做一次引用计数，`MuxCore::drop` 仍可经 `root_.shared_` 不取锁地推进关闭。
 struct RegistryRoot_<A>
 where
-    A: AllocatorClone,
+    A: AllocatorClone + Send + Sync,
 {
     /// 锁外共享状态（原子域 + 三路 waker）。
     shared_: RegistryShared_,
 
     /// 锁内的身份表与配额。
     inner_: CooperativeRwLockOwned<RegistryInner_<A>>,
+
+    /// 写循环的 `Attach` inbox：一次性环半部从这里交给写循环，不走通用事件通道。
+    mux_inbox_: InlineQueue_<WriteAttach_<A>, ATTACH_INBOX_CAP>,
+
+    /// 读循环的 `Attach` inbox（同上）。
+    demux_inbox_: InlineQueue_<ReadAttach_<A>, ATTACH_INBOX_CAP>,
 }
+
+/// `Attach` inbox 的容量（每连接一条；满时建流方按背压等待）。
+pub(crate) const ATTACH_INBOX_CAP: usize = 64usize;
 
 pub(crate) struct ChannelRegistry_<A>
 where
-    A: AllocatorClone,
+    A: AllocatorClone + Send + Sync,
 {
     /// 注册表根：**锁外共享状态 + 锁内的表**，每连接一次分配。
     ///
@@ -1061,7 +1071,7 @@ where
     ///
     /// **放在锁外**：构造后不再变化，因此取用与触发都无需取锁（`Drop` 路径要的
     /// 正是这一点）。
-    loops_: [CancelToken_<A>; 3],
+    loops_: [CancelToken_<A>; 4],
 
     /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
     ///
@@ -1072,7 +1082,7 @@ where
 
 impl<A> Clone for ChannelRegistry_<A>
 where
-    A: AllocatorClone,
+    A: AllocatorClone + Send + Sync,
 {
     fn clone(&self) -> Self {
         ChannelRegistry_ {
@@ -1110,6 +1120,8 @@ where
             // 0：解复用（transport Rx → 各子流接收环）
             // 1：复用（各子流发送环 → transport Tx）
             // 2：计时（保活 PULSE 与空闲超时拆流）
+            // 3：控制面（Listener 入向、建流 / 拆流事务、Attach 分发）
+            CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
@@ -1123,6 +1135,8 @@ where
             root_: Shared::new(
                 RegistryRoot_ {
                     shared_: RegistryShared_::new_(),
+                    mux_inbox_: InlineQueue_::new_(),
+                    demux_inbox_: InlineQueue_::new_(),
                     inner_: CooperativeRwLockOwned::new_owned(RegistryInner_ {
                         opts_: opts,
                         alloc_: alloc.clone(),
@@ -1189,6 +1203,74 @@ where
     /// 等下一个读循环提示：已有提示时立刻返回，否则登记唤醒。
     pub(crate) fn poll_read_hint_(&self, cx: &mut Context<'_>) -> Poll<u64> {
         self.root_.shared_.poll_read_hint_(cx)
+    }
+
+    /// 尝试把写侧 `Attach` 放进 inbox；满时原样带回。
+    pub(crate) fn try_push_write_attach_(&self, attach: WriteAttach_<A>) -> Result<(), WriteAttach_<A>> {
+        self.root_.mux_inbox_.try_push_(attach)
+    }
+
+    /// 异步放写侧 `Attach`：inbox 满时等待写循环取走（可取消）。
+    pub(crate) async fn push_write_attach_async_<K: TrCancellationToken>(
+        &self,
+        attach: WriteAttach_<A>,
+        cancel: K,
+    ) -> Result<(), PushErr_<WriteAttach_<A>>> {
+        self.root_.mux_inbox_.push_async_(attach, cancel).await
+    }
+
+    /// 写循环取一条 `Attach`（非阻塞）。
+    pub(crate) fn take_write_attach_(&self) -> Option<WriteAttach_<A>> {
+        self.root_.mux_inbox_.try_pop_()
+    }
+
+    /// 写循环等一条 `Attach`。
+    pub(crate) fn poll_write_attach_(&self, cx: &mut Context<'_>) -> Poll<Option<WriteAttach_<A>>> {
+        self.root_.mux_inbox_.poll_pop_(cx)
+    }
+
+    /// 写侧 inbox 是否已关闭（循环退出）。
+    pub(crate) fn is_write_inbox_closed_(&self) -> bool {
+        self.root_.mux_inbox_.is_closed_()
+    }
+
+    /// 尝试把读侧 `Attach` 放进 inbox；满时原样带回。
+    pub(crate) fn try_push_read_attach_(&self, attach: ReadAttach_<A>) -> Result<(), ReadAttach_<A>> {
+        self.root_.demux_inbox_.try_push_(attach)
+    }
+
+    /// 异步放读侧 `Attach`：inbox 满时等待读循环取走（可取消）。
+    pub(crate) async fn push_read_attach_async_<K: TrCancellationToken>(
+        &self,
+        attach: ReadAttach_<A>,
+        cancel: K,
+    ) -> Result<(), PushErr_<ReadAttach_<A>>> {
+        self.root_.demux_inbox_.push_async_(attach, cancel).await
+    }
+
+    /// 读循环取一条 `Attach`（非阻塞）。
+    pub(crate) fn take_read_attach_(&self) -> Option<ReadAttach_<A>> {
+        self.root_.demux_inbox_.try_pop_()
+    }
+
+    /// 读循环等一条 `Attach`。
+    pub(crate) fn poll_read_attach_(&self, cx: &mut Context<'_>) -> Poll<Option<ReadAttach_<A>>> {
+        self.root_.demux_inbox_.poll_pop_(cx)
+    }
+
+    /// 读侧 inbox 是否已关闭（循环退出）。
+    pub(crate) fn is_read_inbox_closed_(&self) -> bool {
+        self.root_.demux_inbox_.is_closed_()
+    }
+
+    /// 关闭写侧 inbox（写循环退出时调用；唤醒仍在背压等待的建流方）。
+    pub(crate) fn close_write_inbox_(&self) {
+        self.root_.mux_inbox_.close_();
+    }
+
+    /// 关闭读侧 inbox（读循环退出时调用）。
+    pub(crate) fn close_read_inbox_(&self) {
+        self.root_.demux_inbox_.close_();
     }
 
     /// 连接是否已经进入**优雅关闭**（锁外原子读；数据面与 API 面都可廉价调用）。
