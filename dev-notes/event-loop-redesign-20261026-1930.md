@@ -1751,8 +1751,11 @@ connection/
   （约束：`Cfg` / `Allocator` / `K` / `V` 均 `Send + Sync`；`DockTreeCfg_<A>` 与
   我们的键值类型满足）。`remote_index_` / `wait_close_expiry_` 已换
   `DockBPlusTree_`（值 `()`），`cross_thread_compio` 通过；`docks_` 已换
-  `DockBPlusTree_<A, Dock, DockCtx_<A>>`；`bindings_` 是最后一张仍用 `BTreeMap`
-  的 registry 表。验收：lib 371 / inmem 20 / smoke 5 / cross_thread 1。
+  `DockBPlusTree_<A, Dock, DockCtx_<A>>`；`bindings_` 已换
+  `DockBPlusTree_<A, (Dock, Dock), BindingSlot_<A>>`。**registry 四表全部完成**
+  2 KiB B+ 树迁移；`BTreeMap` / `BTreeSet` 只剩临时统计集合与测试辅助使用，
+  `btreemap_alloc` feature 已删除。验收：lib 371 / inmem 20 / smoke 5 /
+  cross_thread 1。
 
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 

@@ -1,7 +1,6 @@
 #![feature(allocator_ext)]
 // `BTreeMap` / `BTreeSet` 的分配器参数（`new_in`）另有独立 feature 门；注册表的三张
 // 索引表都要用它指定分配器，因此与 `allocator_api` 一并打开。
-#![feature(btreemap_alloc)]
 #![feature(impl_trait_in_assoc_type)]
 // 上游 `abs_mm::res_man::TrBoxed` 把「取回自己那块内存的分配器」写成一个返回
 // `impl Try<Output = &Self::Alloc>` 的方法（分配器可能存在于 `Rc` 这类共享所有权里），

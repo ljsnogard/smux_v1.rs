@@ -133,7 +133,7 @@
 //! 「只用手动绑定的连接」在解绑路径上零额外分配。
 
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     vec::Vec,
 };
 use core::{
@@ -551,7 +551,8 @@ where
     next_fresh_dock_: Dock,
 
     /// `(local, remote)` → 身份；**唯一事实源**。
-    bindings_: BTreeMap<(Dock, Dock), BindingSlot_<A>, A>,
+    bindings_:
+        crate::connection::dock_index_::DockBPlusTree_<A, (Dock, Dock), BindingSlot_<A>>,
 
     /// `(remote, local)` → 活跃子流的反向索引。
     ///
@@ -600,10 +601,10 @@ where
             self.wait_close_expiry_
                 .remove((until, local_dock, remote_dock));
             if matches!(
-                self.bindings_.get(&(local_dock, remote_dock)),
+                self.bindings_.get((local_dock, remote_dock)).map(|(_, slot)| slot),
                 Option::Some(BindingSlot_::WaitClose(_))
             ) {
-                self.bindings_.remove(&(local_dock, remote_dock));
+                self.bindings_.remove((local_dock, remote_dock));
             }
             // 墓碑消失可能正好让这个 dock「空」下来——那正是兑现欠着的归还的时机
             // （见 [`RegistryInner_::settle_pending_return_`]）。同一 dock 上还有别的
@@ -1183,7 +1184,8 @@ where
         ];
         let docks_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
             .expect("2 KiB B+ 树足以容纳 dock 条目");
-        let bindings_ = BTreeMap::new_in(alloc.clone());
+        let bindings_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
+            .expect("2 KiB B+ 树足以容纳身份表项");
         let remote_index_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
             .expect("2 KiB B+ 树足以容纳反向索引表项");
         let wait_close_expiry_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
@@ -1527,12 +1529,12 @@ where
 
             // 检查顺序与旧链表实现一致：用途 → 重复 → dock 限额。
             if matches!(
-                inner.bindings_.get(&telegraph_key_(local_dock)),
+                inner.bindings_.get(telegraph_key_(local_dock)).map(|(_, slot)| slot),
                 Option::Some(BindingSlot_::Telegraph(_))
             ) {
                 return Result::Err(ReserveErr_::DockInUse);
             }
-            match inner.bindings_.get(&(local_dock, remote_dock)) {
+            match inner.bindings_.get((local_dock, remote_dock)).map(|(_, slot)| slot) {
                 Option::Some(BindingSlot_::WaitClose(_)) => {
                     return Result::Err(ReserveErr_::WaitClose);
                 }
@@ -1601,7 +1603,7 @@ where
         let inner = &mut *guard;
         let removed = inner
             .bindings_
-            .remove(&(local_dock, remote_dock));
+            .remove((local_dock, remote_dock));
         let mut became_idle = false;
         if matches!(removed, Option::Some(BindingSlot_::Channel(_))) {
             inner.remote_index_.remove((remote_dock, local_dock));
@@ -1626,7 +1628,7 @@ where
         let inner = &mut *guard;
         inner.reap_wait_close_(now_millis);
         if !matches!(
-            inner.bindings_.get(&(local_dock, remote_dock)),
+            inner.bindings_.get((local_dock, remote_dock)).map(|(_, slot)| slot),
             Option::Some(BindingSlot_::Channel(_))
         ) {
             return Result::Ok(false);
@@ -1660,7 +1662,7 @@ where
         let inner = &mut *guard;
         inner.reap_wait_close_(now_millis);
         Result::Ok(matches!(
-            inner.bindings_.get(&(local_dock, remote_dock)),
+            inner.bindings_.get((local_dock, remote_dock)).map(|(_, slot)| slot),
             Option::Some(BindingSlot_::WaitClose(_))
         ))
     }
@@ -1678,7 +1680,7 @@ where
         let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         let inner = &*guard;
-        Result::Ok(match inner.bindings_.get(&(local_dock, remote_dock)) {
+        Result::Ok(match inner.bindings_.get((local_dock, remote_dock)).map(|(_, slot)| slot) {
             Option::Some(BindingSlot_::Channel(ctx)) => Option::Some(ctx.rec_.clone()),
             _ => Option::None,
         })
@@ -1713,7 +1715,7 @@ where
         let marked = {
             let mut session = self.root_.inner_.acquire_session();
             let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
-            match guard.bindings_.get_mut(&(local_dock, remote_dock)) {
+            match guard.bindings_.get_mut((local_dock, remote_dock)).map(|(_, slot)| slot) {
                 Option::Some(BindingSlot_::Channel(ctx)) => {
                     ctx.inbound_ = Inbound_::Pending(peer_report);
                     // app 侧两半暂存在槽里，等 `TakeInbound` 一起交给句柄。
@@ -1743,7 +1745,7 @@ where
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let Option::Some(BindingSlot_::Channel(ctx)) =
-            guard.bindings_.get_mut(&(local_dock, remote_dock))
+            guard.bindings_.get_mut((local_dock, remote_dock)).map(|(_, slot)| slot)
         else {
             return Result::Ok(Option::None);
         };
@@ -1792,11 +1794,11 @@ where
             }
         }
         for local_dock in retired_listeners {
-            inner.bindings_.remove(&listener_key_(local_dock));
+            inner.bindings_.remove(listener_key_(local_dock));
             inner.settle_pending_return_(local_dock);
         }
         for local_dock in retired_telegraphs {
-            inner.bindings_.remove(&telegraph_key_(local_dock));
+            inner.bindings_.remove(telegraph_key_(local_dock));
             inner.settle_pending_return_(local_dock);
         }
         Result::Ok(())
@@ -1817,7 +1819,7 @@ where
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let Option::Some(BindingSlot_::Channel(ctx)) =
-            guard.bindings_.get_mut(&(local_dock, remote_dock))
+            guard.bindings_.get_mut((local_dock, remote_dock)).map(|(_, slot)| slot)
         else {
             return Result::Ok(());
         };
@@ -1873,7 +1875,7 @@ where
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         let Option::Some(BindingSlot_::Channel(ctx)) =
-            inner.bindings_.get_mut(&(local_dock, remote_dock))
+            inner.bindings_.get_mut((local_dock, remote_dock)).map(|(_, slot)| slot)
         else {
             return Result::Ok(Option::None);
         };
@@ -2043,12 +2045,12 @@ where
             return Result::Err(ReserveErr_::Closing);
         }
         if matches!(
-            inner.bindings_.get(&telegraph_key_(local_dock)),
+            inner.bindings_.get(telegraph_key_(local_dock)).map(|(_, slot)| slot),
             Option::Some(BindingSlot_::Telegraph(_))
         ) {
             return Result::Err(ReserveErr_::DockInUse);
         }
-        match inner.bindings_.get(&listener_key_(local_dock)) {
+        match inner.bindings_.get(listener_key_(local_dock)).map(|(_, slot)| slot) {
             // 已经在监听：交出同一份句柄（幂等，与旧实现的 `Ok(())` 等价）。
             Option::Some(BindingSlot_::Listener(rec)) => Result::Ok(rec.clone()),
             Option::Some(_) => Result::Err(ReserveErr_::DockInUse),
@@ -2074,7 +2076,7 @@ where
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
-        inner.bindings_.remove(&listener_key_(local_dock));
+        inner.bindings_.remove(listener_key_(local_dock));
         // 监听身份消失后该 dock 可能才空下来（它欠着一次归还）：兑现之。
         inner.settle_pending_return_(local_dock);
         Result::Ok(())
@@ -2100,8 +2102,8 @@ where
         if self.is_closing_() {
             return Result::Err(ReserveErr_::Closing);
         }
-        if inner.bindings_.contains_key(&telegraph_key_(local_dock))
-            || inner.bindings_.contains_key(&listener_key_(local_dock))
+        if inner.bindings_.contains_key(telegraph_key_(local_dock))
+            || inner.bindings_.contains_key(listener_key_(local_dock))
             || inner.has_concrete_identity_(local_dock)
         {
             return Result::Err(ReserveErr_::DockInUse);
@@ -2125,7 +2127,7 @@ where
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
-        inner.bindings_.remove(&telegraph_key_(local_dock));
+        inner.bindings_.remove(telegraph_key_(local_dock));
         // telegraph 身份消失后该 dock 可能才空下来（它欠着一次归还）：兑现之。
         inner.settle_pending_return_(local_dock);
         Result::Ok(())
@@ -2191,7 +2193,7 @@ where
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         if let Option::Some(BindingSlot_::Listener(rec)) =
-            guard.bindings_.get_mut(&listener_key_(local_dock))
+            guard.bindings_.get_mut(listener_key_(local_dock)).map(|(_, slot)| slot)
         {
             rec.notify_();
         }
@@ -3057,15 +3059,15 @@ mod tests_ {
 
         registry.with_t_(|inner| {
             assert!(matches!(
-                inner.bindings_.get(&(Dock::new(1u32), Dock::wildcard())),
+                inner.bindings_.get((Dock::new(1u32), Dock::wildcard())).map(|(_, slot)| slot),
                 Option::Some(BindingSlot_::Listener(_))
             ));
             assert!(matches!(
-                inner.bindings_.get(&(Dock::new(1u32), Dock::new(9u32))),
+                inner.bindings_.get((Dock::new(1u32), Dock::new(9u32))).map(|(_, slot)| slot),
                 Option::Some(BindingSlot_::Channel(_))
             ));
             assert!(matches!(
-                inner.bindings_.get(&(Dock::new(2u32), Dock::unspecified())),
+                inner.bindings_.get((Dock::new(2u32), Dock::unspecified())).map(|(_, slot)| slot),
                 Option::Some(BindingSlot_::Telegraph(_))
             ));
             // listener 与 channel 共存，说明二者是不同键。
@@ -4042,7 +4044,7 @@ mod tests_ {
             .await;
         registry.with_t_(|inner| {
             assert!(
-                inner.docks_.contains_key(&Dock::new(21u32)),
+                inner.docks_.contains_key(Dock::new(21u32)),
                 "绑定态是持久占用，条目不可被回收"
             );
         });
