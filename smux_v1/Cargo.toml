@@ -84,8 +84,11 @@ metrics = []
 # 注意 `test-*` feature 会顺带启用 `chan-mpmc`（否则 `--no-default-features` 下
 # 默认通道分支没有依赖），因此两个实现都会被编译，但 `signal_` 按 `chan-flume`
 # 选择 flume 分支。
+#
+# `chan-flume` 同时启用 `chan-mpmc`：请求队列与两条 `Attach` inbox 已固定用
+# `mpmc_chan`（等待者是 Arena slab，不再有 flume 版本），A/B 开关只影响事件通道。
 chan-mpmc = ["dep:mpmc_chan"]
-chan-flume = ["dep:flume"]
+chan-flume = ["dep:flume", "chan-mpmc"]
 default = ["test-compio-runtime", "chan-mpmc"]
 
 [dev-dependencies]
