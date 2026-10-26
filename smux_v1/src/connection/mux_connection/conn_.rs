@@ -520,8 +520,8 @@ where
         })?;
     let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
     match reply {
-        Option::Some(Result::Ok(MainReply_::Dock(bound_dock))) => {
-            Result::Ok(DockBinding::new_(conn.clone(), bound_dock))
+        Option::Some(Result::Ok(MainReply_::Dock { dock, unbind_ })) => {
+            Result::Ok(DockBinding::new_(conn.clone(), dock, unbind_))
         }
         Option::Some(Result::Err(MainErr_::Reserve(ReserveErr_::DockInUse))) => {
             Result::Err(BindError::DockInUse)

@@ -1,6 +1,10 @@
-use core::future::poll_fn;
+use core::{
+    future::poll_fn,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use abs_buff::TrBuffRead;
+use mm_ptr::Shared;
 use abs_cancel::TrCancellationToken;
 use abs_smux::{
     conn::TrDockBinding,
@@ -13,7 +17,6 @@ use crate::{
         ChannelHandle, Dock, MainErr_, MainReply_, MainRequest_, MuxConnection, MuxError,
         PushErr_, ReserveErr_, TcsAbandonGuard_, Tcs_, TrConnCfg,
         channel_listener::ChannelListener,
-        signal_::SessionEvent_,
         util_::read_available_into_vec_,
     },
     x_deps::{abs_buff, abs_cancel, abs_smux, gen_mcf2},
@@ -109,6 +112,9 @@ where
 
     /// 本会话绑定的 local_dock。
     local_dock_: Dock,
+
+    /// 「绑定方已丢弃」标志；`Drop` 只置位 + raise，由 main 解绑。
+    unbind_: Shared<AtomicBool, C::Alloc>,
 }
 
 impl<C> DockBinding<C>
@@ -116,10 +122,15 @@ where
     C: TrConnCfg,
 {
     /// 由连接与 `local_dock` 构造（只允许 `bind_async` 调用）。
-    pub(crate) fn new_(conn: MuxConnection<C>, local_dock: Dock) -> Self {
+    pub(crate) fn new_(
+        conn: MuxConnection<C>,
+        local_dock: Dock,
+        unbind_: Shared<AtomicBool, C::Alloc>,
+    ) -> Self {
         DockBinding {
             conn_: conn,
             local_dock_: local_dock,
+            unbind_,
         }
     }
 
@@ -152,13 +163,11 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        let _ = self
-            .conn_
+        self.unbind_.store(true, Ordering::Release);
+        self.conn_
             .core_()
-            .reg_()
-            .post_session_event_(SessionEvent_::UnbindDock {
-                local_dock: self.local_dock_,
-            });
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
     }
 }
 

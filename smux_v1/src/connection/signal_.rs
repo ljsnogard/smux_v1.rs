@@ -371,15 +371,6 @@ where
 /// `ChannelTx::drop` / `ChannelRx::drop` 早就是这个形状（只投 [`WriteEvent_`] /
 /// [`ReadEvent_`]）；本枚举把剩下的四处会话身份释放拉回同一条纪律。
 pub(crate) enum SessionEvent_ {
-    /// `DockBinding` 被丢弃：解绑 `local_dock`。
-    ///
-    /// binding 是**纯本地**身份（对端不可见，帧属于 channel 而不属于 binding），
-    /// 因此没有可宽限的对端状态：消息落实即可重绑（不需要定时宽限期）。
-    UnbindDock {
-        /// 被解绑的本地 dock。
-        local_dock: Dock,
-    },
-
     /// 发起方句柄未裁决就丢弃：**撤销**尚未露面的子流登记（不留宽限期）。
     UnreserveChannel {
         /// 本端 dock。

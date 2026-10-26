@@ -1768,6 +1768,16 @@ connection/
      的混合策略；或 (c) 更大容量并接受内存换无分配。
   4. 本轮回退，`Vec<Waker>` 保留；工作区停在 `2bb65e1`（registry 四表完成）。
 
+- 20261027-1100：**P4 位化：`DockBinding` 的 Drop 位化完成**。
+  1. `bind_dock_` / `bind_any_dock_` 返回 `(Dock, Shared<AtomicBool, A>)`；
+     `MainReply_::Dock { dock, unbind_ }` 携带该标志。
+  2. `DockBinding::Drop` 只 `store(true)` + `HINT_MAIN_RETIRED`，不再投
+     `SessionEvent_::UnbindDock`；该变体与 drain 分支删除。
+  3. `reap_retired_` 扫描 `docks_` 的 `unbind_requested_`，在写锁外调用
+     `unbind_dock_`。
+  4. 新增 `main_step_` 时序测试 `drop_then_step_allows_rebind_`（drop 后立刻重绑）。
+  5. 验收：lib 372 / inmem 20 / cross_thread 1 / smoke 5；clippy / format 合规。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

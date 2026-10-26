@@ -257,18 +257,18 @@ where
                     .reg_()
                     .bind_any_dock_(cancel.child_token())
                     .await
-                    .map(MainReply_::Dock)
+                    .map(|(dock, unbind_)| MainReply_::Dock { dock, unbind_ })
             } else {
                 shared
                     .reg_()
                     .bind_dock_(local_dock, cancel.child_token())
                     .await
-                    .map(|()| MainReply_::Dock(local_dock))
+                    .map(|(dock, unbind_)| MainReply_::Dock { dock, unbind_ })
             };
             // 登记之后才发现等待方已放弃：**回滚刚登记的身份**，否则这个 dock 会
             // 永久占住（没有句柄能解绑它）。回滚用不可取消令牌：它是收尾动作。
             if reply.is_abandoned_()
-                && let Result::Ok(MainReply_::Dock(dock)) = &result
+                && let Result::Ok(MainReply_::Dock { dock, .. }) = &result
             {
                 let _ = shared
                     .reg_()
@@ -794,5 +794,132 @@ where
         if race_cancel_(cancel, wait_space).await.is_none() {
             return Result::Err(MuxError::Cancelled);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_ {
+    use core::task::{Context, Poll, Waker};
+
+    use abs_cancel::NonCancellableToken;
+    use abs_mm::CoreAlloc;
+    use mm_ptr::Owned;
+
+    use super::{main_step_, MainPublicRead_};
+    use crate::{
+        connection::{
+            main_loop::{MainRequest_, MainReply_},
+            ring_::{new_buffered_channel, BufferedRx, BufferedTx},
+            session_::MuxShared_,
+            test_support_::TestMuxConfig_,
+            ControlState_, Dock, DockBinding, MuxConnection, Tcs_,
+        },
+        handshake::opts::{BasicOpts, HandshakeOpts},
+        x_deps::{abs_cancel, abs_mm, mm_ptr},
+    };
+
+    /// 驱动一个「测试里应当立即完成」的 future。
+    /// - 手段：用 noop waker poll 一次，直到 `Ready` 或 panic。
+    /// - 判断：`Pending` 视为测试失败（说明被挂住了）。
+    ///
+    /// Drive a future that must complete immediately in tests.
+    /// Method: poll once with a noop waker until Ready, panicking on Pending.
+    /// Assertion: Pending is a test failure, meaning something blocked.
+    fn block_on_ready_<F: core::future::Future>(fut: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = core::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("测试期望 future 立即完成，却返回了 Pending"),
+        }
+    }
+
+    /// 提交一次 `Bind`，驱动一轮 `main_step_`，再构造 `DockBinding`。
+    #[allow(clippy::too_many_arguments, reason = "测试辅助需要传全部驱动状态")]
+    fn bind_through_step_(
+        conn: &MuxConnection<TestMuxConfig_>,
+        shared: &MuxShared_<TestMuxConfig_>,
+        ctl: &ControlState_<CoreAlloc>,
+        tx_w: &mut BufferedTx,
+        rx_r: &mut BufferedRx,
+        scratch: &mut [u8],
+        public_read: &mut MainPublicRead_,
+        dock: Dock,
+    ) -> DockBinding<TestMuxConfig_> {
+        let cancel = NonCancellableToken::new();
+        let tcs = Tcs_::new_(CoreAlloc);
+        let waiter = tcs.clone();
+        let submitted = block_on_ready_(ctl.submit_async_(
+            MainRequest_::Bind {
+                local_dock: dock,
+                reply: tcs,
+            },
+            NonCancellableToken::new(),
+        ));
+        assert!(submitted.is_ok(), "Bind 请求应能入队");
+        assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
+            shared, ctl, tx_w, rx_r, scratch, public_read, &cancel
+        )));
+        let reply = block_on_ready_(core::future::poll_fn(|cx| waiter.poll_wait_(cx)))
+            .expect("Bind 请求应完成")
+            .expect("Bind 应成功");
+        let MainReply_::Dock { dock, unbind_ } = reply else {
+            panic!("Bind 的答复应当是 Dock");
+        };
+        DockBinding::new_(conn.clone(), dock, unbind_)
+    }
+
+    /// 测试 `DockBinding::Drop` 与下一轮 `main_step_` 的时序：drop 后立刻重绑应成功。
+    /// - 手段：`new_test_bundle_` 建无循环连接；提交 Bind、跑 `main_step_`，得到
+    ///   `DockBinding`；drop 它之后立刻再提交同 dock 的 Bind 并跑 `main_step_`。
+    /// - 判断：第二次 Bind 仍得到 `MainReply_::Dock`，说明解绑在 Bind 请求处理前落实。
+    ///
+    /// Test the ordering between `DockBinding::Drop` and the next `main_step_`.
+    /// Method: build a loop-less connection with `new_test_bundle_`; run a Bind
+    /// through `main_step_` to obtain a `DockBinding`; drop it and immediately
+    /// submit another Bind for the same dock, running `main_step_` again.
+    /// Assertion: the second Bind also yields `MainReply_::Dock`, proving the
+    /// unbind is applied before the Bind request is served.
+    #[test]
+    fn drop_then_step_allows_rebind_() {
+        let (conn, shared) = MuxConnection::<TestMuxConfig_>::new_test_bundle_(
+            HandshakeOpts {
+                basic_opts: BasicOpts::default(),
+            },
+            TestMuxConfig_,
+        );
+        let ctl = conn.core_().control_().clone();
+        let (mut tx_w, _tx_r) =
+            new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
+                .expect("建公共 TX 环");
+        let (_rx_w, mut rx_r) =
+            new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
+                .expect("建公共 RX 环");
+        let mut scratch = [0u8; 256];
+        let mut public_read = MainPublicRead_::new_();
+        let dock = Dock::new(42u32);
+        let binding = bind_through_step_(
+            &conn,
+            &shared,
+            &ctl,
+            &mut tx_w,
+            &mut rx_r,
+            &mut scratch,
+            &mut public_read,
+            dock,
+        );
+        drop(binding);
+        let binding = bind_through_step_(
+            &conn,
+            &shared,
+            &ctl,
+            &mut tx_w,
+            &mut rx_r,
+            &mut scratch,
+            &mut public_read,
+            dock,
+        );
+        drop(binding);
     }
 }

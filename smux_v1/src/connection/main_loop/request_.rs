@@ -7,7 +7,9 @@
 //! 穷举转换。错误统一成 [`MainErr_`]：注册表预留失败与连接级失败都在里面，API 侧按
 //! 入口映射成 `BindError` / `BindingError`（P3 之后还有 `HandleError`）。
 
-use core::alloc::AllocatorClone;
+use core::{alloc::AllocatorClone, sync::atomic::AtomicBool};
+
+use mm_ptr::Shared;
 
 use crate::connection::{
     Dock, MuxError,
@@ -154,8 +156,15 @@ pub(crate) enum MainReply_<A>
 where
     A: AllocatorClone + Send + Sync,
 {
-    /// 绑定完成，返回**实际**绑定的 dock（自动分配时与请求值不同）。
-    Dock(Dock),
+    /// 绑定完成，返回**实际**绑定的 dock（自动分配时与请求值不同）与
+    /// 「绑定方已丢弃」标志（`DockBinding::Drop` 置位）。
+    Dock {
+        /// 实际绑定的 dock。
+        dock: Dock,
+
+        /// 解绑请求标志。
+        unbind_: Shared<AtomicBool, A>,
+    },
 
     /// 新建的 pending channel：身份节点 + app 侧 message ring 两半。
     Channel {

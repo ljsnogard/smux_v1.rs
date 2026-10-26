@@ -143,7 +143,7 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
-use abs_cancel::TrCancellationToken;
+use abs_cancel::{NonCancellableToken, TrCancellationToken};
 use atomic_sync::{
     mutex::preemptive::SpinningMutexOwned,
     rwlock::cooperative_arena::CooperativeRwLockOwned,
@@ -1428,9 +1428,6 @@ where
         cancel: K,
     ) -> Result<(), ReserveErr_> {
         match event {
-            SessionEvent_::UnbindDock { local_dock } => {
-                self.unbind_dock_(local_dock, cancel).await
-            }
             SessionEvent_::UnreserveChannel {
                 local_dock,
                 remote_dock,
@@ -1801,6 +1798,21 @@ where
             inner.bindings_.remove(telegraph_key_(local_dock));
             inner.settle_pending_return_(local_dock);
         }
+        let mut unbind_docks: Vec<Dock> = Vec::new();
+        for (dock, ctx) in inner.docks_.iter() {
+            if ctx
+                .unbind_requested_
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
+                unbind_docks.push(*dock);
+            }
+        }
+        drop(guard);
+        for local_dock in unbind_docks {
+            let _ = self
+                .unbind_dock_(local_dock, NonCancellableToken::new())
+                .await;
+        }
         Result::Ok(())
     }
 
@@ -1907,7 +1919,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<(), ReserveErr_> {
+    ) -> Result<(Dock, Shared<core::sync::atomic::AtomicBool, A>), ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
@@ -1931,11 +1943,12 @@ where
         dock.bound_ = true;
         // 调用方显式指定的 dock：解绑时不归还复用池。
         dock.auto_ = false;
+        let unbind_ = dock.unbind_requested_.clone();
         // 池里可能正躺着同一个值（自动分配曾归还的那一份）。这里**不**就地摘除：
         // 池是先进先出的队列、没有 O(1) 的中间删除，而滞留至多让一次
         // `take_free_dock_` 多走一步——那一步复核到 `bound_` 就会消费掉它，不会把这个
         // 已被占用的 dock 发出去。
-        Result::Ok(())
+        Result::Ok((local_dock, unbind_))
     }
 
     /// 解除 [`ChannelRegistry_::bind_dock_`] 的独占绑定；不存在时是空操作。
@@ -2013,14 +2026,21 @@ where
     pub(crate) async fn bind_any_dock_<K: TrCancellationToken>(
         &self,
         cancel: K,
-    ) -> Result<Dock, ReserveErr_> {
+    ) -> Result<(Dock, Shared<core::sync::atomic::AtomicBool, A>), ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         // 锁内复查关闭标志：不再自行安排新的 dock（见 `begin_close_`）。
         if self.is_closing_() {
             return Result::Err(ReserveErr_::Closing);
         }
-        guard.take_free_dock_()
+        let dock = guard.take_free_dock_()?;
+        let unbind_ = guard
+            .docks_
+            .get(dock)
+            .map(|(_, ctx)| &ctx.unbind_requested_)
+            .expect("take_free_dock_ 刚插入条目")
+            .clone();
+        Result::Ok((dock, unbind_))
     }
 
     /// 在 `local_dock` 上登记**监听器身份**（`TrDockBinding::listen_async` 的登记点）。
@@ -2651,11 +2671,15 @@ mod tests_ {
         }
 
     async fn bind_dock_t_(&self, local_dock: Dock) -> Result<(), ReserveErr_> {
-            self.bind_dock_(local_dock, NonCancellableToken::new()).await
+        self.bind_dock_(local_dock, NonCancellableToken::new())
+            .await
+            .map(|_| ())
         }
 
     async fn bind_any_dock_t_(&self) -> Result<Dock, ReserveErr_> {
-            self.bind_any_dock_(NonCancellableToken::new()).await
+        self.bind_any_dock_(NonCancellableToken::new())
+            .await
+            .map(|(dock, _)| dock)
         }
 
     async fn unbind_dock_t_(&self, local_dock: Dock) {
