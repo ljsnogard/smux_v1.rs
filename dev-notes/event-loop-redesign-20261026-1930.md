@@ -1692,6 +1692,18 @@ connection/
   bind / unbind 行为不变，`DockBinding` 的 Drop 位化在下一步接入。
   验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
 
+- 20261027-0500：**DockBinding 位化首次尝试回退**（记录，不落地）。
+  1. 尝试：`bind_dock_` / `bind_any_dock_` 返回 `(Dock, Shared<AtomicBool, A>)`；
+     `DockBinding::Drop` 只置位 + `HINT_MAIN_RETIRED`；`reap_retired_` 扫描
+     `docks_` 的 `unbind_requested_`，锁外 `unbind_dock_`。
+  2. 结果：`mux_bind_is_exclusive_dual_` 在「drop 后立刻重绑」处得到
+     `DockInUse`——retired 解绑没有在 Bind 请求处理前落实（或标志可见性 / 时序
+     有误）。回退到 `4f081cd`（`DockCtx_` 泛型化）。
+  3. 下一步：先用 `new_test_` + 手动 `step_` 驱动 main，钉住
+     「Drop → reap_retired_ → unbind_dock_」的顺序与返回值，再接入真实循环。
+     这与 `ChannelHandle` 位化失败（上一节）是同一类问题：**main 的手动驱动
+     测试缺失**，导致时序只能靠集成测试试错。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
