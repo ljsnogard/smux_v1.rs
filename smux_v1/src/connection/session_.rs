@@ -596,7 +596,7 @@ where
         let owner = entry.owner_.clone();
         if owner.is_peer_reset_() {
             table.remove(&pair);
-            pending_fin.remove(&pair);
+            pending_fin.remove(pair);
             maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
             continue;
         }
@@ -687,7 +687,7 @@ where
     //    排不了空、也永远发不出 `FIN`，那会留下一个每轮扫描都要探测一次的僵尸条目。
     //    应用在收到对端 `RESET` 之后再丢弃（或显式封口）发送半边正是这条路径。
     if !table.contains_key(&pair) {
-        pending_fin.remove(&pair);
+        pending_fin.remove(pair);
         return Result::Ok(false);
     }
 
@@ -751,7 +751,7 @@ where
         entry.owner_.notify_tx_progress_();
         entry.fin_sent_ = true;
     }
-    pending_fin.remove(&pair);
+    pending_fin.remove(pair);
     maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
     // **不在这里无条件摘表**：本端 `FIN` 发出后，对端随后的 `CLOSE` 仍要经本表扫描
     // 推进身份释放（`scan_peer_closed_`）。只有身份确实已释放时才摘；否则留到对端
@@ -3042,7 +3042,7 @@ where
                 entry.owner_.notify_both_progress_();
             }
             table.remove(&pair);
-            pending_fin.remove(&pair);
+            pending_fin.remove(pair);
             maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token())
                 .await?;
         }
