@@ -21,10 +21,7 @@
 //! 提示位与请求分开：`HINT_MAIN_*` 只表示「某类事实可能变了」，`main_loop` 一次取走
 //! 整个掩码后自己决定扫描什么（见设计稿 §6.1 / §8.4）。
 
-use core::{
-    alloc::AllocatorClone,
-    task::{Context, Poll},
-};
+use core::task::{Context, Poll};
 
 use abs_cancel::{TrCancellationToken, TrMayCancel};
 use mpmc_chan::{MpmcBuf, MpmcChan, RecvAsync, SendError, TryRecvError};
@@ -32,7 +29,7 @@ use mm_ptr::Shared;
 
 use crate::{
     connection::{
-        MuxChanCfg_,
+        MuxChanCfg_, TrConnAllocCfg,
         main_loop::MainRequest_,
         slot_::{HintSlot_, PushErr_},
     },
@@ -46,41 +43,49 @@ pub(crate) const K_MAIN_REQ_CAP: usize = 64usize;
 pub(crate) const HINT_MAIN_RETIRED: u64 = 1u64 << 0usize;
 
 /// 请求通道的缓冲区类型别名（`MpmcBuf` 由 `MpmcChan` 持有）。
-type ControlBuf_<A> = MpmcBuf<MainRequest_<A>, K_MAIN_REQ_CAP>;
+type ControlBuf_<C> = MpmcBuf<MainRequest_<C>, K_MAIN_REQ_CAP>;
 
 /// 请求通道的发送端类型。
-type ControlTx_<A, CA> =
-    mpmc_chan::Sender<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, MuxChanCfg_<CA>>;
+type ControlTx_<C> = mpmc_chan::Sender<
+    'static,
+    MainRequest_<C>,
+    K_MAIN_REQ_CAP,
+    ControlBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
+>;
 
 /// 请求通道的接收端类型。
-type ControlRx_<A, CA> =
-    mpmc_chan::Receiver<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, MuxChanCfg_<CA>>;
+type ControlRx_<C> = mpmc_chan::Receiver<
+    'static,
+    MainRequest_<C>,
+    K_MAIN_REQ_CAP,
+    ControlBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
+>;
 
 /// `main_loop` 的请求等待 future（`RecvAsync` 是参数载体，`into_future` 之后才登记唤醒）。
-pub(crate) type ControlRecvAsync_<'f, A, CA> = RecvAsync<
+pub(crate) type ControlRecvAsync_<'f, C> = RecvAsync<
     'static,
     'f,
     'f,
-    MainRequest_<A>,
-    ControlBuf_<A>,
-    MuxChanCfg_<CA>,
+    MainRequest_<C>,
+    ControlBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
     K_MAIN_REQ_CAP,
 >;
 
 /// 控制面共享状态句柄（`MuxCore` 与 `main_loop` 各持一份）。
-pub(crate) struct ControlState_<A, CA = A>
+pub(crate) struct ControlState_<C>
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
     /// 共享本体；一次分配，句柄可克隆。
-    inner_: Shared<ControlStateInner_<A, CA>, A>,
+    inner_: Shared<ControlStateInner_<C>, C::RegistryAlloc>,
 }
 
-impl<A, CA> Clone for ControlState_<A, CA>
+impl<C> Clone for ControlState_<C>
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
     fn clone(&self) -> Self {
         ControlState_ {
@@ -90,34 +95,34 @@ where
 }
 
 /// 共享本体的内容。
-struct ControlStateInner_<A, CA>
+struct ControlStateInner_<C>
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
     /// 请求通道的发送端（多生产者共享；`Sender` 是 `Arc` 句柄，克隆廉价）。
-    tx_: ControlTx_<A, CA>,
+    tx_: ControlTx_<C>,
 
     /// 请求通道的接收端（`main_loop` 独占）。
-    rx_: ControlRx_<A, CA>,
+    rx_: ControlRx_<C>,
 
     /// `main_loop` 的合并提示位（`HINT_MAIN_*`）。
     main_hint_: HintSlot_,
 }
 
-impl<A, CA> ControlState_<A, CA>
+impl<C> ControlState_<C>
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
     /// 建一条空的请求通道与提示位（一次 `Shared` 分配）。
     ///
     /// 通道的外层 `Arc` 与缓存用 `alloc` 分配；等待 chunk 在首次 park 时申请。
-    pub(crate) fn new_(alloc: A, mpmc_alloc: CA) -> Self {
-        let (tx_, rx_) = MpmcChan::<MainRequest_<A>, K_MAIN_REQ_CAP, _, MuxChanCfg_<CA>>::new_in(
-            ControlBuf_::<A>::new(),
-            mpmc_alloc,
-        );
+    pub(crate) fn new_(cfg: C) -> Self {
+        let (tx_, rx_) = MpmcChan::<
+            MainRequest_<C>,
+            K_MAIN_REQ_CAP,
+            _,
+            MuxChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
+        >::new_in(ControlBuf_::<C>::new(), cfg.mpmc_alloc());
         ControlState_ {
             inner_: Shared::new(
                 ControlStateInner_ {
@@ -125,7 +130,7 @@ where
                     rx_,
                     main_hint_: HintSlot_::new_(),
                 },
-                alloc,
+                cfg.registry_alloc(),
             ),
         }
     }
@@ -138,9 +143,9 @@ where
     /// - [`PushErr_::Cancelled`]：等空位期间被取消；请求原样带回。
     pub(crate) async fn submit_async_<K>(
         &self,
-        request: MainRequest_<A>,
+        request: MainRequest_<C>,
         cancel: K,
-    ) -> Result<(), PushErr_<MainRequest_<A>>>
+    ) -> Result<(), PushErr_<MainRequest_<C>>>
     where
         K: TrCancellationToken,
     {
@@ -160,7 +165,7 @@ where
     /// 非阻塞取一个请求（`main_loop` 的批处理用）。
     ///
     /// 通道关闭后仍可 drain 已入队元素；空且关闭时返回 `None`。
-    pub(crate) fn try_pop_request_(&self) -> Option<MainRequest_<A>> {
+    pub(crate) fn try_pop_request_(&self) -> Option<MainRequest_<C>> {
         match self.inner_.rx_.try_recv() {
             Result::Ok(request) => Option::Some(request),
             Result::Err(TryRecvError::Empty) | Result::Err(TryRecvError::Closed) => Option::None,
@@ -171,7 +176,7 @@ where
     ///
     /// 返回的 [`RecvAsync`] 是**参数载体**（实现 `IntoFuture`），调用方必须先
     /// `into_future` 再 `pin`，并**跨 poll 持有**它——每次 poll 新建会丢唤醒登记。
-    pub(crate) fn recv_request_async_<'f>(&'f self) -> ControlRecvAsync_<'f, A, CA> {
+    pub(crate) fn recv_request_async_<'f>(&'f self) -> ControlRecvAsync_<'f, C> {
         self.inner_.rx_.recv_async()
     }
 
@@ -202,10 +207,8 @@ where
 #[cfg(test)]
 mod tests_ {
     use abs_cancel::NonCancellableToken;
-    use mm_ptr::x_deps::abs_mm::CoreAlloc;
-
     use super::*;
-    use crate::connection::{Dock, Tcs_};
+    use crate::connection::{Dock, SingleConnAllocCfg, Tcs_};
 
     /// 测试请求通道的 FIFO 与关闭语义。
     /// - 手段：依次提交两条 `Bind`（dock 1 / 2），逐条 `try_pop_request_`；随后
@@ -218,9 +221,10 @@ mod tests_ {
     /// Assertion: pops yield docks 1 then 2; the third submit is `PushErr_::Closed`.
     #[test]
     fn control_state_is_fifo_and_closes_() {
-        let ctl = ControlState_::<CoreAlloc>::new_(CoreAlloc, CoreAlloc);
+        let cfg = SingleConnAllocCfg::default();
+        let ctl = ControlState_::<SingleConnAllocCfg>::new_(cfg);
         for dock in [1u32, 2u32] {
-            let reply = Tcs_::new_(CoreAlloc);
+            let reply = Tcs_::new_(cfg);
             assert!(
                 futures::executor::block_on(ctl.submit_async_(
                     MainRequest_::Bind {
@@ -244,7 +248,7 @@ mod tests_ {
         assert!(ctl.try_pop_request_().is_none());
 
         ctl.close_requests_();
-        let reply = Tcs_::new_(CoreAlloc);
+        let reply = Tcs_::new_(cfg);
         let err = futures::executor::block_on(ctl.submit_async_(
             MainRequest_::Bind {
                 local_dock: Dock::new(3u32),

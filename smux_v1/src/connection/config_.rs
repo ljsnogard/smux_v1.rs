@@ -71,6 +71,27 @@ where
     where
         Self: 'a;
 
+    /// 请求完成源（`Tcs_`）的分配器。
+    type TcsAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// `Attach` 交接（`WriteAttach_` / `ReadAttach_`）的分配器。
+    type AttachAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 数据面本地表（`WriteTable_` / `ReadTable_` / `PendingFin_` / telegraph 表）的分配器。
+    type LocalTableAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 事件通道（`WriteEvent_` / `ReadEvent_`）的分配器。
+    type EventAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 循环暂存（`Owned<[u8]>`）的分配器。
+    type ScratchAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 连接核心 / 共享量 / 取消令牌的分配器。
+    type CoreAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 公共报文子流（`PublicChannel_` 与两条 ring）的分配器。
+    type PublicAlloc: AllocatorClone + Send + Sync + 'static;
+
     /// 取结构分配器的一个实例。
     fn registry_alloc(&self) -> Self::RegistryAlloc;
 
@@ -79,6 +100,27 @@ where
 
     /// 取通道分配器的一个实例（交给 `MpmcChan::new_in`）。
     fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static>;
+
+    /// 取请求完成源分配器的实例。
+    fn tcs_alloc(&self) -> Self::TcsAlloc;
+
+    /// 取 `Attach` 分配器的实例。
+    fn attach_alloc(&self) -> Self::AttachAlloc;
+
+    /// 取本地表分配器的实例。
+    fn local_table_alloc(&self) -> Self::LocalTableAlloc;
+
+    /// 取事件通道分配器的实例。
+    fn event_alloc(&self) -> Self::EventAlloc;
+
+    /// 取循环暂存分配器的实例。
+    fn scratch_alloc(&self) -> Self::ScratchAlloc;
+
+    /// 取连接核心分配器的实例。
+    fn core_alloc(&self) -> Self::CoreAlloc;
+
+    /// 取公共子流分配器的实例。
+    fn public_alloc(&self) -> Self::PublicAlloc;
 }
 
 /// 内建分配器配置：所有用途都用 [`CoreAlloc`]。
@@ -100,6 +142,13 @@ where
     A: 'static + AllocatorClone + Default + Send + Sync,
 {
     type MpmcAlloc<'a> = A;
+    type TcsAlloc = A;
+    type AttachAlloc = A;
+    type LocalTableAlloc = A;
+    type EventAlloc = A;
+    type ScratchAlloc = A;
+    type CoreAlloc = A;
+    type PublicAlloc = A;
 
     fn registry_alloc(&self) -> Self::RegistryAlloc {
         A::default()
@@ -110,6 +159,34 @@ where
     }
 
     fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static> {
+        A::default()
+    }
+
+    fn tcs_alloc(&self) -> Self::TcsAlloc {
+        A::default()
+    }
+
+    fn attach_alloc(&self) -> Self::AttachAlloc {
+        A::default()
+    }
+
+    fn local_table_alloc(&self) -> Self::LocalTableAlloc {
+        A::default()
+    }
+
+    fn event_alloc(&self) -> Self::EventAlloc {
+        A::default()
+    }
+
+    fn scratch_alloc(&self) -> Self::ScratchAlloc {
+        A::default()
+    }
+
+    fn core_alloc(&self) -> Self::CoreAlloc {
+        A::default()
+    }
+
+    fn public_alloc(&self) -> Self::PublicAlloc {
         A::default()
     }
 }

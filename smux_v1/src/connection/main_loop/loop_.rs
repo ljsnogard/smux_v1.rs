@@ -12,7 +12,7 @@
 //! 公共报文子流的 RX / TX（P2）与 tick（P5）尚未接线；park 点已经按设计稿 §6.1
 //! 的形状保留「请求 / 提示 / 取消」三类唤醒源，后续加 ring 时只需再加一个 poll 分支。
 
-use core::{alloc::AllocatorClone, future::poll_fn, pin::pin, task::Poll};
+use core::{future::poll_fn, pin::pin, task::Poll};
 
 use abs_cancel::{NonCancellableToken, TrCancellationToken};
 use abs_smux::dock::TrDock;
@@ -28,6 +28,7 @@ use crate::{
         frame_::encode_header_,
         frame_parser_::decode_header_sync_,
         main_loop::{EstablishRole_, MainErr_, MainReply_, MainRequest_},
+        TrConnAllocCfg,
         owner_::EstablishOutcome_,
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx},
@@ -49,12 +50,12 @@ pub(crate) const K_MAIN_REQ_BATCH: usize = 16usize;
 pub(crate) const K_MAIN_FRAME_BATCH: usize = 32usize;
 
 /// `main_loop` 的 park 点被唤醒的原因。
-enum MainWake_<A>
+enum MainWake_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 队列里取到一条请求。
-    Request(MainRequest_<A>),
+    Request(MainRequest_<C>),
 
     /// 合并提示位（P1 尚无 `HINT_MAIN_*` 使用者）。
     Hint(u64),
@@ -70,7 +71,7 @@ where
 /// 等待。
 pub(crate) async fn main_loop_async_<C, K>(
     shared: MuxShared_<C>,
-    ctl: ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
+    ctl: ControlState_<crate::connection::ConnAllocCfg_<C>>,
     mut public_tx_w: BufferedTx,
     mut public_rx_r: BufferedRx,
     cancel: K,
@@ -79,14 +80,14 @@ pub(crate) async fn main_loop_async_<C, K>(
     K: TrCancellationToken,
 {
     // 公共 RX 的整帧暂存：连接一次分配，容量就是一个最大帧。
-    let alloc = match shared.reg_().allocator_(cancel.child_token()).await {
+    let alloc = match shared.reg_().scratch_alloc_(cancel.child_token()).await {
         Result::Ok(alloc) => alloc,
         Result::Err(_) => {
             exit_(&ctl);
             return;
         }
     };
-    let mut rx_scratch: Owned<[u8], crate::connection::ConnAlloc_<C>> = Owned::new_slice(
+    let mut rx_scratch: Owned<[u8], crate::connection::ConnScratchAlloc_<C>> = Owned::new_slice(
         shared.max_packet_size_(),
         |_idx, slot| {
             slot.write(0u8);
@@ -142,7 +143,7 @@ pub(crate) async fn main_loop_async_<C, K>(
 /// 本函数驱动 `main_loop` 的状态推进，不必 park。
 pub(crate) async fn main_step_<C, K>(
     shared: &MuxShared_<C>,
-    ctl: &ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
+    ctl: &ControlState_<crate::connection::ConnAllocCfg_<C>>,
     public_tx_w: &mut BufferedTx,
     public_rx_r: &mut BufferedRx,
     rx_scratch: &mut [u8],
@@ -205,10 +206,9 @@ where
 }
 
 /// 收尾：关闭队列，并把仍排队的请求以 `Closed` 结束。
-fn exit_<A, CA>(ctl: &ControlState_<A, CA>)
+fn exit_<C>(ctl: &ControlState_<C>)
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
     ctl.close_requests_();
     while let Some(request) = ctl.try_pop_request_() {
@@ -222,7 +222,7 @@ where
 async fn handle_request_<C, K>(
     shared: &MuxShared_<C>,
     public_tx_w: &mut BufferedTx,
-    request: MainRequest_<crate::connection::ConnAlloc_<C>>,
+    request: MainRequest_<crate::connection::ConnAllocCfg_<C>>,
     cancel: &K,
 )
 where
@@ -509,9 +509,9 @@ where
 /// 返回 `None` 表示连接正在收尾（取消令牌触发，或请求队列被关闭）。
 async fn park_main_<C, K>(
     shared: &MuxShared_<C>,
-    ctl: &ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
+    ctl: &ControlState_<crate::connection::ConnAllocCfg_<C>>,
     cancel: &K,
-) -> Option<MainWake_<crate::connection::ConnAlloc_<C>>>
+) -> Option<MainWake_<crate::connection::ConnAllocCfg_<C>>>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -523,7 +523,7 @@ where
     let mut request_fut = pin!(core::future::IntoFuture::into_future(
         ctl.recv_request_async_()
     ));
-    let mut taken: Option<MainWake_<crate::connection::ConnAlloc_<C>>> = None;
+    let mut taken: Option<MainWake_<crate::connection::ConnAllocCfg_<C>>> = None;
     poll_fn(|cx| {
         if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
             return Poll::Ready(());
@@ -898,7 +898,7 @@ mod tests_ {
     fn bind_through_step_(
         conn: &MuxConnection<TestMuxConfig_>,
         shared: &MuxShared_<TestMuxConfig_>,
-        ctl: &ControlState_<CoreAlloc>,
+        ctl: &ControlState_<crate::connection::SingleConnAllocCfg>,
         tx_w: &mut BufferedTx,
         rx_r: &mut BufferedRx,
         scratch: &mut [u8],
@@ -906,7 +906,7 @@ mod tests_ {
         dock: Dock,
     ) -> DockBinding<TestMuxConfig_> {
         let cancel = NonCancellableToken::new();
-        let tcs = Tcs_::new_(CoreAlloc);
+        let tcs = Tcs_::new_(crate::connection::SingleConnAllocCfg::default());
         let waiter = tcs.clone();
         let submitted = block_on_ready_(ctl.submit_async_(
             MainRequest_::Bind {

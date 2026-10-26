@@ -7,12 +7,12 @@
 //! 穷举转换。错误统一成 [`MainErr_`]：注册表预留失败与连接级失败都在里面，API 侧按
 //! 入口映射成 `BindError` / `BindingError`（P3 之后还有 `HandleError`）。
 
-use core::{alloc::AllocatorClone, sync::atomic::AtomicBool};
+use core::sync::atomic::AtomicBool;
 
 use mm_ptr::Shared;
 
 use crate::connection::{
-    Dock, MuxError,
+    Dock, MuxError, TrConnAllocCfg,
     mux_connection::ReserveErr_,
     owner_::{ChannelOwner_, LsnOwner_},
     pending_msg_::PendingMsgApp_,
@@ -33,12 +33,12 @@ pub(crate) enum EstablishRole_ {
 }
 
 /// 一次请求的完整结果：成功时是 [`MainReply_`]，失败时是 [`MainErr_`]。
-pub(crate) type MainResult_<A> = Result<MainReply_<A>, MainErr_>;
+pub(crate) type MainResult_<C> = Result<MainReply_<C>, MainErr_>;
 
 /// 送到 `main_loop` 的一条请求。
-pub(crate) enum MainRequest_<A>
+pub(crate) enum MainRequest_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 独占绑定一个 dock（显式或自动分配）。
     Bind {
@@ -46,7 +46,7 @@ where
         local_dock: Dock,
 
         /// 完成源。
-        reply: Tcs_<MainResult_<A>, A>,
+        reply: Tcs_<MainResult_<C>, C>,
     },
 
     /// 登记 listener 身份。
@@ -58,7 +58,7 @@ where
         reserve: usize,
 
         /// 完成源。
-        reply: Tcs_<MainResult_<A>, A>,
+        reply: Tcs_<MainResult_<C>, C>,
     },
 
     /// 把一条已组好的控制帧写进公共 TX ring（fire-and-forget）。
@@ -72,7 +72,7 @@ where
         frame: ControlFrame_,
 
         /// 完成源：帧真正写进公共 TX ring 后完成，调用方据此保证后续帧的顺序。
-        reply: Tcs_<MainResult_<A>, A>,
+        reply: Tcs_<MainResult_<C>, C>,
     },
 
     /// 为一条子流登记身份（`open_channel_async` 的第一步）。
@@ -84,7 +84,7 @@ where
         remote_dock: Dock,
 
         /// 完成源。
-        reply: Tcs_<MainResult_<A>, A>,
+        reply: Tcs_<MainResult_<C>, C>,
     },
 
     /// 最终裁决：建环已完成，main 从 message ring 读载荷并组 `OPEN` / `ACCEPT`。
@@ -96,7 +96,7 @@ where
         remote_dock: Dock,
 
         /// 该子流的共享状态句柄。
-        owner: ChannelOwner_<A>,
+        owner: ChannelOwner_<C::ChanOwnerAlloc>,
 
         /// 本端角色。
         role_: EstablishRole_,
@@ -105,7 +105,7 @@ where
         initial_window: Credit,
 
         /// 完成源：帧写进公共 TX 后完成。
-        reply: Tcs_<MainResult_<A>, A>,
+        reply: Tcs_<MainResult_<C>, C>,
     },
 
     /// 拒绝入向建流；reason 已写进 outgoing message ring。
@@ -117,22 +117,22 @@ where
         remote_dock: Dock,
 
         /// 该子流的共享状态句柄。
-        owner: ChannelOwner_<A>,
+        owner: ChannelOwner_<C::ChanOwnerAlloc>,
 
         /// 本端角色。
         role_: EstablishRole_,
 
         /// 完成源。
-        reply: Tcs_<MainResult_<A>, A>,
+        reply: Tcs_<MainResult_<C>, C>,
     },
 }
 
-impl<A> MainRequest_<A>
+impl<C> MainRequest_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 本次请求的完成源。
-    pub(crate) fn reply_(&self) -> Option<&Tcs_<MainResult_<A>, A>> {
+    pub(crate) fn reply_(&self) -> Option<&Tcs_<MainResult_<C>, C>> {
         match self {
             MainRequest_::Bind { reply, .. }
             | MainRequest_::Listen { reply, .. }
@@ -152,9 +152,9 @@ where
 }
 
 /// `main_loop` 的统一结果。
-pub(crate) enum MainReply_<A>
+pub(crate) enum MainReply_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 绑定完成，返回**实际**绑定的 dock（自动分配时与请求值不同）与
     /// 「绑定方已丢弃」标志（`DockBinding::Drop` 置位）。
@@ -163,20 +163,20 @@ where
         dock: Dock,
 
         /// 解绑请求标志。
-        unbind_: Shared<AtomicBool, A>,
+        unbind_: Shared<AtomicBool, C::ChanOwnerAlloc>,
     },
 
     /// 新建的 pending channel：身份节点 + app 侧 message ring 两半。
     Channel {
         /// 该子流的共享状态句柄。
-        owner: ChannelOwner_<A>,
+        owner: ChannelOwner_<C::ChanOwnerAlloc>,
 
         /// app 侧 message ring（写 outgoing / 读 incoming）。
         msg_: PendingMsgApp_,
     },
 
     /// 新建的 listener 身份节点。
-    Listener(LsnOwner_<A>),
+    Listener(LsnOwner_<C::ChanOwnerAlloc>),
 
     /// 仅表示「已受理」（P3.2 的 `Accept` / `Reject` 请求使用）。
     #[allow(dead_code, reason = "P3.2 起由 Accept / Reject 使用")]

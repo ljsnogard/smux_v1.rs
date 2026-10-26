@@ -73,7 +73,7 @@ use mm_ptr::Shared;
 
 use crate::{
     connection::{
-        Dock,
+        Dock, TrConnAllocCfg,
         error_::MuxError,
         mux_connection::ChannelRegistry_,
         sync_::NotifySlot_,
@@ -1585,14 +1585,13 @@ where
 }
 
 /// 等待建流完成：等对端的 `OPEN` + `ACCEPT` / `REJECT`，或被取消 / 连接失败打断。
-pub(crate) async fn wait_establish_<A, CA, K>(
-    reg: &ChannelRegistry_<A, CA>,
-    owner: &ChannelOwner_<A>,
+pub(crate) async fn wait_establish_<C, K>(
+    reg: &ChannelRegistry_<C>,
+    owner: &ChannelOwner_<C::ChanOwnerAlloc>,
     cancel: K,
 ) -> Result<EstablishOutcome_, MuxError>
 where
-    A: AllocatorClone + Send + Sync,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
     K: TrCancellationToken,
 {
     loop {

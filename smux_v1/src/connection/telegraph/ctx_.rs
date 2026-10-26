@@ -21,7 +21,7 @@ where
     C: TrConnCfg,
 {
     /// 身份节点句柄（最后一份被丢弃时节点随之释放）。
-    owner_: TgOwner_<crate::connection::ConnAlloc_<C>>,
+    owner_: TgOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
 
     /// 连接智能指针（投递释放消息用）。
     conn_: MuxConnection<C>,
@@ -35,7 +35,7 @@ where
     C: TrConnCfg,
 {
     /// 由身份句柄、连接与 dock 构造。
-    pub(super) fn new_(owner: TgOwner_<crate::connection::ConnAlloc_<C>>, conn: MuxConnection<C>, local_dock: Dock) -> Self {
+    pub(super) fn new_(owner: TgOwner_<crate::connection::ConnChanOwnerAlloc_<C>>, conn: MuxConnection<C>, local_dock: Dock) -> Self {
         TelegraphCtxHolder_ {
             owner_: owner,
             conn_: conn,

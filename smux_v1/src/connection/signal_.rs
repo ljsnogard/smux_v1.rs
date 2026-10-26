@@ -59,7 +59,6 @@
 use alloc::boxed::Box;
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{
-    alloc::AllocatorClone,
     future::Future,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Poll},
@@ -72,7 +71,7 @@ use mpmc_chan::{MpmcBuf, MpmcChan, TryRecvError, TrySendError};
 
 use crate::{
     connection::{
-        Dock, FrameKind,
+        Dock, FrameKind, TrConnAllocCfg,
         owner_::{ChannelOwner_, TgOwner_},
         ring_::{BufferedRx, BufferedTx},
         sync_::NotifySlot_,
@@ -183,26 +182,30 @@ impl ControlFrame_ {
 /// 它不再走事件通道，而是经**内联 inbox**（每连接一条，容量固定）交给写循环：
 /// 环半部是 move 语义的一次性资源，放在共享槽里比塞进通用事件枚举更直接，也不受
 /// 「子流变多 ⇒ 队列被打满」的影响。
-pub(crate) struct WriteAttach_<A>
+pub(crate) struct WriteAttach_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 本端 / 对端 dock。
     pair_: (Dock, Dock),
 
     /// 该子流的共享状态。
-    owner_: ChannelOwner_<A>,
+    owner_: ChannelOwner_<C::ChanOwnerAlloc>,
 
     /// 会话侧发送环读端（应用写、写循环读）。
     reader_: BufferedRx,
 }
 
-impl<A> WriteAttach_<A>
+impl<C> WriteAttach_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 造一条写侧 `Attach`。
-    pub(crate) fn new_(pair: (Dock, Dock), owner_: ChannelOwner_<A>, reader_: BufferedRx) -> Self {
+    pub(crate) fn new_(
+        pair: (Dock, Dock),
+        owner_: ChannelOwner_<C::ChanOwnerAlloc>,
+        reader_: BufferedRx,
+    ) -> Self {
         WriteAttach_ {
             pair_: pair,
             owner_,
@@ -211,32 +214,38 @@ where
     }
 
     /// 拆成 `(dock 对, 身份节点, 发送环读端)`。
-    pub(crate) fn into_parts_(self) -> ((Dock, Dock), ChannelOwner_<A>, BufferedRx) {
+    pub(crate) fn into_parts_(
+        self,
+    ) -> ((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>, BufferedRx) {
         (self.pair_, self.owner_, self.reader_)
     }
 }
 
 /// 读循环的 `Attach` 负载：`(dock 对, 身份节点, 接收环写端)`。
-pub(crate) struct ReadAttach_<A>
+pub(crate) struct ReadAttach_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 本端 / 对端 dock。
     pair_: (Dock, Dock),
 
     /// 该子流的共享状态。
-    owner_: ChannelOwner_<A>,
+    owner_: ChannelOwner_<C::ChanOwnerAlloc>,
 
     /// 会话侧接收环写端（读循环写、应用读）。
     writer_: BufferedTx,
 }
 
-impl<A> ReadAttach_<A>
+impl<C> ReadAttach_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 造一条读侧 `Attach`。
-    pub(crate) fn new_(pair: (Dock, Dock), owner_: ChannelOwner_<A>, writer_: BufferedTx) -> Self {
+    pub(crate) fn new_(
+        pair: (Dock, Dock),
+        owner_: ChannelOwner_<C::ChanOwnerAlloc>,
+        writer_: BufferedTx,
+    ) -> Self {
         ReadAttach_ {
             pair_: pair,
             owner_,
@@ -245,15 +254,17 @@ where
     }
 
     /// 拆成 `(dock 对, 身份节点, 接收环写端)`。
-    pub(crate) fn into_parts_(self) -> ((Dock, Dock), ChannelOwner_<A>, BufferedTx) {
+    pub(crate) fn into_parts_(
+        self,
+    ) -> ((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>, BufferedTx) {
         (self.pair_, self.owner_, self.writer_)
     }
 }
 
 /// 送到**写循环**的事件。
-pub(crate) enum WriteEvent_<A>
+pub(crate) enum WriteEvent_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 一条待写出的控制帧。
     Control {
@@ -283,7 +294,7 @@ where
         /// 本端 dock。
         local_dock: Dock,
         /// 该端点的身份节点句柄（循环由它取「已提交报文长度」队列）。
-        owner: TgOwner_<A>,
+        owner: TgOwner_<C::ChanOwnerAlloc>,
         /// 会话侧发送环读端（应用写、本循环读）。
         reader_: BufferedRx,
     },
@@ -308,9 +319,9 @@ where
 }
 
 /// 送给**读循环**的事件。
-pub(crate) enum ReadEvent_<A>
+pub(crate) enum ReadEvent_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 应用从接收环取走了数据：**接收窗口的账面水位可能变了**。
     ///
@@ -340,7 +351,7 @@ where
         /// 本端 dock。
         local_dock: Dock,
         /// 该端点的身份节点句柄（循环由它取「已收报文长度」队列）。
-        owner: TgOwner_<A>,
+        owner: TgOwner_<C::ChanOwnerAlloc>,
         /// 会话侧接收环写端（本循环写、应用读）。
         writer_: BufferedTx,
     },

@@ -121,16 +121,16 @@ where
     epoch_: <C::Rt as TrClock>::Instant,
 
     /// dock / 子流身份索引、失败标志与四个循环的取消令牌。
-    reg_: ChannelRegistry_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
+    reg_: ChannelRegistry_<crate::connection::ConnAllocCfg_<C>>,
 
     /// 控制面共享状态：定容请求队列 + `main_loop` 的合并提示位。
-    control_: ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
+    control_: ControlState_<crate::connection::ConnAllocCfg_<C>>,
 
     /// 写事件发送端（控制帧、建流注册、水位与拆流通知）。
-    w_events_: EventSender_<WriteEvent_<crate::connection::ConnAlloc_<C>>>,
+    w_events_: EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
 
     /// 读事件发送端（接收环注册与释放）。
-    r_events_: EventSender_<ReadEvent_<crate::connection::ConnAlloc_<C>>>,
+    r_events_: EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
 
     /// 四个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时、`3` = 控制面）。
     ///
@@ -140,7 +140,7 @@ where
     ///
     /// 旧版是五个：贴传输的读 / 写泵连同连接级帧暂存环一起去掉了（见 `session_`
     /// 模块文档）。控制面这一格在 P1 之前是空转的 `ctl_`，现在由 `main_loop` 承担。
-    loops_: [CancelToken_<crate::connection::ConnAlloc_<C>>; 4],
+    loops_: [CancelToken_<crate::connection::ConnCoreAlloc_<C>>; 4],
 }
 
 impl<C> MuxCore<C>
@@ -155,12 +155,12 @@ where
     pub(crate) fn new_(
         config: C,
         opts: HandshakeOpts,
-        reg: ChannelRegistry_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
-        control: ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
+        reg: ChannelRegistry_<crate::connection::ConnAllocCfg_<C>>,
+        control: ControlState_<crate::connection::ConnAllocCfg_<C>>,
         epoch: <C::Rt as TrClock>::Instant,
-        w_events: EventSender_<WriteEvent_<crate::connection::ConnAlloc_<C>>>,
-        r_events: EventSender_<ReadEvent_<crate::connection::ConnAlloc_<C>>>,
-        loops: [CancelToken_<crate::connection::ConnAlloc_<C>>; 4],
+        w_events: EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
+        r_events: EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
+        loops: [CancelToken_<crate::connection::ConnCoreAlloc_<C>>; 4],
     ) -> Self {
         MuxCore {
             config_: config,
@@ -179,7 +179,7 @@ where
     }
 
     /// 控制面共享状态（API 面提交请求用）。
-    pub(crate) fn control_(&self) -> &ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>> {
+    pub(crate) fn control_(&self) -> &ControlState_<crate::connection::ConnAllocCfg_<C>> {
         &self.control_
     }
 
@@ -197,22 +197,22 @@ where
     }
 
     /// dock / 子流身份索引与失败标志。
-    pub(crate) fn reg_(&self) -> &ChannelRegistry_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>> {
+    pub(crate) fn reg_(&self) -> &ChannelRegistry_<crate::connection::ConnAllocCfg_<C>> {
         &self.reg_
     }
 
     /// 写事件发送端。
-    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<crate::connection::ConnAlloc_<C>>> {
+    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>> {
         &self.w_events_
     }
 
     /// 读事件发送端。
-    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<crate::connection::ConnAlloc_<C>>> {
+    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>> {
         &self.r_events_
     }
 
     /// 第 `idx` 个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时）。
-    pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<crate::connection::ConnAlloc_<C>> {
+    pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<crate::connection::ConnCoreAlloc_<C>> {
         self.loops_[idx].clone()
     }
 }
@@ -278,7 +278,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<TgOwner_<crate::connection::ConnAlloc_<C>>, ReserveErr_> {
+    ) -> Result<TgOwner_<crate::connection::ConnChanOwnerAlloc_<C>>, ReserveErr_> {
         self.reg_.reserve_telegraph_(local_dock, cancel).await
     }
 
@@ -301,7 +301,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<Option<(Dock, ChannelOwner_<crate::connection::ConnAlloc_<C>>, PendingMsgApp_)>, ReserveErr_> {
+    ) -> Result<Option<(Dock, ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>, PendingMsgApp_)>, ReserveErr_> {
         self.reg_.take_pending_inbound_(local_dock, cancel).await
     }
 

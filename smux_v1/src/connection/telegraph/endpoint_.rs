@@ -188,7 +188,7 @@ where
     pub(crate) fn new_(
         conn: MuxConnection<C>,
         local_dock: Dock,
-        rec: TgOwner_<crate::connection::ConnAlloc_<C>>,
+        rec: TgOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
         tx_w: BufferedTx,
         rx_r: BufferedRx,
     ) -> Self {

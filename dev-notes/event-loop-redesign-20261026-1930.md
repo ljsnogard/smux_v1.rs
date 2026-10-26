@@ -1888,11 +1888,51 @@ connection/
      `MuxLoopShared_<A, CA, R, M>`：`A = RegistryAlloc`（结构），
      `CA = MpmcAlloc`（通道）；`MuxCore<C>` 用投影别名
      `ConnAlloc_<C>` / `ConnMpmcAlloc_<C>`。
-  5. 三个内建配置写 `type AllocCfg<'a> = CoreAllocCfg;`；测试侧
-     `SmokeMuxConfig` / `FlowCtrlConfig` / `MetricsCfg` 用 `CoreAllocCfg`，
-     `CountMuxConfig` 新增 `CountingAllocCfg`。
+  5. 三个内建配置写 `type AllocCfg<'a> = SingleConnAllocCfg;`（当时的草稿把它写成
+     了 `CoreAllocCfg`，以代码为准）；测试侧 `SmokeMuxConfig` / `FlowCtrlConfig` /
+     `MetricsCfg` 也用 `SingleConnAllocCfg`，`CountMuxConfig` 用
+     `SingleConnAllocCfg<CountingAlloc>`。
   6. 验收：lib 360 / inmem 20 / cross_thread 1 / smoke 5 / keepalive 5；
      clippy 0 error；format 合规（189 文件）。
+
+- 20261027-1700：**分配器配置迁移第 2 阶段：连接内复合结构全部改为 `C`**。
+  1. **目标形状**：连接内的复合结构只带一个分配器配置参数 `C: TrConnAllocCfg`，
+     内部按用途投影取分配器实例。`DockHandle_<T, A>`（及 `ChannelOwner_` /
+     `TgOwner_` / `LsnOwner_` 三个别名）这类**低层句柄**仍以分配器为参数，使用点
+     写 `ChannelOwner_<C::ChanOwnerAlloc>`（与交接示例一致）；`Shared` /
+     `CancelToken_` / `MuxChanCfg_` / `DockBPlusTree_` / `DockSet_` 等通用原语
+     保持分配器参数——它们本身就是「任意分配器的适配器」，不是连接结构。
+  2. **本轮改完的类型**：`WriteAttach_<C>` / `ReadAttach_<C>` / `WriteEvent_<C>` /
+     `ReadEvent_<C>`（`signal_`），`ChanSlot_` / `BindingSlot_` / `DockCtx_` /
+     `RegistryInner_` / `RegistryRoot_` / `ChannelRegistry_` 与两条 `Attach` 通道
+     别名（`registry_`），`MuxLoopShared_<C, R, M>` 与本地表 / 表项 / `PendingFin_` /
+     `ReadWake_`（`session_`），`PublicChannel_<C>`，`TgRecvCtx_<C>`；
+     `wait_establish_` 改为泛型于 `C`。`MuxShared_<C>` 现在是
+     `MuxLoopShared_<ConnAllocCfg_<C>, Rt, Metrics>`。
+  3. **六个此前只声明未使用的 GAT 全部接上**：结构 / 索引与四本 B+ 树 =
+     `RegistryAlloc`；身份节点与 `DockCtx_::unbind_requested_` = `ChanOwnerAlloc`；
+     请求通道 = `MpmcAlloc`；两条 `Attach` inbox = `AttachAlloc`（新增
+     `MuxChanCfg_<C::AttachAlloc>`）；本地表 / `PendingFin_` = `LocalTableAlloc`；
+     循环 `Owned<[u8]>` 暂存 = `ScratchAlloc`；`MuxCore` 的 `Shared` 与四个
+     `CancelToken_` = `CoreAlloc`；公共子流的 `Shared` 与两条 ring = `PublicAlloc`。
+     `RegistryInner_` 因此保存四份分配器实例（结构 / 身份节点 / 本地表 / 暂存），
+     `ChannelRegistry_::allocator_()` 拆成 `local_table_alloc_()` /
+     `scratch_alloc_()`（原来同一个实例被表与暂存共用）。
+  4. `MuxLoopShared_` 的 `#[derive(Clone)]` 改成手写：派生会给参数 `C` 也加上
+     `Clone` 约束，而配置不应被要求可克隆。
+  5. **尚未接线：`EventAlloc`**。事件通道仍是全局 `Box<MpmcBuf>` + `Arc<Overflow_>`，
+     即 `connection-delivery` §3 记载的已知例外；接它要把 `EventSender_` /
+     `EventReceiver_` 参数化、把 `Box`/`Arc` 换成 `Owned`/`Shared`，会改变
+     `alloc_count` 的基线，留作下一步。
+  6. **顺带修复 `alloc_count`**：该目标自 `11c19e5` 起**无法编译**（`CountingAllocCfg`
+     没有实现新增的 GAT），改成 `SingleConnAllocCfg<CountingAlloc>`；其「绑定 + 监听」
+     断言（全局 ≤2 / 注入 =11）是**内联队列时代**的旧基线，在 `de6b699` 与本轮各测
+     一次，结果完全一致（全局 11 次 / 65648 B，注入 52 次 / 97888 B），说明本次
+     类型参数迁移不改变分配行为；断言更新为 ≤16 / =52，并留下「逐笔归因那 11 次全局
+     分配」的待办。
+  7. 验收：lib 360 / inmem 20 / cross_thread 1 / smoke 5 / keepalive 5（compio）；
+     tokio（inmem 20 / cross_thread 1 / smoke 5）；smol（同左）；`alloc_count` 1；
+     clippy 0 error；`format_use_imports.py --check` 189 文件全绿。
 
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 

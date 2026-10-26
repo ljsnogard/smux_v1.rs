@@ -33,7 +33,6 @@
 #![allow(dead_code)]
 
 use core::{
-    alloc::AllocatorClone,
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
@@ -48,7 +47,7 @@ use abs_buff::{
 };
 
 use crate::{
-    connection::sync_::NotifySlot_,
+    connection::{TrConnAllocCfg, sync_::NotifySlot_},
     x_deps::{abs_buff, mm_ptr},
 };
 
@@ -444,17 +443,17 @@ where
 /// | `tx_space_` | mux → main | TX ring 腾出了空间 |
 /// | `rx_ready_` | demux → main | RX ring 里出现了字节 |
 /// | `rx_space_` | main → demux | RX ring 腾出了空间 |
-pub(crate) struct PublicChannel_<A>
+pub(crate) struct PublicChannel_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 共享本体；一次分配，句柄可克隆。
-    inner_: Shared<PublicChannelInner_, A>,
+    inner_: Shared<PublicChannelInner_, C::PublicAlloc>,
 }
 
-impl<A> Clone for PublicChannel_<A>
+impl<C> Clone for PublicChannel_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     fn clone(&self) -> Self {
         PublicChannel_ {
@@ -484,12 +483,12 @@ struct PublicChannelInner_ {
     rx_closed_: AtomicBool,
 }
 
-impl<A> PublicChannel_<A>
+impl<C> PublicChannel_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
-    /// 建一组空唤醒槽（一次 `Shared` 分配）。
-    pub(crate) fn new_(alloc: A) -> Self {
+    /// 建一组空唤醒槽（一次 `Shared` 分配，分配器取 `C::PublicAlloc`）。
+    pub(crate) fn new_(cfg: C) -> Self {
         PublicChannel_ {
             inner_: Shared::new(
                 PublicChannelInner_ {
@@ -500,7 +499,7 @@ where
                     tx_closed_: AtomicBool::new(false),
                     rx_closed_: AtomicBool::new(false),
                 },
-                alloc,
+                cfg.public_alloc(),
             ),
         }
     }

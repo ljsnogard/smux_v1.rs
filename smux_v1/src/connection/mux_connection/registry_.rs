@@ -137,7 +137,6 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    alloc::AllocatorClone,
     ops::Bound,
     sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll, Waker},
@@ -153,7 +152,7 @@ use mpmc_chan::{MpmcBuf, MpmcChan, RecvAsync, SendError, TryRecvError, TrySendEr
 
 use crate::{
     connection::{
-        Dock, MuxChanCfg_, MuxError,
+        Dock, MuxChanCfg_, MuxError, TrConnAllocCfg,
         owner_::{
             AbortCode_, ChannelNotice, ChannelOwner_, LsnOwner_, TgOwner_,
             new_listener_owner_, new_owner_, new_telegraph_owner_,
@@ -357,12 +356,12 @@ pub(crate) enum Inbound_ {
 /// `inbound_` 留在**表槽**里（而不是节点里）：只有建流冷路径会改它，而 `Shared` 只交出
 /// `&T`，放进节点就得为它再加内部可变性（锁或原子打包）；放表槽里正好由注册表的写锁
 /// 保护，零额外代价。
-struct ChanSlot_<A>
+struct ChanSlot_<C>
 where
-    A: AllocatorClone,
+    C: TrConnAllocCfg + 'static,
 {
     /// 该 channel 身份节点的类型化句柄（登记身份时建立；窗口参数在最终裁决时安装）。
-    rec_: ChannelOwner_<A>,
+    rec_: ChannelOwner_<C::ChanOwnerAlloc>,
 
     /// 入向建流请求的状态。
     inbound_: Inbound_,
@@ -377,16 +376,16 @@ where
     msg_main_: Option<PendingMsgMain_>,
 }
 
-impl<A> ChanSlot_<A>
+impl<C> ChanSlot_<C>
 where
-    A: AllocatorClone,
+    C: TrConnAllocCfg + 'static,
 {
     /// 新登记的子流：状态已建（窗口参数待安装）、不是入向请求。
     ///
     /// `msg_app_` 只在入向请求上非空（等 `TakeInbound` 取走）；`msg_main_` 在两种
     /// 角色上都有（发起方的 outgoing 由 main 读）。
     fn new_(
-        rec_: ChannelOwner_<A>,
+        rec_: ChannelOwner_<C::ChanOwnerAlloc>,
         msg_app_: Option<PendingMsgApp_>,
         msg_main_: Option<PendingMsgMain_>,
     ) -> Self {
@@ -411,12 +410,12 @@ struct WaitCloseCtx_;
 /// 四个变体与键的对应关系见模块文档「统一身份表」。三类活身份的载荷都只是一个
 /// **类型化节点句柄**（`Channel` 额外带一份留在表槽里的冷状态 [`ChanSlot_`]），
 /// 因此表槽本身不含堆分配，节点的热状态也在锁外可达。
-enum BindingSlot_<A>
+enum BindingSlot_<C>
 where
-    A: AllocatorClone,
+    C: TrConnAllocCfg + 'static,
 {
     /// 一条子流（键的 `remote` 是具体值）；冷状态与节点句柄见 [`ChanSlot_`]。
-    Channel(ChanSlot_<A>),
+    Channel(ChanSlot_<C>),
 
     /// 数据报端点（键的 `remote` 固定为 `unspecified`）。
     ///
@@ -424,10 +423,10 @@ where
     /// 保留在表槽里是为了形状统一，以及后续「按 `remote_dock` 路由 DATAGRAM」能直接
     /// 从身份表拿到该端点的节点。
     #[allow(dead_code)]
-    Telegraph(TgOwner_<A>),
+    Telegraph(TgOwner_<C::ChanOwnerAlloc>),
 
     /// 监听器（键的 `remote` 固定为 `wildcard`）。
-    Listener(LsnOwner_<A>),
+    Listener(LsnOwner_<C::ChanOwnerAlloc>),
 
     /// 已关闭、宽限期内的子流身份（键的 `remote` 是具体值）。
     WaitClose(WaitCloseCtx_),
@@ -437,13 +436,13 @@ where
 ///
 /// 这里**只**放与「身份种类」无关的量：绑定独占与在册子流计数。身份本身在
 /// `bindings_` 里按键区分（`use_` 之类用途标记已由 `BindingSlot_` 变体承担）。
-struct DockCtx_<A>
+struct DockCtx_<C>
 where
-    A: AllocatorClone,
+    C: TrConnAllocCfg + 'static,
 {
     /// 绑定方已丢弃：main 据此解绑（P4 的 Drop 位化）。
     #[allow(dead_code, reason = "P4 DockBinding 位化时读取")]
-    unbind_requested_: Shared<core::sync::atomic::AtomicBool, A>,
+    unbind_requested_: Shared<core::sync::atomic::AtomicBool, C::ChanOwnerAlloc>,
 
     /// 该 dock 是否已被某个 [`DockBinding`] **独占绑定**。
     ///
@@ -482,12 +481,12 @@ where
     pending_return_: bool,
 }
 
-impl<A> DockCtx_<A>
+impl<C> DockCtx_<C>
 where
-    A: AllocatorClone,
+    C: TrConnAllocCfg + 'static,
 {
     /// 空条目（未绑定、无子流、不欠归还）。
-    fn new_(alloc: A) -> Self {
+    fn new_(alloc: C::ChanOwnerAlloc) -> Self {
         DockCtx_ {
             unbind_requested_: Shared::new(
                 core::sync::atomic::AtomicBool::new(false),
@@ -515,18 +514,28 @@ where
 }
 
 /// 共享注册表的内部状态。
-struct RegistryInner_<A>
+struct RegistryInner_<C>
 where
-    A: AllocatorClone,
+    C: TrConnAllocCfg + 'static,
 {
     /// 协商结果：本层用到配额与拆流宽限期。
     opts_: BasicOpts,
 
-    /// 分配器（各索引结构各自持有它的一个克隆）。
-    alloc_: A,
+    /// 结构分配器（各索引结构各自持有它的一个克隆）。
+    alloc_: C::RegistryAlloc,
+
+    /// 身份节点分配器（节点与 dock 级 `unbind_requested_` 标志）。
+    owner_alloc_: C::ChanOwnerAlloc,
+
+    /// 数据面本地表分配器（循环建本地表时经 [`ChannelRegistry_::local_table_alloc_`] 取）。
+    table_alloc_: C::LocalTableAlloc,
+
+    /// 循环暂存分配器（循环建 `Owned<[u8]>` 暂存时经
+    /// [`ChannelRegistry_::scratch_alloc_`] 取）。
+    scratch_alloc_: C::ScratchAlloc,
 
     /// `local_dock` → dock 级簿记。
-    docks_: crate::connection::dock_index_::DockBPlusTree_<A, Dock, DockCtx_<A>>,
+    docks_: crate::connection::dock_index_::DockBPlusTree_<C::RegistryAlloc, Dock, DockCtx_<C>>,
 
     /// **自动分配曾发出、现已归还、且归还时确实空着**的 dock，**先进先出**，供它优先
     /// 复用。
@@ -541,7 +550,7 @@ where
     /// 不从低号段发号）、**同一个 dock 至多出现一次**（由「出队即离开池」与「只有自动
     /// 归还才入池」保证）、以及**入池时它一定空闲**。「入池之后才变脏」的极少数情形由
     /// 出队时的 [`RegistryInner_::is_free_dock_`] 复核挡下，那个候选被消费掉。
-    reusable_docks_: VecDeque<Dock, A>,
+    reusable_docks_: VecDeque<Dock, C::RegistryAlloc>,
 
     /// 自动分配的**单调游标**：下一个「从未被自动分配过」的候选 dock。
     ///
@@ -552,8 +561,11 @@ where
     next_fresh_dock_: Dock,
 
     /// `(local, remote)` → 身份；**唯一事实源**。
-    bindings_:
-        crate::connection::dock_index_::DockBPlusTree_<A, (Dock, Dock), BindingSlot_<A>>,
+    bindings_: crate::connection::dock_index_::DockBPlusTree_<
+        C::RegistryAlloc,
+        (Dock, Dock),
+        BindingSlot_<C>,
+    >,
 
     /// `(remote, local)` → 活跃子流的反向索引。
     ///
@@ -561,7 +573,7 @@ where
     /// `remote_dock`」的查询能以 O(log n + k) 枚举；只登记活跃 channel，
     /// `WaitClose` 不入索引（它是墓碑，不是活跃子流）。
     remote_index_:
-        crate::connection::dock_index_::DockBPlusTree_<A, (Dock, Dock), ()>,
+        crate::connection::dock_index_::DockBPlusTree_<C::RegistryAlloc, (Dock, Dock), ()>,
 
     /// `(到期时刻, local, remote)` → 宽限态回收索引。
     ///
@@ -571,7 +583,7 @@ where
     /// 时刻是**连接内毫秒**（自连接 epoch 起算，见 [`crate::time`]），因此这套索引
     /// 与「子流最后活动」用的是同一把尺子，也不需要任何 `Instant` 类型。
     wait_close_expiry_:
-        crate::connection::dock_index_::DockBPlusTree_<A, (u64, Dock, Dock), ()>,
+        crate::connection::dock_index_::DockBPlusTree_<C::RegistryAlloc, (u64, Dock, Dock), ()>,
 
     /// 整条连接上当前在册的**活跃子流**数（受 `max_channel_count` 约束）。
     total_: usize,
@@ -580,9 +592,9 @@ where
     fail_: Option<MuxError>,
 }
 
-impl<A> RegistryInner_<A>
+impl<C> RegistryInner_<C>
 where
-    A: AllocatorClone,
+    C: TrConnAllocCfg + 'static,
 {
     /// 回收已到期的 `WaitClose` 身份。
     ///
@@ -714,7 +726,7 @@ where
             }
             if !self.docks_.contains_key(dock) {
                 self.docks_
-                    .insert(dock, DockCtx_::new_(self.alloc_.clone()));
+                    .insert(dock, DockCtx_::new_(self.owner_alloc_.clone()));
             }
             let ctx = self
                 .docks_
@@ -735,7 +747,7 @@ where
             }
             if !self.docks_.contains_key(dock) {
                 self.docks_
-                    .insert(dock, DockCtx_::new_(self.alloc_.clone()));
+                    .insert(dock, DockCtx_::new_(self.owner_alloc_.clone()));
             }
             let ctx = self
                 .docks_
@@ -1094,113 +1106,116 @@ impl RegistryShared_ {
 ///
 /// 原来每个锁外分量各自一个 `Shared`（每连接六次分配）；合并之后注册表在克隆时
 /// 只做一次引用计数，`MuxCore::drop` 仍可经 `root_.shared_` 不取锁地推进关闭。
-struct RegistryRoot_<A, CA>
+struct RegistryRoot_<C>
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
     /// 锁外共享状态（原子域 + 三路 waker）。
     shared_: RegistryShared_,
 
     /// 锁内的身份表与配额。
-    inner_: CooperativeRwLockOwned<RegistryInner_<A>>,
+    inner_: CooperativeRwLockOwned<RegistryInner_<C>>,
 
     /// 写循环的 `Attach` 通道发送端：一次性环半部从这里交给写循环。
-    mux_inbox_tx_: WriteAttachTx_<A, CA>,
+    mux_inbox_tx_: WriteAttachTx_<C>,
 
     /// 写循环的 `Attach` 通道接收端（`mux_loop` 独占）。
-    mux_inbox_rx_: WriteAttachRx_<A, CA>,
+    mux_inbox_rx_: WriteAttachRx_<C>,
 
     /// 读循环的 `Attach` 通道发送端（同上）。
-    demux_inbox_tx_: ReadAttachTx_<A, CA>,
+    demux_inbox_tx_: ReadAttachTx_<C>,
 
     /// 读循环的 `Attach` 通道接收端（`demux_loop` 独占）。
-    demux_inbox_rx_: ReadAttachRx_<A, CA>,
+    demux_inbox_rx_: ReadAttachRx_<C>,
 }
 
 /// `Attach` inbox 的容量（每连接一条；满时建流方按背压等待）。
 pub(crate) const ATTACH_INBOX_CAP: usize = 64usize;
 
 /// 写侧 `Attach` 通道的缓冲区。
-type WriteAttachBuf_<A> = MpmcBuf<WriteAttach_<A>, ATTACH_INBOX_CAP>;
+type WriteAttachBuf_<C> = MpmcBuf<WriteAttach_<C>, ATTACH_INBOX_CAP>;
 
-/// 写侧 `Attach` 通道的发送端。
-type WriteAttachTx_<A, CA> = mpmc_chan::Sender<
+/// 写侧 `Attach` 通道的发送端（通道分配器取 `C::AttachAlloc`）。
+type WriteAttachTx_<C> = mpmc_chan::Sender<
     'static,
-    WriteAttach_<A>,
+    WriteAttach_<C>,
     ATTACH_INBOX_CAP,
-    WriteAttachBuf_<A>,
-    MuxChanCfg_<CA>,
+    WriteAttachBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
 >;
 
 /// 写侧 `Attach` 通道的接收端。
-type WriteAttachRx_<A, CA> = mpmc_chan::Receiver<
+type WriteAttachRx_<C> = mpmc_chan::Receiver<
     'static,
-    WriteAttach_<A>,
+    WriteAttach_<C>,
     ATTACH_INBOX_CAP,
-    WriteAttachBuf_<A>,
-    MuxChanCfg_<CA>,
+    WriteAttachBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
 >;
 
 /// 写循环等一条 `Attach` 的 future。
-pub(crate) type WriteAttachRecvAsync_<'f, A, CA> = RecvAsync<
+pub(crate) type WriteAttachRecvAsync_<'f, C> = RecvAsync<
     'static,
     'f,
     'f,
-    WriteAttach_<A>,
-    WriteAttachBuf_<A>,
-    MuxChanCfg_<CA>,
+    WriteAttach_<C>,
+    WriteAttachBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
     ATTACH_INBOX_CAP,
 >;
 
 /// 读侧 `Attach` 通道的缓冲区。
-type ReadAttachBuf_<A> = MpmcBuf<ReadAttach_<A>, ATTACH_INBOX_CAP>;
+type ReadAttachBuf_<C> = MpmcBuf<ReadAttach_<C>, ATTACH_INBOX_CAP>;
 
-/// 读侧 `Attach` 通道的发送端。
-type ReadAttachTx_<A, CA> = mpmc_chan::Sender<
+/// 读侧 `Attach` 通道的发送端（通道分配器取 `C::AttachAlloc`）。
+type ReadAttachTx_<C> = mpmc_chan::Sender<
     'static,
-    ReadAttach_<A>,
+    ReadAttach_<C>,
     ATTACH_INBOX_CAP,
-    ReadAttachBuf_<A>,
-    MuxChanCfg_<CA>,
+    ReadAttachBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
 >;
 
 /// 读侧 `Attach` 通道的接收端。
-type ReadAttachRx_<A, CA> = mpmc_chan::Receiver<
+type ReadAttachRx_<C> = mpmc_chan::Receiver<
     'static,
-    ReadAttach_<A>,
+    ReadAttach_<C>,
     ATTACH_INBOX_CAP,
-    ReadAttachBuf_<A>,
-    MuxChanCfg_<CA>,
+    ReadAttachBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
 >;
 
 /// 读循环等一条 `Attach` 的 future。
-pub(crate) type ReadAttachRecvAsync_<'f, A, CA> = RecvAsync<
+pub(crate) type ReadAttachRecvAsync_<'f, C> = RecvAsync<
     'static,
     'f,
     'f,
-    ReadAttach_<A>,
-    ReadAttachBuf_<A>,
-    MuxChanCfg_<CA>,
+    ReadAttach_<C>,
+    ReadAttachBuf_<C>,
+    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
     ATTACH_INBOX_CAP,
 >;
 
-pub(crate) struct ChannelRegistry_<A, CA = A>
+/// 身份表 / dock 索引 / 会话通道的注册表句柄。
+///
+/// 参数是**分配器配置**而不是分配器实例：结构分配器（`RegistryAlloc`）、身份节点
+/// 分配器（`ChanOwnerAlloc`）、`Attach` 通道分配器（`AttachAlloc`）与循环取消令牌
+/// 分配器（`CoreAlloc`）都在 [`ChannelRegistry_::new_`] 里按用途各取一次。
+pub(crate) struct ChannelRegistry_<C>
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
     /// 注册表根：**锁外共享状态 + 锁内的表**，每连接一次分配。
     ///
     /// 克隆注册表只做一次引用计数；`root_.shared_` 的部分可以在**不取锁**的前提下
     /// 推进关闭与发通知（`MuxCore::drop` 依赖这一点）。
-    root_: Shared<RegistryRoot_<A, CA>, A>,
+    root_: Shared<RegistryRoot_<C>, C::RegistryAlloc>,
 
-    /// 三个循环的取消令牌：`0` = 解复用、`1` = 复用、`2` = 计时（保活 / 空闲超时）。
+    /// 四个循环的取消令牌：`0` = 解复用、`1` = 复用、`2` = 计时（保活 / 空闲超时）。
     ///
     /// **放在锁外**：构造后不再变化，因此取用与触发都无需取锁（`Drop` 路径要的
     /// 正是这一点）。
-    loops_: [CancelToken_<A>; 4],
+    loops_: [CancelToken_<C::CoreAlloc>; 4],
 
     /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
     ///
@@ -1209,10 +1224,9 @@ where
     mailbox_: SessionMailbox_,
 }
 
-impl<A, CA> Clone for ChannelRegistry_<A, CA>
+impl<C> Clone for ChannelRegistry_<C>
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
     fn clone(&self) -> Self {
         ChannelRegistry_ {
@@ -1225,37 +1239,56 @@ where
     }
 }
 
-impl<A, CA> ChannelRegistry_<A, CA>
+impl<C> ChannelRegistry_<C>
 where
-    A: AllocatorClone + Send + Sync + 'static,
-    CA: AllocatorClone + Send + Sync + 'static,
+    C: TrConnAllocCfg + 'static,
 {
-    /// 取分配器（读 / 写循环为自己的本地表按需分配）。
-    pub(crate) async fn allocator_<K: TrCancellationToken>(
+    /// 取**数据面本地表**的分配器（读 / 写循环按需为本地表分配）。
+    pub(crate) async fn local_table_alloc_<K: TrCancellationToken>(
         &self,
         cancel: K,
-    ) -> Result<A, ReserveErr_> {
+    ) -> Result<C::LocalTableAlloc, ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
-        Result::Ok(guard.alloc_.clone())
+        Result::Ok(guard.table_alloc_.clone())
     }
 
-    /// 建立注册表：分配根对象与四本索引，并为三个循环建好取消令牌。
+    /// 取**循环暂存**的分配器（`Owned<[u8]>` 整帧 / 载荷暂存）。
+    pub(crate) async fn scratch_alloc_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<C::ScratchAlloc, ReserveErr_> {
+        let mut session = self.root_.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(guard.scratch_alloc_.clone())
+    }
+
+    /// 建立注册表：分配根对象与四本索引，并为四个循环建好取消令牌。
+    ///
+    /// 每一项分配器都从分配器配置按用途取：结构（索引 / 根对象）用
+    /// `RegistryAlloc`、身份节点用 `ChanOwnerAlloc`、`Attach` 通道用 `AttachAlloc`、
+    /// 取消令牌用 `CoreAlloc`。
     ///
     /// # Panics
     ///
     /// 分配根对象失败时 panic（与标准库容器在 OOM 时的行为一致）。调用方应按
     /// `max_channel_count` 量级准备分配器。
-    pub(crate) fn new_(opts: BasicOpts, alloc: A, mpmc_alloc: CA) -> Self {
+    pub(crate) fn new_(opts: BasicOpts, cfg: C) -> Self {
+        let alloc = cfg.registry_alloc();
+        let owner_alloc = cfg.chan_owner_alloc();
+        let table_alloc = cfg.local_table_alloc();
+        let scratch_alloc = cfg.scratch_alloc();
+        let attach_alloc = cfg.attach_alloc();
+        let core_alloc = cfg.core_alloc();
         let loops = [
             // 0：解复用（transport Rx → 各子流接收环）
             // 1：复用（各子流发送环 → transport Tx）
             // 2：计时（保活 PULSE 与空闲超时拆流）
             // 3：控制面（Listener 入向、建流 / 拆流事务、Attach 分发）
-            CancelToken_::new_(alloc.clone()),
-            CancelToken_::new_(alloc.clone()),
-            CancelToken_::new_(alloc.clone()),
-            CancelToken_::new_(alloc.clone()),
+            CancelToken_::new_(core_alloc.clone()),
+            CancelToken_::new_(core_alloc.clone()),
+            CancelToken_::new_(core_alloc.clone()),
+            CancelToken_::new_(core_alloc),
         ];
         let docks_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
             .expect("2 KiB B+ 树足以容纳 dock 条目");
@@ -1263,17 +1296,18 @@ where
             .expect("2 KiB B+ 树足以容纳身份表项");
         let remote_index_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
             .expect("2 KiB B+ 树足以容纳反向索引表项");
-        let wait_close_expiry_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
-            .expect("2 KiB B+ 树足以容纳到期索引表项");
+        let wait_close_expiry_ =
+            crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
+                .expect("2 KiB B+ 树足以容纳到期索引表项");
         let (mux_inbox_tx_, mux_inbox_rx_) =
-            MpmcChan::<WriteAttach_<A>, ATTACH_INBOX_CAP, _, MuxChanCfg_<CA>>::new_in(
-                WriteAttachBuf_::<A>::new(),
-                mpmc_alloc.clone(),
+            MpmcChan::<WriteAttach_<C>, ATTACH_INBOX_CAP, _, MuxChanCfg_<C::AttachAlloc>>::new_in(
+                WriteAttachBuf_::<C>::new(),
+                attach_alloc.clone(),
             );
         let (demux_inbox_tx_, demux_inbox_rx_) =
-            MpmcChan::<ReadAttach_<A>, ATTACH_INBOX_CAP, _, MuxChanCfg_<CA>>::new_in(
-                ReadAttachBuf_::<A>::new(),
-                mpmc_alloc,
+            MpmcChan::<ReadAttach_<C>, ATTACH_INBOX_CAP, _, MuxChanCfg_<C::AttachAlloc>>::new_in(
+                ReadAttachBuf_::<C>::new(),
+                attach_alloc,
             );
         // 锁外共享状态与锁内的表放在**同一个根对象**里：每连接一次分配。
         ChannelRegistry_ {
@@ -1287,6 +1321,9 @@ where
                     inner_: CooperativeRwLockOwned::new_owned(RegistryInner_ {
                         opts_: opts,
                         alloc_: alloc.clone(),
+                        owner_alloc_: owner_alloc,
+                        table_alloc_: table_alloc,
+                        scratch_alloc_: scratch_alloc,
                         docks_,
                         reusable_docks_: VecDeque::new_in(alloc.clone()),
                         next_fresh_dock_: Dock::new(K_FIRST_AUTO_DOCK),
@@ -1353,7 +1390,7 @@ where
     }
 
     /// 尝试把写侧 `Attach` 放进通道；满 / 关闭时原样带回。
-    pub(crate) fn try_push_write_attach_(&self, attach: WriteAttach_<A>) -> Result<(), WriteAttach_<A>> {
+    pub(crate) fn try_push_write_attach_(&self, attach: WriteAttach_<C>) -> Result<(), WriteAttach_<C>> {
         match self.root_.mux_inbox_tx_.try_send(attach) {
             Result::Ok(()) => Result::Ok(()),
             Result::Err(TrySendError::Full(item)) | Result::Err(TrySendError::Closed(item)) => {
@@ -1365,9 +1402,9 @@ where
     /// 异步放写侧 `Attach`：通道满时进入 Arena 等待队列（可取消）。
     pub(crate) async fn push_write_attach_async_<K: TrCancellationToken>(
         &self,
-        attach: WriteAttach_<A>,
+        attach: WriteAttach_<C>,
         cancel: K,
-    ) -> Result<(), PushErr_<WriteAttach_<A>>> {
+    ) -> Result<(), PushErr_<WriteAttach_<C>>> {
         match self
             .root_
             .mux_inbox_tx_
@@ -1382,7 +1419,7 @@ where
     }
 
     /// 写循环取一条 `Attach`（非阻塞）。
-    pub(crate) fn take_write_attach_(&self) -> Option<WriteAttach_<A>> {
+    pub(crate) fn take_write_attach_(&self) -> Option<WriteAttach_<C>> {
         match self.root_.mux_inbox_rx_.try_recv() {
             Result::Ok(attach) => Option::Some(attach),
             Result::Err(TryRecvError::Empty) | Result::Err(TryRecvError::Closed) => Option::None,
@@ -1390,7 +1427,7 @@ where
     }
 
     /// 写循环等一条 `Attach`（`IntoFuture` 载体，调用方须跨 poll 持有）。
-    pub(crate) fn recv_write_attach_async_<'f>(&'f self) -> WriteAttachRecvAsync_<'f, A, CA> {
+    pub(crate) fn recv_write_attach_async_<'f>(&'f self) -> WriteAttachRecvAsync_<'f, C> {
         self.root_.mux_inbox_rx_.recv_async()
     }
 
@@ -1400,7 +1437,7 @@ where
     }
 
     /// 尝试把读侧 `Attach` 放进通道；满 / 关闭时原样带回。
-    pub(crate) fn try_push_read_attach_(&self, attach: ReadAttach_<A>) -> Result<(), ReadAttach_<A>> {
+    pub(crate) fn try_push_read_attach_(&self, attach: ReadAttach_<C>) -> Result<(), ReadAttach_<C>> {
         match self.root_.demux_inbox_tx_.try_send(attach) {
             Result::Ok(()) => Result::Ok(()),
             Result::Err(TrySendError::Full(item)) | Result::Err(TrySendError::Closed(item)) => {
@@ -1412,9 +1449,9 @@ where
     /// 异步放读侧 `Attach`：通道满时进入 Arena 等待队列（可取消）。
     pub(crate) async fn push_read_attach_async_<K: TrCancellationToken>(
         &self,
-        attach: ReadAttach_<A>,
+        attach: ReadAttach_<C>,
         cancel: K,
-    ) -> Result<(), PushErr_<ReadAttach_<A>>> {
+    ) -> Result<(), PushErr_<ReadAttach_<C>>> {
         match self
             .root_
             .demux_inbox_tx_
@@ -1429,7 +1466,7 @@ where
     }
 
     /// 读循环取一条 `Attach`（非阻塞）。
-    pub(crate) fn take_read_attach_(&self) -> Option<ReadAttach_<A>> {
+    pub(crate) fn take_read_attach_(&self) -> Option<ReadAttach_<C>> {
         match self.root_.demux_inbox_rx_.try_recv() {
             Result::Ok(attach) => Option::Some(attach),
             Result::Err(TryRecvError::Empty) | Result::Err(TryRecvError::Closed) => Option::None,
@@ -1437,7 +1474,7 @@ where
     }
 
     /// 读循环等一条 `Attach`（`IntoFuture` 载体，调用方须跨 poll 持有）。
-    pub(crate) fn recv_read_attach_async_<'f>(&'f self) -> ReadAttachRecvAsync_<'f, A, CA> {
+    pub(crate) fn recv_read_attach_async_<'f>(&'f self) -> ReadAttachRecvAsync_<'f, C> {
         self.root_.demux_inbox_rx_.recv_async()
     }
 
@@ -1631,7 +1668,7 @@ where
         now_millis: u64,
         msg_cap: usize,
         cancel: K,
-    ) -> Result<(ChannelOwner_<A>, PendingMsgApp_), ReserveErr_> {
+    ) -> Result<(ChannelOwner_<C::ChanOwnerAlloc>, PendingMsgApp_), ReserveErr_> {
         let state = {
             let mut session = self.root_.inner_.acquire_session();
             let mut guard = acquire_write_(&mut session, cancel).await?;
@@ -1667,7 +1704,7 @@ where
                 return Result::Err(ReserveErr_::DockChanLimit);
             }
 
-            let state = new_owner_(inner.alloc_.clone());
+            let state = new_owner_(inner.owner_alloc_.clone());
             // 建流期 message ring：每个 pending channel 一对（设计稿 §5.10）。
             // 冷路径；容量 / 分配失败与连接建立同级（Q15 的口径）。
             let (msg_app, msg_main) = new_pending_msg_(msg_cap, inner.alloc_.clone())
@@ -1681,7 +1718,7 @@ where
             if !inner.docks_.contains_key(local_dock) {
                 inner
                     .docks_
-                    .insert(local_dock, DockCtx_::new_(inner.alloc_.clone()));
+                    .insert(local_dock, DockCtx_::new_(inner.owner_alloc_.clone()));
             }
             let dock = inner
                 .docks_
@@ -1796,7 +1833,7 @@ where
         local_dock: Dock,
         remote_dock: Dock,
         cancel: K,
-    ) -> Result<Option<ChannelOwner_<A>>, ReserveErr_> {
+    ) -> Result<Option<ChannelOwner_<C::ChanOwnerAlloc>>, ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         let inner = &*guard;
@@ -1821,7 +1858,7 @@ where
         now_millis: u64,
         msg_cap: usize,
         cancel: K,
-    ) -> Result<ChannelOwner_<A>, ReserveErr_> {
+    ) -> Result<ChannelOwner_<C::ChanOwnerAlloc>, ReserveErr_> {
         // 先登记身份（自带配额与重复检查），再标成「待决入向请求」。
         let (state, msg_app) = self
             .reserve_channel_(
@@ -2002,7 +2039,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<Option<(Dock, ChannelOwner_<A>, PendingMsgApp_)>, ReserveErr_> {
+    ) -> Result<Option<(Dock, ChannelOwner_<C::ChanOwnerAlloc>, PendingMsgApp_)>, ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
@@ -2067,7 +2104,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<(Dock, Shared<core::sync::atomic::AtomicBool, A>), ReserveErr_> {
+    ) -> Result<(Dock, Shared<core::sync::atomic::AtomicBool, C::ChanOwnerAlloc>), ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
@@ -2078,7 +2115,7 @@ where
         if !inner.docks_.contains_key(local_dock) {
             inner
                 .docks_
-                .insert(local_dock, DockCtx_::new_(inner.alloc_.clone()));
+                .insert(local_dock, DockCtx_::new_(inner.owner_alloc_.clone()));
         }
         let dock = inner
             .docks_
@@ -2141,7 +2178,7 @@ where
                 if !inner.docks_.contains_key(local_dock) {
                     inner
                         .docks_
-                        .insert(local_dock, DockCtx_::new_(inner.alloc_.clone()));
+                        .insert(local_dock, DockCtx_::new_(inner.owner_alloc_.clone()));
                 }
                 if let Option::Some((_, dock)) = inner.docks_.get_mut(local_dock) {
                     dock.pending_return_ = true;
@@ -2174,7 +2211,7 @@ where
     pub(crate) async fn bind_any_dock_<K: TrCancellationToken>(
         &self,
         cancel: K,
-    ) -> Result<(Dock, Shared<core::sync::atomic::AtomicBool, A>), ReserveErr_> {
+    ) -> Result<(Dock, Shared<core::sync::atomic::AtomicBool, C::ChanOwnerAlloc>), ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         // 锁内复查关闭标志：不再自行安排新的 dock（见 `begin_close_`）。
@@ -2204,7 +2241,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<LsnOwner_<A>, ReserveErr_> {
+    ) -> Result<LsnOwner_<C::ChanOwnerAlloc>, ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
@@ -2224,7 +2261,7 @@ where
             Option::Some(_) => Result::Err(ReserveErr_::DockInUse),
             Option::None => {
                 // 身份节点由调用方注入的分配器建立；它内部零堆分配（入向通知是内联槽）。
-                let rec = new_listener_owner_(inner.alloc_.clone());
+                let rec = new_listener_owner_(inner.owner_alloc_.clone());
                 inner
                     .bindings_
                     .insert(listener_key_(local_dock), BindingSlot_::Listener(rec.clone()));
@@ -2262,7 +2299,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<TgOwner_<A>, ReserveErr_> {
+    ) -> Result<TgOwner_<C::ChanOwnerAlloc>, ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
@@ -2276,7 +2313,7 @@ where
         {
             return Result::Err(ReserveErr_::DockInUse);
         }
-        let rec = new_telegraph_owner_(inner.alloc_.clone());
+        let rec = new_telegraph_owner_(inner.owner_alloc_.clone());
         inner
             .bindings_
             .insert(telegraph_key_(local_dock), BindingSlot_::Telegraph(rec.clone()));
@@ -2640,7 +2677,7 @@ where
     /// 取第 `idx` 个循环的取消令牌（`0` = 解复用，`1` = 复用，`2` = 计时）。
     ///
     /// 令牌在锁外，因此本方法**不取锁**（构造路径与 `Drop` 路径都依赖这一点）。
-    pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<A> {
+    pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<C::CoreAlloc> {
         self.loops_[idx].clone()
     }
 
@@ -2673,7 +2710,7 @@ mod tests_ {
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
     use crate::{
-        connection::{Dock, ReserveErr_, owner_::ChannelOwner_},
+        connection::{Dock, ReserveErr_, SingleConnAllocCfg, owner_::ChannelOwner_},
         handshake::opts::BasicOpts,
     };
 
@@ -2771,7 +2808,7 @@ mod tests_ {
         ) -> impl core::future::Future<Output = TimerScan_>;
     }
 
-    impl RegistryTestExt_ for ChannelRegistry_<CoreAlloc> {
+    impl RegistryTestExt_ for ChannelRegistry_<SingleConnAllocCfg> {
     async fn reserve_channel_t_(
             &self,
             local_dock: Dock,
@@ -2954,7 +2991,7 @@ mod tests_ {
         }
     }
 
-    impl ChannelRegistry_<CoreAlloc> {
+    impl ChannelRegistry_<SingleConnAllocCfg> {
         /// 只读地检查是否待决（等价于旧 `has_pending_inbound_`；测试单线程，直接取快路径）。
         fn has_pending_inbound_t_(&self, local_dock: Dock) -> bool {
             let mut session = self.root_.inner_.acquire_session();
@@ -2969,7 +3006,7 @@ mod tests_ {
         }
 
         /// 持读锁执行断言（等价于旧 `with_`；测试单线程，直接取快路径）。
-        fn with_t_<R>(&self, f: impl FnOnce(&RegistryInner_<CoreAlloc>) -> R) -> R {
+        fn with_t_<R>(&self, f: impl FnOnce(&RegistryInner_<SingleConnAllocCfg>) -> R) -> R {
             let mut session = self.root_.inner_.acquire_session();
             let guard = session.try_read().expect("测试里不该争用");
             f(&guard)
@@ -2979,7 +3016,7 @@ mod tests_ {
         ///
         /// 用于直接摆布注册表内部状态，构造那些**经公开路径到不了**的边界——典型是
         /// 「新号段已被用尽」（真去绑 2^32 次当然不可能）。
-        fn with_write_t_<R>(&self, f: impl FnOnce(&mut RegistryInner_<CoreAlloc>) -> R) -> R {
+        fn with_write_t_<R>(&self, f: impl FnOnce(&mut RegistryInner_<SingleConnAllocCfg>) -> R) -> R {
             let mut session = self.root_.inner_.acquire_session();
             let mut guard = session.try_write().expect("测试里不该争用");
             f(&mut guard)
@@ -3012,7 +3049,7 @@ mod tests_ {
     /// - 判断：`total_` = 活跃 channel 数 = `remote_index_` 规模；每个 `DockCtx_`
     ///   的 `chan_count_` 等于该 local 的活跃 channel 数；每条 `WaitClose` 都能在
     ///   到期索引里找到，且二者规模相等；每条活跃 channel 都能在反向索引里找到。
-    fn assert_index_consistent_(registry: &ChannelRegistry_<CoreAlloc>) {
+    fn assert_index_consistent_(registry: &ChannelRegistry_<SingleConnAllocCfg>) {
         registry.with_t_(|inner| {
             let mut active = 0usize;
             let mut wait_close = 0usize;
@@ -3113,7 +3150,7 @@ mod tests_ {
             max_dock_chan_count: 1usize,
             ..opts_zero_grace_()
         };
-        let registry = ChannelRegistry_::new_(opts, CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(opts, SingleConnAllocCfg::default());
         assert_eq!(registry.max_channel_count_t_()
             .await, 2usize);
         assert_eq!(registry.max_dock_chan_count_t_()
@@ -3159,7 +3196,7 @@ mod tests_ {
     /// - 判断：三次相斥的尝试都报 `ReserveErr_::DockInUse`；释放 telegraph 后
     ///   dock 5 可以登记 channel。
         async fn telegraph_is_exclusive_on_a_dock() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
 
         assert!(registry.reserve_telegraph_t_(Dock::new(5u32))
             .await.is_ok());
@@ -3221,7 +3258,7 @@ mod tests_ {
     ///   `(local, unspecified)`、channel 落在 `(local, 具体值)`；listener 与
     ///   channel 可以共存于同一个 local_dock。
         async fn bindings_express_three_kinds_on_one_table() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         assert!(registry.reserve_listener_t_(Dock::new(1u32))
             .await.is_ok());
         assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32))
@@ -3256,7 +3293,7 @@ mod tests_ {
     /// - 判断：第二次绑定报 `ReserveErr_::DockInUse`；不同 dock 互不影响；子流清零
     ///   后再次绑定**仍**报 `DockInUse`（绑定是持久占用）；解绑后重绑成功。
         async fn dock_binding_is_exclusive_and_persistent() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
 
         // 首次绑定成功；同一 dock 第二次绑定必须失败。
         assert!(registry.bind_dock_t_(Dock::new(7u32))
@@ -3308,7 +3345,7 @@ mod tests_ {
     ///   `K_FIRST_AUTO_DOCK`；对已分配的 dock 显式绑定必须报 `DockInUse`——这说明
     ///   自动分配是**真的占住了**它们，而不只是报了一个数回来。
     async fn auto_dock_hands_out_distinct_free_docks_() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
 
         let first = registry
             .bind_any_dock_t_()
@@ -3355,7 +3392,7 @@ mod tests_ {
     /// - 判断：解绑 `d0` 后的那次分配必须拿回 `d0`（复用池优先于新号段，否则会拿到
     ///   `d0 + 2`）；两位都释放后，接下来的两次分配拿回的正是 `{d0, d1}` 这个集合。
     async fn auto_dock_reuses_released_docks_before_new_ones_() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
 
         let d0 = registry.bind_any_dock_t_().await.expect("首次分配应当成功");
         let d1 = registry.bind_any_dock_t_().await.expect("第二次分配应当成功");
@@ -3384,7 +3421,7 @@ mod tests_ {
     /// - 判断：第一次拿回 `d0`、第二次拿回 `d1`。若改成后进先出（或「取最小号」的
     ///   有序集），第一次就会拿到 `d1`，本用例即失败。
     async fn auto_dock_reuses_the_earliest_released_first_() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
 
         let d0 = registry.bind_any_dock_t_().await.expect("首次分配应当成功");
         let d1 = registry.bind_any_dock_t_().await.expect("第二次分配应当成功");
@@ -3408,7 +3445,7 @@ mod tests_ {
     ///   改用新号段的下一个值，且池里不再有它。这是「入池之后才变脏」的罕见路径，代价是
     ///   放弃一个编号；入池路径已保证「入池那一刻它是空的」，所以它不会退化成常态。
     async fn auto_dock_discards_a_pooled_dock_that_became_unusable_() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
 
         let d0 = registry.bind_any_dock_t_().await.expect("自动分配应当成功");
         registry.unbind_dock_t_(d0).await;
@@ -3442,7 +3479,7 @@ mod tests_ {
     ///   「欠归还」标记；墓碑回收后 `d` 被补进池，并被下一次自动分配复用——既不垃圾化
     ///   也不泄漏编号。
     async fn auto_dock_defers_return_until_the_dock_is_free_() {
-        let registry = ChannelRegistry_::new_(opts_zero_grace_(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(opts_zero_grace_(), SingleConnAllocCfg::default());
         let remote = Dock::new(9u32);
 
         let d = registry.bind_any_dock_t_().await.expect("自动分配应当成功");
@@ -3497,7 +3534,7 @@ mod tests_ {
             max_channel_wait_close: Duration::from_secs(60u64),
             ..BasicOpts::default()
         };
-        let registry = ChannelRegistry_::new_(opts, CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(opts, SingleConnAllocCfg::default());
         let remote = Dock::new(9u32);
 
         let d = registry.bind_any_dock_t_().await.expect("自动分配应当成功");
@@ -3530,7 +3567,7 @@ mod tests_ {
     ///   得到起点 `+2`——复用池只收自动分配自己发出的 dock，调用方显式绑定的值由
     ///   调用方管理，不由自动分配回收。
     async fn auto_dock_skips_explicitly_bound_docks_() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         let occupied = Dock::new(K_FIRST_AUTO_DOCK);
         registry
             .bind_dock_t_(occupied)
@@ -3567,7 +3604,7 @@ mod tests_ {
     /// - 判断：自动分配给出候选起点，而不是 `7`——`0..1024` 是留给调用方显式指定的
     ///   区间（仿 UNIX 特权端口约定）。
     async fn auto_dock_never_takes_low_docks_() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         let low = Dock::new(7u32);
         registry.bind_dock_t_(low).await.expect("显式绑定应当成功");
         registry.unbind_dock_t_(low).await;
@@ -3594,7 +3631,7 @@ mod tests_ {
     /// - 判断：新号段用尽且复用池为空时报 `ReserveErr_::DockInUse`；一旦 `d0` 回到
     ///   复用池，自动分配又能成功，且拿到的正是它。
     async fn auto_dock_reports_in_use_when_exhausted_() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         let d0 = registry
             .bind_any_dock_t_()
             .await
@@ -3636,7 +3673,7 @@ mod tests_ {
     /// - 判断：第一次 poll 就绪（通知到达）；重复通知合并成一次，第二次 poll 不就绪
     ///   （持久位已被消费，不堆积）。
         async fn notify_inbound_wakes_registered_listener_once() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         let rx = registry
             .reserve_listener_with_t_(Dock::new(4u32))
             .await
@@ -3659,7 +3696,7 @@ mod tests_ {
     /// - 手段：在 `(1,9)` 上登记一次后重复登记；释放后再登记。
     /// - 判断：重复登记报 `ReserveErr_::Duplicate`；宽限期为 0 时释放后可重新登记。
         async fn duplicate_dock_pair_is_rejected() {
-        let registry = ChannelRegistry_::new_(opts_zero_grace_(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(opts_zero_grace_(), SingleConnAllocCfg::default());
         assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32))
             .await.is_ok());
         assert_eq!(
@@ -3697,7 +3734,7 @@ mod tests_ {
             max_channel_wait_close: Duration::from_secs(60u64),
             ..BasicOpts::default()
         };
-        let registry = ChannelRegistry_::new_(opts, CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(opts, SingleConnAllocCfg::default());
 
         assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32))
             .await.is_ok());
@@ -3733,13 +3770,13 @@ mod tests_ {
     }
     multi_art_test_!(released_pair_enters_wait_close_and_blocks_reuse);
     /// 造一个用缺省协商结果的注册表（计时扫描的阈值由调用方显式给出，与它无关）。
-    fn make_scan_registry_() -> ChannelRegistry_<CoreAlloc> {
-        ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc)
+    fn make_scan_registry_() -> ChannelRegistry_<SingleConnAllocCfg> {
+        ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default())
     }
 
     /// 扫描一次计时循环，返回结果（封装 `timer_scan_t_` 的样板）。
     async fn scan_(
-        registry: &ChannelRegistry_<CoreAlloc>,
+        registry: &ChannelRegistry_<SingleConnAllocCfg>,
         now_millis: u64,
         pulse_millis: u64,
         timeout_millis: u64,
@@ -3977,7 +4014,7 @@ mod tests_ {
     ///   再重新登记同一 dock 对。
     /// - 判断：回收后 `is_wait_close_` 为假，且重新登记成功。
         async fn wait_close_is_reaped_after_expiry() {
-        let registry = ChannelRegistry_::new_(opts_zero_grace_(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(opts_zero_grace_(), SingleConnAllocCfg::default());
         assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32))
             .await.is_ok());
         registry.release_channel_t_(Dock::new(1u32), Dock::new(9u32))
@@ -4004,7 +4041,7 @@ mod tests_ {
     /// - 判断：登记时唤醒计数为 1；取走前 `has_pending_inbound_` 为真、取走后为假；
     ///   取回的通告与登记时给出的完全相同。
         async fn inbound_request_is_handed_out_with_report() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         let rx = registry
             .reserve_listener_with_t_(Dock::new(2u32))
             .await
@@ -4053,7 +4090,7 @@ mod tests_ {
     /// - 判断：dock 2 只取到本 dock 的具体子流（`remote_dock` 升序 → 先 7 后 9），
     ///   listener 身份不会被当成入向请求；dock 3 的请求不受影响。
         async fn per_local_range_covers_only_concrete_channels() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         let report = WindowReport::new(0u64, 64u32);
         assert!(registry.reserve_listener_t_(Dock::new(2u32))
             .await.is_ok());
@@ -4110,7 +4147,7 @@ mod tests_ {
     /// - 判断：`remote=9` 依次得到 `[1,2]`（升序）；`remote=10` 得到 `[1]`；
     ///   释放 `(1,9)` 后 `remote=9` 只剩 `[2]`（墓碑不入索引）；`remote=99` 为空。
         async fn remote_index_tracks_active_channels_only() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
 
         assert!(registry.reserve_channel_t_(Dock::new(1u32), Dock::new(9u32))
             .await.is_ok());
@@ -4146,7 +4183,7 @@ mod tests_ {
         async fn failure_keeps_first_cause_and_cancels_loops() {
         use buffex::x_deps::abs_cancel::TrCancellationToken;
 
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         assert!(!registry.is_failed_t_()
             .await);
         let read_loop = registry.loop_token_(0usize);
@@ -4181,7 +4218,7 @@ mod tests_ {
     /// 用 [`ChannelRegistry_::for_each_local_of_remote_`] 收集某个 remote 的 local 集合。
     /// - 手段：传入一个把元素推进 `Vec` 的回调。
     /// - 判断：返回的 `Vec` 就是该 remote 关联的全部 local（按回调顺序）。
-    async fn collect_locals_(registry: &ChannelRegistry_<CoreAlloc>, remote: Dock) -> Vec<Dock> {
+    async fn collect_locals_(registry: &ChannelRegistry_<SingleConnAllocCfg>, remote: Dock) -> Vec<Dock> {
         let mut out: Vec<Dock> = Vec::new();
         registry.for_each_local_of_remote_t_(remote, |local| out.push(local))
             .await;
@@ -4195,7 +4232,7 @@ mod tests_ {
     /// - 判断：dock 20 的条目消失（宽限墓碑不需要 dock 级簿记）；dock 21 因仍处
     ///   绑定态而保留，且再次绑定仍报 `DockInUse`。
         async fn empty_dock_entry_is_pruned_unless_bound() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
 
         assert!(registry.reserve_channel_t_(Dock::new(20u32), Dock::new(1u32))
             .await.is_ok());
@@ -4233,7 +4270,7 @@ mod tests_ {
     ///   置去重位、看另一个句柄是否可见。
     /// - 判断：查回的句柄存在；两者共享同一份锁外去重位（改一处、另一处可见）。
         async fn owner_is_created_with_the_identity() {
-        let registry = ChannelRegistry_::new_(BasicOpts::default(), CoreAlloc, CoreAlloc);
+        let registry = ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
         let reserved = registry.reserve_channel_t_(Dock::new(3u32), Dock::new(8u32))
             .await
             .expect("登记身份应当成功");

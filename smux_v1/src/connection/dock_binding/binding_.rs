@@ -114,7 +114,7 @@ where
     local_dock_: Dock,
 
     /// 「绑定方已丢弃」标志；`Drop` 只置位 + raise，由 main 解绑。
-    unbind_: Shared<AtomicBool, crate::connection::ConnAlloc_<C>>,
+    unbind_: Shared<AtomicBool, crate::connection::ConnChanOwnerAlloc_<C>>,
 }
 
 impl<C> DockBinding<C>
@@ -125,7 +125,7 @@ where
     pub(crate) fn new_(
         conn: MuxConnection<C>,
         local_dock: Dock,
-        unbind_: Shared<AtomicBool, crate::connection::ConnAlloc_<C>>,
+        unbind_: Shared<AtomicBool, crate::connection::ConnChanOwnerAlloc_<C>>,
     ) -> Self {
         DockBinding {
             conn_: conn,
@@ -226,7 +226,7 @@ where
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
     // 一次请求 + 完成源：登记由 `main_loop` 执行（它是身份表唯一写者）。
-    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
     let waiter = tcs.clone();
     let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
@@ -285,7 +285,7 @@ where
         return Result::Err(BindingError::ReservedDock);
     }
     // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）：由 `main_loop` 执行。
-    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
     let waiter = tcs.clone();
     let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()

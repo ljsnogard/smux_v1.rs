@@ -80,7 +80,7 @@ where
     C: TrConnCfg,
 {
     /// 指向演员核心的强引用；最后一个强引用消失时核心析构（并触发收尾）。
-    core_: Shared<MuxCore<C>, crate::connection::ConnAlloc_<C>>,
+    core_: Shared<MuxCore<C>, crate::connection::ConnCoreAlloc_<C>>,
 }
 
 impl<C> Clone for MuxConnection<C>
@@ -162,7 +162,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        crate::connection::ConnAlloc_<C>: 'static,
+        crate::connection::ConnCoreAlloc_<C>: 'static,
         C::Rt: ScopeHost,
     {
         let rt = config.runtime();
@@ -189,7 +189,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        crate::connection::ConnAlloc_<C>: 'static,
+        crate::connection::ConnCoreAlloc_<C>: 'static,
         S: TrLocalScope + Clone + 'static,
     {
         Self::new_with_rt_(rt, scope, delivery, config)
@@ -204,7 +204,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        crate::connection::ConnAlloc_<C>: 'static,
+        crate::connection::ConnCoreAlloc_<C>: 'static,
         S: TrLocalScope + Clone + 'static,
     {
         let HandshakeDelivery { opts, tx, rx } = delivery;
@@ -332,15 +332,15 @@ struct CoreBundle_<C>
 where
     C: TrConnCfg,
 {
-    core_: Shared<MuxCore<C>, crate::connection::ConnAlloc_<C>>,
+    core_: Shared<MuxCore<C>, crate::connection::ConnCoreAlloc_<C>>,
     shared_: MuxShared_<C>,
-    control_: ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
+    control_: ControlState_<crate::connection::ConnAllocCfg_<C>>,
     public_tx_w_: BufferedTx,
     public_tx_r_: BufferedRx,
     public_rx_w_: BufferedTx,
     public_rx_r_: BufferedRx,
-    w_receiver_: EventReceiver_<WriteEvent_<crate::connection::ConnAlloc_<C>>>,
-    r_receiver_: EventReceiver_<ReadEvent_<crate::connection::ConnAlloc_<C>>>,
+    w_receiver_: EventReceiver_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
+    r_receiver_: EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
 }
 
 impl<C> CoreBundle_<C>
@@ -353,28 +353,28 @@ where
         let max_packet_size = opts.basic_opts.max_packet_size;
         let channel_timeout_millis = millis_of_(opts.basic_opts.max_channel_timeout);
         let pending_msg_cap = config.pending_msg_capacity();
-        let alloc_cfg = config.alloc_cfg();
-        let alloc = alloc_cfg.registry_alloc();
-        let mpmc_alloc = alloc_cfg.mpmc_alloc();
+        // 分配器配置按值交给各结构（它是「取分配器的配方」，不是可克隆的句柄）；
+        // 每处各取一次。
+        let core_alloc: crate::connection::ConnCoreAlloc_<C> = config.alloc_cfg().core_alloc();
+        let public_alloc: crate::connection::ConnPublicAlloc_<C> =
+            config.alloc_cfg().public_alloc();
         // 建连这一刻就是连接的 epoch；此后协议里的时间量一律是「自它起算的毫秒」。
         let conn_clock = ConnClock_::new_(rt.clone());
 
-        let reg = ChannelRegistry_::new_(
-            opts.basic_opts.clone(),
-            alloc.clone(),
-            mpmc_alloc.clone(),
-        );
-        let control = ControlState_::new_(alloc.clone(), mpmc_alloc);
+        // 注册表建连时按用途从配置取走各自的分配器实例（结构 / 身份节点 /
+        // `Attach` 通道 / 取消令牌）。
+        let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), config.alloc_cfg());
+        let control = ControlState_::new_(config.alloc_cfg());
         // 公共报文子流：两条普通 ring + 四路唤醒槽。容量下界保证一个最大控制帧的
         // chunk 能完整写进空 ring（设计稿 §5.3）；建环失败等同连接建立失败。
         let public_cap = PublicChunkIo_::ring_capacity_(max_packet_size);
         let (public_tx_w_, public_tx_r_) =
-            new_buffered_channel(Owned::new_uninit_slice(public_cap, alloc.clone()))
+            new_buffered_channel(Owned::new_uninit_slice(public_cap, public_alloc.clone()))
                 .expect("公共 TX ring：容量由 max_packet_size 决定，失败等同分配失败");
         let (public_rx_w_, public_rx_r_) =
-            new_buffered_channel(Owned::new_uninit_slice(public_cap, alloc.clone()))
+            new_buffered_channel(Owned::new_uninit_slice(public_cap, public_alloc.clone()))
                 .expect("公共 RX ring：容量由 max_packet_size 决定，失败等同分配失败");
-        let public = PublicChannel_::new_(alloc.clone());
+        let public = PublicChannel_::new_(config.alloc_cfg());
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
 
@@ -416,7 +416,7 @@ where
                 r_events,
                 loops,
             ),
-            alloc.clone(),
+            core_alloc,
         );
 
         CoreBundle_ {
@@ -505,7 +505,7 @@ where
         return Result::Err(BindError::Mux(MuxError::Closed));
     }
     // 一次请求 + 完成源：登记动作由 `main_loop`（身份表唯一写者）执行。
-    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
     let waiter = tcs.clone();
     // 等待方取消 / 丢弃 future 时放弃结果；`main_loop` 在登记前后都会检查
     // `is_abandoned_()`，已放弃就回滚刚登记的身份（见 `main_loop::loop_`）。

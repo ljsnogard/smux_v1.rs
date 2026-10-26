@@ -49,7 +49,7 @@ where
     ///
     /// 通知槽内联在节点里（零堆分配），本对象持句柄并在它上面 park——句柄同时保证
     /// 「只要 listener 还在，身份节点就还在」，因此等待期间不会被回收。
-    rec_: LsnOwner_<crate::connection::ConnAlloc_<C>>,
+    rec_: LsnOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
 }
 
 impl<C> ChannelListener<C>
@@ -60,7 +60,7 @@ where
     pub(crate) fn new_(
         conn: MuxConnection<C>,
         local_dock: Dock,
-        rec_: LsnOwner_<crate::connection::ConnAlloc_<C>>,
+        rec_: LsnOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
     ) -> Self {
         ChannelListener {
             conn_: conn,

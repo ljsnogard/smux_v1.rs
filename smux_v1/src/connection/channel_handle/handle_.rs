@@ -17,7 +17,7 @@ use gen_mcf2::gen_may_cancel_future;
 use crate::{
     connection::{
         Dock, EstablishRole_, FrameKind, MainErr_, MainReply_, MainRequest_, MuxConnection, MuxError,
-        TcsAbandonGuard_, Tcs_, TrConnCfg,
+        TcsAbandonGuard_, Tcs_, TrConnAllocCfg, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
         ring_::{RingBuildErr, new_buffered_channel},
@@ -74,8 +74,8 @@ pub enum HandleError {
 /// 类型上消失，可以存进结构体、可以从函数返回。
 /// 建流时因 inbox 满而待补投的两侧 `Attach`。
 type PendingAttach_<C> = (
-    Option<WriteAttach_<crate::connection::ConnAlloc_<C>>>,
-    Option<ReadAttach_<crate::connection::ConnAlloc_<C>>>,
+    Option<WriteAttach_<crate::connection::ConnAllocCfg_<C>>>,
+    Option<ReadAttach_<crate::connection::ConnAllocCfg_<C>>>,
 );
 
 pub struct ChannelHandle<C>
@@ -106,7 +106,7 @@ where
     /// 它在**登记身份**（`reserve_channel_` / `reserve_inbound_`）时建立，句柄随
     /// `ChannelHandle` 一路持有到 `accept_async`，因此「状态与身份同寿命」在这一侧
     /// 就是「句柄与句柄同寿命」。窗口参数直到 `accept_async` 拿到环容量才安装。
-    accepted_owner_: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
+    accepted_owner_: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
 
     /// 接受后本端要通告的**接收窗口**（由接收环实际容量算出）。
     accepted_initial_window_: Credit,
@@ -129,7 +129,7 @@ where
         conn: MuxConnection<C>,
         local_dock: Dock,
         remote_dock: Dock,
-        owner: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
+        owner: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
         msg_: PendingMsgApp_,
     ) -> Self {
         ChannelHandle {
@@ -150,7 +150,7 @@ where
         conn: MuxConnection<C>,
         local_dock: Dock,
         remote_dock: Dock,
-        owner: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
+        owner: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
         msg_: PendingMsgApp_,
     ) -> Self {
         ChannelHandle {
@@ -511,10 +511,10 @@ where
     initial_: Credit,
 
     /// 因写侧 inbox 满而待补投的 `Attach`。
-    pending_w_: Option<WriteAttach_<crate::connection::ConnAlloc_<C>>>,
+    pending_w_: Option<WriteAttach_<crate::connection::ConnAllocCfg_<C>>>,
 
     /// 因读侧 inbox 满而待补投的 `Attach`。
-    pending_r_: Option<ReadAttach_<crate::connection::ConnAlloc_<C>>>,
+    pending_r_: Option<ReadAttach_<crate::connection::ConnAllocCfg_<C>>>,
 }
 
 /// 建流最终裁决的公共部分：按调用方给的缓冲建两条环、把会话侧半部交给两个循环，
@@ -523,7 +523,7 @@ fn install_channel_<C, B>(
     conn: &MuxConnection<C>,
     local: Dock,
     remote: Dock,
-    owner: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
+    owner: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
     tx_buff: B,
     mut rx_buff: B,
 ) -> Result<InstallOutcome_<C>, HandleError>
@@ -639,7 +639,7 @@ where
 
 /// `Attach` 投递失败（inbox 已关闭）时的连接级原因。
 fn attach_closed_reason_<C>(
-    owner: &ChannelOwner_<crate::connection::ConnAlloc_<C>>,
+    owner: &ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
     conn: &MuxConnection<C>,
 ) -> MuxError
 where
@@ -657,8 +657,8 @@ where
 /// 把建流时因 inbox 满而带回来的 `Attach` 补投出去（背压、可取消）。
 async fn attach_channel_async_<C, K>(
     conn: &MuxConnection<C>,
-    pending_w: Option<WriteAttach_<crate::connection::ConnAlloc_<C>>>,
-    pending_r: Option<ReadAttach_<crate::connection::ConnAlloc_<C>>>,
+    pending_w: Option<WriteAttach_<crate::connection::ConnAllocCfg_<C>>>,
+    pending_r: Option<ReadAttach_<crate::connection::ConnAllocCfg_<C>>>,
     cancel: K,
 ) -> Result<(), HandleError>
 where
@@ -706,11 +706,11 @@ where
 }
 
 /// 等一个「只表示受理」的请求完成（`MainReply_::Unit`）。
-async fn wait_unit_<A>(
-    waiter: &Tcs_<Result<MainReply_<A>, MainErr_>, A>,
+async fn wait_unit_<C>(
+    waiter: &Tcs_<Result<MainReply_<C>, MainErr_>, C>,
 ) -> Result<(), HandleError>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     match poll_fn(|cx| waiter.poll_wait_(cx)).await {
         Option::Some(Result::Ok(MainReply_::Unit)) => Result::Ok(()),
@@ -727,7 +727,7 @@ async fn submit_accept_<C, K>(
     conn: &MuxConnection<C>,
     local: Dock,
     remote: Dock,
-    owner: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
+    owner: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
     role_: EstablishRole_,
     initial_window: Credit,
     cancel: K,
@@ -736,7 +736,7 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
     let waiter = tcs.clone();
     let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
@@ -765,7 +765,7 @@ async fn submit_reject_<C, K>(
     conn: &MuxConnection<C>,
     local: Dock,
     remote: Dock,
-    owner: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
+    owner: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
     role_: EstablishRole_,
     cancel: K,
 ) -> Result<(), HandleError>
@@ -773,7 +773,7 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
     let waiter = tcs.clone();
     let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()

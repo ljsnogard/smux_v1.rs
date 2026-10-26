@@ -34,7 +34,6 @@
 #![allow(dead_code)]
 
 use core::{
-    alloc::AllocatorClone,
     fmt,
     task::{Context, Poll, Waker},
 };
@@ -43,23 +42,26 @@ use abs_sync::may_break::TrMayBreak;
 use atomic_sync::mutex::preemptive::SpinningMutexOwned;
 use mm_ptr::Shared;
 
-use crate::x_deps::{abs_sync, atomic_sync, mm_ptr};
+use crate::{
+    connection::TrConnAllocCfg,
+    x_deps::{abs_sync, atomic_sync, mm_ptr},
+};
 
 /// 一次请求的完成源。
 ///
 /// 句柄可克隆：调用方持一份等待，`main_loop` 持一份 `set_`。克隆只增加
 /// `Shared` 的强引用计数，不复制结果。
-pub(crate) struct Tcs_<T, A>
+pub(crate) struct Tcs_<T, C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 完成源本体。
-    inner_: Shared<TcsInner_<T>, A>,
+    inner_: Shared<TcsInner_<T>, C::TcsAlloc>,
 }
 
-impl<T, A> Clone for Tcs_<T, A>
+impl<T, C> Clone for Tcs_<T, C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     fn clone(&self) -> Self {
         Tcs_ {
@@ -68,9 +70,9 @@ where
     }
 }
 
-impl<T, A> fmt::Debug for Tcs_<T, A>
+impl<T, C> fmt::Debug for Tcs_<T, C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tcs_")
@@ -103,19 +105,19 @@ enum TcsState_<T> {
     Abandoned,
 }
 
-impl<T, A> Tcs_<T, A>
+impl<T, C> Tcs_<T, C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 建一个尚未完成的完成源（一次 `Shared` 分配）。
-    pub(crate) fn new_(alloc: A) -> Self {
+    pub(crate) fn new_(cfg: C) -> Self {
         Tcs_ {
             inner_: Shared::new(
                 TcsInner_ {
                     state_: SpinningMutexOwned::new_owned(TcsState_::Pending),
                     waker_: SpinningMutexOwned::new_owned(Option::None),
                 },
-                alloc,
+                cfg.tcs_alloc(),
             ),
         }
     }
@@ -278,27 +280,27 @@ where
 /// API future 在提交请求后把等待句柄包进本守卫：调用方取消 / 丢弃 future 时，
 /// `main_loop` 仍会完成协议动作，但 `set_` 会发现没人要而丢弃结果——不会把结果
 /// 泄漏到已放弃的等待方，也不会让 `main_loop` 卡在答复上。
-pub(crate) struct TcsAbandonGuard_<'a, T, A>
+pub(crate) struct TcsAbandonGuard_<'a, T, C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 被守卫的等待句柄。
-    tcs_: &'a Tcs_<T, A>,
+    tcs_: &'a Tcs_<T, C>,
 }
 
-impl<'a, T, A> TcsAbandonGuard_<'a, T, A>
+impl<'a, T, C> TcsAbandonGuard_<'a, T, C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 守卫一个等待句柄。
-    pub(crate) fn new_(tcs_: &'a Tcs_<T, A>) -> Self {
+    pub(crate) fn new_(tcs_: &'a Tcs_<T, C>) -> Self {
         TcsAbandonGuard_ { tcs_ }
     }
 }
 
-impl<T, A> Drop for TcsAbandonGuard_<'_, T, A>
+impl<T, C> Drop for TcsAbandonGuard_<'_, T, C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     fn drop(&mut self) {
         self.tcs_.abandon_();
@@ -314,8 +316,6 @@ mod tests_ {
         },
         task::{Context, Wake},
     };
-
-    use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
     use super::*;
 
@@ -351,7 +351,9 @@ mod tests_ {
     /// Assertion: first poll is `Ready(Some(7))`; second is `Ready(None)`.
     #[test]
     fn tcs_set_then_poll_takes_value_once_() {
-        let tcs = Tcs_::<u32, CoreAlloc>::new_(CoreAlloc);
+        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
+            crate::connection::SingleConnAllocCfg::default(),
+        );
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
 
@@ -373,7 +375,9 @@ mod tests_ {
     /// Assertion: `Pending` first; wake count increases; `Ready(Some(9))` last.
     #[test]
     fn tcs_set_wakes_pending_waiter_() {
-        let tcs = Tcs_::<u32, CoreAlloc>::new_(CoreAlloc);
+        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
+            crate::connection::SingleConnAllocCfg::default(),
+        );
         let (waker, probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
 
@@ -405,7 +409,9 @@ mod tests_ {
         }
 
         let count = Arc::new(AtomicUsize::new(0usize));
-        let tcs = Tcs_::<DropProbe_, CoreAlloc>::new_(CoreAlloc);
+        let tcs = Tcs_::<DropProbe_, crate::connection::SingleConnAllocCfg>::new_(
+            crate::connection::SingleConnAllocCfg::default(),
+        );
         tcs.abandon_();
         assert!(!tcs.set_(DropProbe_ {
             count_: count.clone(),
@@ -423,7 +429,9 @@ mod tests_ {
     /// Assertion: `Ready(Some(11))`; a second `set_` returns false.
     #[test]
     fn tcs_clone_shares_state_() {
-        let tcs = Tcs_::<u32, CoreAlloc>::new_(CoreAlloc);
+        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
+            crate::connection::SingleConnAllocCfg::default(),
+        );
         let other = tcs.clone();
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
@@ -446,7 +454,9 @@ mod tests_ {
     /// Assertion: `is_abandoned_()` is true; a later `set_(1)` returns false.
     #[test]
     fn tcs_abandon_guard_abandons_on_drop_() {
-        let tcs = Tcs_::<u32, CoreAlloc>::new_(CoreAlloc);
+        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
+            crate::connection::SingleConnAllocCfg::default(),
+        );
         {
             let _guard = TcsAbandonGuard_::new_(&tcs);
         }
@@ -463,7 +473,9 @@ mod tests_ {
     /// Assertion: not abandoned; `Ready(Some(13))`.
     #[test]
     fn tcs_abandon_after_set_keeps_value_() {
-        let tcs = Tcs_::<u32, CoreAlloc>::new_(CoreAlloc);
+        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
+            crate::connection::SingleConnAllocCfg::default(),
+        );
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
 

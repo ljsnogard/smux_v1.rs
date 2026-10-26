@@ -648,13 +648,27 @@ pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
 pub(crate) use chan_cfg_::MuxChanCfg_;
 
+/// 连接配置对应的分配器配置类型。
+pub(crate) type ConnAllocCfg_<C> = <C as TrConnCfg>::AllocCfg<'static>;
+
 /// 连接内部结构（注册表 / 索引 / 事件通道）的分配器投影。
 pub(crate) type ConnAlloc_<C> =
     <<C as TrConnCfg>::AllocCfg<'static> as TrMuxAllocConfig>::RegistryAlloc;
 
-/// 会话内 `mpmc_chan` 通道的分配器投影（`MpmcAlloc<'static>`）。
-pub(crate) type ConnMpmcAlloc_<C> =
-    <<C as TrConnCfg>::AllocCfg<'static> as TrConnAllocCfg>::MpmcAlloc<'static>;
+/// 身份节点（`ChannelOwner_` / `TgOwner_` / `LsnOwner_` 里的 `Shared` 节点，以及
+/// `DockCtx_` 的 `unbind_requested_` 标志）的分配器投影。
+pub(crate) type ConnChanOwnerAlloc_<C> =
+    <ConnAllocCfg_<C> as TrMuxAllocConfig>::ChanOwnerAlloc;
+
+/// 循环暂存（`Owned<[u8]>`）的分配器投影。
+pub(crate) type ConnScratchAlloc_<C> =
+    <ConnAllocCfg_<C> as TrConnAllocCfg>::ScratchAlloc;
+
+/// 连接核心 / 共享量 / 取消令牌的分配器投影。
+pub(crate) type ConnCoreAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::CoreAlloc;
+
+/// 公共报文子流（`PublicChannel_` 与两条 ring）的分配器投影。
+pub(crate) type ConnPublicAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::PublicAlloc;
 pub(crate) use control_state_::{ControlState_, HINT_MAIN_RETIRED};
 pub(crate) use main_loop::{EstablishRole_, MainErr_, MainReply_, MainRequest_, main_loop_async_};
 pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
