@@ -1710,6 +1710,11 @@ connection/
   验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
   本地表 `WriteTable_` / `ReadTable_` 与 registry 四表仍待迁移。
 
+- 20261027-0600：**P4 索引迁移：telegraph 两表换 2 KiB B+ 树**。
+  `TgReadTable_` / `TgWriteTable_` -> `DockBPlusTree_<A, Dock, ...>`；
+  `get_mut` 适配 `(&K, &mut V)`、`remove` 按键值、`iter_mut` item 形态不变。
+  验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

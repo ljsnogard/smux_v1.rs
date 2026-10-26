@@ -407,10 +407,10 @@ where
 ///
 /// 表里**有**条目就是「有接收方」：没有条目时到达的 `DATAGRAM` 整帧丢弃，连丢弃计数
 /// 都不记（无人可归因）。
-type TgReadTable_<A> = BTreeMap<Dock, TgRecvCtx_<A>, A>;
+type TgReadTable_<A> = crate::connection::dock_index_::DockBPlusTree_<A, Dock, TgRecvCtx_<A>>;
 
 /// 复用循环的 telegraph 表：`local_dock` → 发送环读端与身份句柄。
-type TgWriteTable_<A> = BTreeMap<Dock, TgWriteEntry_<A>, A>;
+type TgWriteTable_<A> = crate::connection::dock_index_::DockBPlusTree_<A, Dock, TgWriteEntry_<A>>;
 
 
 /// 「发送方向已收尾、但**数据还没排空**（或额度还没回来），因此还没发 `FIN`」的
@@ -1275,7 +1275,8 @@ pub(crate) async fn demux_loop_async_<C, K>(
     // 包进守卫：循环退出时**显式关闭**每个接收环写端（`buffex` 的环半部被 drop 不会
     // 置位关闭标记，少了这一步应用侧正 park 的 `recv_async` 永远醒不过来）。
     let mut tg_table: TgReadGuard_<'_, C> = TgReadGuard_ {
-        table: BTreeMap::new_in(alloc.clone()),
+        table: crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
+            .expect("2 KiB B+ 树足以容纳一个 telegraph 端点"),
         _use_shared_: core::marker::PhantomData,
     };
     // 自查用的临时集合：复用同一个（每轮先 `clear`）。
@@ -1354,7 +1355,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 .filter(|local_dock| !tg_live.contains(local_dock))
                 .collect();
             for local_dock in gone {
-                if let Option::Some(mut entry) = tg_table.remove(&local_dock) {
+                if let Option::Some(mut entry) = tg_table.remove(local_dock) {
                     entry.close_();
                 }
             }
@@ -1785,7 +1786,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 //    归因；
                 // 2. 中心循环**不认识数据报的内部结构**：帧头不被拆解，帧头与载荷
                 //    一起投出去（见 `telegraph::recv_ctx_` 的模块文档）。
-                let Some(ctx) = tg_table.table.get_mut(&local) else {
+                let Some(ctx) = tg_table.table.get_mut(local).map(|(_, value)| value) else {
                     continue;
                 };
                 ctx.deliver_frame_(&header, bytes, shared.metrics_());
@@ -2565,7 +2566,10 @@ pub(crate) async fn mux_loop_async_<C, K>(
     // 就会在 `&mut table.table` 与 `&mut table.tg_table_` 上撞借用检查。它自己的收尾
     // 很简单（关掉每个发送环读端即可），因此不值得为对称再加一个守卫类型。
     let mut tg_table: TgWriteTable_<C::Alloc> =
-        BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())));
+        crate::connection::dock_index_::DockBPlusTree_::new_in(lock_or_exit_!(
+            shared.reg_.allocator_(cancel.child_token())
+        ))
+        .expect("2 KiB B+ 树足以容纳一个 telegraph 端点");
     let mut events: MuxEventsGuard_<'_, C> = MuxEventsGuard_ {
         events,
         shared: &shared,
@@ -3065,7 +3069,7 @@ where
         WriteEvent_::TgReady { local_dock } => {
             // 只对**已在本地表**里的端点动手：`TgAttach` 可能还在队列后面（同一轮的
             // 事件顺序由应用侧保证不了），真正的排空在主循环第 2.7 步兜底。
-            let Some(entry) = tg_table.get_mut(&local_dock) else {
+            let Some(entry) = tg_table.get_mut(local_dock).map(|(_, value)| value) else {
                 return Result::Ok(());
             };
             let _ = race_cancel_(
@@ -3078,7 +3082,7 @@ where
             // 应用丢掉了发送半边：摘掉表项，并把身份节点里尚未送出的长度记录一并丢弃
             // （环里那些字节已经没有提交者，留着只会让队列永远非空）。身份本身何时
             // 释放由两个半边的守卫共同决定，与这里无关。
-            if let Option::Some(entry) = tg_table.remove(&local_dock) {
+            if let Option::Some(entry) = tg_table.remove(local_dock) {
                 entry.owner_.out_().clear_();
             }
         }
