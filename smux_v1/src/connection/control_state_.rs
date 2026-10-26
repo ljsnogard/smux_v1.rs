@@ -28,6 +28,9 @@ use crate::{
 /// 请求队列容量（设计稿 §10.2：64 条，约 8 KiB）。
 pub(crate) const K_MAIN_REQ_CAP: usize = 64usize;
 
+/// 「有身份被 `Drop` 置了 retired 位」：`main_loop` 扫描并释放。
+pub(crate) const HINT_MAIN_RETIRED: u64 = 1u64 << 0usize;
+
 /// 控制面共享状态句柄（`MuxCore` 与 `main_loop` 各持一份）。
 pub(crate) struct ControlState_<A>
 where
@@ -112,8 +115,6 @@ where
 
     /// 置位若干 `main_loop` 提示并唤醒它；幂等、零分配。
     ///
-    /// P1 尚无 `HINT_MAIN_*` 使用者（retired 位在 P4 接入），先保留入口。
-    #[allow(dead_code)]
     pub(crate) fn raise_main_hint_(&self, bits: u64) {
         self.inner_.main_hint_.raise_(bits);
     }

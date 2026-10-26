@@ -1657,6 +1657,15 @@ connection/
   大小。具体表（`bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_` /
   本地 `WriteTable_` / `ReadTable_`）的迁移仍待 P4。
 
+- 20261027-0320：**P4 第一刀：listener 的 Drop 位化**。
+  1. `LsnRec_` 加 `retired_` 原子位；`ChannelListener::Drop` 只 `set_retired_()` +
+     `raise_main_hint_(HINT_MAIN_RETIRED)`，不再投 `SessionEvent_::ReleaseListener`。
+  2. `ControlState_` 定义 `HINT_MAIN_RETIRED`；`main_loop` 在提示与每条请求前调用
+     `ChannelRegistry_::reap_retired_`（遍历 `bindings_` 的 Listener 变体并释放）。
+  3. 删除 `SessionEvent_::ReleaseListener` 变体与 drain 分支。
+  4. 验收：lib 371 / inmem 20 / smoke 5 / cross_thread 1 / keepalive 5；
+     clippy / format 合规。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -1869,7 +1878,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `WakerSlots_` 原语完成；替换待 P5 |
+| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；`WakerSlots_` 待 P5 替换；`PendingFin_` 待 P4 拆流迁移 |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | 待做 |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 

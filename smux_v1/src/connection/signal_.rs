@@ -380,12 +380,6 @@ pub(crate) enum SessionEvent_ {
         local_dock: Dock,
     },
 
-    /// `ChannelListener` 被丢弃：释放 listener 身份。
-    ReleaseListener {
-        /// 被释放的本地 dock。
-        local_dock: Dock,
-    },
-
     /// `Telegraph` 被丢弃：释放 telegraph 身份。
     ReleaseTelegraph {
         /// 被释放的本地 dock。

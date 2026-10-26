@@ -644,7 +644,7 @@ pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
-pub(crate) use control_state_::ControlState_;
+pub(crate) use control_state_::{ControlState_, HINT_MAIN_RETIRED};
 pub(crate) use main_loop::{EstablishRole_, MainErr_, MainReply_, MainRequest_, main_loop_async_};
 pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
 pub(crate) use mux_connection::ReserveErr_;

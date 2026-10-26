@@ -1339,6 +1339,9 @@ impl TgRec_ {
 pub(crate) struct LsnRec_ {
     /// 「本 dock 上可能有入向事件」的持久通知（协议见 [`NotifySlot_`]）。
     notify_: NotifySlot_,
+
+    /// `ChannelListener` 已被丢弃：main 据此释放 listener 身份（P4 的 Drop 位化）。
+    retired_: core::sync::atomic::AtomicBool,
 }
 
 impl LsnRec_ {
@@ -1346,6 +1349,7 @@ impl LsnRec_ {
     pub(crate) fn new_() -> Self {
         LsnRec_ {
             notify_: NotifySlot_::new_(),
+            retired_: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1357,6 +1361,18 @@ impl LsnRec_ {
     /// 等一次入向通知：消费已到达的提示，或登记 waker 后返回 [`Poll::Pending`]。
     pub(crate) fn poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.notify_.poll_wait_(cx)
+    }
+
+    /// 标记 listener 已被丢弃（`Drop` 只做这一次原子写）。
+    pub(crate) fn set_retired_(&self) {
+        self.retired_
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// listener 是否已被丢弃。
+    pub(crate) fn is_retired_(&self) -> bool {
+        self.retired_
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 }
 

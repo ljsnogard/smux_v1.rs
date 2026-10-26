@@ -1394,9 +1394,6 @@ where
             SessionEvent_::UnbindDock { local_dock } => {
                 self.unbind_dock_(local_dock, cancel).await
             }
-            SessionEvent_::ReleaseListener { local_dock } => {
-                self.release_listener_(local_dock, cancel).await
-            }
             SessionEvent_::ReleaseTelegraph { local_dock } => {
                 self.release_telegraph_(local_dock, cancel).await
             }
@@ -1731,6 +1728,31 @@ where
             }
         }
         Result::Ok(Option::Some(out))
+    }
+
+    /// 释放所有「`ChannelListener` 已丢弃」的 listener 身份（P4 的 retired 扫描）。
+    ///
+    /// 冷路径，O(n)；同一轮合并多个释放。
+    pub(crate) async fn reap_retired_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.root_.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        let mut retired: Vec<Dock> = Vec::new();
+        for (key, binding) in inner.bindings_.iter() {
+            if let BindingSlot_::Listener(rec) = binding
+                && rec.is_retired_()
+            {
+                retired.push(key.0);
+            }
+        }
+        for local_dock in retired {
+            inner.bindings_.remove(&listener_key_(local_dock));
+            inner.settle_pending_return_(local_dock);
+        }
+        Result::Ok(())
     }
 
     /// 把对端 message 写进该 channel 的 incoming ring（`main_loop` 用）。

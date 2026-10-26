@@ -33,6 +33,7 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         session_::race_cancel_,
         session_::MuxShared_,
+        HINT_MAIN_RETIRED,
         signal_::{ControlFrame_, HINT_W_PEER_CLOSED},
     },
     flow_ctrl::{RecvTotal, WindowReport},
@@ -110,8 +111,11 @@ pub(crate) async fn main_loop_async_<C, K>(
             return;
         }
 
-        // 合并提示：P1 只取走，具体位在后续阶段接入。
-        let _hints = ctl.take_main_hint_();
+        // 合并提示：目前只有 retired 位（P4 起逐步接入 window-dirty 等）。
+        let hints = ctl.take_main_hint_();
+        if hints & HINT_MAIN_RETIRED != 0u64 {
+            let _ = shared.reg_().reap_retired_(cancel.child_token()).await;
+        }
 
         // 公共 RX：每轮最多 `K_MAIN_FRAME_BATCH` 条完整帧。
         for _ in 0..K_MAIN_FRAME_BATCH {
@@ -204,6 +208,8 @@ where
         request.fail_(MainErr_::Mux(MuxError::Cancelled));
         return;
     }
+    // 同一轮合并的 retired 释放先落实：保证「丢弃后立刻重听」看到的是已释放。
+    let _ = shared.reg_().reap_retired_(cancel.child_token()).await;
     match request {
         MainRequest_::SendControl { frame, reply } => {
             match write_control_frame_async_::<C, _>(public_tx_w, shared, &frame, cancel).await {

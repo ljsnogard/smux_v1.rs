@@ -9,7 +9,6 @@ use crate::{
         Dock, MuxConnection, MuxError, TrConnCfg,
         channel_handle::ChannelHandle,
         owner_::LsnOwner_,
-        signal_::SessionEvent_,
     },
     x_deps::{abs_cancel, abs_smux, gen_mcf2}
 };
@@ -84,13 +83,12 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        let _ = self
-            .conn_
+        // P4：只置位 + raise，由 main 扫描释放（不再投 SessionMailbox_）。
+        self.rec_.set_retired_();
+        self.conn_
             .core_()
-            .reg_()
-            .post_session_event_(SessionEvent_::ReleaseListener {
-                local_dock: self.local_dock_,
-            });
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
     }
 }
 
