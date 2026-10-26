@@ -4029,7 +4029,7 @@ mod tests_ {
             .await;
         registry.with_t_(|inner| {
             assert!(
-                !inner.docks_.contains_key(&Dock::new(20u32)),
+                !inner.docks_.contains_key(Dock::new(20u32)),
                 "无活跃子流、未绑定的 dock 条目应当被回收"
             );
         });
