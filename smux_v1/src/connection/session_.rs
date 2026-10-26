@@ -374,7 +374,8 @@ where
 type ReadTable_<A> = BTreeMap<(Dock, Dock), ReadEntry_<A>, A>;
 
 /// 复用循环的本地表：dock 对 → 该子流的发送环读端与共享状态。
-type WriteTable_<A> = BTreeMap<(Dock, Dock), WriteEntry_<A>, A>;
+type WriteTable_<A> =
+    crate::connection::dock_index_::DockBPlusTree_<A, (Dock, Dock), WriteEntry_<A>>;
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // telegraph 的两个本地表
@@ -530,7 +531,7 @@ where
             return Result::Ok(());
         };
         cursor = Option::Some(pair);
-        let Some(entry) = table.get(&pair) else {
+        let Some((_, entry)) = table.get(pair) else {
             continue;
         };
         let owner = entry.owner_.clone();
@@ -590,12 +591,12 @@ where
             return Result::Ok(());
         };
         cursor = Option::Some(pair);
-        let Option::Some(entry) = table.get(&pair) else {
+        let Option::Some((_, entry)) = table.get(pair) else {
             continue;
         };
         let owner = entry.owner_.clone();
         if owner.is_peer_reset_() {
-            table.remove(&pair);
+            table.remove(pair);
             pending_fin.remove(pair);
             maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
             continue;
@@ -603,7 +604,7 @@ where
         if !owner.is_peer_fin_() {
             continue;
         }
-        let Option::Some(entry) = table.get_mut(&pair) else {
+        let Option::Some((_, entry)) = table.get_mut(pair) else {
             continue;
         };
         if entry.peer_fin_handled_ {
@@ -612,11 +613,11 @@ where
         entry.peer_fin_handled_ = true;
         maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
         if table
-            .get(&pair)
-            .map(|entry| entry.owner_.is_released_())
+            .get(pair)
+            .map(|(_, entry)| entry.owner_.is_released_())
             .unwrap_or(false)
         {
-            table.remove(&pair);
+            table.remove(pair);
         }
     }
 }
@@ -686,7 +687,7 @@ where
     //    连接收尾）。此时**不能**把它登记进「欠一条 `FIN`」的集合——没有表项就永远
     //    排不了空、也永远发不出 `FIN`，那会留下一个每轮扫描都要探测一次的僵尸条目。
     //    应用在收到对端 `RESET` 之后再丢弃（或显式封口）发送半边正是这条路径。
-    if !table.contains_key(&pair) {
+    if !table.contains_key(pair) {
         pending_fin.remove(pair);
         return Result::Ok(false);
     }
@@ -735,7 +736,7 @@ where
         cancel.child_token(),
     )
     .await?;
-    if let Option::Some(entry) = table.get_mut(&pair) {
+    if let Option::Some((_, entry)) = table.get_mut(pair) {
         #[cfg(feature = "test-loop-probe")]
         crate::connection::loop_probe_::local_fin_sent_();
         entry.owner_.set_local_fin_sent_();
@@ -757,11 +758,11 @@ where
     // 推进身份释放（`scan_peer_closed_`）。只有身份确实已释放时才摘；否则留到对端
     // `CLOSE` / 主动拆流 / 循环退出时处理。
     if table
-        .get(&pair)
-        .map(|entry| entry.owner_.is_released_())
+        .get(pair)
+        .map(|(_, entry)| entry.owner_.is_released_())
         .unwrap_or(false)
     {
-        table.remove(&pair);
+        table.remove(pair);
     }
     Result::Ok(true)
 }
@@ -793,7 +794,7 @@ where
     let Option::Some(pair) = last_ready else {
         return false;
     };
-    let Option::Some(entry) = table.get_mut(&pair) else {
+    let Option::Some((_, entry)) = table.get_mut(pair) else {
         // 「最近通知」的那条环可能已经不存在（子流已收尾并摘掉）。
         return false;
     };
@@ -825,7 +826,7 @@ fn has_writable_<C>(
 where
     C: TrConnCfg,
 {
-    let entry = table.get_mut(&pair)?;
+    let entry = table.get_mut(pair).map(|(_, entry)| entry)?;
     let demand = Demand::at_least(1usize);
     let mut outcome = entry.reader_.try_read(&demand);
     match outcome.as_mut().pick_left() {
@@ -2558,7 +2559,10 @@ pub(crate) async fn mux_loop_async_<C, K>(
     // 表与事件队列都包进收尾守卫：**退出时显式关闭本循环持有的那些半部**。
     // 为什么必须这样做、以及为什么分成两个守卫，见 `MuxLocalGuard_` 的类型文档。
     let mut table: MuxLocalGuard_<'_, C> = MuxLocalGuard_ {
-        table: BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token()))),
+        table: crate::connection::dock_index_::DockBPlusTree_::new_in(lock_or_exit_!(
+            shared.reg_.allocator_(cancel.child_token())
+        ))
+        .expect("2 KiB B+ 树足以容纳一个 channel 表项"),
         shared: &shared,
     };
     // telegraph 的本地写表**单独持有**（不进 `MuxLocalGuard_`）：主循环在同一轮里既要
@@ -3041,11 +3045,11 @@ where
             // `ABORT` 上的 `flush_async` / `close_async` 必须醒来按终局返回，而不是
             // 永远等一条再也不会有进展的环。叫醒放在 `reader_.close()` 之后——判据里
             // 「消费端已关闭」正是一次有效的事实变化。
-            if let Option::Some(entry) = table.get_mut(&pair) {
+            if let Option::Some((_, entry)) = table.get_mut(pair) {
                 entry.reader_.close();
                 entry.owner_.notify_both_progress_();
             }
-            table.remove(&pair);
+            table.remove(pair);
             pending_fin.remove(pair);
             maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token())
                 .await?;
@@ -3352,7 +3356,7 @@ where
     K: TrCancellationToken,
 {
     // 找到 owner：表里可能已经移除，因此用注册表兜底（异步取锁、可取消）。
-    let owner = match table.get(&pair).map(|entry| entry.owner_.clone()) {
+    let owner = match table.get(pair).map(|(_, entry)| entry.owner_.clone()) {
         Option::Some(owner) => Option::Some(owner),
         Option::None => {
             lock_or_fail_!(shared.reg_.channel_owner_(pair.0, pair.1, cancel.child_token()))
@@ -3564,7 +3568,7 @@ where
     K: TrCancellationToken,
 {
     let token = cancel.child_token();
-    let Some(entry) = table.get_mut(&pair) else {
+    let Some((_, entry)) = table.get_mut(pair) else {
         return Result::Ok(false);
     };
     // 本端 `FIN` 已发出：这条子流不再发送数据，表项保留只为等对端 `CLOSE`
@@ -3747,7 +3751,8 @@ mod tests_ {
         owner
             .send_on_report_(WindowReport::new(0u64, credit))
             .expect("测试额度远小于上限，通告应当被接受");
-        let mut table = WriteTable_::<CoreAlloc>::new_in(CoreAlloc);
+        let mut table = crate::connection::dock_index_::DockBPlusTree_::new_in(CoreAlloc)
+            .expect("2 KiB B+ 树足以容纳测试表项");
         table.insert(
             (Dock::new(0x7501u32), Dock::new(0x7502u32)),
             WriteEntry_ {

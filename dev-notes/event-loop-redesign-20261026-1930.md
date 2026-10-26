@@ -1723,6 +1723,14 @@ connection/
   3. 行为不变；lib 371。下一步用它钉住「Drop → reap → unbind / unreserve /
      REJECT」三条时序，再重试 DockBinding / ChannelHandle 位化。
 
+- 20261027-0700：**P4 索引迁移：`WriteTable_` 换 2 KiB B+ 树**。
+  `type WriteTable_<A> = DockBPlusTree_<A, (Dock, Dock), WriteEntry_<A>>`；mux 的
+  `get` / `get_mut` 适配 `(&K, &V)`，`remove` / `contains_key` 改用值键；
+  测试辅助建表改用 `DockBPlusTree_::new_in`。
+  验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
+  `ReadTable_` 与 registry 四表（`bindings_` / `docks_` / `remote_index_` /
+  `wait_close_expiry_`）仍待迁移。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
