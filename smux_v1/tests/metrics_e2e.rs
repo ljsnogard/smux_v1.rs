@@ -130,7 +130,7 @@ where
     RT: TrSmokeRt,
 {
     type Rt = RT;
-    type Alloc = CoreAlloc;
+    type AllocCfg<'a> = smux_v1::connection::CoreAllocCfg;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -142,8 +142,8 @@ where
         self.rt_.clone()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        smux_v1::connection::CoreAllocCfg
     }
 
     fn policy(&self) -> &Self::Policy {

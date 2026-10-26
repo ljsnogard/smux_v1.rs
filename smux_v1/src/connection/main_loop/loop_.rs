@@ -70,7 +70,7 @@ where
 /// 等待。
 pub(crate) async fn main_loop_async_<C, K>(
     shared: MuxShared_<C>,
-    ctl: ControlState_<C::Alloc>,
+    ctl: ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
     mut public_tx_w: BufferedTx,
     mut public_rx_r: BufferedRx,
     cancel: K,
@@ -86,7 +86,7 @@ pub(crate) async fn main_loop_async_<C, K>(
             return;
         }
     };
-    let mut rx_scratch: Owned<[u8], C::Alloc> = Owned::new_slice(
+    let mut rx_scratch: Owned<[u8], crate::connection::ConnAlloc_<C>> = Owned::new_slice(
         shared.max_packet_size_(),
         |_idx, slot| {
             slot.write(0u8);
@@ -142,7 +142,7 @@ pub(crate) async fn main_loop_async_<C, K>(
 /// 本函数驱动 `main_loop` 的状态推进，不必 park。
 pub(crate) async fn main_step_<C, K>(
     shared: &MuxShared_<C>,
-    ctl: &ControlState_<C::Alloc>,
+    ctl: &ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
     public_tx_w: &mut BufferedTx,
     public_rx_r: &mut BufferedRx,
     rx_scratch: &mut [u8],
@@ -205,9 +205,10 @@ where
 }
 
 /// 收尾：关闭队列，并把仍排队的请求以 `Closed` 结束。
-fn exit_<A>(ctl: &ControlState_<A>)
+fn exit_<A, CA>(ctl: &ControlState_<A, CA>)
 where
-    A: AllocatorClone + Send + Sync,
+    A: AllocatorClone + Send + Sync + 'static,
+    CA: AllocatorClone + Send + Sync + 'static,
 {
     ctl.close_requests_();
     while let Some(request) = ctl.try_pop_request_() {
@@ -221,7 +222,7 @@ where
 async fn handle_request_<C, K>(
     shared: &MuxShared_<C>,
     public_tx_w: &mut BufferedTx,
-    request: MainRequest_<C::Alloc>,
+    request: MainRequest_<crate::connection::ConnAlloc_<C>>,
     cancel: &K,
 )
 where
@@ -508,9 +509,9 @@ where
 /// 返回 `None` 表示连接正在收尾（取消令牌触发，或请求队列被关闭）。
 async fn park_main_<C, K>(
     shared: &MuxShared_<C>,
-    ctl: &ControlState_<C::Alloc>,
+    ctl: &ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
     cancel: &K,
-) -> Option<MainWake_<C::Alloc>>
+) -> Option<MainWake_<crate::connection::ConnAlloc_<C>>>
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -522,7 +523,7 @@ where
     let mut request_fut = pin!(core::future::IntoFuture::into_future(
         ctl.recv_request_async_()
     ));
-    let mut taken: Option<MainWake_<C::Alloc>> = None;
+    let mut taken: Option<MainWake_<crate::connection::ConnAlloc_<C>>> = None;
     poll_fn(|cx| {
         if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
             return Poll::Ready(());

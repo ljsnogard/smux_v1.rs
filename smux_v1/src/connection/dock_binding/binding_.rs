@@ -114,7 +114,7 @@ where
     local_dock_: Dock,
 
     /// 「绑定方已丢弃」标志；`Drop` 只置位 + raise，由 main 解绑。
-    unbind_: Shared<AtomicBool, C::Alloc>,
+    unbind_: Shared<AtomicBool, crate::connection::ConnAlloc_<C>>,
 }
 
 impl<C> DockBinding<C>
@@ -125,7 +125,7 @@ where
     pub(crate) fn new_(
         conn: MuxConnection<C>,
         local_dock: Dock,
-        unbind_: Shared<AtomicBool, C::Alloc>,
+        unbind_: Shared<AtomicBool, crate::connection::ConnAlloc_<C>>,
     ) -> Self {
         DockBinding {
             conn_: conn,

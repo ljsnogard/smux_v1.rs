@@ -178,6 +178,28 @@ unsafe impl Allocator for CountingAlloc {
 
 unsafe impl AllocatorClone for CountingAlloc {}
 
+/// `CountingAlloc` 的连接分配器配置：所有用途都用注入分配器。
+#[derive(Debug, Clone, Copy, Default)]
+struct CountingAllocCfg;
+
+impl smux_v1::connection::TrConnAllocCfg for CountingAllocCfg {
+    type RegistryAlloc = CountingAlloc;
+    type ChanOwnerAlloc = CountingAlloc;
+    type MpmcAlloc<'a> = CountingAlloc;
+
+    fn registry_alloc(&self) -> Self::RegistryAlloc {
+        CountingAlloc
+    }
+
+    fn chan_owner_alloc(&self) -> Self::ChanOwnerAlloc {
+        CountingAlloc
+    }
+
+    fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static> {
+        CountingAlloc
+    }
+}
+
 /// 子流环存储的类型（与冒烟配置同构，只换分配器）。
 ///
 /// 用[注入分配器](CountingAlloc)记账的连接配置。
@@ -246,7 +268,7 @@ where
     RT: common::TrSmokeRt,
 {
     type Rt = RT;
-    type Alloc = CountingAlloc;
+    type AllocCfg<'a> = CountingAllocCfg;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -256,8 +278,8 @@ where
         self.rt_.clone()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CountingAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        CountingAllocCfg
     }
 
     fn policy(&self) -> &Self::Policy {

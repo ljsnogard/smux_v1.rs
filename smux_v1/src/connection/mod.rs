@@ -639,13 +639,22 @@ pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
 pub use config_::{
-    CurrentConnCfg, DefaultConnCfg, K_TRANSPORT_RING_CAPACITY, TrConnCfg,
+    CoreAllocCfg, CurrentConnCfg, DefaultConnCfg, K_TRANSPORT_RING_CAPACITY, TrConnAllocCfg,
+    TrConnCfg, TrMuxAllocConfig,
 };
 pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
 pub(crate) use chan_cfg_::MuxChanCfg_;
+
+/// 连接内部结构（注册表 / 索引 / 事件通道）的分配器投影。
+pub(crate) type ConnAlloc_<C> =
+    <<C as TrConnCfg>::AllocCfg<'static> as TrConnAllocCfg>::RegistryAlloc;
+
+/// 会话内 `mpmc_chan` 通道的分配器投影（`MpmcAlloc<'static>`）。
+pub(crate) type ConnMpmcAlloc_<C> =
+    <<C as TrConnCfg>::AllocCfg<'static> as TrConnAllocCfg>::MpmcAlloc<'static>;
 pub(crate) use control_state_::{ControlState_, HINT_MAIN_RETIRED};
 pub(crate) use main_loop::{EstablishRole_, MainErr_, MainReply_, MainRequest_, main_loop_async_};
 pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};

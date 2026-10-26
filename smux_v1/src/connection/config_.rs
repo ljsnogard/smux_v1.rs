@@ -49,6 +49,62 @@ pub trait TrMuxAllocConfig {
     type ChanOwnerAlloc: AllocatorClone;
 }
 
+/// `smux_v1::connection` 内部**所有分配器用途**的聚合。
+///
+/// 每一项对应一类结构，而不是「一个全局分配器」：
+///
+/// - [`Self::RegistryAlloc`]：注册表、索引树、事件通道等连接内部结构；
+/// - [`Self::ChanOwnerAlloc`]：身份节点（`ChannelOwner_` / `DockBinding_` 等）；
+/// - [`Self::MpmcAlloc`]：会话内 `mpmc_chan` 通道（外层 `Arc` + 等待 chunk）。
+///
+/// 本 trait **不要求 `'static`**；只有 [`Self::MpmcAlloc`] 的 GAT 在 `'a` 上带
+/// 生命周期约束——通道把分配器类型嵌进 `MpmcChan<'static, …>`，需要
+/// `MpmcAlloc<'static>: 'static`，但这条需求停在通道这一层。以后新增分配器用途时
+/// 在这里加 GAT 即可。
+pub trait TrConnAllocCfg {
+    /// 连接内部结构（注册表、索引树、事件通道、载荷暂存等）的分配器。
+    type RegistryAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 身份节点的分配器。
+    type ChanOwnerAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 会话内 `mpmc_chan` 通道的分配器（外层 `Arc` 与等待 chunk 都用它）。
+    type MpmcAlloc<'a>: AllocatorClone + Send + Sync + 'a
+    where
+        Self: 'a;
+
+    /// 取结构分配器的一个实例。
+    fn registry_alloc(&self) -> Self::RegistryAlloc;
+
+    /// 取身份节点分配器的一个实例。
+    fn chan_owner_alloc(&self) -> Self::ChanOwnerAlloc;
+
+    /// 取通道分配器的一个实例（交给 `MpmcChan::new_in`）。
+    fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static>;
+}
+
+/// 内建分配器配置：所有用途都用 [`CoreAlloc`]。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CoreAllocCfg;
+
+impl TrConnAllocCfg for CoreAllocCfg {
+    type RegistryAlloc = CoreAlloc;
+    type ChanOwnerAlloc = CoreAlloc;
+    type MpmcAlloc<'a> = CoreAlloc;
+
+    fn registry_alloc(&self) -> Self::RegistryAlloc {
+        CoreAlloc
+    }
+
+    fn chan_owner_alloc(&self) -> Self::ChanOwnerAlloc {
+        CoreAlloc
+    }
+
+    fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static> {
+        CoreAlloc
+    }
+}
+
 /// **连接的传输环容量**（推荐值）：调用方自己造传输环时可以参考它。
 ///
 /// 与旧版的「连接级帧暂存环容量」是同一个数，但语义变了：它不再是连接**自己**
@@ -99,12 +155,14 @@ where
     /// [`TrDelay`]: abs_art::TrDelay
     type Rt: TrTime + Clone + 'static;
 
-    /// 连接内部结构（注册表、事件通道、载荷暂存等）的分配器。
+    /// 分配器配置：由实现者选定一个 [`TrConnAllocCfg`]。
     ///
-    /// 要求 `'static`：会话内的 `mpmc_chan` 通道把分配器类型嵌进
-    /// `MpmcChan<'static, …>`（外层 `Arc` 与等待 chunk 都用它），因此分配器
-    /// 必须比连接实例活得更久。所有由连接持有的分配器实现都满足这一条。
-    type Alloc: AllocatorClone + Send + Sync + 'static;
+    /// 用 GAT 只是为了携带 `Self: 'a`；实际取 `AllocCfg<'static>` 的关联类型
+    /// （`TrConnCfg` 自身要求 `'static`）。这样连接配置**不必实现**分配器配置，
+    /// 只是通过这个关联类型引用它。
+    type AllocCfg<'a>: TrConnAllocCfg
+    where
+        Self: 'a;
 
     /// 流控策略。
     type Policy: TrFlowCtrlPolicy;
@@ -164,8 +222,16 @@ where
     /// `Runtime::current()` 要求调用点已在上下文内，做不到这一点。
     fn runtime(&self) -> Self::Rt;
 
-    /// 取连接内部结构用的分配器（按值，`buffex` 的构建器按值接收）。
-    fn allocator(&self) -> Self::Alloc;
+    /// 取分配器配置（按值；内部各结构再按用途取具体分配器）。
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static>;
+
+    /// 取连接内部结构用的分配器（`AllocCfg::RegistryAlloc` 的便捷投影）。
+    fn allocator(&self) -> crate::connection::ConnAlloc_<Self>
+    where
+        Self: Sized,
+    {
+        self.alloc_cfg().registry_alloc()
+    }
 
     /// 取流控策略。
     fn policy(&self) -> &Self::Policy;
@@ -225,7 +291,10 @@ where
     ///
     /// 只有需要**不同分配器实例**时才覆盖；若要不同**类型**，需要新增关联类型
     /// `MsgAlloc`（破坏性变更，本阶段不做，设计稿 Q10）。
-    fn pending_msg_allocator(&self) -> Self::Alloc {
+    fn pending_msg_allocator(&self) -> crate::connection::ConnAlloc_<Self>
+    where
+        Self: Sized,
+    {
         self.allocator()
     }
 
@@ -411,7 +480,7 @@ where
     Rt: TrTime + Clone + 'static,
 {
     type Rt = Rt;
-    type Alloc = CoreAlloc;
+    type AllocCfg<'a> = CoreAllocCfg;
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
@@ -421,8 +490,8 @@ where
         self.rt_.clone()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        CoreAllocCfg
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -569,7 +638,7 @@ where
     Rt: TrTime + Clone + 'static + TrRtCurrent,
 {
     type Rt = Rt;
-    type Alloc = CoreAlloc;
+    type AllocCfg<'a> = CoreAllocCfg;
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
@@ -585,8 +654,8 @@ where
         <Rt as TrRtCurrent>::current_rt()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        CoreAllocCfg
     }
 
     fn policy(&self) -> &Self::Policy {

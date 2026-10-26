@@ -1585,13 +1585,14 @@ where
 }
 
 /// 等待建流完成：等对端的 `OPEN` + `ACCEPT` / `REJECT`，或被取消 / 连接失败打断。
-pub(crate) async fn wait_establish_<A, K>(
-    reg: &ChannelRegistry_<A>,
+pub(crate) async fn wait_establish_<A, CA, K>(
+    reg: &ChannelRegistry_<A, CA>,
     owner: &ChannelOwner_<A>,
     cancel: K,
 ) -> Result<EstablishOutcome_, MuxError>
 where
     A: AllocatorClone + Send + Sync,
+    CA: AllocatorClone + Send + Sync + 'static,
     K: TrCancellationToken,
 {
     loop {

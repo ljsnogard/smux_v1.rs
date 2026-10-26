@@ -101,7 +101,7 @@ where
     ring_: BufferedTx,
 
     /// 该子流的共享状态（「已入队」去重与关闭记账）。
-    owner_: ChannelOwner_<C::Alloc>,
+    owner_: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
 
     /// 连接智能指针：通知写循环 + 保活。
     conn_: MuxConnection<C>,
@@ -140,7 +140,7 @@ where
     /// `abs_smux` 的 trait 产出。
     pub(crate) fn new_(
         ring: BufferedTx,
-        owner: ChannelOwner_<C::Alloc>,
+        owner: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
         conn: MuxConnection<C>,
         local_dock: Dock,
         remote_dock: Dock,
@@ -545,7 +545,7 @@ where
 
     /// 该子流的共享状态（「已消费」去重位在锁外，见
     /// [`ChannelOwner_::mark_rx_consumed_`]）。
-    owner_: ChannelOwner_<C::Alloc>,
+    owner_: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
 
     /// 连接智能指针：通知写循环 + 保活。
     conn_: MuxConnection<C>,
@@ -564,7 +564,7 @@ where
     /// 由环消费端、共享状态、连接与 dock 对构造；可见性同 [`ChannelTx::new_`]。
     pub(crate) fn new_(
         ring: BufferedRx,
-        owner: ChannelOwner_<C::Alloc>,
+        owner: ChannelOwner_<crate::connection::ConnAlloc_<C>>,
         conn: MuxConnection<C>,
         local_dock: Dock,
         remote_dock: Dock,

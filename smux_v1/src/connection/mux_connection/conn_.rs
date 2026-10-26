@@ -14,7 +14,7 @@ use mm_ptr::{Owned, Shared};
 use crate::{
     connection::{
         BufferedRx, BufferedTx, ControlState_, Dock, MainErr_, MainReply_, MainRequest_, MuxError,
-        PushErr_, TrConnCfg, TcsAbandonGuard_, Tcs_,
+        PushErr_, TrConnAllocCfg, TrConnCfg, TcsAbandonGuard_, Tcs_,
         dock_binding::DockBinding,
         main_loop_async_,
         public_channel_::{PublicChannel_, PublicChunkIo_},
@@ -80,7 +80,7 @@ where
     C: TrConnCfg,
 {
     /// 指向演员核心的强引用；最后一个强引用消失时核心析构（并触发收尾）。
-    core_: Shared<MuxCore<C>, C::Alloc>,
+    core_: Shared<MuxCore<C>, crate::connection::ConnAlloc_<C>>,
 }
 
 impl<C> Clone for MuxConnection<C>
@@ -162,7 +162,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        C::Alloc: 'static,
+        crate::connection::ConnAlloc_<C>: 'static,
         C::Rt: ScopeHost,
     {
         let rt = config.runtime();
@@ -189,7 +189,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        C::Alloc: 'static,
+        crate::connection::ConnAlloc_<C>: 'static,
         S: TrLocalScope + Clone + 'static,
     {
         Self::new_with_rt_(rt, scope, delivery, config)
@@ -204,7 +204,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        C::Alloc: 'static,
+        crate::connection::ConnAlloc_<C>: 'static,
         S: TrLocalScope + Clone + 'static,
     {
         let HandshakeDelivery { opts, tx, rx } = delivery;
@@ -332,15 +332,15 @@ struct CoreBundle_<C>
 where
     C: TrConnCfg,
 {
-    core_: Shared<MuxCore<C>, C::Alloc>,
+    core_: Shared<MuxCore<C>, crate::connection::ConnAlloc_<C>>,
     shared_: MuxShared_<C>,
-    control_: ControlState_<C::Alloc>,
+    control_: ControlState_<crate::connection::ConnAlloc_<C>, crate::connection::ConnMpmcAlloc_<C>>,
     public_tx_w_: BufferedTx,
     public_tx_r_: BufferedRx,
     public_rx_w_: BufferedTx,
     public_rx_r_: BufferedRx,
-    w_receiver_: EventReceiver_<WriteEvent_<C::Alloc>>,
-    r_receiver_: EventReceiver_<ReadEvent_<C::Alloc>>,
+    w_receiver_: EventReceiver_<WriteEvent_<crate::connection::ConnAlloc_<C>>>,
+    r_receiver_: EventReceiver_<ReadEvent_<crate::connection::ConnAlloc_<C>>>,
 }
 
 impl<C> CoreBundle_<C>
@@ -353,12 +353,18 @@ where
         let max_packet_size = opts.basic_opts.max_packet_size;
         let channel_timeout_millis = millis_of_(opts.basic_opts.max_channel_timeout);
         let pending_msg_cap = config.pending_msg_capacity();
-        let alloc = config.allocator();
+        let alloc_cfg = config.alloc_cfg();
+        let alloc = alloc_cfg.registry_alloc();
+        let mpmc_alloc = alloc_cfg.mpmc_alloc();
         // 建连这一刻就是连接的 epoch；此后协议里的时间量一律是「自它起算的毫秒」。
         let conn_clock = ConnClock_::new_(rt.clone());
 
-        let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), alloc.clone());
-        let control = ControlState_::new_(alloc.clone());
+        let reg = ChannelRegistry_::new_(
+            opts.basic_opts.clone(),
+            alloc.clone(),
+            mpmc_alloc.clone(),
+        );
+        let control = ControlState_::new_(alloc.clone(), mpmc_alloc);
         // 公共报文子流：两条普通 ring + 四路唤醒槽。容量下界保证一个最大控制帧的
         // chunk 能完整写进空 ring（设计稿 §5.3）；建环失败等同连接建立失败。
         let public_cap = PublicChunkIo_::ring_capacity_(max_packet_size);

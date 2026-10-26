@@ -14,8 +14,9 @@
 //! 于是「无上界等待」与「长期运行不产生碎片」同时成立，也不需要给调用方引入
 //! `Busy` 重试契约。
 //!
-//! 通道的外层 `Arc` 与等待 chunk 都用**连接分配器**（[`MuxChanCfg_`]），不落到
-//! 全局堆：每个连接只有这一条请求通道，分配次数固定、不随并发增长。
+//! 通道的外层 `Arc` 与等待 chunk 都用 [`crate::connection::TrConnAllocCfg::MpmcAlloc`]（经
+//! [`MuxChanCfg_`]），不落到全局堆：每个连接只有这一条请求通道，分配次数固定、
+//! 不随并发增长。
 //!
 //! 提示位与请求分开：`HINT_MAIN_*` 只表示「某类事实可能变了」，`main_loop` 一次取走
 //! 整个掩码后自己决定扫描什么（见设计稿 §6.1 / §8.4）。
@@ -48,36 +49,38 @@ pub(crate) const HINT_MAIN_RETIRED: u64 = 1u64 << 0usize;
 type ControlBuf_<A> = MpmcBuf<MainRequest_<A>, K_MAIN_REQ_CAP>;
 
 /// 请求通道的发送端类型。
-type ControlTx_<A> =
-    mpmc_chan::Sender<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, MuxChanCfg_<A>>;
+type ControlTx_<A, CA> =
+    mpmc_chan::Sender<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, MuxChanCfg_<CA>>;
 
 /// 请求通道的接收端类型。
-type ControlRx_<A> =
-    mpmc_chan::Receiver<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, MuxChanCfg_<A>>;
+type ControlRx_<A, CA> =
+    mpmc_chan::Receiver<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, MuxChanCfg_<CA>>;
 
 /// `main_loop` 的请求等待 future（`RecvAsync` 是参数载体，`into_future` 之后才登记唤醒）。
-pub(crate) type ControlRecvAsync_<'f, A> = RecvAsync<
+pub(crate) type ControlRecvAsync_<'f, A, CA> = RecvAsync<
     'static,
     'f,
     'f,
     MainRequest_<A>,
     ControlBuf_<A>,
-    MuxChanCfg_<A>,
+    MuxChanCfg_<CA>,
     K_MAIN_REQ_CAP,
 >;
 
 /// 控制面共享状态句柄（`MuxCore` 与 `main_loop` 各持一份）。
-pub(crate) struct ControlState_<A>
+pub(crate) struct ControlState_<A, CA = A>
 where
     A: AllocatorClone + Send + Sync + 'static,
+    CA: AllocatorClone + Send + Sync + 'static,
 {
     /// 共享本体；一次分配，句柄可克隆。
-    inner_: Shared<ControlStateInner_<A>, A>,
+    inner_: Shared<ControlStateInner_<A, CA>, A>,
 }
 
-impl<A> Clone for ControlState_<A>
+impl<A, CA> Clone for ControlState_<A, CA>
 where
     A: AllocatorClone + Send + Sync + 'static,
+    CA: AllocatorClone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         ControlState_ {
@@ -87,31 +90,33 @@ where
 }
 
 /// 共享本体的内容。
-struct ControlStateInner_<A>
+struct ControlStateInner_<A, CA>
 where
     A: AllocatorClone + Send + Sync + 'static,
+    CA: AllocatorClone + Send + Sync + 'static,
 {
     /// 请求通道的发送端（多生产者共享；`Sender` 是 `Arc` 句柄，克隆廉价）。
-    tx_: ControlTx_<A>,
+    tx_: ControlTx_<A, CA>,
 
     /// 请求通道的接收端（`main_loop` 独占）。
-    rx_: ControlRx_<A>,
+    rx_: ControlRx_<A, CA>,
 
     /// `main_loop` 的合并提示位（`HINT_MAIN_*`）。
     main_hint_: HintSlot_,
 }
 
-impl<A> ControlState_<A>
+impl<A, CA> ControlState_<A, CA>
 where
     A: AllocatorClone + Send + Sync + 'static,
+    CA: AllocatorClone + Send + Sync + 'static,
 {
     /// 建一条空的请求通道与提示位（一次 `Shared` 分配）。
     ///
     /// 通道的外层 `Arc` 与缓存用 `alloc` 分配；等待 chunk 在首次 park 时申请。
-    pub(crate) fn new_(alloc: A) -> Self {
-        let (tx_, rx_) = MpmcChan::<MainRequest_<A>, K_MAIN_REQ_CAP, _, MuxChanCfg_<A>>::new_in(
+    pub(crate) fn new_(alloc: A, mpmc_alloc: CA) -> Self {
+        let (tx_, rx_) = MpmcChan::<MainRequest_<A>, K_MAIN_REQ_CAP, _, MuxChanCfg_<CA>>::new_in(
             ControlBuf_::<A>::new(),
-            alloc.clone(),
+            mpmc_alloc,
         );
         ControlState_ {
             inner_: Shared::new(
@@ -166,7 +171,7 @@ where
     ///
     /// 返回的 [`RecvAsync`] 是**参数载体**（实现 `IntoFuture`），调用方必须先
     /// `into_future` 再 `pin`，并**跨 poll 持有**它——每次 poll 新建会丢唤醒登记。
-    pub(crate) fn recv_request_async_<'f>(&'f self) -> ControlRecvAsync_<'f, A> {
+    pub(crate) fn recv_request_async_<'f>(&'f self) -> ControlRecvAsync_<'f, A, CA> {
         self.inner_.rx_.recv_async()
     }
 
@@ -213,7 +218,7 @@ mod tests_ {
     /// Assertion: pops yield docks 1 then 2; the third submit is `PushErr_::Closed`.
     #[test]
     fn control_state_is_fifo_and_closes_() {
-        let ctl = ControlState_::<CoreAlloc>::new_(CoreAlloc);
+        let ctl = ControlState_::<CoreAlloc>::new_(CoreAlloc, CoreAlloc);
         for dock in [1u32, 2u32] {
             let reply = Tcs_::new_(CoreAlloc);
             assert!(

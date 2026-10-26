@@ -1872,6 +1872,28 @@ connection/
   3. 验收：lib 360（删 13 个测试变体后的数量）/ inmem 20 / cross_thread 1 /
      smoke 5 / keepalive 5；clippy 0 error；format 合规（189 文件）。
 
+- 20261027-1600：**分配器配置改为 GAT（撤销 `TrConnCfg::Alloc` 的 `'static`）**。
+  1. 先前的做法（给 `TrConnCfg::Alloc` 加 `'static`）是错误设计：`'static` 需求来自
+     「分配器实例被嵌入 `Shared` 身份节点与 `MpmcChan<'static, …>` 的元素类型」，
+     不应该把这条约束压到通用的结构分配器上，也不应该让 `TrConnCfg` 去实现
+     `TrMuxAllocConfig`。
+  2. 新增 `TrConnAllocCfg`（**不带 `'static` supertrait**），聚合连接内所有分配器
+     用途：`RegistryAlloc` / `ChanOwnerAlloc` / GAT `MpmcAlloc<'a>`。只有
+     `MpmcAlloc` 的 GAT 带生命周期约束（`MpmcAlloc<'static>: 'static`），`'static`
+     需求停在通道这一层。
+  3. `TrConnCfg` 通过 GAT `type AllocCfg<'a>: TrConnAllocCfg` 引用它，提供
+     `fn alloc_cfg(&self) -> Self::AllocCfg<'static>`；删除 `type Alloc`。保留
+     `fn allocator(&self)` 作为 `RegistryAlloc` 的便捷投影。
+  4. `ControlState_<A, CA = A>` / `ChannelRegistry_<A, CA = A>` /
+     `MuxLoopShared_<A, CA, R, M>`：`A = RegistryAlloc`（结构），
+     `CA = MpmcAlloc`（通道）；`MuxCore<C>` 用投影别名
+     `ConnAlloc_<C>` / `ConnMpmcAlloc_<C>`。
+  5. 三个内建配置写 `type AllocCfg<'a> = CoreAllocCfg;`；测试侧
+     `SmokeMuxConfig` / `FlowCtrlConfig` / `MetricsCfg` 用 `CoreAllocCfg`，
+     `CountMuxConfig` 新增 `CountingAllocCfg`。
+  6. 验收：lib 360 / inmem 20 / cross_thread 1 / smoke 5 / keepalive 5；
+     clippy 0 error；format 合规（189 文件）。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

@@ -16,7 +16,7 @@
 
 | 文档 | 状态 | 一句话 |
 | --- | --- | --- |
-| `event-loop-redesign-20261026-1930.md` | **设计稿（已评审，P0–P3 完成，P4 位化完成、`PendingFin_` 待做，P5 请求/Attach 通道已换 `mpmc_chan`）** | 三业务循环 + 计时服务 + 公共报文子流（ring + chunked）+ 建流期 message ring + arena 索引（bplus_tree_cmp）+ 请求通道 + TCS |
+| `event-loop-redesign-20261026-1930.md` | **设计稿（已评审，P0–P3 完成，P4 位化完成、`PendingFin_` 待做，P5 请求/Attach 通道已换 `mpmc_chan`，分配器配置改 `TrConnAllocCfg` GAT）** | 三业务循环 + 计时服务 + 公共报文子流（ring + chunked）+ 建流期 message ring + arena 索引（bplus_tree_cmp）+ 请求通道 + TCS |
 | `connection-delivery-20261026-1845.md` | **现行** | 从 socket 收到什么帧、交给哪些对象、当前用什么队列/槽交付；含重复路径与待决问题 |
 | `event-backpressure-20261026-0514.md` | **现行** | 拆流/释放通知位化、`Attach` 迁入内联 inbox、容量 256、锁与锁外状态收敛的实施记录 |
 | `no-stage-20261015-1955.md` | 历史 | 去掉连接级 stage 环与两个贴传输的泵 |
