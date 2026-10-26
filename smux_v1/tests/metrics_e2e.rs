@@ -130,7 +130,7 @@ where
     RT: TrSmokeRt,
 {
     type Rt = RT;
-    type AllocCfg<'a> = smux_v1::connection::CoreAllocCfg;
+    type AllocCfg<'a> = smux_v1::connection::SingleConnAllocCfg;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -143,7 +143,7 @@ where
     }
 
     fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
-        smux_v1::connection::CoreAllocCfg
+        smux_v1::connection::SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {

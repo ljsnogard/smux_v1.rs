@@ -639,7 +639,7 @@ pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
 pub use config_::{
-    CoreAllocCfg, CurrentConnCfg, DefaultConnCfg, K_TRANSPORT_RING_CAPACITY, TrConnAllocCfg,
+    SingleConnAllocCfg, CurrentConnCfg, DefaultConnCfg, K_TRANSPORT_RING_CAPACITY, TrConnAllocCfg,
     TrConnCfg, TrMuxAllocConfig,
 };
 pub use dock_binding::{BindingError, DockBinding};
@@ -650,7 +650,7 @@ pub(crate) use chan_cfg_::MuxChanCfg_;
 
 /// 连接内部结构（注册表 / 索引 / 事件通道）的分配器投影。
 pub(crate) type ConnAlloc_<C> =
-    <<C as TrConnCfg>::AllocCfg<'static> as TrConnAllocCfg>::RegistryAlloc;
+    <<C as TrConnCfg>::AllocCfg<'static> as TrMuxAllocConfig>::RegistryAlloc;
 
 /// 会话内 `mpmc_chan` 通道的分配器投影（`MpmcAlloc<'static>`）。
 pub(crate) type ConnMpmcAlloc_<C> =

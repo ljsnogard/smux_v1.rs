@@ -118,7 +118,7 @@ impl TrMuxConfig for TestMuxConfig_ {
 
 impl TrConnCfg for TestMuxConfig_ {
     type Rt = NullRt_;
-    type AllocCfg<'a> = crate::connection::CoreAllocCfg;
+    type AllocCfg<'a> = crate::connection::SingleConnAllocCfg;
     type Policy = DefaultPolicy;
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
@@ -129,7 +129,7 @@ impl TrConnCfg for TestMuxConfig_ {
     }
 
     fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
-        crate::connection::CoreAllocCfg
+        crate::connection::SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {

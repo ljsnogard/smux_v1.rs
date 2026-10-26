@@ -41,12 +41,13 @@ use crate::{
     x_deps::{abs_buff, abs_mm},
 };
 
-#[allow(unused)]
-pub trait TrMuxAllocConfig {
-    type RegistryAlloc: AllocatorClone;
 
-    /// Allocator for ChannelOwner
-    type ChanOwnerAlloc: AllocatorClone;
+pub trait TrMuxAllocConfig {
+    /// 连接内部结构的分配器。
+    type RegistryAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 身份节点的分配器。
+    type ChanOwnerAlloc: AllocatorClone + Send + Sync + 'static;
 }
 
 /// `smux_v1::connection` 内部**所有分配器用途**的聚合。
@@ -61,13 +62,10 @@ pub trait TrMuxAllocConfig {
 /// 生命周期约束——通道把分配器类型嵌进 `MpmcChan<'static, …>`，需要
 /// `MpmcAlloc<'static>: 'static`，但这条需求停在通道这一层。以后新增分配器用途时
 /// 在这里加 GAT 即可。
-pub trait TrConnAllocCfg {
-    /// 连接内部结构（注册表、索引树、事件通道、载荷暂存等）的分配器。
-    type RegistryAlloc: AllocatorClone + Send + Sync + 'static;
-
-    /// 身份节点的分配器。
-    type ChanOwnerAlloc: AllocatorClone + Send + Sync + 'static;
-
+pub trait TrConnAllocCfg
+where
+    Self: TrMuxAllocConfig,
+{
     /// 会话内 `mpmc_chan` 通道的分配器（外层 `Arc` 与等待 chunk 都用它）。
     type MpmcAlloc<'a>: AllocatorClone + Send + Sync + 'a
     where
@@ -85,23 +83,34 @@ pub trait TrConnAllocCfg {
 
 /// 内建分配器配置：所有用途都用 [`CoreAlloc`]。
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CoreAllocCfg;
+pub struct SingleConnAllocCfg<A = CoreAlloc>(PhantomData<A>)
+where
+    A: 'static + AllocatorClone + Default + Send + Sync;
 
-impl TrConnAllocCfg for CoreAllocCfg {
-    type RegistryAlloc = CoreAlloc;
-    type ChanOwnerAlloc = CoreAlloc;
-    type MpmcAlloc<'a> = CoreAlloc;
+impl<A> TrMuxAllocConfig for SingleConnAllocCfg<A>
+where
+    A: 'static + AllocatorClone + Default + Send + Sync,
+{
+    type RegistryAlloc = A;
+    type ChanOwnerAlloc = A;
+}
+
+impl<A> TrConnAllocCfg for SingleConnAllocCfg<A>
+where
+    A: 'static + AllocatorClone + Default + Send + Sync,
+{
+    type MpmcAlloc<'a> = A;
 
     fn registry_alloc(&self) -> Self::RegistryAlloc {
-        CoreAlloc
+        A::default()
     }
 
     fn chan_owner_alloc(&self) -> Self::ChanOwnerAlloc {
-        CoreAlloc
+        A::default()
     }
 
     fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static> {
-        CoreAlloc
+        A::default()
     }
 }
 
@@ -480,7 +489,7 @@ where
     Rt: TrTime + Clone + 'static,
 {
     type Rt = Rt;
-    type AllocCfg<'a> = CoreAllocCfg;
+    type AllocCfg<'a> = SingleConnAllocCfg;
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
@@ -491,7 +500,7 @@ where
     }
 
     fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
-        CoreAllocCfg
+        SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -638,7 +647,7 @@ where
     Rt: TrTime + Clone + 'static + TrRtCurrent,
 {
     type Rt = Rt;
-    type AllocCfg<'a> = CoreAllocCfg;
+    type AllocCfg<'a> = SingleConnAllocCfg;
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
@@ -655,7 +664,7 @@ where
     }
 
     fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
-        CoreAllocCfg
+        SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {
