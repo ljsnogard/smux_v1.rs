@@ -33,7 +33,7 @@ use abs_smux::conf::TrMuxConfig;
 use abs_mm::CoreAlloc;
 
 use crate::{
-    connection::Dock,
+    connection::{Dock, pending_msg_::K_PENDING_MSG_CAP_DEFAULT},
     flow_ctrl::{DefaultPolicy, TrFlowCtrlPolicy},
     handshake::agent::HandshakeDelivery,
     metrics::{NoMetrics, TrMetricsSink},
@@ -204,6 +204,26 @@ where
     /// }
     /// ```
     fn metrics(&self) -> &Self::Metrics;
+
+    /// 建流期 message 的**每个方向**载荷上限（字节）；`0` 表示只允许空 message。
+    ///
+    /// `open` 的 message、`accept` 的 welcome、`reject` 的 reason 都受它约束：
+    /// 超出时按「outgoing 报 `MessageTooLong`（P3 接入）/ incoming 回 `REJECT`」处理。
+    /// ring 实际容量是 `max(2, 2 + 本值)`，因此 `0` 仍然能写一个空的 `0x0000`。
+    ///
+    /// 默认值见 [`K_PENDING_MSG_CAP_DEFAULT`]（512 字节）。现有 `TrConnCfg` 实现不必
+    /// 改：它带默认实现（设计稿 Q2）。
+    fn pending_msg_capacity(&self) -> usize {
+        K_PENDING_MSG_CAP_DEFAULT
+    }
+
+    /// 建流期 message ring 的分配器；默认复用连接内部结构的分配器。
+    ///
+    /// 只有需要**不同分配器实例**时才覆盖；若要不同**类型**，需要新增关联类型
+    /// `MsgAlloc`（破坏性变更，本阶段不做，设计稿 Q10）。
+    fn pending_msg_allocator(&self) -> Self::Alloc {
+        self.allocator()
+    }
 
     /// 子流环的**建议容量**：调用方自己分配那块内存时可以参考它。
     ///

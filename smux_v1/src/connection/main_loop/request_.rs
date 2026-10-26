@@ -13,6 +13,7 @@ use crate::connection::{
     Dock, MuxError,
     mux_connection::ReserveErr_,
     owner_::{ChannelOwner_, LsnOwner_},
+    pending_msg_::PendingMsgApp_,
     tcs_::Tcs_,
 };
 
@@ -85,8 +86,14 @@ where
     /// 绑定完成，返回**实际**绑定的 dock（自动分配时与请求值不同）。
     Dock(Dock),
 
-    /// 新建的 pending channel：身份节点（窗口 / 状态随身份建立）。
-    Channel(ChannelOwner_<A>),
+    /// 新建的 pending channel：身份节点 + app 侧 message ring 两半。
+    Channel {
+        /// 该子流的共享状态句柄。
+        owner: ChannelOwner_<A>,
+
+        /// app 侧 message ring（写 outgoing / 读 incoming）。
+        msg_: PendingMsgApp_,
+    },
 
     /// 新建的 listener 身份节点。
     Listener(LsnOwner_<A>),

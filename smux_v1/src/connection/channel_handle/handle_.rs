@@ -19,6 +19,7 @@ use crate::{
         ring_::{RingBuildErr, new_buffered_channel},
         signal_::{ControlFrame_, ReadAttach_, SessionEvent_, WriteAttach_, WriteEvent_},
         slot_::PushErr_,
+        pending_msg_::PendingMsgApp_,
         util_::read_available_into_vec_,
     },
     flow_ctrl::{
@@ -88,7 +89,17 @@ where
     is_initiator_: bool,
 
     /// 发起方暂存的开场消息（响应方恒为空）：`OPEN` 要等 `accept_async` 才发。
+    ///
+    /// P3.1 先保留 `Vec` 作为发送来源；同一份 message 也写进了 `msg_` 的 outgoing
+    /// ring，P3.1b 改由 `main_loop` 从 ring 读走后再删除本字段。
     message_: Vec<u8>,
+
+    /// app 侧建流期 message ring（写 outgoing / 读 incoming）。
+    ///
+    /// P3.1b 起 `main_loop` 从这里读 `OPEN` message / welcome，应用从 incoming 读
+    /// 对端 message；本轮先随句柄保活。
+    #[allow(dead_code, reason = "P3.1b 起由 main / read_message_async 读取")]
+    msg_: PendingMsgApp_,
 
     /// 这条子流的**共享原子状态句柄**。
     ///
@@ -119,6 +130,7 @@ where
         local_dock: Dock,
         remote_dock: Dock,
         owner: ChannelOwner_<C::Alloc>,
+        msg_: PendingMsgApp_,
     ) -> Self {
         ChannelHandle {
             conn_: conn,
@@ -126,6 +138,7 @@ where
             remote_dock_: remote_dock,
             is_initiator_: false,
             message_: Vec::new(),
+            msg_,
             accepted_owner_: owner,
             accepted_initial_window_: 0u32 as Credit,
             settled_: false,
@@ -140,6 +153,7 @@ where
         remote_dock: Dock,
         owner: ChannelOwner_<C::Alloc>,
         message: Vec<u8>,
+        msg_: PendingMsgApp_,
     ) -> Self {
         ChannelHandle {
             conn_: conn,
@@ -147,6 +161,7 @@ where
             remote_dock_: remote_dock,
             is_initiator_: true,
             message_: message,
+            msg_,
             accepted_owner_: owner,
             accepted_initial_window_: 0u32 as Credit,
             settled_: false,

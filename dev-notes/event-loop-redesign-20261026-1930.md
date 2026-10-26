@@ -1802,8 +1802,8 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | P0 原语完成（未接线） |
-| T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 默认常量完成；配置方法待 P3 |
+| T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | P3.1a 完成（登记 / 取出 / 句柄持有）；main 读 ring 组帧待 P3.1b |
+| T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 完成（默认实现 + 建连快照） |
 | T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | 待做 |
 | T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | 待拍板 Q12/Q11 |
 

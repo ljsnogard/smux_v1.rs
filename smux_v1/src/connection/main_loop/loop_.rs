@@ -252,9 +252,15 @@ where
             let now_millis = shared.conn_clock_().now_millis_();
             let result = shared
                 .reg_()
-                .reserve_channel_(local_dock, remote_dock, now_millis, cancel.child_token())
+                .reserve_channel_(
+                    local_dock,
+                    remote_dock,
+                    now_millis,
+                    shared.pending_msg_cap_(),
+                    cancel.child_token(),
+                )
                 .await
-                .map(MainReply_::Channel);
+                .map(|(owner, msg_)| MainReply_::Channel { owner, msg_ });
             if reply.is_abandoned_() {
                 let _ = shared
                     .reg_()

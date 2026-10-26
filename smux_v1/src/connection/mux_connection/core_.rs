@@ -51,6 +51,7 @@ use crate::{
         control_state_::ControlState_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
         owner_::{ChannelOwner_, TgOwner_},
+        pending_msg_::PendingMsgApp_,
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
         sync_::CancelToken_,
     },
@@ -328,7 +329,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<Option<(Dock, ChannelOwner_<C::Alloc>)>, ReserveErr_> {
+    ) -> Result<Option<(Dock, ChannelOwner_<C::Alloc>, PendingMsgApp_)>, ReserveErr_> {
         self.reg_.take_pending_inbound_(local_dock, cancel).await
     }
 

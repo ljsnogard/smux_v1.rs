@@ -154,6 +154,7 @@ use crate::{
             AbortCode_, ChannelNotice, ChannelOwner_, LsnOwner_, TgOwner_,
             new_listener_owner_, new_owner_, new_telegraph_owner_,
         },
+        pending_msg_::{PendingMsgApp_, PendingMsgMain_, new_pending_msg_},
         signal_::{ReadAttach_, SessionEvent_, SessionMailbox_, WriteAttach_},
         slot_::{InlineQueue_, PushErr_},
         sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
@@ -360,6 +361,15 @@ where
 
     /// 入向建流请求的状态。
     inbound_: Inbound_,
+
+    /// 响应方在 `TakeInbound` 之前暂存的 app 侧 message ring；取走后为 `None`。
+    msg_app_: Option<PendingMsgApp_>,
+
+    /// main 侧 message ring（main 独占；裁决 / retired 时关闭）。
+    ///
+    /// P3.1b 起由 `main_loop` 在 `Accept` / `Reject` 请求里读走；此时先保活。
+    #[allow(dead_code, reason = "P3.1b 起由 main_loop 读取")]
+    msg_main_: Option<PendingMsgMain_>,
 }
 
 impl<A> ChanSlot_<A>
@@ -367,10 +377,19 @@ where
     A: AllocatorClone,
 {
     /// 新登记的子流：状态已建（窗口参数待安装）、不是入向请求。
-    fn new_(rec_: ChannelOwner_<A>) -> Self {
+    ///
+    /// `msg_app_` 只在入向请求上非空（等 `TakeInbound` 取走）；`msg_main_` 在两种
+    /// 角色上都有（发起方的 outgoing 由 main 读）。
+    fn new_(
+        rec_: ChannelOwner_<A>,
+        msg_app_: Option<PendingMsgApp_>,
+        msg_main_: Option<PendingMsgMain_>,
+    ) -> Self {
         ChanSlot_ {
             rec_,
             inbound_: Inbound_::None,
+            msg_app_,
+            msg_main_,
         }
     }
 }
@@ -1455,8 +1474,9 @@ where
         local_dock: Dock,
         remote_dock: Dock,
         now_millis: u64,
+        msg_cap: usize,
         cancel: K,
-    ) -> Result<ChannelOwner_<A>, ReserveErr_> {
+    ) -> Result<(ChannelOwner_<A>, PendingMsgApp_), ReserveErr_> {
         let state = {
             let mut session = self.root_.inner_.acquire_session();
             let mut guard = acquire_write_(&mut session, cancel).await?;
@@ -1493,6 +1513,10 @@ where
             }
 
             let state = new_owner_(inner.alloc_.clone());
+            // 建流期 message ring：每个 pending channel 一对（设计稿 §5.10）。
+            // 冷路径；容量 / 分配失败与连接建立同级（Q15 的口径）。
+            let (msg_app, msg_main) = new_pending_msg_(msg_cap, inner.alloc_.clone())
+                .expect("pending message ring: 容量 / 分配失败与连接建立同级");
             // 两个时钟立刻用「现在」打点：连接的 epoch 可能远早于本条子流的诞生，
             // 从 0 起算会让它第一条扫描就被判空闲超时。
             state.mark_data_(now_millis);
@@ -1506,11 +1530,11 @@ where
             dock.chan_count_ += 1usize;
             inner.bindings_.insert(
                 (local_dock, remote_dock),
-                BindingSlot_::Channel(ChanSlot_::new_(state.clone())),
+                BindingSlot_::Channel(ChanSlot_::new_(state.clone(), Option::None, Option::Some(msg_main))),
             );
             inner.remote_index_.insert((remote_dock, local_dock));
             inner.total_ += 1usize;
-            state
+            (state, msg_app)
         };
         // 守卫已在上面那个块结束时释放：新身份要参与保活计时，因此现在才唤醒计时循环
         // （**不得在持锁时唤醒**，理由见 `ChannelRegistry_::notify_timer_`）。
@@ -1634,11 +1658,18 @@ where
         remote_dock: Dock,
         peer_report: WindowReport,
         now_millis: u64,
+        msg_cap: usize,
         cancel: K,
     ) -> Result<ChannelOwner_<A>, ReserveErr_> {
         // 先登记身份（自带配额与重复检查），再标成「待决入向请求」。
-        let state = self
-            .reserve_channel_(local_dock, remote_dock, now_millis, cancel.child_token())
+        let (state, msg_app) = self
+            .reserve_channel_(
+                local_dock,
+                remote_dock,
+                now_millis,
+                msg_cap,
+                cancel.child_token(),
+            )
             .await?;
         let marked = {
             let mut session = self.root_.inner_.acquire_session();
@@ -1646,6 +1677,8 @@ where
             match guard.bindings_.get_mut(&(local_dock, remote_dock)) {
                 Option::Some(BindingSlot_::Channel(ctx)) => {
                     ctx.inbound_ = Inbound_::Pending(peer_report);
+                    // app 侧两半暂存在槽里，等 `TakeInbound` 一起交给句柄。
+                    ctx.msg_app_ = Option::Some(msg_app);
                     true
                 }
                 _ => false,
@@ -1670,7 +1703,7 @@ where
         &self,
         local_dock: Dock,
         cancel: K,
-    ) -> Result<Option<(Dock, ChannelOwner_<A>)>, ReserveErr_> {
+    ) -> Result<Option<(Dock, ChannelOwner_<A>, PendingMsgApp_)>, ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
@@ -1680,8 +1713,12 @@ where
             if let BindingSlot_::Channel(ctx) = binding
                 && let Inbound_::Pending(report) = ctx.inbound_
             {
+                let Some(msg_app) = ctx.msg_app_.take() else {
+                    // 不应发生：Pending 的槽一定带着 app 侧 ring。保持状态、看下一条。
+                    continue;
+                };
                 ctx.inbound_ = Inbound_::HandedOut(report);
-                found = Option::Some((key.1, ctx.rec_.clone()));
+                found = Option::Some((key.1, ctx.rec_.clone(), msg_app));
                 break;
             }
         }
@@ -2423,8 +2460,15 @@ mod tests_ {
             local_dock: Dock,
             remote_dock: Dock,
         ) -> Result<ChannelOwner_<CoreAlloc>, ReserveErr_> {
-            self.reserve_channel_(local_dock, remote_dock, TEST_NOW_MILLIS_, NonCancellableToken::new())
-                .await
+            self.reserve_channel_(
+                local_dock,
+                remote_dock,
+                TEST_NOW_MILLIS_,
+                64usize,
+                NonCancellableToken::new(),
+            )
+            .await
+            .map(|(owner, _msg)| owner)
         }
 
     async fn release_channel_t_(&self, local_dock: Dock, remote_dock: Dock) {
@@ -2498,9 +2542,10 @@ mod tests_ {
                 remote_dock,
                 report,
                 TEST_NOW_MILLIS_,
+                64usize,
                 NonCancellableToken::new(),
             )
-                .await
+            .await
         }
 
     async fn take_pending_inbound_t_(
@@ -2510,6 +2555,7 @@ mod tests_ {
             self.take_pending_inbound_(local_dock, NonCancellableToken::new())
                 .await
                 .expect("测试里不该被取消")
+                .map(|(remote, owner, _msg)| (remote, owner))
         }
 
     async fn take_inbound_report_t_(

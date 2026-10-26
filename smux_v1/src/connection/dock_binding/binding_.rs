@@ -295,8 +295,8 @@ where
             PushErr_::Cancelled(_) => BindingError::Cancelled,
         })?;
     let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
-    let owner = match reply {
-        Option::Some(Result::Ok(MainReply_::Channel(owner))) => owner,
+    let (owner, mut msg_) = match reply {
+        Option::Some(Result::Ok(MainReply_::Channel { owner, msg_ })) => (owner, msg_),
         Option::Some(Result::Err(MainErr_::Reserve(err))) => {
             return Result::Err(map_reserve_err_(err));
         }
@@ -316,11 +316,19 @@ where
     )
     .await;
 
+    // 同时写进建流期 message ring：P3.1b 起由 `main_loop` 从这里读走组 `OPEN`。
+    if msg_
+        .write_outgoing_(&payload, conn.core_().config_().pending_msg_capacity())
+        .is_err()
+    {
+        return Result::Err(BindingError::Mux(MuxError::FrameTooLarge));
+    }
     Result::Ok(ChannelHandle::new_initiator_(
         conn,
         local,
         remote_dock,
         owner,
         payload,
+        msg_,
     ))
 }

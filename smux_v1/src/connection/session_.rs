@@ -202,6 +202,9 @@ where
     /// 协商出的单帧总长上限。
     max_packet_size_: usize,
 
+    /// 建流期 message 的每方向载荷上限（建连时从配置取一次的快照）。
+    pending_msg_cap_: usize,
+
     /// 连接级时钟（运行时值 + 建连 epoch）。
     conn_clock_: ConnClock_<R>,
 
@@ -246,6 +249,7 @@ where
     pub(crate) fn new_(
         reg: ChannelRegistry_<A>,
         max_packet_size: usize,
+        pending_msg_cap: usize,
         conn_clock: ConnClock_<R>,
         channel_timeout_millis: u64,
         public: PublicChannel_<A>,
@@ -254,6 +258,7 @@ where
         MuxLoopShared_ {
             reg_: reg,
             max_packet_size_: max_packet_size,
+            pending_msg_cap_: pending_msg_cap,
             conn_clock_: conn_clock,
             channel_timeout_millis_: channel_timeout_millis,
             public_: public,
@@ -286,6 +291,11 @@ where
     /// 协商出的单帧总长上限。
     pub(crate) fn max_packet_size_(&self) -> usize {
         self.max_packet_size_
+    }
+
+    /// 建流期 message 的每方向载荷上限。
+    pub(crate) fn pending_msg_cap_(&self) -> usize {
+        self.pending_msg_cap_
     }
 
     /// 公共报文子流的唤醒槽。
@@ -1655,6 +1665,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                             remote,
                             report,
                             shared.conn_clock_().now_millis_(),
+                            shared.pending_msg_cap_(),
                             cancel.child_token(),
                         )
                         .await;

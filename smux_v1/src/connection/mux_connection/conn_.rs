@@ -352,6 +352,7 @@ where
     {
         let max_packet_size = opts.basic_opts.max_packet_size;
         let channel_timeout_millis = millis_of_(opts.basic_opts.max_channel_timeout);
+        let pending_msg_cap = config.pending_msg_capacity();
         let alloc = config.allocator();
         // 建连这一刻就是连接的 epoch；此后协议里的时间量一律是「自它起算的毫秒」。
         let conn_clock = ConnClock_::new_(rt.clone());
@@ -383,6 +384,7 @@ where
         let shared = MuxShared_::<C>::new_(
             reg.clone(),
             max_packet_size,
+            pending_msg_cap,
             conn_clock.clone(),
             channel_timeout_millis,
             public,
