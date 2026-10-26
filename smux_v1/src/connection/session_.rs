@@ -142,6 +142,7 @@ use crate::{
         frame_parser_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
         owner_::{ChannelOwner_, TgOwner_},
+        public_channel_::PublicChannel_,
         ring_::{BufferedRx, BufferedTx},
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, EventTake_,
@@ -207,6 +208,12 @@ where
     /// 协商出的**活跃子流空闲超时**（毫秒）；计时循环的判据。
     channel_timeout_millis_: u64,
 
+    /// 公共报文子流的四路唤醒槽与关闭位（ring 半部按方向由各循环独占）。
+    ///
+    /// P2.1 先接线，搬运逻辑在 P2.2 接入；此前的短暂未读由 `allow` 标出。
+    #[allow(dead_code)]
+    public_: PublicChannel_<A>,
+
     /// 本次连接的**指标接收方**（建连时从配置克隆的一份）。
     ///
     /// 三个循环不持有核心（见模块文档 §2.2），拿不到 `MuxCore`，只能像运行时值那样
@@ -241,6 +248,7 @@ where
         max_packet_size: usize,
         conn_clock: ConnClock_<R>,
         channel_timeout_millis: u64,
+        public: PublicChannel_<A>,
         metrics: M,
     ) -> Self {
         MuxLoopShared_ {
@@ -248,6 +256,7 @@ where
             max_packet_size_: max_packet_size,
             conn_clock_: conn_clock,
             channel_timeout_millis_: channel_timeout_millis,
+            public_: public,
             metrics_: metrics,
         }
     }
@@ -272,6 +281,12 @@ where
     /// 协商出的活跃子流空闲超时（毫秒）。
     pub(crate) fn channel_timeout_millis_(&self) -> u64 {
         self.channel_timeout_millis_
+    }
+
+    /// 公共报文子流的唤醒槽。
+    #[allow(dead_code, reason = "P2.2 起由 mux / main 的搬运逻辑读取")]
+    pub(crate) fn public_(&self) -> &PublicChannel_<A> {
+        &self.public_
     }
 
     /// 本次连接携带的**指标接收方**（总有值，见字段文档）。
@@ -1203,6 +1218,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
     shared: MuxShared_<C>,
     events: EventReceiver_<ReadEvent_<C::Alloc>>,
     events_tx: EventSender_<WriteEvent_<C::Alloc>>,
+    _public_rx_w: BufferedTx,
     cancel: K,
 ) where
     C: TrConnCfg,
@@ -2407,6 +2423,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
     shared: MuxShared_<C>,
     events: EventReceiver_<WriteEvent_<C::Alloc>>,
     read_events: EventSender_<ReadEvent_<C::Alloc>>,
+    _public_tx_r: BufferedRx,
     cancel: K,
 ) where
     C: TrConnCfg,

@@ -52,6 +52,8 @@ where
 pub(crate) async fn main_loop_async_<C, K>(
     shared: MuxShared_<C>,
     ctl: ControlState_<C::Alloc>,
+    _public_tx_w: crate::connection::ring_::BufferedTx,
+    _public_rx_r: crate::connection::ring_::BufferedRx,
     cancel: K,
 ) where
     C: TrConnCfg,

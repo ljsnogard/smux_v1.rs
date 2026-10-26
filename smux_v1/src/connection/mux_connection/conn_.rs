@@ -9,14 +9,16 @@ use abs_smux::{
     dock::TrDock,
 };
 use gen_mcf2::gen_may_cancel_future;
-use mm_ptr::Shared;
+use mm_ptr::{Owned, Shared};
 
 use crate::{
     connection::{
-        ControlState_, Dock, MainErr_, MainReply_, MainRequest_, MuxError, PushErr_, TrConnCfg,
-        TcsAbandonGuard_, Tcs_,
+        BufferedRx, BufferedTx, ControlState_, Dock, MainErr_, MainReply_, MainRequest_, MuxError,
+        PushErr_, TrConnCfg, TcsAbandonGuard_, Tcs_,
         dock_binding::DockBinding,
         main_loop_async_,
+        public_channel_::{PublicChannel_, PublicChunkIo_},
+        ring_::new_buffered_channel,
         session_::{MuxShared_, demux_loop_async_, mux_loop_async_, race_cancel_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
         timer_::timer_loop_async_,
@@ -211,6 +213,10 @@ where
             core_,
             shared_,
             control_,
+            public_tx_w_,
+            public_tx_r_,
+            public_rx_w_,
+            public_rx_r_,
             w_receiver_,
             r_receiver_,
         } = bundle;
@@ -223,6 +229,7 @@ where
                 shared_.clone(),
                 r_receiver_,
                 core_.w_events_().clone(),
+                public_rx_w_,
                 core_.loop_token_(0usize),
             ),
         );
@@ -236,6 +243,7 @@ where
                 shared_.clone(),
                 w_receiver_,
                 core_.r_events_().clone(),
+                public_tx_r_,
                 core_.loop_token_(1usize),
             ),
         );
@@ -250,6 +258,8 @@ where
             main_loop_async_::<C, _>(
                 shared_.clone(),
                 control_.clone(),
+                public_tx_w_,
+                public_rx_r_,
                 core_.loop_token_(3usize),
             ),
         );
@@ -325,6 +335,10 @@ where
     core_: Shared<MuxCore<C>, C::Alloc>,
     shared_: MuxShared_<C>,
     control_: ControlState_<C::Alloc>,
+    public_tx_w_: BufferedTx,
+    public_tx_r_: BufferedRx,
+    public_rx_w_: BufferedTx,
+    public_rx_r_: BufferedRx,
     w_receiver_: EventReceiver_<WriteEvent_<C::Alloc>>,
     r_receiver_: EventReceiver_<ReadEvent_<C::Alloc>>,
 }
@@ -344,6 +358,16 @@ where
 
         let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), alloc.clone());
         let control = ControlState_::new_(alloc.clone());
+        // 公共报文子流：两条普通 ring + 四路唤醒槽。容量下界保证一个最大控制帧的
+        // chunk 能完整写进空 ring（设计稿 §5.3）；建环失败等同连接建立失败。
+        let public_cap = PublicChunkIo_::ring_capacity_(max_packet_size);
+        let (public_tx_w_, public_tx_r_) =
+            new_buffered_channel(Owned::new_uninit_slice(public_cap, alloc.clone()))
+                .expect("公共 TX ring：容量由 max_packet_size 决定，失败等同分配失败");
+        let (public_rx_w_, public_rx_r_) =
+            new_buffered_channel(Owned::new_uninit_slice(public_cap, alloc.clone()))
+                .expect("公共 RX ring：容量由 max_packet_size 决定，失败等同分配失败");
+        let public = PublicChannel_::new_(alloc.clone());
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
 
@@ -361,6 +385,7 @@ where
             max_packet_size,
             conn_clock.clone(),
             channel_timeout_millis,
+            public,
             metrics.clone(),
         );
         // 核心自持一份三个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
@@ -390,6 +415,10 @@ where
             core_: core,
             shared_: shared,
             control_: control,
+            public_tx_w_,
+            public_tx_r_,
+            public_rx_w_,
+            public_rx_r_,
             w_receiver_: w_receiver,
             r_receiver_: r_receiver,
         }
