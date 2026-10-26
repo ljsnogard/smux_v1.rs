@@ -62,7 +62,7 @@ mod tests_ {
         for i in 0u32..64u32 {
             let key = (Dock::new(i), Dock::new(i + 1u32));
             assert_eq!(
-                tree.get(&key).map(|(_, value)| *value),
+                tree.get(key).map(|(_, value)| *value),
                 map.get(&key).copied()
             );
         }
@@ -84,7 +84,7 @@ mod tests_ {
 
         for i in (0u32..64u32).step_by(2usize) {
             let key = (Dock::new(i), Dock::new(i + 1u32));
-            assert_eq!(tree.remove(&key), map.remove(&key));
+            assert_eq!(tree.remove(key), map.remove(&key));
         }
         assert_eq!(tree.len(), map.len());
         assert_eq!(
