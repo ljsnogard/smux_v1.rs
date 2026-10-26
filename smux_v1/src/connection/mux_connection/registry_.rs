@@ -133,7 +133,7 @@
 //! 「只用手动绑定的连接」在解绑路径上零额外分配。
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     vec::Vec,
 };
 use core::{
@@ -558,7 +558,8 @@ where
     /// 当前协议路径**不依赖**它（每帧都同时带两个 dock），保留是为了让「只知
     /// `remote_dock`」的查询能以 O(log n + k) 枚举；只登记活跃 channel，
     /// `WaitClose` 不入索引（它是墓碑，不是活跃子流）。
-    remote_index_: BTreeSet<(Dock, Dock), A>,
+    remote_index_:
+        crate::connection::dock_index_::DockBPlusTree_<A, (Dock, Dock), ()>,
 
     /// `(到期时刻, local, remote)` → 宽限态回收索引。
     ///
@@ -567,7 +568,8 @@ where
     ///
     /// 时刻是**连接内毫秒**（自连接 epoch 起算，见 [`crate::time`]），因此这套索引
     /// 与「子流最后活动」用的是同一把尺子，也不需要任何 `Instant` 类型。
-    wait_close_expiry_: BTreeSet<(u64, Dock, Dock), A>,
+    wait_close_expiry_:
+        crate::connection::dock_index_::DockBPlusTree_<A, (u64, Dock, Dock), ()>,
 
     /// 整条连接上当前在册的**活跃子流**数（受 `max_channel_count` 约束）。
     total_: usize,
@@ -590,13 +592,13 @@ where
     /// 误删活跃身份。
     fn reap_wait_close_(&mut self, now_millis: u64) {
         while let Option::Some((until, local_dock, remote_dock)) =
-            self.wait_close_expiry_.first().copied()
+            self.wait_close_expiry_.iter().next().map(|(key, _)| *key)
         {
             if until > now_millis {
                 break;
             }
             self.wait_close_expiry_
-                .remove(&(until, local_dock, remote_dock));
+                .remove((until, local_dock, remote_dock));
             if matches!(
                 self.bindings_.get(&(local_dock, remote_dock)),
                 Option::Some(BindingSlot_::WaitClose(_))
@@ -1171,8 +1173,10 @@ where
         ];
         let docks_ = BTreeMap::new_in(alloc.clone());
         let bindings_ = BTreeMap::new_in(alloc.clone());
-        let remote_index_ = BTreeSet::new_in(alloc.clone());
-        let wait_close_expiry_ = BTreeSet::new_in(alloc.clone());
+        let remote_index_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
+            .expect("2 KiB B+ 树足以容纳反向索引表项");
+        let wait_close_expiry_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
+            .expect("2 KiB B+ 树足以容纳到期索引表项");
         // 锁外共享状态与锁内的表放在**同一个根对象**里：每连接一次分配。
         ChannelRegistry_ {
             root_: Shared::new(
@@ -1550,7 +1554,7 @@ where
                 (local_dock, remote_dock),
                 BindingSlot_::Channel(ChanSlot_::new_(state.clone(), Option::None, Option::Some(msg_main))),
             );
-            inner.remote_index_.insert((remote_dock, local_dock));
+            inner.remote_index_.insert((remote_dock, local_dock), ());
             inner.total_ += 1usize;
             (state, msg_app)
         };
@@ -1583,7 +1587,7 @@ where
             .remove(&(local_dock, remote_dock));
         let mut became_idle = false;
         if matches!(removed, Option::Some(BindingSlot_::Channel(_))) {
-            inner.remote_index_.remove(&(remote_dock, local_dock));
+            inner.remote_index_.remove((remote_dock, local_dock));
             inner.total_ = inner.total_.saturating_sub(1usize);
             became_idle = inner.total_ == 0usize;
             if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
@@ -1617,9 +1621,9 @@ where
         );
         inner
             .wait_close_expiry_
-            .insert((until, local_dock, remote_dock));
+            .insert((until, local_dock, remote_dock), ());
         // 反向索引只跟活跃子流；宽限态不再登记。
-        inner.remote_index_.remove(&(remote_dock, local_dock));
+        inner.remote_index_.remove((remote_dock, local_dock));
         inner.total_ = inner.total_.saturating_sub(1usize);
         let became_idle = inner.total_ == 0usize;
         if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
@@ -2146,8 +2150,8 @@ where
         let guard = acquire_read_(&mut session, cancel).await?;
         let inner = &*guard;
         let (start, end) = remote_range_(remote_dock);
-        for (_, local) in inner.remote_index_.range((start, end)) {
-            f(*local);
+        for (pair, _) in inner.remote_index_.range((start, end)) {
+            f(pair.1);
         }
         Result::Ok(())
     }
@@ -2825,7 +2829,7 @@ mod tests_ {
                             inner
                                 .wait_close_expiry_
                                 .iter()
-                                .any(|(_, local, remote)| *local == key.0 && *remote == key.1),
+                                .any(|((_, local, remote), _)| *local == key.0 && *remote == key.1),
                             "宽限态 {:?} 必须出现在到期索引里",
                             key
                         );
@@ -2864,7 +2868,7 @@ mod tests_ {
             for (key, binding) in inner.bindings_.iter() {
                 if let BindingSlot_::Channel(_) = binding {
                     assert!(
-                        inner.remote_index_.contains(&(key.1, key.0)),
+                        inner.remote_index_.contains_key((key.1, key.0)),
                         "反向索引缺少 ({:?}, {:?})",
                         key.1,
                         key.0

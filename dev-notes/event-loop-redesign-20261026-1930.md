@@ -1737,15 +1737,21 @@ connection/
   验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
   registry 四表受 `Send` 限制保留标准库容器（见 0800 记录）。
 
-- 20261027-0800：**P4 索引迁移的边界：`BPlusTree` / `BTree` 不是 `Send`**。
-  1. 尝试把 `remote_index_` / `wait_close_expiry_` 换 `DockBPlusTree_` / `DockSet_`
+- 20261027-0800：**P4 索引迁移的边界：`BPlusTree` / `BTree` 曾不是 `Send`**。
+  1. 当时把 `remote_index_` / `wait_close_expiry_` 换 `DockBPlusTree_` / `DockSet_`
      后，`RegistryInner_<CoreAlloc>` 不再 `Send`，`cross_thread_compio` 编译失败
      （arena 含 `NonNull`，上游未 `unsafe impl Send`）；已回退。
-  2. 结论：设计稿 §18 的「registry 四表换 2 KiB arena 树」**不可行**，除非上游为
-     `BPlusTree` / `BTree` 补 `Send`，或把 registry 表移出跨线程共享。
+  2. 当时的结论是「registry 四表换 arena 树不可行」；**该结论已作废**：上游
+     `d65e5ec` 已补 `Send` / `Sync`，见下一条 0900。
   3. 本地数据面表（`WriteTable_` / `ReadTable_` / `TgReadTable_` / `TgWriteTable_`）
      在循环私有的 `MuxShared_` 中，`PendingFin_` 在循环栈上，均不受此限，已迁移。
-  4. registry 四表保留 `BTreeMap` / `BTreeSet`。
+
+- 20261027-0900：**上游补 `Send` / `Sync`，registry 索引继续迁移**。
+  `bplus_tree_cmp` `d65e5ec` 为 `BPlusTree` / `BTree` 实现 `Send` / `Sync`
+  （约束：`Cfg` / `Allocator` / `K` / `V` 均 `Send + Sync`；`DockTreeCfg_<A>` 与
+  我们的键值类型满足）。`remote_index_` / `wait_close_expiry_` 已换
+  `DockBPlusTree_`（值 `()`），`cross_thread_compio` 通过；`bindings_` / `docks_`
+  仍待迁移。验收：lib 371 / inmem 20 / smoke 5 / cross_thread 1。
 
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
@@ -1952,7 +1958,7 @@ value，key 与树结构保持不变。
 | T17 | `bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_` 换 arena 树 | P1.5 | 待做 |
 | T18 | `DockCtx_` 只加 `unbind_requested`；`range` / `range_mut` / `remote_index_.range` 直接替换；`docks_` 的 entry helper | P1.5 | 待做 |
 | T19 | `take_pending_inbound` 改用 `bindings_.range_mut`；不引入侵入链表 | P1.5 | 待做 |
-| T20 | 数据面本地表换 B+；用 `iter_mut` / `range_mut`；range 边界与 `BTreeMap` 对拍 | P4 | 数据面五表完成；registry 四表因 `BPlusTree: !Send` 保留标准库容器（见 §17 0800） |
+| T20 | 数据面本地表换 B+；用 `iter_mut` / `range_mut`；range 边界与 `BTreeMap` 对拍 | P4 | 数据面五表完成；registry 两小表完成（上游已补 `Send`/`Sync`）；`bindings_` / `docks_` 待迁移 |
 | T21 | `reusable_docks_` 去 `VecDeque`；degree / chunk 调优 | P6 | 待做 |
 
 ### F. 清理
