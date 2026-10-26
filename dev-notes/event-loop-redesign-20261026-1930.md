@@ -1675,6 +1675,18 @@ connection/
   4. 验收：lib 371 / inmem 20 / smoke 5 / cross_thread 1 / keepalive 5；
      clippy / format 合规。
 
+- 20261027-0410：**`ChannelHandle` 未裁决 Drop 位化首次尝试回退**（记录，不落地）。
+  1. 尝试：`ChannelHandle::Drop` 只置 `RETIRED` + `HINT_MAIN_RETIRED`；
+     `reap_retired_` 按 `inbound_` 区分发起方（`unreserve_channel_`）/ 响应方
+     （main 发 `REJECT` 后 `release_channel_`）。
+  2. 结果：`mux_unsettled_handle_dual_` 挂起（>60s），回退到 Telegraph 位化
+     （`32d437d`）。
+  3. 下次尝试前先钉住三件事：
+     - 未裁决 Drop 时 `ChanSlot_.msg_main_` / `msg_app_` 的关闭顺序；
+     - `reap_retired_` 锁外 `unreserve_channel_` 与 `handle_request_` 的交互
+       （重入 / hint 丢失）；
+     - 响应方 `REJECT` 与 `release_channel_` 的先后与取消语义。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
