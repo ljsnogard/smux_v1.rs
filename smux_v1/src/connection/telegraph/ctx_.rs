@@ -1,7 +1,6 @@
 use crate::connection::{
     Dock, MuxConnection, TrConnCfg,
     owner_::{TgLenQueue_, TgOwner_},
-    signal_::SessionEvent_,
 };
 
 /// telegraph 端点身份的**共享守卫**：两份克隆（tx / rx）都丢掉时才释放身份。
@@ -78,12 +77,11 @@ where
         if !self.owner_.is_last_strong_ref_() {
             return;
         }
-        let _ = self
-            .conn_
+        // P4：只置位 + raise，由 main 扫描释放（不再投 SessionMailbox_）。
+        self.owner_.set_retired_();
+        self.conn_
             .core_()
-            .reg_()
-            .post_session_event_(SessionEvent_::ReleaseTelegraph {
-                local_dock: self.local_dock_,
-            });
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
     }
 }

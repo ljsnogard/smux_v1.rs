@@ -62,7 +62,7 @@ use crate::{
         dock_binding::map_reserve_err_,
         owner_::TgOwner_,
         ring_::{BufferedRx, BufferedTx, RingBuildErr, new_buffered_channel},
-        signal_::{ReadEvent_, SessionEvent_, WriteEvent_},
+        signal_::{ReadEvent_, WriteEvent_},
     },
     x_deps::{abs_cancel, abs_mm, gen_mcf2},
 };
@@ -355,10 +355,10 @@ where
                 writer_: rx_w,
             });
     if !attached && !cfg!(test) {
-        let _ = conn
-            .core_()
-            .reg_()
-            .post_session_event_(SessionEvent_::ReleaseTelegraph { local_dock: local });
+        rec.set_retired_();
+        conn.core_()
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
         return Result::Err(BindingError::Closed);
     }
 

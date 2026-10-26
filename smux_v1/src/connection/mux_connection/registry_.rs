@@ -1394,9 +1394,6 @@ where
             SessionEvent_::UnbindDock { local_dock } => {
                 self.unbind_dock_(local_dock, cancel).await
             }
-            SessionEvent_::ReleaseTelegraph { local_dock } => {
-                self.release_telegraph_(local_dock, cancel).await
-            }
             SessionEvent_::UnreserveChannel {
                 local_dock,
                 remote_dock,
@@ -1740,16 +1737,25 @@ where
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
-        let mut retired: Vec<Dock> = Vec::new();
+        let mut retired_listeners: Vec<Dock> = Vec::new();
+        let mut retired_telegraphs: Vec<Dock> = Vec::new();
         for (key, binding) in inner.bindings_.iter() {
-            if let BindingSlot_::Listener(rec) = binding
-                && rec.is_retired_()
-            {
-                retired.push(key.0);
+            match binding {
+                BindingSlot_::Listener(rec) if rec.is_retired_() => {
+                    retired_listeners.push(key.0);
+                }
+                BindingSlot_::Telegraph(rec) if rec.is_retired_() => {
+                    retired_telegraphs.push(key.0);
+                }
+                _ => {}
             }
         }
-        for local_dock in retired {
+        for local_dock in retired_listeners {
             inner.bindings_.remove(&listener_key_(local_dock));
+            inner.settle_pending_return_(local_dock);
+        }
+        for local_dock in retired_telegraphs {
+            inner.bindings_.remove(&telegraph_key_(local_dock));
             inner.settle_pending_return_(local_dock);
         }
         Result::Ok(())
@@ -2060,6 +2066,7 @@ where
     /// 解除 [`ChannelRegistry_::reserve_telegraph_`] 的登记；不存在时是空操作。
     ///
     /// 由 `Telegraph` 的 `Drop` 调用。
+    #[cfg_attr(not(test), allow(dead_code, reason = "测试辅助仍直接调用"))]
     pub(crate) async fn release_telegraph_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,

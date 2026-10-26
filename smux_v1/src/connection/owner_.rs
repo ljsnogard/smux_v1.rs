@@ -1293,6 +1293,9 @@ fn unpack_entry_(packed: usize) -> (Dock, usize) {
 /// 应用侧读走的字节数由队列项决定，而不是由环的可读量决定。
 #[derive(Debug, Default)]
 pub(crate) struct TgRec_ {
+    /// `Telegraph` 已被丢弃：main 据此释放 telegraph 身份（P4 的 Drop 位化）。
+    retired_: core::sync::atomic::AtomicBool,
+
     /// **发送**方向：已提交、待成帧发出的条目 `(目的 dock, 长度)`
     /// （应用入队、复用循环出队）。
     ///
@@ -1311,9 +1314,22 @@ pub(crate) struct TgRec_ {
 }
 
 impl TgRec_ {
+    /// 标记 telegraph 端点已被丢弃。
+    pub(crate) fn set_retired_(&self) {
+        self.retired_
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// telegraph 端点是否已被丢弃。
+    pub(crate) fn is_retired_(&self) -> bool {
+        self.retired_
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// 空载荷（登记 telegraph 身份时建立）。
     pub(crate) fn new_() -> Self {
         TgRec_ {
+            retired_: core::sync::atomic::AtomicBool::new(false),
             out_: TgLenQueue_::new_(),
             in_: TgLenQueue_::new_(),
         }

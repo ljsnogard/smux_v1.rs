@@ -1666,6 +1666,15 @@ connection/
   4. 验收：lib 371 / inmem 20 / smoke 5 / cross_thread 1 / keepalive 5；
      clippy / format 合规。
 
+- 20261027-0350：**P4 第二刀：telegraph 的 Drop 位化**。
+  1. `TgRec_` 加 `retired_`；`TelegraphCtxHolder_::drop` 在最后一份强引用时置位 +
+     `HINT_MAIN_RETIRED`（不再投 `SessionEvent_::ReleaseTelegraph`）。
+  2. `reap_retired_` 同时扫描 `bindings_` 的 Listener / Telegraph 变体并释放。
+  3. 删除 `SessionEvent_::ReleaseTelegraph` 与 drain 分支；`endpoint_` 的登记失败
+     回滚也改用 retired 位。
+  4. 验收：lib 371 / inmem 20 / smoke 5 / cross_thread 1 / keepalive 5；
+     clippy / format 合规。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
