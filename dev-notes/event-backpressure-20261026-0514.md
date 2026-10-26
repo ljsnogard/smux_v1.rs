@@ -309,8 +309,11 @@ FIFO。若 `RxConsumed` 先被取出（此时读表还没有该对），事件�
 验证：compio / tokio / smol `--all-targets` 全通过（343 lib + 全部集成；inmem 仍约 1 s
 （compio/smol）/ 15 s（tokio），smoke 11–16 s）。
 
-剩余：ctl 尚未承担 Listener registry 与拆流事务（2c）；`EVENT_CHAN_CAP` 仍是 1024，
-等 `Control` / `TgAttach` 也迁走后再降（2d）。
+**2d：容量下调。** `Attach` 移出后 `EVENT_CHAN_CAP` 从 1024 降到 256（两条通道从
+128 KiB 降到 32 KiB/连接）。256 条并发子流的 `cross_thread_*` 与三后端真实 socket
+`smoke_*` 全部通过。
+
+剩余：ctl 尚未承担 Listener registry 与拆流事务（2c）。
 
 ### 6.1 阶段 0 的接口
 

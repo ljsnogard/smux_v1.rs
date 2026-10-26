@@ -444,11 +444,11 @@ pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;
 ///   [`TrEventSender_::try_send_event_`]，满时丢弃并置「需要全扫」标志，由消费者按
 ///   状态位 / 全表排空重建。
 ///
-/// 因此容量只需覆盖不可重建通知的在途量与可重建提示的突发。首轮取 256，在 256 条
-/// 并发子流的跨线程用例里会满到无法收敛；实测 1024 足够（事件枚举 64 字节，约
-/// 64 KiB/通道），4096 没有再快。详见 `dev-notes/mpmc-chan-20261026-0046.md` §6。
+/// `Attach` 移出到内联 inbox 之后，这条通道只剩控制帧、拆流通知与高频提示；256 在
+/// 256 条并发子流的跨线程用例与三后端 smoke（真实 socket）上均通过。事件枚举 64
+/// 字节，256 容量约 16 KiB/通道（两条共 32 KiB/连接），比原先的 1024 省 96 KiB。
 #[cfg_attr(feature = "chan-flume", allow(dead_code))]
-pub(crate) const EVENT_CHAN_CAP: usize = 1024;
+pub(crate) const EVENT_CHAN_CAP: usize = 256;
 
 /// 会话释放邮箱的容量（同样只是快速路径；满时走自旋锁溢出暂存）。
 #[cfg_attr(feature = "chan-flume", allow(dead_code))]
