@@ -1687,6 +1687,11 @@ connection/
        （重入 / hint 丢失）；
      - 响应方 `REJECT` 与 `release_channel_` 的先后与取消语义。
 
+- 20261027-0440：**P4 前置：`DockCtx_` 泛型化 + `unbind_requested_`**。
+  `DockCtx_<A>` 内嵌 `Shared<AtomicBool, A>`；条目创建时用注册表分配器建一次。
+  bind / unbind 行为不变，`DockBinding` 的 Drop 位化在下一步接入。
+  验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

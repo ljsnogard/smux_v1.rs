@@ -436,7 +436,14 @@ where
 ///
 /// 这里**只**放与「身份种类」无关的量：绑定独占与在册子流计数。身份本身在
 /// `bindings_` 里按键区分（`use_` 之类用途标记已由 `BindingSlot_` 变体承担）。
-struct DockCtx_ {
+struct DockCtx_<A>
+where
+    A: AllocatorClone,
+{
+    /// 绑定方已丢弃：main 据此解绑（P4 的 Drop 位化）。
+    #[allow(dead_code, reason = "P4 DockBinding 位化时读取")]
+    unbind_requested_: Shared<core::sync::atomic::AtomicBool, A>,
+
     /// 该 dock 是否已被某个 [`DockBinding`] **独占绑定**。
     ///
     /// 绑定是**持久**占用：直到 [`ChannelRegistry_::unbind_dock_`] 被调用（即对应
@@ -474,10 +481,17 @@ struct DockCtx_ {
     pending_return_: bool,
 }
 
-impl DockCtx_ {
+impl<A> DockCtx_<A>
+where
+    A: AllocatorClone,
+{
     /// 空条目（未绑定、无子流、不欠归还）。
-    const fn new_() -> Self {
+    fn new_(alloc: A) -> Self {
         DockCtx_ {
+            unbind_requested_: Shared::new(
+                core::sync::atomic::AtomicBool::new(false),
+                alloc,
+            ),
             bound_: false,
             chan_count_: 0usize,
             auto_: false,
@@ -511,7 +525,7 @@ where
     alloc_: A,
 
     /// `local_dock` → dock 级簿记。
-    docks_: BTreeMap<Dock, DockCtx_, A>,
+    docks_: BTreeMap<Dock, DockCtx_<A>, A>,
 
     /// **自动分配曾发出、现已归还、且归还时确实空着**的 dock，**先进先出**，供它优先
     /// 复用。
@@ -694,7 +708,10 @@ where
                 // 入池之后才变脏（见上）：池不做就地摘除，只能消费掉它。
                 continue;
             }
-            let ctx = self.docks_.entry(dock).or_insert_with(DockCtx_::new_);
+            let ctx = self
+                .docks_
+                .entry(dock)
+                .or_insert_with(|| DockCtx_::new_(self.alloc_.clone()));
             ctx.bound_ = true;
             ctx.auto_ = true;
             return Result::Ok(dock);
@@ -707,7 +724,10 @@ where
             if !self.is_free_dock_(dock) {
                 continue;
             }
-            let ctx = self.docks_.entry(dock).or_insert_with(DockCtx_::new_);
+            let ctx = self
+                .docks_
+                .entry(dock)
+                .or_insert_with(|| DockCtx_::new_(self.alloc_.clone()));
             ctx.bound_ = true;
             ctx.auto_ = true;
             return Result::Ok(dock);
@@ -1524,7 +1544,7 @@ where
             let dock = inner
                 .docks_
                 .entry(local_dock)
-                .or_insert_with(DockCtx_::new_);
+                .or_insert_with(|| DockCtx_::new_(inner.alloc_.clone()));
             dock.chan_count_ += 1usize;
             inner.bindings_.insert(
                 (local_dock, remote_dock),
@@ -1875,7 +1895,7 @@ where
         let dock = inner
             .docks_
             .entry(local_dock)
-            .or_insert_with(DockCtx_::new_);
+            .or_insert_with(|| DockCtx_::new_(inner.alloc_.clone()));
         if dock.bound_ {
             return Result::Err(ReserveErr_::DockInUse);
         }
@@ -1931,7 +1951,7 @@ where
                 inner
                     .docks_
                     .entry(local_dock)
-                    .or_insert_with(DockCtx_::new_)
+                    .or_insert_with(|| DockCtx_::new_(inner.alloc_.clone()))
                     .pending_return_ = true;
             } else {
                 inner.reusable_docks_.push_back(local_dock);
