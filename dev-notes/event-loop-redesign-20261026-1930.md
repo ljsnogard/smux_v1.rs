@@ -1731,6 +1731,14 @@ connection/
   `ReadTable_` 与 registry 四表（`bindings_` / `docks_` / `remote_index_` /
   `wait_close_expiry_`）仍待迁移。
 
+- 20261027-0730：**P4 索引迁移：`ReadTable_` 换 2 KiB B+ 树**。
+  `type ReadTable_<A> = DockBPlusTree_<A, (Dock, Dock), ReadEntry_<A>>`；demux 的
+  `get` / `get_mut` 适配 `(&K, &V)`；两表统一后，全部 `table.*(&pair)` 借用改为
+  值键（B+ 树 `Q: Borrow<K>`）。
+  验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
+  registry 四表（`bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_`）
+  仍待迁移。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

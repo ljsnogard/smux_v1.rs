@@ -123,7 +123,7 @@ use core::{
     ptr::NonNull,
     task::{Context, Poll},
 };
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
 
 use abs_buff::{
     Demand, TrBuffRead, TrBuffTryFlush, TrBuffTryWrite, TrBuffWrite,
@@ -371,7 +371,8 @@ where
 /// 用 `BTreeMap` 而不是手写单链表：链表的 `find` / `remove` 是 O(n)，且每次
 /// 增删都要自己用分配器构造 / 释放节点；`BTreeMap` 直接以调用方注入的分配器
 /// （`allocator_api` 的 `new_in`）承担这些分配，查找降到 O(log n)。
-type ReadTable_<A> = BTreeMap<(Dock, Dock), ReadEntry_<A>, A>;
+type ReadTable_<A> =
+    crate::connection::dock_index_::DockBPlusTree_<A, (Dock, Dock), ReadEntry_<A>>;
 
 /// 复用循环的本地表：dock 对 → 该子流的发送环读端与共享状态。
 type WriteTable_<A> =
@@ -645,11 +646,11 @@ where
         };
         cursor = Option::Some(pair);
         let released = table
-            .get(&pair)
-            .map(|entry| entry.owner_.is_released_())
+            .get(pair)
+            .map(|(_, entry)| entry.owner_.is_released_())
             .unwrap_or(false);
         if released
-            && let Option::Some(mut entry) = table.remove(&pair)
+            && let Option::Some(mut entry) = table.remove(pair)
         {
             entry.writer_.close();
         }
@@ -1267,7 +1268,10 @@ pub(crate) async fn demux_loop_async_<C, K>(
 {
     // 表与事件队列都包进收尾守卫（与复用侧对称；理由见 `MuxLocalGuard_`）。
     let mut table: DemuxLocalGuard_<'_, C> = DemuxLocalGuard_ {
-        table: BTreeMap::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token()))),
+        table: crate::connection::dock_index_::DockBPlusTree_::new_in(lock_or_exit_!(
+            shared.reg_.allocator_(cancel.child_token())
+        ))
+        .expect("2 KiB B+ 树足以容纳一个 channel 表项"),
         shared: &shared,
     };
     // telegraph 的读表与 channel 分开持有：主循环在自查「哪些端点已被释放」时既要读
@@ -1550,7 +1554,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
         match kind {
             FrameKind::Data => {
                 let amount = Credit::try_from(len).unwrap_or(Credit::MAX);
-                let Some(entry) = table.get_mut(&pair) else {
+                let Some((_, entry)) = table.get_mut(pair) else {
                     // 本地表里没有这条子流，分两种情况：
                     //
                     // - 该 dock 对刚被拆掉（**宽限态**）：这是拆流竞态里对端在收到
@@ -1656,7 +1660,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 }
             }
             FrameKind::Accept | FrameKind::Reject => {
-                if table.get(&pair).is_some() {
+                if table.get(pair).is_some() {
                     let (head, head_len) = match encode_header_(&header) {
                         Result::Ok(value) => value,
                         Result::Err(err) => {
@@ -1680,7 +1684,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
             }
             FrameKind::Close => {
                 let reset = header.flags() & flags::K_RESET != 0;
-                if let Option::Some(entry) = table.get_mut(&pair) {
+                if let Option::Some((_, entry)) = table.get_mut(pair) {
                     if reset {
                         // 对端宣告**不再接收**：收尾的是**本端的发送方向**，与本端
                         // 接收方向无关。因此**不**关接收环写端——那会把对端仍在途、
@@ -1728,7 +1732,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 }
             }
             FrameKind::WindowUpdate | FrameKind::Pulse => {
-                if let Option::Some(entry) = table.get(&pair)
+                if let Option::Some((_, entry)) = table.get(pair)
                     && let Option::Some(report) = window_report_of_(&header)
                 {
                     let owner = entry.owner_.clone();
@@ -1878,7 +1882,7 @@ where
         cursor = Option::Some(pair);
 
         // 先取快照再 awaits：`entry` 的借用不能跨 `await`。
-        let Option::Some((owner, buffered)) = table.get(&pair).map(|entry| {
+        let Option::Some((owner, buffered)) = table.get(pair).map(|(_, entry)| {
             (
                 entry.owner_.clone(),
                 entry.writer_.ring_state().data_size(),
@@ -1927,7 +1931,7 @@ where
             remote_dock,
         } => {
             let pair = (local_dock, remote_dock);
-            let Some(entry) = table.get_mut(&pair) else {
+            let Some((_, entry)) = table.get_mut(pair) else {
                 // 表里没有这条子流：附加事件还没到（或已被 Release 摘掉），
                 // 本次通知已无对象，直接丢弃。
                 return Result::Ok(());
