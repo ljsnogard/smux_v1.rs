@@ -517,6 +517,11 @@ where
 {
     let cancel_fut = cancel.child_token().cancellation();
     let mut cancel_fut = pin!(cancel_fut);
+    // `mpmc_chan` 的 `RecvAsync` 是参数载体（实现 `IntoFuture`），不是 `Future`：
+    // 先转成 future 再 `pin`，以便跨 poll 持有它的唤醒登记；本次 park 内复用同一份。
+    let mut request_fut = pin!(core::future::IntoFuture::into_future(
+        ctl.recv_request_async_()
+    ));
     let mut taken: Option<MainWake_<C::Alloc>> = None;
     poll_fn(|cx| {
         if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
@@ -527,13 +532,18 @@ where
             taken = Some(MainWake_::RxReady);
             return Poll::Ready(());
         }
-        match ctl.poll_pop_request_(cx) {
-            Poll::Ready(Some(request)) => {
+        // 快路径：通道里已有请求就直接取，避免空通道时 `recv` future 先做有界自旋。
+        if let Option::Some(request) = ctl.try_pop_request_() {
+            taken = Some(MainWake_::Request(request));
+            return Poll::Ready(());
+        }
+        match core::future::Future::poll(request_fut.as_mut(), cx) {
+            Poll::Ready(Result::Ok(request)) => {
                 taken = Some(MainWake_::Request(request));
                 return Poll::Ready(());
             }
-            // 队列关闭：连接收尾。
-            Poll::Ready(None) => return Poll::Ready(()),
+            // 通道关闭：连接收尾。
+            Poll::Ready(Result::Err(_)) => return Poll::Ready(()),
             Poll::Pending => {}
         }
         if let Poll::Ready(bits) = ctl.poll_main_hint_(cx) {

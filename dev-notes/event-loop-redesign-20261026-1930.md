@@ -1825,6 +1825,25 @@ connection/
   7. P4 剩余：`PendingFin_` → `TX_DRAINED` 位 + main 发 `CLOSE(FIN)`（与 §8.1 / T1
      绑定，属于关闭状态机主体迁移）。
 
+- 20261027-1400：**P5 第一步：请求队列换 `mpmc_chan`（Arena 等待队列）**。
+  1. 背景：`InlineQueue_::free_waiters_: Vec<Waker>` 的等待者集合无上界；定容
+     `WakerSlots_` 方案需要 `Busy` 契约，而「单连接并发建流数」没有依据。改用
+     `mpmc_chan`：等待者逻辑无界，物理上是 chunked `SlabList`（4 KiB chunk），
+     节点复用、取消/丢弃时归还 slab，不反复触碰全局分配器。
+  2. `ControlState_.requests_` 从 `InlineQueue_<MainRequest_, 64>` 换成
+     `mpmc_chan::{Sender, Receiver}`；通道的外层 `Arc` 与等待 chunk 都用**连接
+     分配器**（`ControlChanCfg_` 的 `ChanAlloc = A`），不落全局堆。
+  3. `park_main_` 改为在 `poll_fn` 外 `into_future` + `pin` 一个 `RecvFuture`
+     跨 poll 持有（`RecvAsync` 是参数载体，不是 `Future`）；快路径先
+     `try_pop_request_`，避免空通道时 `recv` 先做 512 次自旋。
+  4. `poll_pop_request_` 删除；`close_requests_` 改用 `Receiver::close`（此后
+     `send` 返回 `Closed`，`try_recv` 仍可 drain）。`Get`/`Cancelled` 映射回
+     `PushErr_`，调用方语义不变。
+  5. 验收：lib 373 / inmem 20 / cross_thread 1（256 并发无 Busy、无挂起）/
+     smoke 5 / keepalive 5；clippy 0 error；format 合规。
+  6. 剩余：`mux_inbox_` / `demux_inbox_` 两条 `Attach` inbox 仍是 `InlineQueue_`，
+     下一步同样替换；`WakerSlots_` 方案（T22）据此搁置——请求队列已不需要它。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2010,7 +2029,7 @@ value，key 与树结构保持不变。
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | P0 完成 |
-| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 除 `TakeInbound`/`Close`/`OpenTelegraph` 外完成（`Accept`/`Reject` 见 P3.2） |
+| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 除 `TakeInbound`/`Close`/`OpenTelegraph` 外完成（`Accept`/`Reject` 见 P3.2）；队列已换 `mpmc_chan`（P5，等待者用 Arena slab，不再需要 `WakerSlots_`） |
 | T11 | `MainReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | 待做 |
 
 ### D. 建流期 message ring
@@ -2037,7 +2056,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；`WakerSlots_` 待 P5 替换；`PendingFin_` 待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
+| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列的等待者已改由 `mpmc_chan` 的 Arena 等待队列承担（P5，`WakerSlots_` 搁置）；`PendingFin_` 待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` / `util_` 待 P5 |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 
