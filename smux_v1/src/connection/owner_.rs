@@ -44,7 +44,7 @@
 //! | --- | --- | --- |
 //! | `active_millis_` | 任何 `touch_` / `mark_data_` 调用点（热路径，每帧一次） | 最近一次活动（存活时钟） |
 //! | `data_millis_` | 任何 `mark_data_` 调用点 + 计时循环发 `PULSE` 时 | 最近一次非保活活动（保活职责时钟） |
-//! | `abort_` | **只有计时循环**（一次 CAS 认领） | 中止代码，见 [`AbortCode_`] |
+//! | `flags_` 的 bit 16-17 | **只有计时循环**（一次 CAS 认领） | 中止代码，见 [`AbortCode_`] |
 //!
 //! 两个时钟分开是**保活能否收敛**的前提：收到对端 `PULSE` 只刷新存活时钟，
 //! 因此两端都会按自己的职责时钟继续发 `PULSE`（若合一，两端会互相把对方的保活
@@ -62,7 +62,7 @@
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -134,7 +134,7 @@ const GRACEFUL_FIN_REQUESTED: usize = 1usize << 14usize;
 /// 建流是否已**裁决完毕**（本端 `accept` / `reject` 收尾）。
 ///
 /// 计时循环据此区分同一根存活时钟上的两类到点（见 `TimerAction_`）：
-/// - **未裁决** ⇒ 建流超时：向对端发 `REJECT`、释放身份、把原因留在 `abort_` 上；
+/// - **未裁决** ⇒ 建流超时：向对端发 `REJECT`、释放身份、把中止代码写进状态字；
 /// - **已裁决** ⇒ 活跃子流空闲超时：`CLOSE(FIN)` + `CLOSE(RESET)` 拆流。
 const ESTABLISH_SETTLED: usize = 1usize << 13usize;
 
@@ -145,6 +145,18 @@ const ESTABLISH_SETTLED: usize = 1usize << 13usize;
 /// 成功返回之后置位，因此它是
 /// [`TrChannelRx::close_async`](abs_smux::chan::TrChannelRx::close_async) 的完成判据。
 const LOCAL_RESET_FLUSHED: usize = 1usize << 15usize;
+
+/// 中止代码在位域里的位移与掩码（2 位，够 `AbortCode_` 的 3 个取值）。
+///
+/// 它原本是一个独立的 `AtomicU8`；中止代码只由计时循环认领、只被 `is_aborted_`
+/// 读，因此并进同一个状态字，省掉每子流一个原子。
+const ABORT_SHIFT: usize = 16usize;
+const ABORT_MASK: usize = 0b11usize << ABORT_SHIFT;
+
+/// 从状态字里取出中止代码。
+fn abort_of_(value: usize) -> u8 {
+    ((value & ABORT_MASK) >> ABORT_SHIFT) as u8
+}
 
 /// 测试某个位。
 fn has_flag_(value: usize, flag: usize) -> bool {
@@ -203,7 +215,7 @@ pub(crate) enum EstablishOutcome_ {
 /// （[`ChannelState_::claim_abort_`]）并通过 [`ChannelState_::abort_reason_`] 回传给
 /// 应用侧的两个半部（[`ChannelTx::abort_reason`](super::ChannelTx::abort_reason)）。
 ///
-/// 存成 `AtomicU8` 而不是把 `MuxError` 塞进原子：`MuxError` 是普通的 `Copy` 枚举，
+/// 存成状态字里的两位而不是把 `MuxError` 塞进原子：`MuxError` 是普通的 `Copy` 枚举，
 /// 没有稳定的整数表示，直接把它的位模式存下来会随编译选项变化。这里只存一个
 /// **代码**，读出来时再映射成 [`MuxError`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,13 +415,10 @@ pub(crate) struct ChannelState_ {
     /// 被判 `IdleTimeout` 的恰好是先发出 `PULSE` 的那一侧）。
     data_millis_: AtomicU64,
 
-    /// 中止代码：[`AbortCode_::NONE`] 表示未中止（见 [`AbortCode_`]）。
-    abort_: AtomicU8,
-
     /// **不可忽略通知**槽：`0` = 无，否则是 [`ChannelNotice`] 的编码。
     ///
-    /// 与 [`ChannelState_::abort_`] 分开的理由见 [`ChannelNotice`]；这里只补两条实现
-    /// 上的理由：
+    /// 与状态字里的中止代码（bit 16-17）分开的理由见 [`ChannelNotice`]；这里只补
+    /// 两条实现上的理由：
     ///
     /// - **无锁、零分配**：应用可能在任意线程、甚至在非异步上下文里读它（`Closing`
     ///   也能从非阻塞接口拿到），而连接级失败路径可能在 `Drop` 的调用栈里写它；
@@ -447,7 +456,6 @@ impl ChannelState_ {
             created_millis_: AtomicU64::new(0u64),
             active_millis_: AtomicU64::new(0u64),
             data_millis_: AtomicU64::new(0u64),
-            abort_: AtomicU8::new(AbortCode_::NONE),
             notice_: AtomicU32::new(K_NOTICE_NONE),
             tx_progress_: NotifySlot_::new_(),
             rx_progress_: NotifySlot_::new_(),
@@ -556,14 +564,12 @@ impl ChannelState_ {
     /// 但**原因必须在动作之前就位**——应用可能在任何一次唤醒之后立刻读它。
     pub(crate) fn claim_abort_(&self, code: AbortCode_) -> bool {
         let claimed = self
-            .abort_
-            .compare_exchange(
-                AbortCode_::NONE,
-                code.as_u8_(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
+            .flags_
+            .try_spin_compare_exchange_weak(
+                |value| abort_of_(value) == AbortCode_::NONE,
+                |value| (value & !ABORT_MASK) | ((code.as_u8_() as usize) << ABORT_SHIFT),
             )
-            .is_ok();
+            .is_succ();
         if claimed {
             let notice = match code {
                 AbortCode_::IdleTimeout => ChannelNotice::IdleTimeout,
@@ -576,7 +582,7 @@ impl ChannelState_ {
 
     /// 本子流是否已被中止（计时循环判定空闲超时后为真）。
     pub(crate) fn is_aborted_(&self) -> bool {
-        self.abort_.load(Ordering::Acquire) != AbortCode_::NONE
+        abort_of_(self.flags_.value()) != AbortCode_::NONE
     }
 
     /// 发布一条**不可忽略通知**；规则是「只升级、不降级」，同优先级首个生效。
@@ -696,8 +702,7 @@ impl ChannelState_ {
     ///
     /// 返回值给应用侧半部做**幂等去重**：`drop` 与显式
     /// [`close`](abs_buff::TrBuffTryFlush::close) 都会走到这里，而「排空 + 发 `FIN`」
-    /// 的收尾事件只能投递一次——若第二条事件在表项已被摘掉之后到达，写循环会把它
-    /// 重新登记进「欠一条 `FIN`」的集合，留下一个永远查不到表项的僵尸条目。
+    /// 的收尾提示只需发一次——重复置位虽幂等，但会让写循环多做一轮扫描。
     pub(crate) fn set_app_tx_closed_(&self) -> bool {
         self.flags_
             .try_spin_compare_exchange_weak(
@@ -705,6 +710,11 @@ impl ChannelState_ {
                 |value| value | APP_TX_CLOSED,
             )
             .is_succ()
+    }
+
+    /// 应用是否已丢弃发送半边（写循环扫描收尾事实时用）。
+    pub(crate) fn is_app_tx_closed_(&self) -> bool {
+        has_flag_(self.flags_.value(), APP_TX_CLOSED)
     }
 
     /// 认领「连接（优雅关闭）请求这条子流**排空并收尾**」：首次调用返回 `true`。
@@ -717,9 +727,9 @@ impl ChannelState_ {
     ///
     /// # 认领之后发生什么
     ///
-    /// 调用方（计时循环）投一条 [`WriteEvent_::TxClosed`](super::signal_::WriteEvent_)
-    /// 给复用循环；那条路径与应用自己 `drop(tx)` 完全同形——**排空发送环之后**才发
-    /// `CLOSE(FIN)`（`FIN` 绝不越过未上网的数据，见 `crate::connection` §7.0）。
+    /// 调用方（计时循环）置上应用侧的 `APP_TX_CLOSED` 位并唤醒复用循环；那条路径与
+    /// 应用自己 `drop(tx)` 完全同形——**排空发送环之后**才发 `CLOSE(FIN)`（`FIN` 绝不
+    /// 越过未上网的数据，见 `crate::connection` §7.0）。
     /// 本方法只置位，**不**改 `APP_TX_CLOSED`：应用手里那份 `ChannelTx` 的行为由既有
     /// 路径决定（排空完成后消费端被关闭，写入随即报「发送方向已关闭」）。
     pub(crate) fn claim_graceful_fin_(&self) -> bool {
@@ -870,10 +880,24 @@ impl ChannelState_ {
             .is_succ()
     }
 
-    /// 身份是否已经认领释放（诊断用）。
-    #[cfg(test)]
+    /// 身份是否已经认领释放。
+    ///
+    /// 读循环按它摘掉本地读表并关闭接收环写端（释放提示只负责唤醒，事实是这个位）。
     pub(crate) fn is_released_(&self) -> bool {
         has_flag_(self.flags_.value(), RELEASED)
+    }
+
+    /// **强制**标记身份已释放（计时循环的空闲拆流路径专用）。
+    ///
+    /// 该路径直接调 `release_channel_` 把身份转成宽限态，不走 [`ChannelState_::claim_release_`]
+    /// 的「两个方向都收尾」判据（空闲超时恰恰是应用没有收尾）。读循环仍需要
+    /// `RELEASED` 这个事实来摘本地读表，因此这里补一次置位；之后任何
+    /// `claim_release_` 都会因位已置而失败，不会重复释放。
+    pub(crate) fn mark_released_(&self) {
+        let _ = self.flags_.try_spin_compare_exchange_weak(
+            |value| !has_flag_(value, RELEASED),
+            |value| value | RELEASED,
+        );
     }
 
     //-- ---- 锁外去重位 ----

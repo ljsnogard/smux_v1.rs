@@ -9,11 +9,9 @@
 //!
 //! - [`WriteEvent_`] → **写循环**：会话侧发送环读端上线（
 //!   [`WriteEvent_::Attach`]）、待写出的控制帧（[`WriteEvent_::Control`]）、
-//!   「某条子流发送环有数据」（[`WriteEvent_::TxReady`]）、拆流（`TxClosed` /
-//!   `RxClosed` / `PeerClosed`）；
+//!   「某条子流发送环有数据」（[`WriteEvent_::TxReady`]）、拆流（`LocalAbort`）；
 //! - [`ReadEvent_`] → **读循环**：会话侧接收环写端上线（[`ReadEvent_::Attach`]）、
-//!   拆流（[`ReadEvent_::Release`]）、「应用取走了数据，去看看接收水位」
-//!   （[`ReadEvent_::RxConsumed`]）。
+//!   「应用取走了数据，去看看接收水位」（[`ReadEvent_::RxConsumed`]）。
 //!
 //! # 两条水位通知的方向**刻意不同**
 //!
@@ -30,13 +28,21 @@
 //!    只置一个「需要全扫」标志并唤醒消费者。写循环的排空本来就是全表扫描，读循环的
 //!    `rescan_read_` 则按 `RX_CONSUMED` 位 + 环内积压重算窗口。这些事件的信息量只是
 //!    「可能变了」，状态位才是事实来源。
-//! 2. **不可重建的一次性通知**（`Attach` / `Control` / `TgAttach` / `TxClosed` /
-//!    `RxClosed` / `PeerClosed` / `LocalAbort` / `Release` / `TgTxClosed`）：环满时
+//! 2. **不可重建的一次性通知**（`Attach` / `Control` / `TgAttach` / `LocalAbort` /
+//!    `TgTxClosed`）：环满时
 //!    推进 [`Overflow_::durable_`] 暂存（自旋锁 FIFO），消费者下次取事件时先取它。
 //!    它们携带环半部句柄、控制帧或一次性拆流决定，丢了就真的无法可靠恢复。
 //!
 //! 这样正常路径只走定容环与一次原子读；全扫只在环满的极端情况下发生。`chan-flume`
 //! 后端是无界通道，两条兜底路径都不会被触发（保留它是为了同一提交内 A/B 对比）。
+//!
+//! # 拆流通知正在位化（2026-10-26）
+//!
+//! `TxClosed` / `RxClosed` / `PeerClosed` / `Release` 已不再走事件通道：收尾事实在
+//! `owner_::ChannelState_` 的状态字（`APP_*` / `PEER_*` / `RELEASED`），生产者只
+//! `raise_` 一个合并提示（`HINT_W_*` / `HINT_R_*`），对应循环醒来后按表扫描并推进
+//! `finalize` / `RESET` / 摘表。这样共享队列里少了每子流四条消息，也不再需要在「满」
+//! 时暂存它们。`LocalAbort` 仍走事件通道（它还要精确摘写侧表项）。
 //!
 //! # 为什么不是一条通道
 //!
@@ -198,25 +204,9 @@ where
         remote_dock: Dock,
     },
 
-    /// 应用丢弃了发送半边：写循环排空剩余数据后发 `CLOSE(FIN)`。
-    TxClosed {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-    },
-
-    /// 应用丢弃了接收半边：写循环发 `CLOSE(RESET)` 并让读循环关掉接收环。
-    RxClosed {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-    },
-
     /// **本端计时循环**判定空闲超时：放弃该子流的发送方向、摘掉本地表项。
     ///
-    /// 与 [`WriteEvent_::PeerClosed`]（对端发来 `CLOSE`）的区别是**谁有权关闭发送环的
+    /// 与「对端发来 `CLOSE`」那条路径的区别是**谁有权关闭发送环的
     /// 消费端**：本端主动拆流时没有别的执行者会去关它，因此写循环在这里显式
     /// `close()`，应用侧才会立刻看到发送方向已关闭（`is_rx_closed()` 为真、写入返回
     /// `Closing`）。对端 `RESET` 那条路径**不**关——协议只要求「允许放弃已提交字节」，
@@ -227,16 +217,6 @@ where
         local_dock: Dock,
         /// 对端 dock。
         remote_dock: Dock,
-    },
-
-    /// 对端发来 `CLOSE`：读循环已处理完帧面状态，通知写循环推进拆流记账。
-    PeerClosed {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-        /// 是否为 `RESET`（对端不再接收）而非 `FIN`（对端不再发送）。
-        reset_: bool,
     },
 
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -291,14 +271,6 @@ where
         owner: ChannelOwner_<A>,
         /// 会话侧接收环写端（本循环写、应用读）。
         writer_: BufferedTx,
-    },
-
-    /// 释放一条子流：读循环丢弃本地表项。
-    Release {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
     },
 
     /// 应用从接收环取走了数据：**接收窗口的账面水位可能变了**。
@@ -389,6 +361,27 @@ pub(crate) enum SessionEvent_ {
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 通道
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 合并提示的位定义
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 「应用已丢弃发送半边」：写循环据此在发送环排空后补 `CLOSE(FIN)`。
+///
+/// 事实本身记在 `owner_::ChannelState_` 的 `APP_TX_CLOSED` 位；这一位只是**唤醒**
+/// 写循环的提示，重复置位幂等。
+pub(crate) const HINT_W_TX_CLOSED: u64 = 1u64 << 0usize;
+
+/// 「应用已丢弃接收半边」：写循环据此发 `CLOSE(RESET)` 并关闭接收环。
+pub(crate) const HINT_W_RX_CLOSED: u64 = 1u64 << 1usize;
+
+/// 「对端发来 `CLOSE`」：写循环据此丢弃发送方向 / 推进身份释放。
+///
+/// `FIN` 与 `RESET` 的事实同样在各子流状态字（`PEER_FIN` / `PEER_RESET`）上。
+pub(crate) const HINT_W_PEER_CLOSED: u64 = 1u64 << 2usize;
+
+/// 「身份已释放」：读循环据此摘掉接收表项并关闭接收环写端。
+pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;
 
 /// 定容事件通道的容量（`mpmc_chan` 要求 2 的幂且 `>= 2`）。
 ///

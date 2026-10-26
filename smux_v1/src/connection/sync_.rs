@@ -73,7 +73,7 @@ use atomex::StrictOrderings;
 // 便于在调用点直接声明 `let mut session = reg.lock_session_();`）。
 use atomic_sync::{
     mutex::preemptive::SpinningMutexOwned,
-    rwlock::cooperative::{CooperativeAcqSession, ReaderGuard, WriterGuard},
+    rwlock::cooperative_arena::{CooperativeAcqSession, ReaderGuard, WriterGuard},
 };
 use mm_ptr::Shared;
 
@@ -154,33 +154,96 @@ where
 /// 令牌的入口全是**同步**的：[`TrCancellationToken::is_cancelled`] 可以从任意线程
 /// 调用，[`TrCancellationToken::cancellation`] 的 future 在 `poll` 里登记等待——
 /// 同步入口里没有 `await`，套一把「可异步获取」的锁也解决不了等待问题。因此这里
-/// 用「原子标志 + 零分配通知槽」：
+/// 用「一个原子位 + 一个 waker 槽」：
 ///
 /// - 取消状态是一个 `AtomicBool`，`is_cancelled()` 就是一次原子读（循环热路径不取锁）；
-/// - 唤醒走 [`NotifySlot_`]：`cancel_` 置位后 `notify_`，等待方在 `poll` 里
-///   「先查原子标志、再登记 waker」。
+/// - 唤醒只需要一个 waker 槽：`cancel_` 置位后取走 waker 并 `wake`，等待方在 `poll`
+///   里「先查原子标志、再登记 waker、再复检」。
 ///
-/// 槽是**持久**的，因此「先取消、后登记」不会丢唤醒：等待 future 每次 poll 先查
-/// 原子标志，已取消就直接就绪。
+/// 取消位是**持久**的，因此「先取消、后登记」不会丢唤醒：等待 future 每次 poll 先查
+/// 原子标志，已取消就直接就绪。原实现另有一个「通知 pending」位，但对取消语义是
+/// 冗余的（每次 poll 都先查取消位）；合并后取消令牌只剩**一个**原子、**一次**分配。
 ///
 /// # 单等待者
 ///
-/// 通知槽只保存一个 waker，因此假定**同一个令牌在同一时刻至多一个等待者**（本 crate
-/// 的用法：每个循环一个令牌，一次只 `await` 一处）。这与 [`NotifySlot_`] 的前提一致。
+/// waker 槽只保存一个 waker，因此假定**同一个令牌在同一时刻至多一个等待者**（本 crate
+/// 的用法：每个循环一个令牌，一次只 `await` 一处）。
 pub(crate) struct CancelToken_<A>
 where
     A: AllocatorClone,
 {
-    /// 取消标志（走原子，读侧无锁）。
-    cancelled_: Shared<AtomicBool, A>,
+    /// 取消位 + 等待者槽，**同一次分配**。
+    shared_: Shared<CancelShared_, A>,
+}
 
-    /// 持久通知槽：`cancel_` 置位并唤醒，`cancellation()` 在它上面 park。
-    ///
-    /// 取消信号只需要「持久 + 单等待者」这一条语义，不需要队列。用零分配的自旋槽
-    /// （[`NotifySlot_`]）比容量 1/2 的通道更轻：`cancel_` 只是一次原子置位 + 唤醒，
-    /// 等待侧也不必每次 park 都进入通道的慢路径。`Shared` 的这一次分配与
-    /// `cancelled_` 同源、每令牌一次。
-    notify_: Shared<NotifySlot_, A>,
+/// 取消令牌的共享内核。
+///
+/// 取消信号只需要「持久位 + 单等待者」这一条语义：`cancelled_` 是持久位，`waker_`
+/// 是唯一的等待者槽。原实现把「取消位」与「通知槽的 pending 位」分成两个
+/// `AtomicBool`、两次 `Shared` 分配；但等待方每一轮都先查取消位，通知位对取消
+/// 语义是冗余的——合并后只剩一个原子与一次分配。
+struct CancelShared_ {
+    /// 已取消（持久）。
+    cancelled_: AtomicBool,
+
+    /// 唯一等待者的 waker 槽（零分配自旋锁保护）。
+    waker_: SpinningMutexOwned<Option<Waker>>,
+}
+
+impl CancelShared_ {
+    /// 未取消、无等待者。
+    fn new_() -> Self {
+        CancelShared_ {
+            cancelled_: AtomicBool::new(false),
+            waker_: SpinningMutexOwned::new_owned(Option::None),
+        }
+    }
+
+    /// 在 waker 槽锁下访问内容。
+    fn with_waker_<R>(&self, f: impl FnOnce(&mut Option<Waker>) -> R) -> R {
+        let mut session = self.waker_.lock_session();
+        let mut guard = session
+            .lock()
+            .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
+        f(&mut guard)
+    }
+
+    /// 是否已取消。
+    fn is_cancelled_(&self) -> bool {
+        self.cancelled_.load(Ordering::Acquire)
+    }
+
+    /// 触发取消：第一次置位者取走 waker 并唤醒。
+    fn cancel_(&self) {
+        if self.cancelled_.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let waker = self.with_waker_(|slot| slot.take());
+        if let Option::Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// 等取消：先查持久位 → 登记 waker → 复检。
+    fn poll_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.is_cancelled_() {
+            return Poll::Ready(());
+        }
+        self.with_waker_(|slot| {
+            let replace = match slot.as_ref() {
+                Option::Some(old) => !old.will_wake(cx.waker()),
+                Option::None => true,
+            };
+            if replace {
+                *slot = Option::Some(cx.waker().clone());
+            }
+        });
+        if self.is_cancelled_() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 impl<A> Clone for CancelToken_<A>
@@ -189,8 +252,7 @@ where
 {
     fn clone(&self) -> Self {
         CancelToken_ {
-            cancelled_: self.cancelled_.clone(),
-            notify_: self.notify_.clone(),
+            shared_: self.shared_.clone(),
         }
     }
 }
@@ -202,19 +264,13 @@ where
     /// 用调用方注入的分配器建立令牌（未取消）。
     pub(crate) fn new_(alloc: A) -> Self {
         CancelToken_ {
-            cancelled_: Shared::new(AtomicBool::new(false), alloc.clone()),
-            notify_: Shared::new(NotifySlot_::new_(), alloc),
+            shared_: Shared::new(CancelShared_::new_(), alloc),
         }
     }
 
-    /// 触发取消：置位并投一条通知（幂等）。
-    ///
-    /// 只有**第一次**置位者投通知，因此重复取消不会在通道里堆积消息。
+    /// 触发取消：置位并唤醒等待者（幂等）。
     pub(crate) fn cancel_(&self) {
-        if !self.cancelled_.swap(true, Ordering::AcqRel) {
-            // 通知槽是**持久**的：「先取消、后登记」不会丢（见 `NotifySlot_` 协议）。
-            self.notify_.notify_();
-        }
+        self.shared_.cancel_();
     }
 }
 
@@ -227,7 +283,7 @@ where
     type ChildToken = Self;
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled_.load(Ordering::Acquire)
+        self.shared_.is_cancelled_()
     }
 
     fn can_be_cancelled(&self) -> bool {
@@ -239,25 +295,9 @@ where
     }
 
     /// 等待取消的 future。
-    ///
-    /// 它是 async 块（而不是手写 `poll`），因为 `recv_async()` 的 future 要借用
-    /// 消费端并**跨 poll 存活**——手写 `poll` 里临时建、出 `poll` 就丢，会在
-    /// 「登记后、消息到达前」丢掉唤醒。
     fn cancellation(self) -> Self::Cancellation {
         async move {
-            if self.is_cancelled() {
-                return;
-            }
-            // 通知槽是持久的：上面的原子检查与这里的登记之间发生的取消，`pending_`
-            // 已经置位，`poll_wait_` 会立即就绪；登记之后发生的取消会走 waker 唤醒。
-            // 每一轮 poll 都先复检原子标志，因此不依赖「消息恰好被这一条 future 取到」。
-            core::future::poll_fn(|cx| {
-                if self.is_cancelled() {
-                    return Poll::Ready(());
-                }
-                self.notify_.poll_wait_(cx)
-            })
-            .await;
+            core::future::poll_fn(|cx| self.shared_.poll_(cx)).await;
         }
     }
 }
@@ -390,7 +430,7 @@ mod tests_ {
         task::Wake,
     };
 
-    use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
+    use atomic_sync::rwlock::cooperative_arena::CooperativeRwLockOwned;
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
     use super::*;

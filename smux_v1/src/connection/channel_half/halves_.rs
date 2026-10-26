@@ -57,7 +57,9 @@ use crate::{
         // config_::TrMuxAllocConfig,
         owner_::ChannelOwner_,
         session_::race_cancel_,
-        signal_::{ReadEvent_, TrEventSender_, WriteEvent_},
+        signal_::{
+            HINT_W_RX_CLOSED, HINT_W_TX_CLOSED, ReadEvent_, TrEventSender_, WriteEvent_,
+        },
     },
     flow_ctrl::Credit,
     x_deps::{abs_buff, abs_cancel, abs_smux, anylr, buffex, gen_mcf2},
@@ -316,18 +318,16 @@ where
     ///
     /// [`BufferedTx`] 的 `close` 本身幂等；协议侧那一次「排空 + 发 `FIN`」的**投递**
     /// 用 `ChannelState_::set_app_tx_closed_` 的首次置位去重。少了这层去重，第二条
-    /// `TxClosed` 会在写循环的表项已被摘掉之后重新登记一个「欠一条 `FIN`」的僵尸条目
+    /// 收尾提示会在写循环的表项已被摘掉之后重新登记一个「欠一条 `FIN`」的僵尸条目
     /// （`pending_fin` 里永远查不到表项的那一条）。
     fn seal_tx_(&mut self) {
         self.ring_.close();
         if self.owner_.set_app_tx_closed_() {
-            let _ = self
-                .conn_
+            // 收尾事实已经在状态字上；这里只唤醒写循环，不再逐条投事件。
+            self.conn_
                 .core_()
-                .w_events_()
-                .try_send_durable_event_(WriteEvent_::TxClosed {
-                    local_dock: self.local_dock_,
-                    remote_dock: self.remote_dock_});
+                .reg_()
+                .raise_write_hint_(HINT_W_TX_CLOSED);
         }
     }
 
@@ -480,7 +480,7 @@ where
         Result::Ok(())
     }
 
-    /// **同步封口**：等价于 [`ChannelTx::seal_tx_`]（关生产端 + 首次投递 `TxClosed`）。
+    /// **同步封口**：等价于 [`ChannelTx::seal_tx_`]（关生产端 + 首次置位并提示写循环）。
     /// 幂等，因此调用者不必区分「已经 `drop` 过」还是「第一次 `close`」。
     #[inline]
     fn close(&mut self) -> Result<(), Self::Err> {
@@ -692,13 +692,11 @@ where
     fn seal_rx_(&mut self) {
         self.ring_.close();
         if self.owner_.set_app_rx_closed_() {
-            let _ = self
-                .conn_
+            // 同 `seal_tx_`：位是事实，提示只负责唤醒。
+            self.conn_
                 .core_()
-                .w_events_()
-                .try_send_durable_event_(WriteEvent_::RxClosed {
-                    local_dock: self.local_dock_,
-                    remote_dock: self.remote_dock_});
+                .reg_()
+                .raise_write_hint_(HINT_W_RX_CLOSED);
         }
     }
 
@@ -1279,7 +1277,7 @@ mod tests_ {
     /// - 手段：先调同步 `close`，读出状态字里的首置位（应当已经置上）；再调一次
     ///   `close`，最后丢弃发送半边。
     /// - 判断：第二次读首置位为 `false`（说明第一次已经置位、且不会重复投递
-    ///   `TxClosed`）；重复 `close` 与随后的 `drop` 都不失败。
+    ///   收尾提示）；重复 `close` 与随后的 `drop` 都不失败。
     async fn tx_close_is_idempotent_across_drop() {
         let (mut tx, _rx) = make_halves_();
 
@@ -1289,7 +1287,7 @@ mod tests_ {
             "封口位应当已经由首次 close 置上"
         );
         TrBuffTryFlush::close(&mut tx).expect("重复封口应当幂等成功");
-        // `drop` 走同一套收尾：这里只需不 panic，且不再产生第二条 `TxClosed`。
+        // `drop` 走同一套收尾：这里只需不 panic，且不再产生第二条收尾提示。
         drop(tx);
     }
     multi_art_test_!(tx_close_is_idempotent_across_drop);

@@ -24,7 +24,7 @@
 //!
 //! - **帧解析需要的字节数无法用一次 await 表达**：帧头是自描述字段序列，载荷长度到
 //!   解析完才揭晓；一旦传输端长时间没有足够字节，循环就只能挂在传输上，事件通道里的
-//!   `Attach` / `TxClosed` 全部滞留在队列里；
+//!   `Attach` 等一次性通知全部滞留在队列里；
 //! - **写路线上的「写到一半」状态无法与合作式取消共存**：成帧写进环是可重试的短操作，
 //!   而写进**设备**是可能长期 park 的操作（对端不读时）；
 //! - **批量化**：一次网络读装载整段、一次写交出连续段，把系统调用次数与帧数解耦。
@@ -82,7 +82,7 @@
 //! - 复用循环：无数据可发时优先 park 在**最近一次收到 `TxReady` 的那条发送环**上
 //!   （Q4 裁决的兜底，覆盖「应用还没提交就发了事件」的竞态），否则 park 在事件
 //!   通道上。**这些 park 都必须同时与事件通道 / 取消令牌竞争**：只 park 在环上
-//!   会让别的子流刚入队的事件（例如某条子流的 `TxClosed`）一直排在后面，多子流下
+//!   会让别的子流刚入队的事件（例如某条子流的 `Attach`）一直排在后面，多子流下
 //!   就是死锁；不与取消令牌竞争则连接被丢弃后循环无法退出。
 //!
 //! 另有一条容易踩的约束：循环里**借出环数据一律用非阻塞的 `try_read`**
@@ -144,8 +144,10 @@ use crate::{
         owner_::{ChannelOwner_, TgOwner_},
         ring_::{BufferedRx, BufferedTx},
         signal_::{
-            ControlFrame_, EventReceiver_, EventSender_, EventTake_, ReadEvent_,
-            TrEventReceiver_, TrEventSender_, WriteEvent_,
+            ControlFrame_, EventReceiver_, EventSender_, EventTake_,
+            HINT_R_RELEASE, HINT_W_PEER_CLOSED, HINT_W_RX_CLOSED,
+            HINT_W_TX_CLOSED, ReadEvent_, TrEventReceiver_, TrEventSender_,
+            WriteEvent_,
         },
         telegraph::TgRecvCtx_,
     },
@@ -324,6 +326,14 @@ where
 {
     owner_: ChannelOwner_<A>,
     reader_: BufferedRx,
+
+    /// 「对端 `FIN` 已经推进过拆流记账」：状态位是持久的，没有这一格，写循环每轮
+    /// 扫描都会对同一条子流重复调一次 `maybe_release_`（并取注册表锁）。
+    peer_fin_handled_: bool,
+
+    /// 本端 `CLOSE(FIN)` 已经发出：此后这条子流不再发送数据，但表项要**留到身份
+    /// 释放**——对端随后的 `FIN` / `RESET` 仍需要经本表扫描推进释放。
+    fin_sent_: bool,
 }
 
 /// 解复用循环的本地表：dock 对 → 该子流的接收环写端与共享状态。
@@ -385,6 +395,181 @@ type TgWriteTable_<A> = BTreeMap<Dock, TgWriteEntry_<A>, A>;
 /// 用全局分配器会让「丢半边 + 额度为 0」这条收尾路径隐式落到全局堆上
 /// （`dev-notes/audit-heap-alloc-20261004-1122.md` N1）。
 type PendingFin_<A> = BTreeSet<(Dock, Dock), A>;
+
+/// 把「应用已丢弃发送半边」的条目登记进待收尾集合。
+///
+/// 收尾事实（`APP_TX_CLOSED`）在状态字里，提示位只负责把写循环叫醒；这里按表扫描一次，
+/// 把尚未发 `FIN` 的条目交给主循环 2.5 步的 [`finalize_entry_`] 推进。幂等：同一对反复
+/// 插入同一个键没有副作用（`BTreeSet`）。
+fn scan_tx_closed_<A>(table: &WriteTable_<A>, pending_fin: &mut PendingFin_<A>)
+where
+    A: AllocatorClone + Send + Sync + 'static,
+{
+    for (pair, entry) in table.iter() {
+        if entry.owner_.is_app_tx_closed_()
+            && !entry.owner_.is_local_fin_sent_()
+            && pending_fin.insert(*pair)
+        {
+            #[cfg(feature = "test-loop-probe")]
+            crate::connection::loop_probe_::tx_closed_handled_();
+        }
+    }
+}
+
+/// 对每条「应用已丢弃接收半边」的子流补一次 `CLOSE(RESET)`。
+///
+/// 与原 `RxClosed` 事件分支同序：认领发送权 → 整帧写出 → 置「已上线」位 → 唤醒应用侧
+/// 接收方向 → 上报 → 尝试释放身份。认领（`claim_local_reset_`）保证同一条至多写一次。
+async fn flush_rx_closed_<C, K>(
+    tx_stage: &mut C::ConnTx,
+    shared: &MuxShared_<C>,
+    table: &mut WriteTable_<C::Alloc>,
+    read_events: &EventSender_<ReadEvent_<C::Alloc>>,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    C::Rt: TrTime + Clone,
+    K: TrCancellationToken,
+{
+    // 游标推进而不是收集 `Vec`：热路径上不引入堆分配，也不跨 `await` 持有表借用。
+    let mut cursor: Option<(Dock, Dock)> = Option::None;
+    loop {
+        let next = match cursor {
+            Option::None => table.keys().next().copied(),
+            Option::Some(last) => table
+                .range((Bound::Excluded(last), Bound::Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        };
+        let Option::Some(pair) = next else {
+            return Result::Ok(());
+        };
+        cursor = Option::Some(pair);
+        let Some(entry) = table.get(&pair) else {
+            continue;
+        };
+        let owner = entry.owner_.clone();
+        if !owner.is_app_rx_closed_() || owner.is_local_reset_flushed_() {
+            continue;
+        }
+        if !owner.claim_local_reset_() {
+            continue;
+        }
+        control_close_via_::<C, _>(
+            tx_stage,
+            shared,
+            shared.max_packet_size_,
+            pair.0,
+            pair.1,
+            true,
+            cancel.child_token(),
+        )
+        .await?;
+        owner.set_local_reset_flushed_();
+        owner.notify_rx_progress_();
+        shared.metrics_().on_reset(pair.0, pair.1, false);
+        maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
+    }
+}
+
+/// 推进「对端已发来 `CLOSE`」的拆流记账。
+///
+/// `PEER_FIN` / `PEER_RESET` 位由读循环在处理帧面时置上；这里只负责本地表动作：
+///
+/// - `RESET`：对端不再接收，本端发送方向作废 —— 摘写表项、放弃「欠一条 `FIN`」的
+///   登记，再尝试释放身份；
+/// - `FIN`：对端不再发送，发送方向仍可继续；只做一次 `maybe_release_`（由表项的
+///   `peer_fin_handled_` 去重，状态位本身是持久的）。
+async fn scan_peer_closed_<C, K>(
+    shared: &MuxShared_<C>,
+    table: &mut WriteTable_<C::Alloc>,
+    pending_fin: &mut PendingFin_<C::Alloc>,
+    read_events: &EventSender_<ReadEvent_<C::Alloc>>,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    C::Rt: TrTime + Clone,
+    K: TrCancellationToken,
+{
+    let mut cursor: Option<(Dock, Dock)> = Option::None;
+    loop {
+        let next = match cursor {
+            Option::None => table.keys().next().copied(),
+            Option::Some(last) => table
+                .range((Bound::Excluded(last), Bound::Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        };
+        let Option::Some(pair) = next else {
+            return Result::Ok(());
+        };
+        cursor = Option::Some(pair);
+        let Option::Some(entry) = table.get(&pair) else {
+            continue;
+        };
+        let owner = entry.owner_.clone();
+        if owner.is_peer_reset_() {
+            table.remove(&pair);
+            pending_fin.remove(&pair);
+            maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
+            continue;
+        }
+        if !owner.is_peer_fin_() {
+            continue;
+        }
+        let Option::Some(entry) = table.get_mut(&pair) else {
+            continue;
+        };
+        if entry.peer_fin_handled_ {
+            continue;
+        }
+        entry.peer_fin_handled_ = true;
+        maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
+        if table
+            .get(&pair)
+            .map(|entry| entry.owner_.is_released_())
+            .unwrap_or(false)
+        {
+            table.remove(&pair);
+        }
+    }
+}
+
+/// 摘掉「身份已释放」的读表项并关闭接收环写端。
+///
+/// `buffex` 的环半部被 drop **不会**置位关闭标记：少了显式 `close()`，应用侧正 park
+/// 的读永远拿不到 EOF。释放事实是 `RELEASED` 位（`claim_release_` 的一次性 CAS），
+/// 提示位只负责把读循环叫醒。
+fn scan_released_<C>(table: &mut ReadTable_<C::Alloc>)
+where
+    C: TrConnCfg,
+{
+    let mut cursor: Option<(Dock, Dock)> = Option::None;
+    loop {
+        let next = match cursor {
+            Option::None => table.keys().next().copied(),
+            Option::Some(last) => table
+                .range((Bound::Excluded(last), Bound::Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        };
+        let Option::Some(pair) = next else {
+            return;
+        };
+        cursor = Option::Some(pair);
+        let released = table
+            .get(&pair)
+            .map(|entry| entry.owner_.is_released_())
+            .unwrap_or(false);
+        if released
+            && let Option::Some(mut entry) = table.remove(&pair)
+        {
+            entry.writer_.close();
+        }
+    }
+}
 
 /// 尝试把一条「已丢弃发送半边」的子流真正收尾：排空发送环 → 发 `CLOSE(FIN)` →
 /// 设置 `local_fin_sent_` → 从本地表移除。
@@ -466,7 +651,7 @@ where
         cancel.child_token(),
     )
     .await?;
-    if let Option::Some(mut entry) = table.remove(&pair) {
+    if let Option::Some(entry) = table.get_mut(&pair) {
         #[cfg(feature = "test-loop-probe")]
         crate::connection::loop_probe_::local_fin_sent_();
         entry.owner_.set_local_fin_sent_();
@@ -480,9 +665,20 @@ where
         entry.reader_.close();
         // `FIN` 已上线：应用侧的 `close_async` 等待者由此醒来并复检成功。
         entry.owner_.notify_tx_progress_();
+        entry.fin_sent_ = true;
     }
     pending_fin.remove(&pair);
     maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
+    // **不在这里无条件摘表**：本端 `FIN` 发出后，对端随后的 `CLOSE` 仍要经本表扫描
+    // 推进身份释放（`scan_peer_closed_`）。只有身份确实已释放时才摘；否则留到对端
+    // `CLOSE` / 主动拆流 / 循环退出时处理。
+    if table
+        .get(&pair)
+        .map(|entry| entry.owner_.is_released_())
+        .unwrap_or(false)
+    {
+        table.remove(&pair);
+    }
     Result::Ok(true)
 }
 
@@ -1004,6 +1200,13 @@ pub(crate) async fn demux_loop_async_<C, K>(
         lock_or_exit_!(shared
             .reg_
             .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token()));
+
+        // 0.05 合并提示：身份释放只置位 + 唤醒，读循环按 `RELEASED` 位摘表。
+        let read_hints = shared.reg_().take_read_hint_();
+        if read_hints & HINT_R_RELEASE != 0u64 {
+            scan_released_::<C>(&mut *table);
+        }
+
         // 0.1 telegraph 自查：本地表里哪些端点**已经不在身份表里**了（tx / rx 两个半边
         //     都被丢弃 ⇒ 身份已被上面那步释放）。这些端点的接收环写端必须关掉，否则
         //     应用侧正 park 的 `recv_async` 永远醒不过来。
@@ -1061,7 +1264,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
             // 唯一触发点，而它到来时传输完全可能长期为空（对端正等额度、没有新帧）。
             // 只 park 在传输上会让这条通知一直排在一条睡着的循环后面——应用读空了环却
             // 没人补发额度，两端互等（本仓库流控验收用例的死锁形态）。
-            match park_read_wake_::<C, _>(&cancel, &mut rx_stage, &mut *events).await {
+            match park_read_wake_::<C, _>(&cancel, &mut rx_stage, &mut *events, &shared).await {
                 // 传输里有字节：回顶部交给正式的帧头解析。
                 ReadWake_::Bytes => {}
                 // 生产端封口且已排空：与上面的 `RxState_::Eof` 同义。
@@ -1078,8 +1281,8 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     return;
                 }
                 // 事件已由 park **取出**（异步接收是消费语义，丢掉它就等于把这条
-                // `Attach` / `Release` / `RxConsumed` 静默吞掉），因此必须在这里就地
-                // 处理，不能只回顶部等 `drain_read_events_` 再取一次。
+                // `Attach` / `RxConsumed` 静默吞掉），因此必须在这里就地处理，不能只
+                // 回顶部等 `drain_read_events_` 再取一次。
                 ReadWake_::Event(event) => {
                     if let Result::Err(err) = handle_read_event_::<C, _>(
                         event,
@@ -1095,7 +1298,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                         return;
                     }
                 }
-                // 有可重建事件被丢弃：全扫读表（水位与释放提示都在状态位里）。
+                // 有可重建事件被丢弃：全扫读表（水位提示在状态位里）。
                 ReadWake_::Rescan => {
                     if let Result::Err(err) = rescan_read_::<C, _>(
                         &mut table.table,
@@ -1107,6 +1310,12 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     {
                         fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                         return;
+                    }
+                }
+                // 合并提示（身份释放）：按 `RELEASED` 位摘读表并关接收环写端。
+                ReadWake_::Hint(bits) => {
+                    if bits & HINT_R_RELEASE != 0u64 {
+                        scan_released_::<C>(&mut table.table);
                     }
                 }
                 ReadWake_::Cancelled => return,
@@ -1371,11 +1580,8 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     }
                     entry.owner_.mark_data_(now_millis);
                     // 拆流记账（移除写侧表项、释放身份）交给复用循环的统一入口。
-                    let _ = events_tx.try_send_durable_event_(WriteEvent_::PeerClosed {
-                        local_dock: local,
-                        remote_dock: remote,
-                        reset_: reset,
-                    });
+                    // `PEER_FIN` / `PEER_RESET` 位已经置上，这里只负责唤醒写循环。
+                    shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
                 }
             }
             FrameKind::WindowUpdate | FrameKind::Pulse => {
@@ -1501,8 +1707,9 @@ where
 /// 读事件里只有 `RxConsumed` 是可重建的：位在 [`ChannelState_`] 上；清位时若真的
 /// 置着，就按「环内实际积压」重算一次窗口通告。
 ///
-/// `Attach` 携带环半部句柄、`Release` 是身份释放的一次性通知，二者都**不可重建**，
-/// 生产者走 [`EventSender_::try_send_durable_event_`]，不会丢。
+/// `Attach` 携带环半部句柄，生产者走 [`EventSender_::try_send_durable_event_`]，
+/// 不会丢；身份释放（`Release`）已经改为 `RELEASED` 位 + `HINT_R_RELEASE` 合并提示，
+/// 由 [`scan_released_`] 按位摘表，不再经过事件通道。
 async fn rescan_read_<C, K>(
     table: &mut ReadTable_<C::Alloc>,
     events_tx: &EventSender_<WriteEvent_<C::Alloc>>,
@@ -1578,6 +1785,14 @@ where
             owner,
             writer_,
         } => {
+            // 身份可能在本循环处理 `Attach` **之前**就已经释放（`Release` 现在只置位 +
+            // 唤醒，不再排在同一个队列里保证先后）。已释放就不插表：直接关掉接收环
+            // 写端，让应用读到 EOF；后续到达的帧按注册表的宽限态静默丢弃。
+            if owner.is_released_() {
+                let mut writer_ = writer_;
+                writer_.close();
+                return Result::Ok(());
+            }
             // 节点分配由表自己的分配器承担（`new_in` 时已注入），这里不再需要
             // 手工构造 `Owned`。重复 `Attach` 直接覆盖，不会留下陈旧条目。
             table.insert(
@@ -1587,18 +1802,6 @@ where
                     writer_,
                 },
             );
-        }
-        ReadEvent_::Release {
-            local_dock,
-            remote_dock,
-        } => {
-            // 身份已被释放：本循环不再向这条接收环投递任何字节。**必须显式关闭
-            // 生产端**——`buffex` 的环半部被 drop **不会**置位关闭标记，少了这一步
-            // 应用侧永远读不到 EOF（计时循环的超时拆流走的正是这条事件；对端 `FIN`
-            // 那条路径由 `Close` 分支自己 `close()`）。
-            if let Option::Some(mut entry) = table.remove(&(local_dock, remote_dock)) {
-                entry.writer_.close();
-            }
         }
         ReadEvent_::RxConsumed {
             local_dock,
@@ -1708,8 +1911,11 @@ where
     /// 必须由调用方处理：异步接收是**消费**语义，丢掉它就等于静默吞掉这条事件。
     Event(ReadEvent_<A>),
 
-    /// 有可重建事件被丢弃：调用方应全扫读表，把水位/释放提示重建出来。
+    /// 有可重建事件被丢弃：调用方应全扫读表，把水位提示重建出来。
     Rescan,
+
+    /// 合并提示（身份释放等）：把掩码带回调用方，按状态位推进本地表。
+    Hint(u64),
 
     /// 取消令牌触发：连接正在收尾，本循环退出。
     Cancelled,
@@ -1728,6 +1934,7 @@ async fn park_read_wake_<C, K>(
     cancel: &K,
     rx_stage: &mut C::ConnRx,
     events: &mut EventReceiver_<ReadEvent_<C::Alloc>>,
+    shared: &MuxShared_<C>,
 ) -> ReadWake_<C::Alloc>
 where
     C: TrConnCfg,
@@ -1750,6 +1957,8 @@ where
     let mut need_rescan = false;
     // 传输读 future 就绪时的分类（段本身借用 `ring_fut`，因此就地判、就地 drop）。
     let mut woke: Option<ReadWake_<C::Alloc>> = Option::None;
+    // 合并提示（身份释放）：把掩码带回调用方。
+    let mut hint_bits = 0u64;
     poll_fn(|cx| {
         // 取消令牌优先：连接已收尾，直接退出。
         if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
@@ -1803,6 +2012,11 @@ where
                 }
             }
         }
+        // 合并提示：身份释放不再逐条投事件，这里把掩码带回调用方。
+        if let Poll::Ready(bits) = shared.reg_().poll_read_hint_(cx) {
+            hint_bits = bits;
+            return Poll::Ready(());
+        }
         Poll::Pending
     })
     .await;
@@ -1810,6 +2024,8 @@ where
         ReadWake_::Cancelled
     } else if need_rescan {
         ReadWake_::Rescan
+    } else if hint_bits != 0u64 {
+        ReadWake_::Hint(hint_bits)
     } else if let Option::Some(event) = taken {
         ReadWake_::Event(event)
     } else if let Option::Some(woke) = woke {
@@ -2177,6 +2393,8 @@ pub(crate) async fn mux_loop_async_<C, K>(
     // `CLOSE(FIN)`，由下面第 2.5 步在有进展时继续收尾（见 `finalize_entry_`）。
     let mut pending_fin: PendingFin_<C::Alloc> =
         BTreeSet::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())));
+    // park 期间被合并提示唤醒时，把掩码带到这里、在下一轮顶部统一处理。
+    let mut pending_hints = 0u64;
     // 环段字节的搬出暂存：`clone_items_from_buff` / `move_items_to_buff` 需要一个
     // 连续切片作为中间落点（段本身不能作为 `write_all_async_` 的源）。走调用方注入
     // 的分配器（`mm_ptr::Owned`），整条连接只分配一次。
@@ -2200,6 +2418,57 @@ pub(crate) async fn mux_loop_async_<C, K>(
         lock_or_exit_!(shared
             .reg_
             .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token()));
+
+        // 0.1 合并提示：应用侧封口 / 关接收只置位 + 唤醒，不再逐条投事件。
+        //
+        // 位是**唤醒**而不是事实：事实在各子流状态字里，这里按表扫一次即可补齐。
+        let mut hints = shared.reg_().take_write_hint_();
+        hints |= core::mem::take(&mut pending_hints);
+        if hints & HINT_W_TX_CLOSED != 0u64 {
+            scan_tx_closed_(&table, &mut pending_fin);
+        }
+        if hints & HINT_W_RX_CLOSED != 0u64 {
+            match race_cancel_(
+                &cancel,
+                flush_rx_closed_::<C, _>(
+                    &mut tx_stage,
+                    &shared,
+                    &mut *table,
+                    &read_events,
+                    &cancel,
+                ),
+            )
+            .await
+            {
+                Option::None => return,
+                Option::Some(Result::Ok(())) => {}
+                Option::Some(Result::Err(err)) => {
+                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                    return;
+                }
+            }
+        }
+        if hints & HINT_W_PEER_CLOSED != 0u64 {
+            match race_cancel_(
+                &cancel,
+                scan_peer_closed_::<C, _>(
+                    &shared,
+                    &mut *table,
+                    &mut pending_fin,
+                    &read_events,
+                    &cancel,
+                ),
+            )
+            .await
+            {
+                Option::None => return,
+                Option::Some(Result::Ok(())) => {}
+                Option::Some(Result::Err(err)) => {
+                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                    return;
+                }
+            }
+        }
 
         // 1. 先把**已经到达**的事件成批处理掉（非阻塞），**但批有上限**。
         //
@@ -2231,7 +2500,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &mut tx_stage,
                     &mut *table,
                     &mut tg_table,
-                    &mut scratch,
                     &mut pending_fin,
                     &shared,
                     &read_events,
@@ -2361,6 +2629,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
         let mut taken: Option<WriteEvent_<C::Alloc>> = Option::None;
         let mut need_rescan = false;
         let mut ring_ready = false;
+        let mut hint_ready = false;
         let alive = {
             let cancel_fut = cancel.child_token().cancellation();
             let mut event_fut = core::pin::pin!(events.take_event_async_());
@@ -2424,6 +2693,12 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     ring_ready = true;
                     return Poll::Ready(true);
                 }
+                // 合并提示：应用侧封口 / 关接收只置位并唤醒，这里把掩码带回顶部处理。
+                if let Poll::Ready(bits) = shared.reg_().poll_write_hint_(cx) {
+                    pending_hints |= bits;
+                    hint_ready = true;
+                    return Poll::Ready(true);
+                }
                 Poll::Pending
             })
             .await
@@ -2444,7 +2719,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &mut tx_stage,
                     &mut *table,
                     &mut tg_table,
-                    &mut scratch,
                     &mut pending_fin,
                     &shared,
                     &read_events,
@@ -2467,6 +2741,11 @@ pub(crate) async fn mux_loop_async_<C, K>(
             // 借出的段在 future 里被 drop（不消费）：回顶部由 `drain_once_` 正式取走。
             continue;
         }
+        if hint_ready {
+            // 收尾事实变了（排空/发 FIN/RESET）：回顶部按位扫描，不清 `last_ready`
+            // ——那条环仍是下一轮值得 park 的目标。
+            continue;
+        }
         last_ready = Option::None;
         continue;
     }
@@ -2479,7 +2758,6 @@ async fn handle_write_event_<C, K>(
     tx_stage: &mut C::ConnTx,
     table: &mut WriteTable_<C::Alloc>,
     tg_table: &mut TgWriteTable_<C::Alloc>,
-    scratch: &mut Owned<[u8], C::Alloc>,
     pending_fin: &mut PendingFin_<C::Alloc>,
     shared: &MuxShared_<C>,
     read_events: &EventSender_<ReadEvent_<C::Alloc>>,
@@ -2498,14 +2776,34 @@ where
             owner,
             reader_,
         } => {
+            let pair = (local_dock, remote_dock);
+            // 插入之前先看状态字：应用侧完全可能在 `Attach` 被处理之前就已经封口 /
+            // 关接收（`accept_async` 返回后立刻 drop 半部）。提示位只保证「有一次
+            // 唤醒」，若它在本表还没有这一对时被消费，扫描会漏掉——因此这里在插入
+            // 之后补登记 / 补提示。
+            let tx_closed = owner.is_app_tx_closed_();
+            let rx_closed = owner.is_app_rx_closed_();
+            // 对端 `CLOSE` 也可能先于本表项到达（读循环处理帧比写循环处理事件快）。
+            let peer_closed = owner.is_peer_fin_() || owner.is_peer_reset_();
+            if tx_closed {
+                pending_fin.insert(pair);
+            }
             // 节点分配由表自己的分配器承担（`new_in` 时已注入）。
             table.insert(
-                (local_dock, remote_dock),
+                pair,
                 WriteEntry_ {
                     owner_: owner,
                     reader_,
+                    peer_fin_handled_: false,
+                    fin_sent_: false,
                 },
             );
+            if rx_closed {
+                shared.reg_().raise_write_hint_(HINT_W_RX_CLOSED);
+            }
+            if peer_closed {
+                shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
+            }
         }
         WriteEvent_::Control { frame_ } => {
             // 控制帧也必须整帧进入写环；装不下时先 park 在写环上，再重试同一帧。
@@ -2523,95 +2821,6 @@ where
             remote_dock,
         } => {
             *last_ready = Option::Some((local_dock, remote_dock));
-        }
-        WriteEvent_::TxClosed {
-            local_dock,
-            remote_dock,
-        } => {
-            #[cfg(feature = "test-loop-probe")]
-            crate::connection::loop_probe_::tx_closed_handled_();
-            let pair = (local_dock, remote_dock);
-            // 应用已不再写：记下这件事，然后**尝试**收尾。
-            //
-            // 收尾不一定一次成功：应用此前写进发送环的字节是「承诺要送达」的，`FIN`
-            // 必须等它们全部上线（`drop(tx)` 本身不等待送达，见 README §5）；而发送
-            // 额度可能中途用尽。因此这里不再「无条件发 FIN」，而是交给
-            // [`finalize_entry_`]——它在「环已排空」时才发 FIN，否则把这条子流记进
-            // `pending_fin`，等窗口通告 / 环推进之后由主循环第 2.5 步继续。
-            if let Option::Some(entry) = table.get(&pair) {
-                entry.owner_.set_app_tx_closed_();
-            }
-            // 返回值只表示「本轮有进展」；成功收尾与暂时受阻两种结果都已经由
-            // [`finalize_entry_`] 自己落实（受阻时它已登记进 `pending_fin`），
-            // 主循环第 2.5 步会在有进展时再试。
-            let _ = finalize_entry_::<C, _>(
-                tx_stage,
-                shared,
-                table,
-                scratch,
-                pending_fin,
-                read_events,
-                pair,
-                cancel,
-            )
-            .await?;
-        }
-        WriteEvent_::RxClosed {
-            local_dock,
-            remote_dock,
-        } => {
-            let pair = (local_dock, remote_dock);
-            // 找到 owner：本地表里可能已经没有（例如对端先发了 `RESET`），用注册表兜底。
-            let owner = match table.get(&pair).map(|entry| entry.owner_.clone()) {
-                Option::Some(owner) => Option::Some(owner),
-                Option::None => {
-                    lock_or_fail_!(shared
-                        .reg_
-                        .channel_owner_(local_dock, remote_dock, cancel.child_token()))
-                }
-            };
-            if let Option::Some(owner) = owner {
-                let _ = owner.set_app_rx_closed_();
-                // 接收方向的收尾**已经启动**：即使下面的 `claim_local_reset_` 没抢到
-                // （别的路径已经在发那一条帧），等待者也应当醒来复检一次。
-                owner.notify_rx_progress_();
-                // 向对端宣告「我不再接收」：这条通知与发送方向无关，`RESET` 只关对端
-                // 的发送方向（见 `connection` 模块文档 §7 的半关闭映射）。
-                if owner.claim_local_reset_() {
-                    control_close_via_::<C, _>(
-                        tx_stage,
-                        shared,
-                        shared.max_packet_size_,
-                        local_dock,
-                        remote_dock,
-                        true,
-                        cancel.child_token(),
-                    )
-                    .await?;
-                    // 本端发出的 `RESET` 到此才真正上线，因此「已上线」位与上报点
-                    // 都放在发送成功之后。
-                    owner.set_local_reset_flushed_();
-                    owner.notify_rx_progress_();
-                    shared.metrics_().on_reset(local_dock, remote_dock, false);
-                }
-            }
-            // **绝不在这里摘写侧表项、也不在这里丢掉读侧表项**：
-            //
-            // - 写侧：`drop(rx)` 只结束接收方向，发送方向写进环里的字节仍是承诺要送达
-            //   的，`FIN` 还没发。旧实现无条件 `table.remove`，于是已入 `pending_fin` 的
-            //   条目变成查不到表项的僵尸、在途数据被放弃；
-            // - 读侧：读表项要留到**身份真正释放**（`maybe_release_`）时由 `Release`
-            //   摘掉。否则对端在收到我们 `RESET` 之前发出的在途帧会掉进「未知子流」
-            //   分支，把整条连接判成协议违例。留着的这段窗口里，数据分支按
-            //   `is_app_rx_closed_` 静默丢弃。
-            maybe_release_::<C, _>(
-                shared,
-                read_events,
-                table,
-                pair,
-                cancel.child_token(),
-            )
-            .await?;
         }
         WriteEvent_::LocalAbort {
             local_dock,
@@ -2633,27 +2842,6 @@ where
             pending_fin.remove(&pair);
             maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token())
                 .await?;
-        }
-        WriteEvent_::PeerClosed {
-            local_dock,
-            remote_dock,
-            reset_,
-        } => {
-            let pair = (local_dock, remote_dock);
-            if reset_ {
-                // 对端不再接收：本端发送方向就此作废——未发出的数据与「欠一条 FIN」的
-                // 登记一起放弃（这是唯一允许放弃已提交字节的情形，`RESET` 就是它的授权）。
-                table.remove(&pair);
-                pending_fin.remove(&pair);
-            }
-            maybe_release_::<C, _>(
-                shared,
-                read_events,
-                table,
-                pair,
-                cancel.child_token(),
-            )
-            .await?;
         }
         // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
         // telegraph（数据报）
@@ -2945,7 +3133,8 @@ where
 /// 完成**——那只是「不再写」的意图。
 async fn maybe_release_<C, K>(
     shared: &MuxShared_<C>,
-    read_events: &EventSender_<ReadEvent_<C::Alloc>>,
+    // 释放提示已改为 `HINT_R_RELEASE` 合并提示；该参数保留到事件通道整体清理时删除。
+    _read_events: &EventSender_<ReadEvent_<C::Alloc>>,
     table: &WriteTable_<C::Alloc>,
     pair: (Dock, Dock),
     cancel: K,
@@ -2975,14 +3164,13 @@ where
                 .await,
             Result::Ok(true)
         );
-        let _ = read_events.try_send_durable_event_(ReadEvent_::Release {
-            local_dock: pair.0,
-            remote_dock: pair.1,
-        });
-        // 身份已释放：两个方向都不会再有新的进展，等待中的 `TrBuffFlush` /
-        // `close_async` 必须醒来并**按终局复检**（否则它们会永远 park 在一条已经
-        // 从注册表消失的子流上）。放在投递 `Release` 之后：先让读循环有机会摘表项，
-        // 再叫醒应用——顺序反了只是多一次无谓唤醒，不会有正确性问题。
+        // 身份已释放：读循环据此摘本地读表并关接收环写端。事实是 `RELEASED` 位，
+        // 提示只负责唤醒。
+        shared.reg_().raise_read_hint_(HINT_R_RELEASE);
+        // 两个方向都不会再有新的进展，等待中的 `TrBuffFlush` / `close_async` 必须醒来
+        // 并**按终局复检**（否则它们会永远 park 在一条已经从注册表消失的子流上）。
+        // 放在释放提示之后：先让读循环有机会摘表项，再叫醒应用——顺序反了只是多一次
+        // 无谓唤醒，不会有正确性问题。
         owner.notify_both_progress_();
         // 上报子流关闭（正常协议收尾）。`claim_release_` 是一次性的 CAS，因此这里
         // **恰好上报一次**；超时与建流超时两条路径不经过本函数，各自在 `timer_` 里上报。
@@ -3172,6 +3360,12 @@ where
     let Some(entry) = table.get_mut(&pair) else {
         return Result::Ok(false);
     };
+    // 本端 `FIN` 已发出：这条子流不再发送数据，表项保留只为等对端 `CLOSE`
+    // （见 `scan_peer_closed_`）。热点排空循环直接跳过它，避免每轮对已关闭的环
+    // 做一次 `try_read`。
+    if entry.fin_sent_ {
+        return Result::Ok(false);
+    }
 
     // 清「已入队」位：此后新的写入会重新入队（顺序不可反，见 dev-notes §11.4）。
     let owner = entry.owner_.clone();
@@ -3352,6 +3546,8 @@ mod tests_ {
             WriteEntry_ {
                 owner_: owner,
                 reader_: ring,
+                peer_fin_handled_: false,
+                fin_sent_: false,
             },
         );
         table

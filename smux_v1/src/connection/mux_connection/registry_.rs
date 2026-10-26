@@ -136,12 +136,15 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::{
     alloc::AllocatorClone,
     ops::Bound,
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
-    task::{Context, Poll},
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll, Waker},
 };
 
 use abs_cancel::TrCancellationToken;
-use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
+use atomic_sync::{
+    mutex::preemptive::SpinningMutexOwned,
+    rwlock::cooperative_arena::CooperativeRwLockOwned,
+};
 use mm_ptr::Shared;
 
 use crate::{
@@ -152,21 +155,15 @@ use crate::{
             new_listener_owner_, new_owner_, new_telegraph_owner_,
         },
         signal_::{SessionEvent_, SessionMailbox_},
-        sync_::{
-            CancelToken_, LockCancelled_, NotifySlot_,
-            acquire_read_, acquire_write_,
-        },
+        sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
         timer_::TimerAction_,
     },
     flow_ctrl::WindowReport,
     handshake::opts::BasicOpts,
     metrics::ConnCloseReason,
     time::millis_of_,
-    x_deps::abs_cancel,
+    x_deps::{abs_cancel, abs_sync::may_break::TrMayBreak},
 };
-
-/// [`ChannelRegistry_::fail_kind_`] 的取值；`0` = 从未发生连接级失败（正常收尾）。
-const K_FAIL_NONE: u8 = 0u8;
 
 /// 对端主动关闭。
 const K_FAIL_PEER_CLOSED: u8 = 1u8;
@@ -752,7 +749,7 @@ impl TimerScan_ {
 /// 读写循环与 API 面共享的 dock / 子流身份索引。
 ///
 /// 所有方法都取 `&self`：内部可变性由 `atomic_sync` 的**协作式读写锁**
-/// （`rwlock::cooperative::CooperativeRwLock`）提供。临界区都很短（映射增删与
+/// （`rwlock::cooperative_arena::CooperativeRwLock`）提供。临界区都很短（映射增删与
 /// 计数），且**不跨 `await`**；取锁一律 `acquire_session` + 异步获取
 /// （`read_async` / `write_async().may_cancel_with(cancel).await`），因此争用时
 /// 让出执行权、可被外部 cancel token 取消，也没有 CPU 忙等。
@@ -766,72 +763,311 @@ impl TimerScan_ {
 /// # 分配
 ///
 /// 四本索引在构造时各拿一份分配器克隆（`allocator_api` 的 `new_in`），此后每个
-/// 条目的分配 / 归还都由该分配器承担，注册表本身不隐式分配。
+/// 条目的分配 / 归还都由该分配器承担，注册表本身不隐式分配。**锁外共享状态与锁内的
+/// 表**放在同一个 `Shared` 根对象里：注册表在克隆时只做一次引用计数（见
+/// [`RegistryShared_`]）。
 ///
 /// 已知例外：外层锁 `CooperativeRwLockOwned` 内部用全局 `Arc` 持有同步核心
 /// （`atomic_sync` 尚未支持 `allocator_api`），即**每次连接一次**的全局分配；
 /// 释放邮箱走定容通道（`mpmc_chan`，满时进入自旋锁暂存），同样是全局分配
 /// （已有例外）。后续引入 `TrMaxAllocConfig` 时会连同这两处一起记账。
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 锁外共享状态
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+/// 注册表里**跨克隆共享、且必须在锁外访问**的状态。
+///
+/// # 为什么是一个原子字
+///
+/// 这些状态原本是六个独立的 `Shared<Atomic…>` / `Shared<NotifySlot_>`：每连接六次
+/// 堆分配，每次读还要挑一个原子。它们都是「小整数 / 位集」，因此压进同一个
+/// `AtomicU64`：
+///
+/// ```text
+/// bit  0- 1  state_（Normal / WaitingClose / ForcedClose）
+/// bit  2- 3  fail_kind_（无 / PeerClosed / Transport / Protocol）
+/// bit  4     timer_wake_ 的持久通知位
+/// bit  8-31  write_hint_ 掩码（24 位）
+/// bit 32-55  read_hint_ 掩码（24 位）
+/// ```
+///
+/// 三路 waker 仍是各自独立的槽（`Option<Waker>` 无法压进位域），但它们内联在同一个
+/// 结构里，随注册表根部**一次分配**。
+///
+/// # 顺序
+///
+/// 所有置位用 `Release` / `AcqRel`，读取用 `Acquire`：状态位与通知位必须对
+/// 「先置位、后登记 waker」的等待方可见（协议见 [`NotifySlot_`]）。
+pub(crate) struct RegistryShared_ {
+    /// 位域（布局见类型文档）。
+    flags_: AtomicU64,
+
+    /// 进入「等待关闭」的连接内毫秒（未进入时为 `0`）。
+    close_since_millis_: AtomicU64,
+
+    /// 计时循环的 waker 槽。
+    timer_waker_: SpinningMutexOwned<Option<Waker>>,
+
+    /// 写循环的 waker 槽。
+    write_waker_: SpinningMutexOwned<Option<Waker>>,
+
+    /// 读循环的 waker 槽。
+    read_waker_: SpinningMutexOwned<Option<Waker>>,
+}
+
+// 位布局（与 `RegistryShared_` 的类型文档同步维护）。
+const STATE_SHIFT: u32 = 0u32;
+const STATE_MASK: u64 = 0b11u64;
+const FAIL_SHIFT: u32 = 2u32;
+const FAIL_MASK: u64 = 0b11u64;
+const TIMER_WAKE_BIT: u64 = 1u64 << 4usize;
+const WRITE_HINT_SHIFT: u32 = 8u32;
+const READ_HINT_SHIFT: u32 = 32u32;
+/// 每个方向的提示掩码宽度。24 位足够覆盖当前全部 `HINT_*` 位，并留出扩展余量。
+const HINT_MASK: u64 = 0x00ff_ffffu64;
+const WRITE_HINT_MASK: u64 = HINT_MASK << WRITE_HINT_SHIFT;
+const READ_HINT_MASK: u64 = HINT_MASK << READ_HINT_SHIFT;
+
+/// 在 waker 槽锁下访问内容（不可取消的自旋等待）。
+fn with_waker_<R>(
+    slot: &SpinningMutexOwned<Option<Waker>>,
+    f: impl FnOnce(&mut Option<Waker>) -> R,
+) -> R {
+    let mut session = slot.lock_session();
+    let mut guard = session
+        .lock()
+        .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
+    f(&mut guard)
+}
+
+/// 取走并唤醒 waker（锁外 `wake`）。
+fn wake_slot_(slot: &SpinningMutexOwned<Option<Waker>>) {
+    let waker = with_waker_(slot, |content| content.take());
+    if let Option::Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+/// 登记 waker（同一个 waker 不重复 clone）。
+fn register_waker_(slot: &SpinningMutexOwned<Option<Waker>>, cx: &mut Context<'_>) {
+    with_waker_(slot, |content| {
+        let replace = match content.as_ref() {
+            Option::Some(old) => !old.will_wake(cx.waker()),
+            Option::None => true,
+        };
+        if replace {
+            *content = Option::Some(cx.waker().clone());
+        }
+    });
+}
+
+impl RegistryShared_ {
+    /// 全零（`Normal` / 无失败 / 无通知）。
+    fn new_() -> Self {
+        RegistryShared_ {
+            flags_: AtomicU64::new(0u64),
+            close_since_millis_: AtomicU64::new(0u64),
+            timer_waker_: SpinningMutexOwned::new_owned(Option::None),
+            write_waker_: SpinningMutexOwned::new_owned(Option::None),
+            read_waker_: SpinningMutexOwned::new_owned(Option::None),
+        }
+    }
+
+    /// 当前生命周期状态。
+    fn state_(&self) -> u8 {
+        ((self.flags_.load(Ordering::Acquire) >> STATE_SHIFT) & STATE_MASK) as u8
+    }
+
+    /// 是否已经进入优雅关闭（`WaitingClose` 或 `ForcedClose`）。
+    fn is_closing_(&self) -> bool {
+        matches!(
+            self.state_(),
+            K_STATE_WAITING_CLOSE | K_STATE_FORCED_CLOSE
+        )
+    }
+
+    /// 本次关闭是否由整体超时强制收尾。
+    fn is_forced_close_(&self) -> bool {
+        self.state_() == K_STATE_FORCED_CLOSE
+    }
+
+    /// 尝试从 `Normal` 迁移到 `WaitingClose`；首次成功时记下关闭起点。
+    fn enter_waiting_close_(&self, now_millis: u64) -> bool {
+        let mut current = self.flags_.load(Ordering::Acquire);
+        loop {
+            if ((current >> STATE_SHIFT) & STATE_MASK) != u64::from(K_STATE_NORMAL) {
+                return false;
+            }
+            let next = (current & !(STATE_MASK << STATE_SHIFT))
+                | (u64::from(K_STATE_WAITING_CLOSE) << STATE_SHIFT);
+            match self.flags_.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Result::Ok(_) => break,
+                Result::Err(observed) => current = observed,
+            }
+        }
+        self.close_since_millis_.store(now_millis, Ordering::Release);
+        true
+    }
+
+    /// 把 `WaitingClose` 改写成 `ForcedClose`（幂等）。
+    fn mark_forced_close_(&self) {
+        let mut current = self.flags_.load(Ordering::Acquire);
+        loop {
+            if ((current >> STATE_SHIFT) & STATE_MASK) != u64::from(K_STATE_WAITING_CLOSE) {
+                return;
+            }
+            let next = (current & !(STATE_MASK << STATE_SHIFT))
+                | (u64::from(K_STATE_FORCED_CLOSE) << STATE_SHIFT);
+            match self.flags_.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Result::Ok(_) => return,
+                Result::Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// 进入等待关闭的连接内毫秒。
+    fn close_since_millis_(&self) -> u64 {
+        self.close_since_millis_.load(Ordering::Acquire)
+    }
+
+    /// 首个连接级失败的种类（`0` = 无失败）。
+    fn fail_kind_(&self) -> u8 {
+        ((self.flags_.load(Ordering::Acquire) >> FAIL_SHIFT) & FAIL_MASK) as u8
+    }
+
+    /// 记下首个连接级失败的种类（调用方保证只在 `fail_` 为空时调用）。
+    fn mark_fail_kind_(&self, kind: u8) {
+        let bits = (u64::from(kind) & FAIL_MASK) << FAIL_SHIFT;
+        self.flags_.fetch_or(bits, Ordering::Release);
+    }
+
+    /// 置计时循环的持久通知位并唤醒。
+    fn raise_timer_(&self) {
+        self.flags_.fetch_or(TIMER_WAKE_BIT, Ordering::Release);
+        wake_slot_(&self.timer_waker_);
+    }
+
+    /// 等计时循环的下一次唤醒；已有持久位时立刻返回。
+    fn poll_timer_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.flags_.fetch_and(!TIMER_WAKE_BIT, Ordering::AcqRel) & TIMER_WAKE_BIT != 0u64 {
+            return Poll::Ready(());
+        }
+        register_waker_(&self.timer_waker_, cx);
+        if self.flags_.fetch_and(!TIMER_WAKE_BIT, Ordering::AcqRel) & TIMER_WAKE_BIT != 0u64 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// 置写循环提示位并唤醒。
+    fn raise_write_hint_(&self, bits: u64) {
+        let masked = (bits & HINT_MASK) << WRITE_HINT_SHIFT;
+        if masked == 0u64 {
+            return;
+        }
+        self.flags_.fetch_or(masked, Ordering::Release);
+        wake_slot_(&self.write_waker_);
+    }
+
+    /// 取走并清除写循环提示位。
+    fn take_write_hint_(&self) -> u64 {
+        let removed = self.flags_.fetch_and(!WRITE_HINT_MASK, Ordering::AcqRel);
+        (removed & WRITE_HINT_MASK) >> WRITE_HINT_SHIFT
+    }
+
+    /// 等写循环的下一次提示。
+    fn poll_write_hint_(&self, cx: &mut Context<'_>) -> Poll<u64> {
+        let bits = self.take_write_hint_();
+        if bits != 0u64 {
+            return Poll::Ready(bits);
+        }
+        register_waker_(&self.write_waker_, cx);
+        let bits = self.take_write_hint_();
+        if bits != 0u64 {
+            Poll::Ready(bits)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// 置读循环提示位并唤醒。
+    fn raise_read_hint_(&self, bits: u64) {
+        let masked = (bits & HINT_MASK) << READ_HINT_SHIFT;
+        if masked == 0u64 {
+            return;
+        }
+        self.flags_.fetch_or(masked, Ordering::Release);
+        wake_slot_(&self.read_waker_);
+    }
+
+    /// 取走并清除读循环提示位。
+    fn take_read_hint_(&self) -> u64 {
+        let removed = self.flags_.fetch_and(!READ_HINT_MASK, Ordering::AcqRel);
+        (removed & READ_HINT_MASK) >> READ_HINT_SHIFT
+    }
+
+    /// 等读循环的下一次提示。
+    fn poll_read_hint_(&self, cx: &mut Context<'_>) -> Poll<u64> {
+        let bits = self.take_read_hint_();
+        if bits != 0u64 {
+            return Poll::Ready(bits);
+        }
+        register_waker_(&self.read_waker_, cx);
+        let bits = self.take_read_hint_();
+        if bits != 0u64 {
+            Poll::Ready(bits)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// 注册表根：锁外小状态 + 锁内的表，**同一次分配**。
+///
+/// 原来每个锁外分量各自一个 `Shared`（每连接六次分配）；合并之后注册表在克隆时
+/// 只做一次引用计数，`MuxCore::drop` 仍可经 `root_.shared_` 不取锁地推进关闭。
+struct RegistryRoot_<A>
+where
+    A: AllocatorClone,
+{
+    /// 锁外共享状态（原子域 + 三路 waker）。
+    shared_: RegistryShared_,
+
+    /// 锁内的身份表与配额。
+    inner_: CooperativeRwLockOwned<RegistryInner_<A>>,
+}
+
 pub(crate) struct ChannelRegistry_<A>
 where
     A: AllocatorClone,
 {
-    inner_: Shared<CooperativeRwLockOwned<RegistryInner_<A>>, A>,
+    /// 注册表根：**锁外共享状态 + 锁内的表**，每连接一次分配。
+    ///
+    /// 克隆注册表只做一次引用计数；`root_.shared_` 的部分可以在**不取锁**的前提下
+    /// 推进关闭与发通知（`MuxCore::drop` 依赖这一点）。
+    root_: Shared<RegistryRoot_<A>, A>,
 
     /// 三个循环的取消令牌：`0` = 解复用、`1` = 复用、`2` = 计时（保活 / 空闲超时）。
     ///
     /// **放在锁外**：构造后不再变化，因此取用与触发都无需取锁（`Drop` 路径要的
     /// 正是这一点）。
-    ///
-    /// 旧版这里是五个：另外两个是「贴传输」的读 / 写泵，本版把它们连同连接级帧暂存
-    /// 环一起去掉了——内侧两个循环直接驱动传输的两条半边（见 `session_` 模块文档）。
     loops_: [CancelToken_<A>; 3],
 
     /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
+    ///
+    /// 它内部已经是共享句柄（`mpmc_chan` 的 `Sender` / `Receiver` + 溢出 `Arc`），
+    /// 因此**不需要**再套一层 `Shared`。
     mailbox_: SessionMailbox_,
-
-    /// **计时循环的唤醒槽**：「身份表变了，期限可能要重算」的持久提示。
-    ///
-    /// 它让计时循环可以**动态**睡到「最早的期限」而不是固定 tick：一条新子流的
-    /// 登记、或一次身份释放，都会在锁外 `notify_` 一次，把睡着的计时循环叫醒重算。
-    ///
-    /// 用 `Shared` 包一层是为了让它的各个注册表克隆（核心、三个循环各持一份）指向
-    /// **同一个**槽；`NotifySlot_` 本身只有一个 waker 位与一个原子位，零堆分配，
-    /// `Shared` 这一次分配是**每连接一次**。
-    timer_wake_: Shared<NotifySlot_, A>,
-
-    /// **连接级失败的种类**（锁外的原子快照）。
-    ///
-    /// 存在理由见 [`fail_kind_of_`]：`MuxCore::drop` 不能取锁，却要报出「连接为什么
-    /// 结束」。用 `Shared` 包一层是为了让注册表的**各个克隆**（核心、三个循环各持一份）
-    /// 指向同一份值——失败由循环侧写入、由核心侧在收尾时读出。
-    /// 每连接一次分配，与 [`ChannelRegistry_::timer_wake_`] 同源。
-    fail_kind_: Shared<AtomicU8, A>,
-
-    /// **连接生命周期状态**（锁外的原子快照）。
-    ///
-    /// 目前只有两个取值：`Normal`（正常服务）与 `WaitingClose`（已经发起优雅关闭：
-    /// 不再接受新身份，正在排空已提交字节、等对端 `FIN`）。
-    ///
-    /// # 为什么放在注册表而不是 `MuxCore`
-    ///
-    /// 语义上它是「核心的状态」，但**三个循环不持有核心**——那是「最后一个应用面
-    /// 引用消失 ⇒ 核心析构 ⇒ 取消令牌触发」这条不变量的前提（见
-    /// `mux_connection::core_` 模块文档）。而推进关闭的引擎恰恰是循环（计时循环扫描
-    /// 并认领收尾动作、复用循环排空并发 `FIN`），所以状态必须放在它们都拿得到的地方
-    /// ——注册表正是那个「核心与三个循环共享」的载体。
-    ///
-    /// 放在**锁外**的理由同 [`ChannelRegistry_::fail_kind_`]：`MuxCore::drop` 要能不取
-    /// 锁地推进它（一次 CAS），数据面与各 API 入口也要能廉价地读它。`Shared` 让注册表
-    /// 的各个克隆看到同一份值，每连接一次分配。
-    state_: Shared<AtomicU8, A>,
-
-    /// **进入「等待关闭」的时刻**（连接内毫秒；只在首次进入时写一次）。
-    ///
-    /// 计时循环用它算关闭的**整体超时**：进入等待关闭之后 `max_channel_timeout` 内
-    /// 还没收敛就强制收尾。`drop` 路径没有调用方在等，这是唯一的兜底；`close_async`
-    /// 自己也有一份同样长度的等待上限（两者取先到者）。
-    close_since_millis_: Shared<AtomicU64, A>,
 }
 
 impl<A> Clone for ChannelRegistry_<A>
@@ -840,14 +1076,11 @@ where
 {
     fn clone(&self) -> Self {
         ChannelRegistry_ {
-            inner_: self.inner_.clone(),
+            // 根对象只做一次引用计数：锁外状态与锁内的表都指向同一份。
+            root_: self.root_.clone(),
             loops_: self.loops_.clone(),
             // 邮箱按值克隆：生产端共享同一条队列，消费端因此有**多个** drain 者。
             mailbox_: self.mailbox_.clone(),
-            timer_wake_: self.timer_wake_.clone(),
-            fail_kind_: self.fail_kind_.clone(),
-            state_: self.state_.clone(),
-            close_since_millis_: self.close_since_millis_.clone(),
         }
     }
 }
@@ -861,7 +1094,7 @@ where
         &self,
         cancel: K,
     ) -> Result<A, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         Result::Ok(guard.alloc_.clone())
     }
@@ -882,38 +1115,31 @@ where
             CancelToken_::new_(alloc.clone()),
         ];
         let docks_ = BTreeMap::new_in(alloc.clone());
-        // 计时唤醒槽的节点：与注册表根部同源分配器，**每连接一次**。
-        let timer_wake_ = Shared::new(NotifySlot_::new_(), alloc.clone());
-        // 连接级失败种类的共享快照：同样**每连接一次**，让所有克隆看得同一份。
-        let fail_kind_ = Shared::new(AtomicU8::new(K_FAIL_NONE), alloc.clone());
-        // 连接生命周期状态与「进入等待关闭的时刻」：同样**每连接一次**。
-        let state_ = Shared::new(AtomicU8::new(K_STATE_NORMAL), alloc.clone());
-        let close_since_millis_ = Shared::new(AtomicU64::new(0u64), alloc.clone());
         let bindings_ = BTreeMap::new_in(alloc.clone());
         let remote_index_ = BTreeSet::new_in(alloc.clone());
         let wait_close_expiry_ = BTreeSet::new_in(alloc.clone());
+        // 锁外共享状态与锁内的表放在**同一个根对象**里：每连接一次分配。
         ChannelRegistry_ {
-            inner_: Shared::new(
-                CooperativeRwLockOwned::new_owned(RegistryInner_ {
-                    opts_: opts,
-                    alloc_: alloc.clone(),
-                    docks_,
-                    reusable_docks_: VecDeque::new_in(alloc.clone()),
-                    next_fresh_dock_: Dock::new(K_FIRST_AUTO_DOCK),
-                    bindings_,
-                    remote_index_,
-                    wait_close_expiry_,
-                    total_: 0usize,
-                    fail_: Option::None,
-                }),
+            root_: Shared::new(
+                RegistryRoot_ {
+                    shared_: RegistryShared_::new_(),
+                    inner_: CooperativeRwLockOwned::new_owned(RegistryInner_ {
+                        opts_: opts,
+                        alloc_: alloc.clone(),
+                        docks_,
+                        reusable_docks_: VecDeque::new_in(alloc.clone()),
+                        next_fresh_dock_: Dock::new(K_FIRST_AUTO_DOCK),
+                        bindings_,
+                        remote_index_,
+                        wait_close_expiry_,
+                        total_: 0usize,
+                        fail_: Option::None,
+                    }),
+                },
                 alloc,
             ),
             loops_: loops,
             mailbox_: SessionMailbox_::new_(),
-            timer_wake_,
-            fail_kind_,
-            state_,
-            close_since_millis_,
         }
     }
 
@@ -925,12 +1151,44 @@ where
     /// 单线程执行器上 `wake` 可能同步重入 `poll`，后者又要取注册表锁
     /// （见 `keepalive…` §6.3）。因此登记路径一律「先出作用域、再 call」。
     pub(crate) fn notify_timer_(&self) {
-        self.timer_wake_.notify_();
+        self.root_.shared_.raise_timer_();
     }
 
     /// 计时循环的等待点：有唤醒提示时立刻就绪，否则登记 waker 后 `Pending`。
     pub(crate) fn poll_timer_wake_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.timer_wake_.poll_wait_(cx)
+        self.root_.shared_.poll_timer_(cx)
+    }
+
+    /// 提醒写循环「某些子流的收尾事实变了」；位定义见 `signal_::HINT_W_*`。
+    ///
+    /// 幂等、不阻塞、零分配；可从任意线程（包括 `Drop`）调用。
+    pub(crate) fn raise_write_hint_(&self, bits: u64) {
+        self.root_.shared_.raise_write_hint_(bits);
+    }
+
+    /// 取走并清除写循环的合并提示。
+    pub(crate) fn take_write_hint_(&self) -> u64 {
+        self.root_.shared_.take_write_hint_()
+    }
+
+    /// 等下一个写循环提示：已有提示时立刻返回，否则登记唤醒。
+    pub(crate) fn poll_write_hint_(&self, cx: &mut Context<'_>) -> Poll<u64> {
+        self.root_.shared_.poll_write_hint_(cx)
+    }
+
+    /// 提醒读循环「身份释放了」；位定义见 `signal_::HINT_R_*`。
+    pub(crate) fn raise_read_hint_(&self, bits: u64) {
+        self.root_.shared_.raise_read_hint_(bits);
+    }
+
+    /// 取走并清除读循环的合并提示。
+    pub(crate) fn take_read_hint_(&self) -> u64 {
+        self.root_.shared_.take_read_hint_()
+    }
+
+    /// 等下一个读循环提示：已有提示时立刻返回，否则登记唤醒。
+    pub(crate) fn poll_read_hint_(&self, cx: &mut Context<'_>) -> Poll<u64> {
+        self.root_.shared_.poll_read_hint_(cx)
     }
 
     /// 连接是否已经进入**优雅关闭**（锁外原子读；数据面与 API 面都可廉价调用）。
@@ -938,10 +1196,7 @@ where
     /// 「关闭中」的语义有两条：**不再接受任何新身份**；已登记的子流由连接自己推进
     /// 「排空 + 发 `FIN`」，并在最后一条与对端双向收尾时执行收尾。
     pub(crate) fn is_closing_(&self) -> bool {
-        matches!(
-            self.state_.load(Ordering::Acquire),
-            K_STATE_WAITING_CLOSE | K_STATE_FORCED_CLOSE
-        )
+        self.root_.shared_.is_closing_()
     }
 
     /// 记下「本次关闭是**超时强制收尾**」这一事实（幂等、锁外原子写）。
@@ -949,17 +1204,12 @@ where
     /// 由计时循环在认领 [`K_CLOSE_TIMEOUT`] 时调用；只写不读回，因此不会与
     /// `enter_waiting_close_` 的 CAS 相争（后者只从 `K_STATE_NORMAL` 迁移）。
     pub(crate) fn mark_forced_close_(&self) {
-        let _ = self.state_.compare_exchange(
-            K_STATE_WAITING_CLOSE,
-            K_STATE_FORCED_CLOSE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.root_.shared_.mark_forced_close_();
     }
 
     /// 本次关闭是否由**整体超时**强制收尾（见 [`K_STATE_FORCED_CLOSE`]）。
     pub(crate) fn is_forced_close_(&self) -> bool {
-        self.state_.load(Ordering::Acquire) == K_STATE_FORCED_CLOSE
+        self.root_.shared_.is_forced_close_()
     }
 
     /// **进入「等待关闭」**（幂等、不取锁、不阻塞），返回本次是否**首次**进入。
@@ -985,28 +1235,15 @@ where
     ///
     /// 两者进入之后都要 `notify_timer_` 唤醒推进引擎；本函数只负责状态转换。
     pub(crate) fn enter_waiting_close_(&self, now_millis: u64) -> bool {
-        if self
-            .state_
-            .compare_exchange(
-                K_STATE_NORMAL,
-                K_STATE_WAITING_CLOSE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            // 已经是等待关闭：起点早已写下，重复进入不重置超时零点。
-            return false;
-        }
-        self.close_since_millis_.store(now_millis, Ordering::Release);
-        true
+        // 位域里同时保存状态与其他锁外位，因此迁移用「保留其余位的 CAS 循环」。
+        self.root_.shared_.enter_waiting_close_(now_millis)
     }
 
     /// 进入「等待关闭」的连接内毫秒（未进入时是 `0`）。
     ///
     /// 计时循环用它算关闭的整体超时（见 [`ChannelRegistry_::state_`]）。
     pub(crate) fn close_since_millis_(&self) -> u64 {
-        self.close_since_millis_.load(Ordering::Acquire)
+        self.root_.shared_.close_since_millis_()
     }
 
     /// 投递一条**会话释放消息**（会话句柄的 `Drop` 调用）。
@@ -1088,7 +1325,7 @@ where
         &self,
         cancel: K,
     ) -> Result<usize, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         Result::Ok(guard.opts_.max_channel_count)
     }
@@ -1100,7 +1337,7 @@ where
         &self,
         cancel: K,
     ) -> Result<usize, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         Result::Ok(guard.opts_.max_dock_chan_count)
     }
@@ -1112,7 +1349,7 @@ where
         &self,
         cancel: K,
     ) -> Result<usize, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         Result::Ok(guard.total_)
     }
@@ -1139,7 +1376,7 @@ where
         cancel: K,
     ) -> Result<ChannelOwner_<A>, ReserveErr_> {
         let state = {
-            let mut session = self.inner_.acquire_session();
+            let mut session = self.root_.inner_.acquire_session();
             let mut guard = acquire_write_(&mut session, cancel).await?;
             let inner = &mut *guard;
             // 锁内复查关闭标志：置位与登记并发时，以锁内这一次为准（见 `begin_close_`）。
@@ -1214,7 +1451,7 @@ where
     ///   不知道这条子流存在、没有任何在途帧，因此身份与配额**立即**归还，同一 dock
     ///   对可以马上再用（否则「打开后反悔」会白白占住 dock 对一整个宽限期）。
     pub(crate) async fn unreserve_channel_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, cancel: K) -> Result<bool, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         let removed = inner
@@ -1239,7 +1476,7 @@ where
 
     /// 拆掉一条 channel：**不删键**，改成宽限态；返回**本次释放后活跃子流是否归零**。
     pub(crate) async fn release_channel_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, now_millis: u64, cancel: K) -> Result<bool, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         inner.reap_wait_close_(now_millis);
@@ -1273,7 +1510,7 @@ where
     /// 读循环用它区分两类「本地表里查不到」的帧：命中 → 刚关闭，静默丢弃；
     /// 未命中 → 真正的未知子流，按协议违例处理。查询顺带回收已到期的宽限态。
     pub(crate) async fn is_wait_close_<K: TrCancellationToken>(&self, local_dock: Dock, remote_dock: Dock, now_millis: u64, cancel: K) -> Result<bool, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         inner.reap_wait_close_(now_millis);
@@ -1293,7 +1530,7 @@ where
         remote_dock: Dock,
         cancel: K,
     ) -> Result<Option<ChannelOwner_<A>>, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         let inner = &*guard;
         Result::Ok(match inner.bindings_.get(&(local_dock, remote_dock)) {
@@ -1322,7 +1559,7 @@ where
             .reserve_channel_(local_dock, remote_dock, now_millis, cancel.child_token())
             .await?;
         let marked = {
-            let mut session = self.inner_.acquire_session();
+            let mut session = self.root_.inner_.acquire_session();
             let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
             match guard.bindings_.get_mut(&(local_dock, remote_dock)) {
                 Option::Some(BindingSlot_::Channel(ctx)) => {
@@ -1352,7 +1589,7 @@ where
         local_dock: Dock,
         cancel: K,
     ) -> Result<Option<(Dock, ChannelOwner_<A>)>, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         let (start, end) = channel_range_(local_dock);
@@ -1376,7 +1613,7 @@ where
         remote_dock: Dock,
         cancel: K,
     ) -> Result<Option<WindowReport>, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         let Option::Some(BindingSlot_::Channel(ctx)) =
@@ -1413,7 +1650,7 @@ where
         local_dock: Dock,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         // 锁内复查关闭标志：不再接受新的独占绑定（见 `begin_close_`）。
@@ -1462,7 +1699,7 @@ where
         local_dock: Dock,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         let mut was_bound = false;
@@ -1510,7 +1747,7 @@ where
         &self,
         cancel: K,
     ) -> Result<Dock, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         // 锁内复查关闭标志：不再自行安排新的 dock（见 `begin_close_`）。
         if self.is_closing_() {
@@ -1533,7 +1770,7 @@ where
         local_dock: Dock,
         cancel: K,
     ) -> Result<LsnOwner_<A>, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         // 锁内复查关闭标志：不再接受新的监听器（见 `begin_close_`）。
@@ -1569,7 +1806,7 @@ where
         local_dock: Dock,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         inner.bindings_.remove(&listener_key_(local_dock));
@@ -1591,7 +1828,7 @@ where
         local_dock: Dock,
         cancel: K,
     ) -> Result<TgOwner_<A>, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         // 锁内复查关闭标志：不再接受新的数据报端点（见 `begin_close_`）。
@@ -1619,7 +1856,7 @@ where
         local_dock: Dock,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         let inner = &mut *guard;
         inner.bindings_.remove(&telegraph_key_(local_dock));
@@ -1643,7 +1880,7 @@ where
     ///
     /// 返回 `false` 表示**这次没拿到锁**（结果不可用）；`true` 表示回调已按当前快照跑完。
     pub(crate) fn for_each_live_telegraph_(&self, mut f: impl FnMut(Dock)) -> bool {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let Result::Ok(guard) = session.try_read() else {
             return false;
         };
@@ -1669,7 +1906,7 @@ where
         mut f: impl FnMut(Dock),
         cancel: K,
     ) -> Result<(), ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         let inner = &*guard;
         let (start, end) = remote_range_(remote_dock);
@@ -1685,7 +1922,7 @@ where
         local_dock: Dock,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel).await?;
         if let Option::Some(BindingSlot_::Listener(rec)) =
             guard.bindings_.get_mut(&listener_key_(local_dock))
@@ -1706,16 +1943,16 @@ where
         // 子流状态是**无锁**的原子字，因此通知建流等待者不需要离开注册表锁：直接在
         // 同一次遍历里投持久通知即可（旧实现要先把 owner 收集出来、再逐个取子流锁）。
         {
-            let mut session = self.inner_.acquire_session();
+            let mut session = self.root_.inner_.acquire_session();
             let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
             if guard.fail_.is_none() {
                 guard.fail_ = Option::Some(*err);
                 // 锁外的关闭原因快照：与 `fail_` 同一判据，只记**首个**失败。
-                self.fail_kind_.store(fail_kind_of_(err), Ordering::Release);
+                self.root_.shared_.mark_fail_kind_(fail_kind_of_(err));
             }
             // 逐条发布通知时用的**类别**：读锁外快照而不是当前这次调用的 `err`——
             // 第二次调用 `mark_failed_` 时，保留的仍然是**第一个**失败（与 `fail_` 一致）。
-            let fail_kind = decode_fail_kind_(self.fail_kind_.load(Ordering::Acquire));
+            let fail_kind = decode_fail_kind_(self.root_.shared_.fail_kind_());
             for binding in guard.bindings_.values() {
                 match binding {
                     BindingSlot_::Listener(rec) => {
@@ -1756,7 +1993,7 @@ where
     /// 失败的快照，而不是本次调用的参数）。见 [`fail_kind_of_`] 与
     /// [`ChannelRegistry_::fail_kind_`]。
     pub(crate) fn fail_kind_(&self) -> Option<ConnCloseReason> {
-        decode_fail_kind_(self.fail_kind_.load(Ordering::Acquire))
+        decode_fail_kind_(self.root_.shared_.fail_kind_())
     }
 
     /// 连接级失败的原因（若有）。
@@ -1764,7 +2001,7 @@ where
         &self,
         cancel: K,
     ) -> Result<Option<MuxError>, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         Result::Ok(guard.fail_)
     }
@@ -1775,7 +2012,7 @@ where
         &self,
         cancel: K,
     ) -> Result<bool, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         Result::Ok(guard.fail_.is_some())
     }
@@ -1810,7 +2047,7 @@ where
         actions: &mut [TimerAction_],
         cancel: K,
     ) -> Result<TimerScan_, ReserveErr_> {
-        let mut session = self.inner_.acquire_session();
+        let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         let inner = &*guard;
 
@@ -2271,7 +2508,7 @@ mod tests_ {
     impl ChannelRegistry_<CoreAlloc> {
         /// 只读地检查是否待决（等价于旧 `has_pending_inbound_`；测试单线程，直接取快路径）。
         fn has_pending_inbound_t_(&self, local_dock: Dock) -> bool {
-            let mut session = self.inner_.acquire_session();
+            let mut session = self.root_.inner_.acquire_session();
             let guard = session.try_read().expect("测试里不该争用");
             let (start, end) = channel_range_(local_dock);
             guard.bindings_.range((start, end)).any(|(_, binding)| {
@@ -2284,7 +2521,7 @@ mod tests_ {
 
         /// 持读锁执行断言（等价于旧 `with_`；测试单线程，直接取快路径）。
         fn with_t_<R>(&self, f: impl FnOnce(&RegistryInner_<CoreAlloc>) -> R) -> R {
-            let mut session = self.inner_.acquire_session();
+            let mut session = self.root_.inner_.acquire_session();
             let guard = session.try_read().expect("测试里不该争用");
             f(&guard)
         }
@@ -2294,7 +2531,7 @@ mod tests_ {
         /// 用于直接摆布注册表内部状态，构造那些**经公开路径到不了**的边界——典型是
         /// 「新号段已被用尽」（真去绑 2^32 次当然不可能）。
         fn with_write_t_<R>(&self, f: impl FnOnce(&mut RegistryInner_<CoreAlloc>) -> R) -> R {
-            let mut session = self.inner_.acquire_session();
+            let mut session = self.root_.inner_.acquire_session();
             let mut guard = session.try_write().expect("测试里不该争用");
             f(&mut guard)
         }

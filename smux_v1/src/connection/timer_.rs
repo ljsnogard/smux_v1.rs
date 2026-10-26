@@ -79,7 +79,10 @@ use crate::{
         Dock, FrameKind, TrConnCfg, flags,
         mux_connection::{K_CLOSE_NONE, K_CLOSE_TIMEOUT},
         session_::MuxShared_,
-        signal_::{ControlFrame_, EventSender_, ReadEvent_, WriteEvent_},
+        signal_::{
+            ControlFrame_, EventSender_, HINT_R_RELEASE, HINT_W_TX_CLOSED, ReadEvent_,
+            WriteEvent_,
+        },
     },
     flow_ctrl::WindowReport,
     metrics::{ChannelCloseReason, TrMetricsSink},
@@ -287,7 +290,8 @@ pub(crate) async fn timer_loop_async_<C, K>(
 async fn deliver_action_<C, K>(
     shared: &MuxShared_<C>,
     w_events: &EventSender_<WriteEvent_<C::Alloc>>,
-    r_events: &EventSender_<ReadEvent_<C::Alloc>>,
+    // 读方向只剩合并提示；参数保留到事件通道整体清理时删除。
+    _r_events: &EventSender_<ReadEvent_<C::Alloc>>,
     action: &TimerAction_,
     cancel: K,
 ) -> bool
@@ -302,13 +306,24 @@ where
             local_dock,
             remote_dock,
         } => {
-            // 复用**既有的**「应用丢弃发送半边」路径：复用循环收到它以后会
-            // `set_app_tx_closed_` 并在发送环排空之后补 `CLOSE(FIN)`。这里因此
-            // 不需要新事件类型，也不需要复制任何排空逻辑。
-            w_events.try_send_durable_event_(WriteEvent_::TxClosed {
-                local_dock: *local_dock,
-                remote_dock: *remote_dock,
-            })
+            // 复用**既有的**「应用丢弃发送半边」路径：状态字上的
+            // `APP_TX_CLOSED` 就是事实，写循环按位在发送环排空之后补
+            // `CLOSE(FIN)`。这里只负责置位 + 唤醒写循环，不再投事件。
+            let owner = match shared
+                .reg_()
+                .channel_owner_(*local_dock, *remote_dock, cancel.child_token())
+                .await
+            {
+                Result::Ok(owner) => owner,
+                Result::Err(_) => return false,
+            };
+            let Option::Some(owner) = owner else {
+                // 身份已经释放：没有可排空的东西。
+                return true;
+            };
+            let _ = owner.set_app_tx_closed_();
+            shared.reg_().raise_write_hint_(HINT_W_TX_CLOSED);
+            true
         }
 
         TimerAction_::Pulse {
@@ -374,6 +389,9 @@ where
             if let Option::Some(owner) = owner {
                 owner.set_local_fin_sent_();
                 let _ = owner.claim_local_reset_();
+                // 身份已经被本路径直接释放（绕过 `claim_release_` 的两方向判据）：
+                // 补置 `RELEASED`，读循环据此摘本地读表并关接收环写端。
+                owner.mark_released_();
                 // 两个方向就此收尾（`FIN` / `RESET` 均已投递）：叫醒应用侧的收尾
                 // 等待者，让 `flush_async` / `close_async` 按「空闲超时」的终局返回，
                 // 而不是继续 park 在一条再也不会被排空的环上。原因（`IdleTimeout`）
@@ -411,10 +429,8 @@ where
             }) {
                 return false;
             }
-            let _ = r_events.try_send_durable_event_(ReadEvent_::Release {
-                local_dock: local,
-                remote_dock: remote,
-            });
+            // 身份已释放：读循环按 `RELEASED` 位摘表并关接收环写端。
+            shared.reg_().raise_read_hint_(HINT_R_RELEASE);
             true
         }
 

@@ -38,8 +38,8 @@ std::thread_local! {
     /// 计时循环在等待关闭状态下**认领**「排空 + `FIN`」动作的次数。
     static CLOSE_FIN_CLAIMED: Cell<u64> = const { Cell::new(0) };
 
-    /// 复用循环**处理** `WriteEvent_::TxClosed` 的次数（应用丢弃发送半边，或连接
-    /// 在关闭流程里代为投递——两者同一条路径）。
+    /// 复用循环扫描到**新**「应用已封口、尚欠 `FIN`」条目的次数（应用丢弃发送半边，
+    /// 或连接在关闭流程里代为置位——两者同一条路径）。
     static TX_CLOSED_HANDLED: Cell<u64> = const { Cell::new(0) };
 
     /// 复用循环**成功发出一条 `CLOSE(FIN)`** 的次数（`finalize_entry_` 走完）。
