@@ -1651,6 +1651,12 @@ connection/
   5. 验收：lib 370 / inmem 20 / smoke 5 / cross_thread 1 / keepalive 5；
      clippy / format 合规。
 
+- 20261027-0245：**P4 前置：`dock_index_` 别名 + 2 KiB 等价性**。
+  `K_DOCK_TREE_DEGREE = 16`；`DockBPlusTree_` / `DockSet_` 以 `DockTreeCfg_`（2 KiB）
+  为配置。单测与 `BTreeMap` 对拍 get / insert / iter / range / remove 以及 chunk
+  大小。具体表（`bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_` /
+  本地 `WriteTable_` / `ReadTable_`）的迁移仍待 P4。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

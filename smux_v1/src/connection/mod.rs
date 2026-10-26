@@ -606,6 +606,7 @@ mod config_;
 mod connect_;
 mod control_state_;
 mod dock_binding;
+mod dock_index_;
 mod error_;
 mod frame_;
 mod frame_parser_;
