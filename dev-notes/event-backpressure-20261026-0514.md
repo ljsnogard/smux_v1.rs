@@ -1,9 +1,10 @@
 # 事件队列的背压化与一次性通知内联（20261026-0514）
 
 - 分支：`feat/mpmc-chan`（延续同名试验）
-- 状态：**方案已定稿；阶段 0（基础原语）已落地，阶段 1 起待实施**
+- 状态：**阶段 0 / 1a / 1b / 2a / 2b / 2d 已实施；2c 与阶段 3/4 待检阅**
+- 现状速查：`connection-delivery-20261026-1845.md`（报文 → 处理对象 → 交付方式）
 - 相关：`signal_` / `slot_` / `session_` / `owner_` / `timer_` / `mux_connection`
-- 前序：`mpmc-chan-20261026-0046.md`（把 `flume` 换成 `mpmc_chan`，暴露了共享定容队列的
+- 前序：`archive/mpmc-chan-20261026-0046.md`（把 `flume` 换成 `mpmc_chan`，暴露了共享定容队列的
   容量问题）
 
 ## 0. 结论先行
@@ -131,7 +132,7 @@ by_local_: BTreeMap<Dock, BTreeMap<Dock, ChannelOwner_<A>>>,
 | --- | --- | --- | --- |
 | `ctl_rx`（mpmc 定容） | `Attach`、会话释放、`Wake` | 64 | `send_async` 背压（可取消） |
 | `mux_inbox` / `demux_inbox`（内联 SPSC） | `ctl` → 数据循环的 Attach | 64 | `ctl` 等消费者取 |
-| `hint_w` / `hint_r`（`HintSlot_`） | 拆流/释放/水位提示 | 1（位集） | **不会饱和** |
+| `hint_w` / `hint_r`（`HintSlot_`） | 拆流/释放/水位提示 | 1（位集） | **不会饱和**（实现时并入 `RegistryShared_` 位域，见 §6.4） |
 | 每子流 `InlineQueue_` | OPEN / ACCEPT / REJECT | 2 | 生产者等待（上界内不发生） |
 
 `CLOSE(FIN/RESET)`、`WINDOW_UPDATE`、`PULSE` **不占队列**：由 owner 位与窗口快照重建。
@@ -164,8 +165,11 @@ by_local_: BTreeMap<Dock, BTreeMap<Dock, ChannelOwner_<A>>>,
 | 0 | `InlineQueue_` / `HintSlot_` 原语 + 单元测试 | **已完成**（`slot_.rs`，15 个测试全过） |
 | 1a | `TxClosed` / `RxClosed` 位化 + 写循环扫描；删对应 durable 事件 | **已完成**（见 §6.2） |
 | 1b | `PeerClosed` / `Release` 位化 + 读循环扫描 | **已完成**（见 §6.3） |
-| 2 | `ctl` 循环 + Listener registry + `Attach` 分发；两条大队列缩为 `ctl_rx` | 待做 |
-| 3 | 控制帧入 `InlineQueue_`；CLOSE/窗口/PULSE 改重建；删除旧事件通道 | 待做 |
+| 2a | 第 4 个 `ctl` 循环骨架 + 第 4 个取消令牌 | **已完成**（见 §6.5） |
+| 2b | `Attach` 改走内联 inbox；补投背压；删事件 `Attach` | **已完成**（见 §6.5） |
+| 2c | Listener registry（按 `local_dock`）+ ctl 承担入向 / 拆流事务 | **待检阅**（先定交付矩阵，见 `connection-delivery-20261026-1845.md` §4） |
+| 2d | `EVENT_CHAN_CAP` 1024 → 256 | **已完成**（见 §6.5） |
+| 3 | 控制帧入 `InlineQueue_`；CLOSE/窗口/PULSE 改重建；删除无界 durable 暂存 | 待做 |
 | 4 | `DrainExecutor_` 长事务（finalize / release） | 待做 |
 
 ### 6.2 阶段 1a 实现记录
@@ -174,6 +178,7 @@ by_local_: BTreeMap<Dock, BTreeMap<Dock, ChannelOwner_<A>>>,
 
 - `ChannelRegistry_` 新增 `write_hint_: Shared<HintSlot_, A>`（每连接一次分配，与
   `timer_wake_` 同源）与 `raise_write_hint_` / `take_write_hint_` / `poll_write_hint_`；
+  **§6.4 已把这组 `Shared` 合并为 `RegistryShared_` 的位域**；
 - `ChannelTx::seal_tx_` / `ChannelRx::seal_rx_`：保留 `set_app_*` 置位，把原来的
   `try_send_durable_event_(TxClosed / RxClosed)` 换成一次 `raise_write_hint_`；
 - timer 的 `TimerAction_::Finalize`：取 owner 并置 `APP_TX_CLOSED`，再 `raise`；
@@ -323,8 +328,9 @@ FIFO。若 `RxConsumed` 先被取出（此时读表还没有该对），事件�
 - `HintSlot_`：`raise_` / `take_` / `poll_wait_`；
 - 测试覆盖 FIFO、满时拒绝、异步入队 park、取消、关闭唤醒、提示合并与唤醒。
 
-过渡期在模块头用 `#![allow(dead_code)]` 抑制「尚未接入」的警告，接入完成后删除；
-该行是阶段 2/3 的收尾项。
+过渡期在模块头用 `#![allow(dead_code)]` 抑制「尚未接入」的警告。**现状**：
+`InlineQueue_` 已接入（`Attach` inbox）；`HintSlot_` 已被 §6.4 的位域取代、没有任何
+外部引用；`#![allow(dead_code)]` 与 `HintSlot_` 应在交付矩阵定稿后一起删除。
 
 ## 7. 风险与待确认
 
