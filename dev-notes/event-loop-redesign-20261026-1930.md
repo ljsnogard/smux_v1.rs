@@ -1708,7 +1708,7 @@ connection/
   `type PendingFin_<A> = DockSet_<A, (Dock, Dock)>`；初始化用 `DockSet_::new_in`；
   `insert` 的 bool 语义用 `.is_none()`，`iter` / `range` 适配 `(&K, &V)` item 形态。
   验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
-  本地表 `WriteTable_` / `ReadTable_` 与 registry 四表仍待迁移。
+  本地表 `WriteTable_` / `ReadTable_` 已迁移；registry 四表受 `Send` 限制保留标准库容器（见 0800 记录）。
 
 - 20261027-0600：**P4 索引迁移：telegraph 两表换 2 KiB B+ 树**。
   `TgReadTable_` / `TgWriteTable_` -> `DockBPlusTree_<A, Dock, ...>`；
@@ -1728,16 +1728,24 @@ connection/
   `get` / `get_mut` 适配 `(&K, &V)`，`remove` / `contains_key` 改用值键；
   测试辅助建表改用 `DockBPlusTree_::new_in`。
   验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
-  `ReadTable_` 与 registry 四表（`bindings_` / `docks_` / `remote_index_` /
-  `wait_close_expiry_`）仍待迁移。
+  `ReadTable_` 已迁移；registry 四表受 `Send` 限制保留标准库容器（见 0800 记录）。
 
 - 20261027-0730：**P4 索引迁移：`ReadTable_` 换 2 KiB B+ 树**。
   `type ReadTable_<A> = DockBPlusTree_<A, (Dock, Dock), ReadEntry_<A>>`；demux 的
   `get` / `get_mut` 适配 `(&K, &V)`；两表统一后，全部 `table.*(&pair)` 借用改为
   值键（B+ 树 `Q: Borrow<K>`）。
   验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
-  registry 四表（`bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_`）
-  仍待迁移。
+  registry 四表受 `Send` 限制保留标准库容器（见 0800 记录）。
+
+- 20261027-0800：**P4 索引迁移的边界：`BPlusTree` / `BTree` 不是 `Send`**。
+  1. 尝试把 `remote_index_` / `wait_close_expiry_` 换 `DockBPlusTree_` / `DockSet_`
+     后，`RegistryInner_<CoreAlloc>` 不再 `Send`，`cross_thread_compio` 编译失败
+     （arena 含 `NonNull`，上游未 `unsafe impl Send`）；已回退。
+  2. 结论：设计稿 §18 的「registry 四表换 2 KiB arena 树」**不可行**，除非上游为
+     `BPlusTree` / `BTree` 补 `Send`，或把 registry 表移出跨线程共享。
+  3. 本地数据面表（`WriteTable_` / `ReadTable_` / `TgReadTable_` / `TgWriteTable_`）
+     在循环私有的 `MuxShared_` 中，`PendingFin_` 在循环栈上，均不受此限，已迁移。
+  4. registry 四表保留 `BTreeMap` / `BTreeSet`。
 
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
@@ -1944,7 +1952,7 @@ value，key 与树结构保持不变。
 | T17 | `bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_` 换 arena 树 | P1.5 | 待做 |
 | T18 | `DockCtx_` 只加 `unbind_requested`；`range` / `range_mut` / `remote_index_.range` 直接替换；`docks_` 的 entry helper | P1.5 | 待做 |
 | T19 | `take_pending_inbound` 改用 `bindings_.range_mut`；不引入侵入链表 | P1.5 | 待做 |
-| T20 | 数据面本地表换 B+；用 `iter_mut` / `range_mut`；range 边界与 `BTreeMap` 对拍 | P4 | 待做 |
+| T20 | 数据面本地表换 B+；用 `iter_mut` / `range_mut`；range 边界与 `BTreeMap` 对拍 | P4 | 数据面五表完成；registry 四表因 `BPlusTree: !Send` 保留标准库容器（见 §17 0800） |
 | T21 | `reusable_docks_` 去 `VecDeque`；degree / chunk 调优 | P6 | 待做 |
 
 ### F. 清理
