@@ -38,13 +38,13 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
+use abs_cancel::TrCancellationToken;
+use abs_sync::may_break::TrMayBreak;
+use atomic_sync::mutex::preemptive::SpinningMutexOwned;
+
 use crate::{
     connection::sync_::NotifySlot_,
-    x_deps::{
-        abs_cancel::TrCancellationToken,
-        abs_sync::may_break::TrMayBreak,
-        atomic_sync::mutex::preemptive::SpinningMutexOwned,
-    },
+    x_deps::{abs_cancel, abs_sync, atomic_sync},
 };
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
