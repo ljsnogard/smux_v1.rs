@@ -1863,6 +1863,15 @@ connection/
   6. 验收：lib 373 / inmem 20 / cross_thread 1 / smoke 5 / keepalive 5；
      clippy 0 error；format 合规（189 文件）。
 
+- 20261027-1530：**T22 清理：删除 `InlineQueue_` / `SlotRing_` / `WakerSlots_`**。
+  1. 三条通道换 `mpmc_chan` 后，这三个原语在生产路径已无使用者（只剩 `slot_.rs`
+     自己的单测）。删除 `SlotRing_`、`InlineQueue_`（含 `push_async_` 背压与
+     `free_waiters_`）、`WakerSlots_`，以及对应的 5 个队列测试与 2 个槽测试。
+  2. `slot_.rs` 只剩 [`PushErr_`]（请求通道的失败形状，由 `SendError` 映射）与
+     [`HintSlot_`]（连接级合并提示）；模块文档改为说明它们为何留下。
+  3. 验收：lib 360（删 13 个测试变体后的数量）/ inmem 20 / cross_thread 1 /
+     smoke 5 / keepalive 5；clippy 0 error；format 合规（189 文件）。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2075,7 +2084,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5，`InlineQueue_` / `WakerSlots_` 生产路径已无使用者、待删）；`PendingFin_` 待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
+| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 仍待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` / `util_` 待 P5 |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 
