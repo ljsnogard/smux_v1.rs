@@ -56,7 +56,8 @@
    快收池）、每个 pending channel 的两条小 message ring。数据面热路径与 `Drop` 路径
    **零分配**。
 8. **索引迁移**：registry / dock 相关 `BTreeMap` / `BTreeSet` 改为 `bplus_tree_cmp` 的
-   `BPlusTree` / `BTree`；`SlabList` 64 KiB chunk 降低长期碎片。范围查询直接用
+   `BPlusTree` / `BTree`；`SlabList` **2 KiB chunk**（本 crate 默认，见 §18）降低长期
+   碎片与固定开销。范围查询直接用
    `range` / `range_mut` / `iter_mut`（§18）。任务清单见 §19。
 
 ---
@@ -145,7 +146,7 @@
 - **I10 建流期 ring 的所有权**：app 侧两半随 `ChannelHandle`，main 侧两半放进身份表槽
   `ChanSlot_.msg_main_`；建流裁决或 `Drop` 时两侧关闭，身份释放后不保留。
 - **I11 索引使用 arena 树**：身份表与 dock 相关表改用 `bplus_tree_cmp` 的
-  `BPlusTree` / `BTree`，分配走 `SlabList` 的 64 KiB chunk；查询路径不得把整表复制到
+  `BPlusTree` / `BTree`，分配走 `SlabList` 的 **2 KiB chunk**（本 crate 默认）；查询路径不得把整表复制到
   `Vec`，不得为范围扫描临时分配容器。范围需求直接用 `range` / `range_mut` / `iter_mut`，不复制整表
   （§18）。
 
@@ -1341,7 +1342,7 @@ main_loop：
 ### 10.3 保留的堆（需在评审时确认）
 
 - `ChannelRegistry_` / `RegistryInner_` 的 `BPlusTree` / `BTree`：身份表、dock 表、反向
-  索引、宽限到期索引。底层 `SlabList` 按 64 KiB chunk 分配，chunk 内槽位复用，不逐条
+  索引、宽限到期索引。底层 `SlabList` 按 **2 KiB chunk** 分配（本 crate 默认），chunk 内槽位复用，不逐条
   分配；树非空期间一个 chunk 常驻（这是换取低碎片的固定开销，见 §18）；
 - `mux_loop` / `demux_loop` 的本地 `BPlusTree`：每子流占一个数据槽 + 索引项，随表所在
   的 chunk 复用；
@@ -1396,7 +1397,9 @@ connection/
   public_channel_.rs // PublicChannel_ / chunked 读写（不新增 buffer 类型）
   pending_msg_.rs    // PendingMsgApp_ / PendingMsgMain_ / 建流期 message ring
   dock_index_.rs     // BPlusTree / BTree 类型别名、degree、comparer、DockCtx_ unbind 辅助
-  tcs_.rs            // Tcs_ / TcsInner_ / WakerSlots_
+  tcs_.rs            // Tcs_ / TcsInner_ / TcsAbandonGuard_
+  control_state_.rs  // 请求队列 + main 提示位
+  tree_config_.rs    // 索引树的 2 KiB chunk 配置（P1.5 建树时使用）
   session_.rs        // 只留 mux_loop / demux_loop 与数据面辅助
   ...
 ```
@@ -1533,9 +1536,9 @@ connection/
 15. **`TreeError` 的构造失败**：`BPlusTree::new_in` / `BTree::new_in` 返回
     `Result<_, TreeError>`；`MuxConnection::new` 目前不返回 `Result`。需要决定是
     `expect`（配置错误即 panic）还是把构造改成 `try_new` / 加连接级错误（Q15）。
-16. **chunk 常驻与 degree**：`SlabList` 的 64 KiB chunk 在树非空期间常驻；degree 过小
+16. **chunk 常驻与 degree**：`SlabList` 的 2 KiB chunk 在树非空期间常驻；degree 过小
     会增加节点数，过大则单节点浪费。需要按 registry 规模 / 8~32 的 degree 做基准（Q16）。
-17. **每连接树数量 / 固定 chunk 开销**：≈10 棵树 × 64 KiB（B+ 两个 arena 时更多）会在
+17. **每连接树数量 / 固定 chunk 开销**：≈10 棵树 × 2 KiB（B+ 两个 arena 时更多）会在
     小连接上放大固定内存；必须先做基准，必要时缩小迁移范围或给上游加可配置 chunk。
 
 ### 15.2 待拍板
@@ -1557,7 +1560,7 @@ connection/
 | Q13 | Listener 是否共享一条 message ring？ | **不共享**；每个入向 pending channel 一对，避免容量被并发请求打满 |
 | Q14 | 是否还需要 dock 计数 / 侵入链表作为 range 的优化？ | **不需要**；`range` / `range_mut` 已够。计数只在基准显示 `has_any_identity` 成为热点时再加 |
 | Q15 | `TreeError` 构造失败怎么处理？ | 先 `expect`（容量/degree 是配置错误，与 OOM 同级）；若需要可诊断，再加 `try_new` / 连接级错误 |
-| Q16 | degree、chunk 大小与迁移范围？ | 先 `K_DOCK_TREE_DEGREE = 16`、默认 64 KiB chunk；按“每连接树数 × chunk”基准决定是否只迁 `bindings_` + 本地表，或推动上游支持可配置 chunk |
+| Q16 | degree、chunk 大小与迁移范围？ | 先 `K_DOCK_TREE_DEGREE = 16`、**本 crate 默认 2 KiB chunk**（`K_DOCK_TREE_CHUNK_SIZE`）；按“每连接树数 × chunk”基准再调 |
 
 ---
 
@@ -1615,7 +1618,8 @@ connection/
 高建流 / 拆流 churn 的连接上，节点反复分配 / 释放会把分配器切成碎片。`bplus_tree_cmp`
 的 `BPlusTree` / `BTree` 把节点与数据放进 `SlabList`：
 
-- `SlabList` 默认按 **64 KiB chunk** 分配，chunk 内槽位复用；不按条目逐个分配；
+- `SlabList` 上游默认按 **64 KiB chunk** 分配（`DefaultSlabConfig`）；本 crate 通过
+  `SlabListConfig<2 KiB, A>` 取 **2 KiB**（见 §18.3），chunk 内槽位复用；不按条目逐个分配；
 - `BPlusTree` 的数据 `(K,V)` 放在独立 data slab，索引节点只保存 `SlotPtr`，分裂/合并
   不移动数据，值的地址稳定；
 - comparer-first：`K` 不必 `Ord`，查询对象可以与 `K` 不同，等值查询可用
@@ -1739,12 +1743,12 @@ value，key 与树结构保持不变。
   需要把 `TreeError` 映射成连接构造失败。`MuxConnection::new` 当前不返回 `Result`，
   因此要么 `expect`（把 degree/chunk 当配置错误，与 OOM 同级），要么新增 `try_new`
   （公开 API 变更，Q15）。
-- 每棵树首次插入时按 64 KiB chunk 分配；之后 chunk 内槽位复用。B+ tree 两个 arena，
+- 每棵树首次插入时按 **2 KiB chunk** 分配；之后 chunk 内槽位复用。B+ tree 两个 arena，
   BTree 一个 arena。树清空后 chunk 仍可能保留（由 `SlabList` 管理）。
 - 不再有“每条身份一次 BTreeMap 节点分配”；改为“每棵树若干个 chunk”。这降低长期
   碎片概率，但**单连接固定内存可能明显增加**：registry 四棵树 + 数据面本地四棵树 +
-  telegraph 两棵树 ≈ 10 棵；每棵树首次插入按 64 KiB chunk 分配，B+ tree 有 data/node
-  两个 arena（最多约 128 KiB/树）。小连接可能因此多出数百 KiB。
+  telegraph 两棵树 ≈ 10 棵；每棵树首次插入按 **2 KiB chunk** 分配，B+ tree 有 data/node
+  两个 arena（最多约 4 KiB/树）。小连接因此只多出几十 KiB，而不是数百 KiB。
 - 迁移前必须用 `alloc_count` / RSS / 峰值基准决定哪些表值得迁：优先 `bindings_` 与
   数据面本地表（条目多、churn 高）；`remote_index_` / `wait_close_expiry_` 条目少时
   可以继续 `BTreeSet`，或等上游支持可配置 chunk 大小。
@@ -1774,9 +1778,9 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 待做 |
 | T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | 待做 |
-| T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | 待做 |
+| T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；控制帧 / 关闭 / tick 待 P2–P5 |
 | T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | 待做 |
-| T5 | 删除 `ctl_`；循环数 / 取消令牌覆盖 4 个 | P1 | 待做 |
+| T5 | 删除 `ctl_`；循环数 / 取消令牌覆盖 4 个 | P1 | 完成（`loops_[3]` = main） |
 
 ### B. 传输与公共子流
 
@@ -1791,7 +1795,7 @@ value，key 与树结构保持不变。
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | P0 完成 |
-| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | `WakerSlots_` 完成；请求队列待 P1 |
+| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 队列 + `Bind`/`Listen`/`ReserveChannel` 完成；其余待 P3 |
 | T11 | `MainReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | 待做 |
 
 ### D. 建流期 message ring
@@ -1807,7 +1811,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T16 | `dock_index_` 适配层：degree 16、allocator、comparer、树类型别名 | P1.5 | 待做 |
+| T16 | `dock_index_` 适配层：degree 16、allocator、comparer、树类型别名 | P1.5 | 2 KiB chunk 配置完成；类型别名待 P1.5 |
 | T17 | `bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_` 换 arena 树 | P1.5 | 待做 |
 | T18 | `DockCtx_` 只加 `unbind_requested`；`range` / `range_mut` / `remote_index_.range` 直接替换；`docks_` 的 entry helper | P1.5 | 待做 |
 | T19 | `take_pending_inbound` 改用 `bindings_.range_mut`；不引入侵入链表 | P1.5 | 待做 |

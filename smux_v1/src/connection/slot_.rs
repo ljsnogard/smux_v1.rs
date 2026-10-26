@@ -223,22 +223,23 @@ impl<T, const N: usize> InlineQueue_<T, N> {
 
     /// 异步出队：空时 park，消费者关闭后返回 `None`。
     pub(crate) fn poll_pop_(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if let Option::Some(item) = self.try_pop_() {
-            return Poll::Ready(Option::Some(item));
-        }
-        if self.closed_.load(Ordering::Acquire) {
-            return Poll::Ready(Option::None);
-        }
-        // 登记「有数据」的唤醒；持久位保证「先入队、后 park」不丢。
-        if self.ready_.poll_wait_(cx).is_ready() {
+        // 循环而不是「复检一次就返回 Pending」：`ready_` 是持久位，消费它之后若队列
+        // 仍然为空（条目已被批处理的 `try_pop_` 取走、或只拿到一个陈旧位），必须**重新
+        // 登记** waker。否则下一次 `try_push_` 的 `notify_` 只会置位、看不到等待者，
+        // 消费者永久睡下去（P1 的 bind 请求第二次提交时实测撞到）。
+        loop {
             if let Option::Some(item) = self.try_pop_() {
                 return Poll::Ready(Option::Some(item));
             }
             if self.closed_.load(Ordering::Acquire) {
                 return Poll::Ready(Option::None);
             }
+            // 登记「有数据」的唤醒；持久位保证「先入队、后 park」不丢。
+            if self.ready_.poll_wait_(cx).is_ready() {
+                continue;
+            }
+            return Poll::Pending;
         }
-        Poll::Pending
     }
 
     /// 异步入队：满时等待消费者取走（背压），可被取消令牌打断。
@@ -463,19 +464,20 @@ impl HintSlot_ {
 
     /// 等下一次提示：已有提示时立刻返回，否则登记唤醒。
     pub(crate) fn poll_wait_(&self, cx: &mut Context<'_>) -> Poll<u64> {
-        let bits = self.take_();
-        if bits != 0u64 {
-            return Poll::Ready(bits);
-        }
-        // 持久位的「先置位、后登记」保证不丢；醒后必须复检掩码（置位与唤醒之间
-        // 可能已有另一批提示被 `take_` 清走，但 `raise_` 会重新置位）。
-        if self.wake_.poll_wait_(cx).is_ready() {
+        // 与 `InlineQueue_::poll_pop_` 同理：消费持久位之后若掩码仍为空，必须重新登记
+        // waker，不能直接返回 `Pending`。
+        loop {
             let bits = self.take_();
             if bits != 0u64 {
                 return Poll::Ready(bits);
             }
+            // 持久位的「先置位、后登记」保证不丢；醒后必须复检掩码（置位与唤醒之间
+            // 可能已有另一批提示被 `take_` 清走，但 `raise_` 会重新置位）。
+            if self.wake_.poll_wait_(cx).is_ready() {
+                continue;
+            }
+            return Poll::Pending;
         }
-        Poll::Pending
     }
 }
 

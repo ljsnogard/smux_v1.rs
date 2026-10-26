@@ -589,6 +589,9 @@
 //! | `tcs_` | 请求完成源 `Tcs_`（`Pending` / `Done` / `Taken` / `Abandoned`） | —（内部，P0 已落、未接线） |
 //! | `public_channel_` | 公共子流的 chunked 读写原语（`PublicChunkIo_` / `ChunkReadState_`） | —（内部，P0 已落、未接线） |
 //! | `pending_msg_` | 建流期 message ring（`PendingMsgApp_` / `PendingMsgMain_`） | —（内部，P0 已落、未接线） |
+//! | `control_state_` | 控制面请求队列 + `HINT_MAIN_*` 提示位 | —（内部，P1 已接线） |
+//! | `main_loop` | `main_loop_async_` / `MainRequest_` / `MainReply_` | —（内部，P1 已接管 bind / listen / reserve） |
+//! | `tree_config_` | 索引树的 2 KiB chunk 配置（`TrConfig`） | —（内部，P1.5 建树时使用） |
 //!
 //! 纪律：**任何 struct / enum 成员都不得带 `pub(crate)`**；跨模块访问一律经
 //! `pub(crate)` 关联函数。同一个 `impl` 内按「`pub` → `pub(crate)` → 私有」集中排列。
@@ -601,11 +604,12 @@ mod channel_half;
 mod channel_listener;
 mod config_;
 mod connect_;
-mod ctl_;
+mod control_state_;
 mod dock_binding;
 mod error_;
 mod frame_;
 mod frame_parser_;
+mod main_loop;
 mod mux_connection;
 mod owner_;
 mod pending_msg_;
@@ -618,6 +622,7 @@ mod sync_;
 mod tcs_;
 mod telegraph;
 mod timer_;
+mod tree_config_;
 #[cfg(test)]
 mod test_support_;
 
@@ -638,7 +643,11 @@ pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
+pub(crate) use control_state_::ControlState_;
+pub(crate) use main_loop::{MainErr_, MainReply_, MainRequest_, main_loop_async_};
+pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
 pub(crate) use mux_connection::ReserveErr_;
+pub(crate) use slot_::PushErr_;
 pub use ring_::{
     BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff_, MuxChanBuffOwnedBy, RingBuildErr,
     new_buffered_channel,

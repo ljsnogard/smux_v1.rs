@@ -1,3 +1,5 @@
+use core::future::poll_fn;
+
 use abs_buff::TrBuffRead;
 use abs_cancel::TrCancellationToken;
 use abs_smux::{
@@ -8,7 +10,8 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        ChannelHandle, Dock, MuxError, MuxConnection, ReserveErr_, TrConnCfg,
+        ChannelHandle, Dock, MainErr_, MainReply_, MainRequest_, MuxConnection, MuxError,
+        PushErr_, ReserveErr_, TcsAbandonGuard_, Tcs_, TrConnCfg,
         channel_listener::ChannelListener,
         signal_::SessionEvent_,
         util_::read_available_into_vec_,
@@ -209,27 +212,38 @@ where
     K: TrCancellationToken,
 {
     // `reserve` 是上游新加的「入向邀请最多同时挂起多少条」的上限。当前实现还没有按它
-    // 预分配的队列（入向通知是身份节点里的**内联**槽），因此这里先显式消费掉参数；
-    // 等定容队列落地后再按它预分配（见 `crate::connection` 模块文档 §2.3 的遗留项）。
-    let _ = reserve;
+    // 预分配的队列（入向通知是身份节点里的**内联**槽），因此它只随请求带给
+    // `main_loop`，等定容队列落地后再按它预分配。
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
-    // 先清空释放邮箱：上一位持有者可能刚丢弃它的 listener（Drop 只投消息），
-    // 不先落实就会把「已释放」误判成「已被占用」。
+    // 一次请求 + 完成源：登记由 `main_loop` 执行（它是身份表唯一写者）。
+    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let waiter = tcs.clone();
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
-        .drain_session_events_(cancel.child_token())
+        .control_()
+        .submit_async_(
+            MainRequest_::Listen {
+                local_dock: local,
+                reserve,
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
         .await
-        .map_err(map_reserve_err_)?;
-    // 登记 listener 身份（统一身份表里的 `(local, wildcard)`）：它既是「本 dock 在
-    // 监听」的事实，也是入向等待者的落点；若该 dock 已作 telegraph 会被拒。
-    // 入向通知是身份节点里**内联的零分配通知槽**（不再是 `flume` 通道），listener
-    // 持节点句柄并在它上面等通知（协议见 `sync_::NotifySlot_`）。
-    let rec = conn
-        .core_()
-        .reserve_listener_(local, cancel.child_token())
-        .await
-        .map_err(map_reserve_err_)?;
-    Result::Ok(ChannelListener::new_(conn, local, rec))
+        .map_err(|err| match err {
+            PushErr_::Closed(_) => BindingError::Closed,
+            PushErr_::Cancelled(_) => BindingError::Cancelled,
+        })?;
+    let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
+    match reply {
+        Option::Some(Result::Ok(MainReply_::Listener(rec))) => {
+            Result::Ok(ChannelListener::new_(conn, local, rec))
+        }
+        Option::Some(Result::Err(MainErr_::Reserve(err))) => Result::Err(map_reserve_err_(err)),
+        Option::Some(Result::Err(MainErr_::Mux(err))) => Result::Err(BindingError::Mux(err)),
+        Option::Some(Result::Ok(_)) | Option::None => Result::Err(BindingError::Closed),
+    }
 }
 
 /// [`TrDockBinding::open_channel_async`] 的 step 函数。
@@ -261,18 +275,38 @@ where
     if remote_dock.is_special() {
         return Result::Err(BindingError::ReservedDock);
     }
-    // 先落实积压的释放消息：发起方「未裁决就丢弃」的撤销（`UnreserveChannel`）与
-    // 响应方的宽限登记（`ReleaseChannel`）都可能是同一条 dock 对的上一轮残留。
+    // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）：由 `main_loop` 执行。
+    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let waiter = tcs.clone();
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
-        .drain_session_events_(cancel.child_token())
+        .control_()
+        .submit_async_(
+            MainRequest_::ReserveChannel {
+                local_dock: local,
+                remote_dock,
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
         .await
-        .map_err(map_reserve_err_)?;
-    // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）；共享状态随身份一起建立。
-    let owner = conn
-        .core_()
-        .reserve_channel_(local, remote_dock, cancel.child_token())
-        .await
-        .map_err(map_reserve_err_)?;
+        .map_err(|err| match err {
+            PushErr_::Closed(_) => BindingError::Closed,
+            PushErr_::Cancelled(_) => BindingError::Cancelled,
+        })?;
+    let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
+    let owner = match reply {
+        Option::Some(Result::Ok(MainReply_::Channel(owner))) => owner,
+        Option::Some(Result::Err(MainErr_::Reserve(err))) => {
+            return Result::Err(map_reserve_err_(err));
+        }
+        Option::Some(Result::Err(MainErr_::Mux(err))) => {
+            return Result::Err(BindingError::Mux(err));
+        }
+        Option::Some(Result::Ok(_)) | Option::None => {
+            return Result::Err(BindingError::Closed);
+        }
+    };
 
     // 2. 把开场消息搬进句柄（`OPEN` 要等 `accept_async` 才发）。
     let payload = read_available_into_vec_(

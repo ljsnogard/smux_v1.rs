@@ -273,6 +273,38 @@ where
     }
 }
 
+/// 等待守卫：等待 future 被丢弃时自动 [`Tcs_::abandon_`]。
+///
+/// API future 在提交请求后把等待句柄包进本守卫：调用方取消 / 丢弃 future 时，
+/// `main_loop` 仍会完成协议动作，但 `set_` 会发现没人要而丢弃结果——不会把结果
+/// 泄漏到已放弃的等待方，也不会让 `main_loop` 卡在答复上。
+pub(crate) struct TcsAbandonGuard_<'a, T, A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 被守卫的等待句柄。
+    tcs_: &'a Tcs_<T, A>,
+}
+
+impl<'a, T, A> TcsAbandonGuard_<'a, T, A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 守卫一个等待句柄。
+    pub(crate) fn new_(tcs_: &'a Tcs_<T, A>) -> Self {
+        TcsAbandonGuard_ { tcs_ }
+    }
+}
+
+impl<T, A> Drop for TcsAbandonGuard_<'_, T, A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    fn drop(&mut self) {
+        self.tcs_.abandon_();
+    }
+}
+
 #[cfg(test)]
 mod tests_ {
     use std::{
@@ -402,6 +434,24 @@ mod tests_ {
             tcs.poll_wait_(&mut cx),
             Poll::Ready(Option::Some(11u32))
         ));
+    }
+
+    /// 测试等待守卫在 `Drop` 时放弃完成源。
+    /// - 手段：`TcsAbandonGuard_::new_(&tcs)` 放进一个块，块结束时守卫析构。
+    /// - 判断：`is_abandoned_()` 为真；随后 `set_(1)` 返回 `false`。
+    ///
+    /// Test goal: the wait guard abandons the source when dropped.
+    /// Method: create `TcsAbandonGuard_::new_(&tcs)` inside a block so it drops at
+    /// the end of the block.
+    /// Assertion: `is_abandoned_()` is true; a later `set_(1)` returns false.
+    #[test]
+    fn tcs_abandon_guard_abandons_on_drop_() {
+        let tcs = Tcs_::<u32, CoreAlloc>::new_(CoreAlloc);
+        {
+            let _guard = TcsAbandonGuard_::new_(&tcs);
+        }
+        assert!(tcs.is_abandoned_());
+        assert!(!tcs.set_(1u32));
     }
 
     /// 测试 `set_` 之后再 `abandon_` 不会丢掉已就绪的值。

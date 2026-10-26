@@ -48,8 +48,9 @@ use abs_cancel::TrCancellationToken;
 use crate::{
     connection::{
         Dock, TrConnCfg,
+        control_state_::ControlState_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
-        owner_::{ChannelOwner_, LsnOwner_, TgOwner_},
+        owner_::{ChannelOwner_, TgOwner_},
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
         sync_::CancelToken_,
     },
@@ -119,8 +120,11 @@ where
     /// 存的是**纯数据**（时刻类型来自运行时值），不是运行时值本身——理由见类型文档。
     epoch_: <C::Rt as TrClock>::Instant,
 
-    /// dock / 子流身份索引、失败标志与两个循环的取消令牌。
+    /// dock / 子流身份索引、失败标志与四个循环的取消令牌。
     reg_: ChannelRegistry_<C::Alloc>,
+
+    /// 控制面共享状态：定容请求队列 + `main_loop` 的合并提示位。
+    control_: ControlState_<C::Alloc>,
 
     /// 写事件发送端（控制帧、建流注册、水位与拆流通知）。
     w_events_: EventSender_<WriteEvent_<C::Alloc>>,
@@ -128,14 +132,14 @@ where
     /// 读事件发送端（接收环注册与释放）。
     r_events_: EventSender_<ReadEvent_<C::Alloc>>,
 
-    /// 三个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时）。
+    /// 四个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时、`3` = 控制面）。
     ///
     /// 核心自己持一份克隆，**而不是在 `Drop` 里去注册表取**：注册表取锁在跨线程
     /// 争用时是阻塞等待，而 `Drop` 必须不阻塞。令牌是可克隆的共享句柄，因此这里
     /// 持有的就是循环在用的那一个。
     ///
     /// 旧版是五个：贴传输的读 / 写泵连同连接级帧暂存环一起去掉了（见 `session_`
-    /// 模块文档）。
+    /// 模块文档）。控制面这一格在 P1 之前是空转的 `ctl_`，现在由 `main_loop` 承担。
     loops_: [CancelToken_<C::Alloc>; 4],
 }
 
@@ -145,13 +149,14 @@ where
 {
     /// 由建连路径展开后的全部量构造（成员私有，构造只能走这里）。
     ///
-    /// 参数确实多（策略 / 协商结果 / 注册表 / 建连时刻 / 两条通道 / 三个令牌）：
+    /// 参数确实多（策略 / 协商结果 / 注册表 / 控制面 / 建连时刻 / 两条通道 / 四个令牌）：
     /// 它们全部来自同一个建连路径，打成一个中间结构只会多一层壳而没有别的收益。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_(
         config: C,
         opts: HandshakeOpts,
         reg: ChannelRegistry_<C::Alloc>,
+        control: ControlState_<C::Alloc>,
         epoch: <C::Rt as TrClock>::Instant,
         w_events: EventSender_<WriteEvent_<C::Alloc>>,
         r_events: EventSender_<ReadEvent_<C::Alloc>>,
@@ -162,6 +167,7 @@ where
             opts_: opts,
             epoch_: epoch,
             reg_: reg,
+            control_: control,
             w_events_: w_events,
             r_events_: r_events,
             loops_: loops}
@@ -170,6 +176,11 @@ where
     /// 资源策略。
     pub(crate) fn config_(&self) -> &C {
         &self.config_
+    }
+
+    /// 控制面共享状态（API 面提交请求用）。
+    pub(crate) fn control_(&self) -> &ControlState_<C::Alloc> {
+        &self.control_
     }
 
     /// 握手协商结果（连接级配额）。
@@ -262,38 +273,6 @@ where
         self.reg_.notify_timer_()
     }
 
-    /// 独占绑定一个 `local_dock`（[`TrConnection::bind_async`] 的登记点）。
-    ///
-    /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
-    pub(crate) async fn bind_dock_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        cancel: K,
-    ) -> Result<(), ReserveErr_> {
-        self.reg_.bind_dock_(local_dock, cancel).await
-    }
-
-    /// 自行安排一个空闲 `local_dock` 并独占绑定它（`bind_async(unspecified)` 的
-    /// 登记点）：实际的 dock 由注册表在同一个临界区里选出并占住，见
-    /// [`ChannelRegistry_::bind_any_dock_`]。
-    ///
-    /// [`ChannelRegistry_::bind_any_dock_`]: super::registry_::ChannelRegistry_::bind_any_dock_
-    pub(crate) async fn bind_any_dock_<K: TrCancellationToken>(
-        &self,
-        cancel: K,
-    ) -> Result<Dock, ReserveErr_> {
-        self.reg_.bind_any_dock_(cancel).await
-    }
-
-    /// 登记 listener 身份，并交出它的**身份节点句柄**（listener 在该句柄上等入向通知）。
-    pub(crate) async fn reserve_listener_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        cancel: K,
-    ) -> Result<LsnOwner_<C::Alloc>, ReserveErr_> {
-        self.reg_.reserve_listener_(local_dock, cancel).await
-    }
-
     /// 登记 telegraph 身份，并交出它的**身份节点句柄**。
     pub(crate) async fn reserve_telegraph_<K: TrCancellationToken>(
         &self,
@@ -301,20 +280,6 @@ where
         cancel: K,
     ) -> Result<TgOwner_<C::Alloc>, ReserveErr_> {
         self.reg_.reserve_telegraph_(local_dock, cancel).await
-    }
-
-    /// 为一条子流登记身份（dock 对即身份），并返回它的共享状态句柄。
-    ///
-    /// 状态与身份**一起建立**：调用方拿到句柄后，在建流最终裁决时把窗口参数安装进去。
-    pub(crate) async fn reserve_channel_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        remote_dock: Dock,
-        cancel: K,
-    ) -> Result<ChannelOwner_<C::Alloc>, ReserveErr_> {
-        self.reg_
-            .reserve_channel_(local_dock, remote_dock, self.now_millis_(), cancel)
-            .await
     }
 
     /// 撤销一条尚未露面的子流登记。

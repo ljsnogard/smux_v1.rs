@@ -1,4 +1,4 @@
-use core::task::Poll;
+use core::{future::poll_fn, task::Poll};
 
 use abs_art::{TrClock, TrDelay, TrJoinHandle, TrLocalScope};
 use abs_art_facade::ScopeHost;
@@ -13,8 +13,10 @@ use mm_ptr::Shared;
 
 use crate::{
     connection::{
-        Dock, MuxError, TrConnCfg,
+        ControlState_, Dock, MainErr_, MainReply_, MainRequest_, MuxError, PushErr_, TrConnCfg,
+        TcsAbandonGuard_, Tcs_,
         dock_binding::DockBinding,
+        main_loop_async_,
         session_::{MuxShared_, demux_loop_async_, mux_loop_async_, race_cancel_},
         signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
         timer_::timer_loop_async_,
@@ -208,6 +210,7 @@ where
         let CoreBundle_ {
             core_,
             shared_,
+            control_,
             w_receiver_,
             r_receiver_,
         } = bundle;
@@ -241,15 +244,16 @@ where
         // 计时循环：保活（PULSE）与空闲超时拆流。它不搬字节，只按连接级时钟算
         // 期限、把保活动作投进上面两条事件通道（见 `timer_` 模块文档）。
         //
-        // 控制面循环先拿一份共享面克隆：计时循环随后按值接管 `shared_`。
-        let ctl_fut = keep_queue_alive_(
+        // 控制面：请求队列 + 身份表写者（P1 接管 bind / listen / reserve）。
+        let main_fut = keep_queue_alive_(
             scope.clone(),
-            crate::connection::ctl_::ctl_loop_async_::<C, _>(
+            main_loop_async_::<C, _>(
                 shared_.clone(),
+                control_.clone(),
                 core_.loop_token_(3usize),
             ),
         );
-        scope.spawn_local(ctl_fut).detach();
+        scope.spawn_local(main_fut).detach();
 
         let timer_fut = keep_queue_alive_(
             scope.clone(),
@@ -320,6 +324,7 @@ where
 {
     core_: Shared<MuxCore<C>, C::Alloc>,
     shared_: MuxShared_<C>,
+    control_: ControlState_<C::Alloc>,
     w_receiver_: EventReceiver_<WriteEvent_<C::Alloc>>,
     r_receiver_: EventReceiver_<ReadEvent_<C::Alloc>>,
 }
@@ -338,6 +343,7 @@ where
         let conn_clock = ConnClock_::new_(rt.clone());
 
         let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), alloc.clone());
+        let control = ControlState_::new_(alloc.clone());
         let (w_events, w_receiver) = event_channel_();
         let (r_events, r_receiver) = event_channel_();
 
@@ -371,6 +377,7 @@ where
                 config,
                 opts,
                 reg,
+                control.clone(),
                 conn_clock.epoch_(),
                 w_events,
                 r_events,
@@ -382,6 +389,7 @@ where
         CoreBundle_ {
             core_: core,
             shared_: shared,
+            control_: control,
             w_receiver_: w_receiver,
             r_receiver_: r_receiver,
         }
@@ -450,43 +458,55 @@ where
     if local_dock.is_wildcard() {
         return Result::Err(BindError::ReservedDock);
     }
-    // 连接已经进入优雅关闭：不再受理新 binding。这里是**锁外快路径**（登记路径在
-    // 锁内还会复查一次，见 `ChannelRegistry_::begin_close_`），省掉一次可能很长的
-    // 等锁；关闭之后调用方本来也只能改去丢弃句柄。
+    // 连接已经进入优雅关闭：不再受理新 binding。这里是**锁外快路径**（main 的登记
+    // 路径在锁内还会复查一次，见 `ChannelRegistry_::begin_close_`），省掉一次可能
+    // 很长的等锁；关闭之后调用方本来也只能改去丢弃句柄。
     if conn.core_().is_closing_() {
         return Result::Err(BindError::Mux(MuxError::Closed));
     }
-    // 先清空释放邮箱：上一个 `DockBinding` 可能刚被丢弃（`Drop` 只投消息），
-    // 不先落实就会把「已解绑」误判成 `DockInUse`——这是「丢弃后立刻重绑」这条
-    // 既有约定的确定性来源。自动分配路径同样依赖它：「丢弃后立刻再要一个」应当能
-    // 拿回刚释放的那个 dock，而它要先进复用池（见 `ChannelRegistry_::unbind_dock_`）。
+    // 一次请求 + 完成源：登记动作由 `main_loop`（身份表唯一写者）执行。
+    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let waiter = tcs.clone();
+    // 等待方取消 / 丢弃 future 时放弃结果；`main_loop` 在登记前后都会检查
+    // `is_abandoned_()`，已放弃就回滚刚登记的身份（见 `main_loop::loop_`）。
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
-        .drain_session_events_(cancel.child_token())
+        .control_()
+        .submit_async_(
+            MainRequest_::Bind {
+                local_dock,
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
         .await
-        .map_err(|_| BindError::Cancelled)?;
-    // 两条路径都只做「登记独占绑定」这一件事：显式路径绑定给定值，自动分配路径把
-    // 「找空闲 + 占位」合成一次临界区内的原子操作，并回传选中的值。
-    let bound_dock = if local_dock.is_unspecified() {
-        conn.core_()
-            .bind_any_dock_(cancel.child_token())
-            .await
-    } else {
-        conn.core_()
-            .bind_dock_(local_dock, cancel.child_token())
-            .await
-            .map(|()| local_dock)
-    }
-    .map_err(|err| match err {
-        ReserveErr_::Cancelled => BindError::Cancelled,
+        .map_err(|err| match err {
+            PushErr_::Closed(_) => BindError::Mux(MuxError::Closed),
+            PushErr_::Cancelled(_) => BindError::Cancelled,
+        })?;
+    let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
+    match reply {
+        Option::Some(Result::Ok(MainReply_::Dock(bound_dock))) => {
+            Result::Ok(DockBinding::new_(conn.clone(), bound_dock))
+        }
+        Option::Some(Result::Err(MainErr_::Reserve(ReserveErr_::DockInUse))) => {
+            Result::Err(BindError::DockInUse)
+        }
         // 连接已经进入优雅关闭：不再接受任何新 binding。用连接级 `Closed` 表达——
         // 「这条连接不再提供服务」正是调用方此刻的处境，它不必区分「dock 被占」
         // 与「连接在关」这两种在关闭语义下都无法补救的情形。
-        ReserveErr_::Closing => BindError::Mux(MuxError::Closed),
-        // 显式路径是「该 dock 已被占用」，自动分配路径是「候选范围已占满」：调用方
-        // 在两种情形下能做的事没有区别，因此共用 `DockInUse`。
-        _ => BindError::DockInUse,
-    })?;
-    Result::Ok(DockBinding::new_(conn.clone(), bound_dock))
+        Option::Some(Result::Err(MainErr_::Reserve(ReserveErr_::Closing))) => {
+            Result::Err(BindError::Mux(MuxError::Closed))
+        }
+        Option::Some(Result::Err(MainErr_::Reserve(ReserveErr_::Cancelled))) => {
+            Result::Err(BindError::Cancelled)
+        }
+        Option::Some(Result::Err(MainErr_::Mux(err))) => Result::Err(BindError::Mux(err)),
+        // 其他预留原因 / 非 Dock 结果：绑定路径不该出现，保守映射为关闭。
+        Option::Some(Result::Err(MainErr_::Reserve(_)))
+        | Option::Some(Result::Ok(_))
+        | Option::None => Result::Err(BindError::Mux(MuxError::Closed)),
+    }
 }
 
 /// [`TrConnection::close_async`] 的 step 函数：**优雅关闭**。
