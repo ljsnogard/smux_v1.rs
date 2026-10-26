@@ -168,6 +168,10 @@ where
 }
 
 /// 未裁决就丢弃句柄 = **放弃建立**。
+///
+/// P4 起只置位 + 唤醒 `main_loop`（不再在 `Drop` 里投 `SessionEvent_`）：发起方 /
+/// 响应方的收尾动作由 `main_loop` 的 retired 扫描按角色落实（设计稿 §6.7）。
+/// 应用侧建流期 message ring 随本句柄字段一并释放。
 impl<C> Drop for ChannelHandle<C>
 where
     C: TrConnCfg,
@@ -176,20 +180,21 @@ where
         if self.settled_ {
             return;
         }
-        abort_pending_(
-            &self.conn_,
-            self.local_dock_,
-            self.remote_dock_,
-            self.is_initiator_,
-        );
+        self.accepted_owner_.set_handle_retired_();
+        self.conn_
+            .core_()
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
     }
 }
 
-/// 裁决失败 / 未裁决就丢弃时的收尾：按**角色**把这条待决子流收拾干净。
+/// 裁决**显式失败**时的收尾：按**角色**把这条待决子流收拾干净。
 ///
-/// **不取注册表锁**（本函数由 `Drop` 调用）：身份表改动一律投成
-/// [`SessionEvent_`]，由核心执行者 drain 后落实。协议帧（响应方的 `REJECT`）本来
-/// 就是投事件，保持原样。
+/// 只由 `accept_async` 的失败分支调用（建环失败 / attach 失败 / 提交被拒 / 取消）；
+/// 应用直接丢弃句柄走的是 [`ChannelHandle::Drop`] 的 retired 位，不经过这里。
+///
+/// **不取注册表锁**：身份表改动一律投成 [`SessionEvent_`]，由核心执行者 drain 后
+/// 落实。协议帧（响应方的 `REJECT`）本来就是投事件，保持原样。
 fn abort_pending_<C>(
     conn: &MuxConnection<C>,
     local: Dock,

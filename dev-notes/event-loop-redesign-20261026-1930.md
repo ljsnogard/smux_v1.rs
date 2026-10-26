@@ -1778,6 +1778,33 @@ connection/
   4. 新增 `main_step_` 时序测试 `drop_then_step_allows_rebind_`（drop 后立刻重绑）。
   5. 验收：lib 372 / inmem 20 / cross_thread 1 / smoke 5；clippy / format 合规。
 
+- 20261027-1200：**P4 位化完成：`ChannelHandle` 的 Drop 位化**，并修复提示位丢失。
+  1. `ChannelState_` 加 `HANDLE_RETIRED`（bit 18）；`ChannelHandle::Drop` 只
+     `set_handle_retired_()` + `HINT_MAIN_RETIRED`，不再投 `SessionEvent_`。
+     `abort_pending_` 仅保留给 `accept_async` 的**显式失败**分支。
+  2. `reap_retired_` 增加 Channel 扫描：发起方（`inbound_ == None`）锁外
+     `unreserve_channel_`；响应方返回 `(local, remote)` 列表——`REJECT` 需要公共
+     TX 写端，只有 main 有。main 的 `reap_retired_and_release_` 先写 `REJECT`、
+     再 `release_channel_`（设计稿 §6.7 的顺序）。
+  3. **根因（上次挂起的原因）**：`park_main_` 的 `poll_main_hint_` 是「取出并返回」
+     语义，主循环的 `MainWake_::Hint(_bits)` 分支却直接丢弃了 `_bits`；下一轮
+     `main_step_` 的 `take_main_hint_` 得到空掩码，于是 retired 提示**只唤醒、
+     从不落实**。此前 `DockBinding` 位化能过，是因为每条请求前都会再 `reap` 一次
+     （有后续请求才掩盖了问题）；响应方 Drop 之后只等对端 `REJECT` 的场景没有后续
+     请求，于是永久挂起。修复：`Hint(bits)` 分支 `ctl.raise_main_hint_(bits)` 回放。
+  4. 新增单测 `drop_pending_responder_sends_reject_`：用 `new_test_bundle_` +
+     `reserve_inbound_` / `take_pending_inbound_` 造响应方待决句柄，drop 后先 poll
+     `park_main_` 拿提示并回放，再 `main_step_`；断言身份进 `WaitClose` 且公共 TX
+     第一帧是 `REJECT`。
+  5. 顺带修复既有格式违规：`handshake/mod.rs` 两条同根 `pub(crate) use magic_::…`
+     合并为一条（基线 `format_use_imports.py --check` 未过，与本次改动无关）。
+  6. 验收：lib 373 / inmem 20 / cross_thread 1 / smoke 5 / keepalive 5；
+     clippy 0 error；`format_use_imports.py --check` 全绿（188 文件）。
+  7. **仍未等价于设计稿的一处**：发起方在 `accept` 中已发出 `OPEN` 之后才取消，
+     当前仍按「未发 `OPEN`」走 `unreserve`（与位化前的 `abort_pending_` 一致），
+     而不是 `reject_after_open_`。需要新增「`OPEN` 已发」位，留待 P5。
+  8. P4 剩余：拆流迁移（`PendingFin_` / `LocalAbort` 改 owner 位 + 扫描）。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -1946,7 +1973,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 待做 |
 | T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P3.3b 完成：`OPEN/ACCEPT/REJECT/CLOSE` 全部写公共 RX，直接状态推进已删 |
-| T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；控制帧 / 关闭 / tick 待 P2–P5 |
+| T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；P2–P3 完成控制帧组帧与建流裁决；关闭推进 / tick 待 P5 |
 | T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | 待做 |
 | T5 | 删除 `ctl_`；循环数 / 取消令牌覆盖 4 个 | P1 | 完成（`loops_[3]` = main） |
 
@@ -1980,18 +2007,18 @@ value，key 与树结构保持不变。
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T16 | `dock_index_` 适配层：degree 16、allocator、comparer、树类型别名 | P1.5 | 2 KiB chunk 配置完成；类型别名待 P1.5 |
-| T17 | `bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_` 换 arena 树 | P1.5 | 待做 |
-| T18 | `DockCtx_` 只加 `unbind_requested`；`range` / `range_mut` / `remote_index_.range` 直接替换；`docks_` 的 entry helper | P1.5 | 待做 |
-| T19 | `take_pending_inbound` 改用 `bindings_.range_mut`；不引入侵入链表 | P1.5 | 待做 |
-| T20 | 数据面本地表换 B+；用 `iter_mut` / `range_mut`；range 边界与 `BTreeMap` 对拍 | P4 | 数据面五表完成；registry 两小表完成（上游已补 `Send`/`Sync`）；`bindings_` / `docks_` 待迁移 |
+| T17 | `bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_` 换 arena 树 | P1.5 | 完成（P4；上游 `d65e5ec` 补 `Send`/`Sync` 后四表全部迁移） |
+| T18 | `DockCtx_` 只加 `unbind_requested`；`range` / `range_mut` / `remote_index_.range` 直接替换；`docks_` 的 entry helper | P1.5 | 完成（P4：`DockCtx_` 内嵌 `Shared<AtomicBool>`，`unbind_requested_` 由 `reap_retired_` 落实） |
+| T19 | `take_pending_inbound` 改用 `bindings_.range_mut`；不引入侵入链表 | P1.5 | 完成（P3.1a；`bindings_` 已是 2 KiB B+ 树） |
+| T20 | 数据面本地表换 B+；用 `iter_mut` / `range_mut`；range 边界与 `BTreeMap` 对拍 | P4 | 完成：数据面五表 + registry 四表全部 2 KiB B+ 树（上游 `d65e5ec` 补 `Send`/`Sync`） |
 | T21 | `reusable_docks_` 去 `VecDeque`；degree / chunk 调优 | P6 | 待做 |
 
 ### F. 清理
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；`WakerSlots_` 待 P5 替换；`PendingFin_` 待 P4 拆流迁移 |
-| T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | 待做 |
+| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化完成（P4）；`WakerSlots_` 待 P5 替换；`PendingFin_` / `LocalAbort` 待 P4 拆流迁移 |
+| T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` / `util_` 待 P5 |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 
 ### G. 测试与验收

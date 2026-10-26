@@ -1767,18 +1767,29 @@ where
         Result::Ok(Option::Some(out))
     }
 
-    /// 释放所有「`ChannelListener` 已丢弃」的 listener 身份（P4 的 retired 扫描）。
+    /// 释放所有已被 `Drop` 置 retired 位的身份（P4 的 retired 扫描）。
     ///
-    /// 冷路径，O(n)；同一轮合并多个释放。
+    /// 一次扫描处理三类：
+    ///
+    /// - `ChannelListener` / `Telegraph`：锁内删除身份；
+    /// - **未裁决**的 `ChannelHandle`：发起方（`inbound_ == None`）在锁外
+    ///   [`unreserve_channel_`](Self::unreserve_channel_)；响应方**不在本函数内落实**
+    ///   ——它要先回 `REJECT`，而那需要公共 TX 写端，因此以 `(local, remote)` 列表
+    ///   返回给 `main_loop`，由它发帧后再 [`release_channel_`](Self::release_channel_)；
+    /// - `DockBinding`：锁外 [`unbind_dock_`](Self::unbind_dock_)。
+    ///
+    /// 冷路径，O(n)；同一轮合并多个释放。返回的列表通常是空的（`Vec::new()` 不分配）。
     pub(crate) async fn reap_retired_<K: TrCancellationToken>(
         &self,
         cancel: K,
-    ) -> Result<(), ReserveErr_> {
+    ) -> Result<Vec<(Dock, Dock)>, ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
-        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
         let inner = &mut *guard;
         let mut retired_listeners: Vec<Dock> = Vec::new();
         let mut retired_telegraphs: Vec<Dock> = Vec::new();
+        let mut retired_unreserve: Vec<(Dock, Dock)> = Vec::new();
+        let mut retired_reject: Vec<(Dock, Dock)> = Vec::new();
         for (key, binding) in inner.bindings_.iter() {
             match binding {
                 BindingSlot_::Listener(rec) if rec.is_retired_() => {
@@ -1786,6 +1797,14 @@ where
                 }
                 BindingSlot_::Telegraph(rec) if rec.is_retired_() => {
                     retired_telegraphs.push(key.0);
+                }
+                BindingSlot_::Channel(ctx) if ctx.rec_.is_handle_retired_() => {
+                    // 发起方还没发过 `OPEN`：撤销即可。响应方要先回 `REJECT`。
+                    if matches!(ctx.inbound_, Inbound_::None) {
+                        retired_unreserve.push(*key);
+                    } else {
+                        retired_reject.push(*key);
+                    }
                 }
                 _ => {}
             }
@@ -1813,7 +1832,13 @@ where
                 .unbind_dock_(local_dock, NonCancellableToken::new())
                 .await;
         }
-        Result::Ok(())
+        // 撤销预留会再取一次写锁，因此必须在上面 `drop(guard)` 之后。
+        for (local_dock, remote_dock) in retired_unreserve {
+            let _ = self
+                .unreserve_channel_(local_dock, remote_dock, cancel.child_token())
+                .await;
+        }
+        Result::Ok(retired_reject)
     }
 
     /// 把对端 message 写进该 channel 的 incoming ring（`main_loop` 用）。

@@ -146,6 +146,16 @@ const ESTABLISH_SETTLED: usize = 1usize << 13usize;
 /// [`TrChannelRx::close_async`](abs_smux::chan::TrChannelRx::close_async) 的完成判据。
 const LOCAL_RESET_FLUSHED: usize = 1usize << 15usize;
 
+/// 应用已丢弃**尚未裁决**的 [`ChannelHandle`](super::ChannelHandle)（P4 的 Drop 位化）。
+///
+/// 只由 `ChannelHandle::Drop` 置位，不取锁；`main_loop` 在 `HINT_MAIN_RETIRED`
+/// 时扫描 `bindings_`，按角色落实「撤销预留」或「回 `REJECT` + 拆流宽限」
+/// （设计稿 §6.7）。
+///
+/// 与 [`RELEASED`] 分开：后者是**身份**已释放，本位只是「应用不要这次建流了」，
+/// 身份还要由 `main_loop` 释放。
+const HANDLE_RETIRED: usize = 1usize << 18usize;
+
 /// 中止代码在位域里的位移与掩码（2 位，够 `AbortCode_` 的 3 个取值）。
 ///
 /// 它原本是一个独立的 `AtomicU8`；中止代码只由计时循环认领、只被 `is_aborted_`
@@ -759,6 +769,23 @@ impl ChannelState_ {
     /// 在途数据必须**静默丢弃**。
     pub(crate) fn is_app_rx_closed_(&self) -> bool {
         has_flag_(self.flags_.value(), APP_RX_CLOSED)
+    }
+
+    /// 标记「应用已丢弃尚未裁决的建流句柄」。
+    ///
+    /// 幂等：重复置位不产生额外语义；由 `ChannelHandle::Drop` 调用，**不取锁**。
+    pub(crate) fn set_handle_retired_(&self) {
+        let _ = self.flags_.try_spin_compare_exchange_weak(
+            |value| !has_flag_(value, HANDLE_RETIRED),
+            |value| value | HANDLE_RETIRED,
+        );
+    }
+
+    /// 尚未裁决的建流句柄是否已被应用丢弃。
+    ///
+    /// `main_loop` 的 retired 扫描据此区分「这条身份还在、但应用已放弃」。
+    pub(crate) fn is_handle_retired_(&self) -> bool {
+        has_flag_(self.flags_.value(), HANDLE_RETIRED)
     }
 
     /// 记录「本端已发出 `CLOSE(FIN)`」（调用方保证发送环已排空）。

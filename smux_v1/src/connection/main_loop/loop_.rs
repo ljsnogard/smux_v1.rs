@@ -119,8 +119,12 @@ pub(crate) async fn main_loop_async_<C, K>(
             Some(MainWake_::Request(request)) => {
                 handle_request_::<C, _>(&shared, &mut public_tx_w, request, &cancel).await;
             }
-            // 提示已由下一轮顶部的 `take_main_hint_` 取走；这里只需回顶部。
-            Some(MainWake_::Hint(_bits)) => {}
+            // `park_main_` 在 poll 时**已经取走**提示位（`HintSlot_::poll_wait_` 是
+            // 「取出并返回」语义）；这里必须放回去，否则下一轮 `main_step_` 的
+            // `take_main_hint_` 看到的是空掩码——提示只唤醒、从不落实（P4 的
+            // retired 位正是靠它驱动）。回顶部后 step 立即 `take_main_hint_` 清空，
+            // 因此这一次回放只会多一次 park 循环，不会丢位也不会忙等。
+            Some(MainWake_::Hint(bits)) => ctl.raise_main_hint_(bits),
             // 公共 RX 有新字节：回顶部继续读帧。
             Some(MainWake_::RxReady) => {}
             // 取消或请求队列关闭：连接正在收尾。
@@ -149,7 +153,8 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    // 过渡：`Drop` 仍投 `SessionEvent_`（P4 改为 retired 位）。
+    // 过渡：显式失败路径（`abort_pending_`）仍投 `SessionEvent_`；`Drop` 已改为
+    // retired 位（P4），剩余的投递点在 P5 清理。
     if shared
         .reg_()
         .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token())
@@ -162,7 +167,7 @@ where
     // 合并提示：目前只有 retired 位（P4 起逐步接入 window-dirty 等）。
     let hints = ctl.take_main_hint_();
     if hints & HINT_MAIN_RETIRED != 0u64 {
-        let _ = shared.reg_().reap_retired_(cancel.child_token()).await;
+        reap_retired_and_release_::<C, _>(shared, public_tx_w, cancel).await;
     }
 
     // 公共 RX：每轮最多 `K_MAIN_FRAME_BATCH` 条完整帧。
@@ -223,8 +228,8 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    // 过渡：`Drop` 仍投 `SessionEvent_`。登记之前先把它落实，保证「丢弃后立刻重绑 /
-    // 重听 / 重新登记同一条 dock 对」与旧 API 的语义一致（P4 改为 retired 位后删除）。
+    // 过渡：显式失败路径仍投 `SessionEvent_`。登记之前先把它落实，保证「丢弃后
+    // 立刻重绑 / 重听 / 重新登记同一条 dock 对」与旧 API 的语义一致。
     if shared
         .reg_()
         .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token())
@@ -235,7 +240,7 @@ where
         return;
     }
     // 同一轮合并的 retired 释放先落实：保证「丢弃后立刻重听」看到的是已释放。
-    let _ = shared.reg_().reap_retired_(cancel.child_token()).await;
+    reap_retired_and_release_::<C, _>(shared, public_tx_w, cancel).await;
     match request {
         MainRequest_::SendControl { frame, reply } => {
             match write_control_frame_async_::<C, _>(public_tx_w, shared, &frame, cancel).await {
@@ -751,6 +756,46 @@ fn window_report_(header: &FrameHeader) -> Option<WindowReport> {
     }
 }
 
+/// 落实 `Drop` 置上的 retired 位：释放 listener / telegraph / dock，并把**响应方**
+/// 未裁决 channel 的 `REJECT` 发出去、再让它进拆流宽限。
+///
+/// 发起方（`inbound_ == None`）的撤销预留已在注册表的 `reap_retired_` 内部
+/// 完成；响应方必须先回帧，而那需要公共 TX 写端，所以在这里做。
+///
+/// 顺序刻意是「先发 `REJECT`、后 `release_channel_`」：对端此刻正在等裁决，身份
+/// 先转宽限态并不影响它，但帧必须真的发出去（设计稿 §6.7）。
+async fn reap_retired_and_release_<C, K>(
+    shared: &MuxShared_<C>,
+    public_tx_w: &mut BufferedTx,
+    cancel: &K,
+) where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let Result::Ok(pending_rejects) = shared.reg_().reap_retired_(cancel.child_token()).await
+    else {
+        return;
+    };
+    for (local_dock, remote_dock) in pending_rejects {
+        let _ = write_control_frame_async_::<C, _>(
+            public_tx_w,
+            shared,
+            &ControlFrame_::plain_(FrameKind::Reject, 0u8, local_dock, remote_dock),
+            cancel,
+        )
+        .await;
+        let _ = shared
+            .reg_()
+            .release_channel_(
+                local_dock,
+                remote_dock,
+                shared.conn_clock_().now_millis_(),
+                cancel.child_token(),
+            )
+            .await;
+    }
+}
+
 /// 把一条控制帧写进公共 TX ring（背压时 park 等 `tx_space`）。
 ///
 /// 帧头由 `FrameHeader` + `encode_header_` 重新编码；载荷仍在 `ControlFrame_` 里。
@@ -805,15 +850,17 @@ mod tests_ {
     use abs_mm::CoreAlloc;
     use mm_ptr::Owned;
 
-    use super::{main_step_, MainPublicRead_};
+    use super::{main_step_, park_main_, try_read_public_frame_, MainPublicRead_, MainWake_};
     use crate::{
         connection::{
-            main_loop::{MainRequest_, MainReply_},
+            main_loop::{MainReply_, MainRequest_},
             ring_::{new_buffered_channel, BufferedRx, BufferedTx},
             session_::MuxShared_,
             test_support_::TestMuxConfig_,
-            ControlState_, Dock, DockBinding, MuxConnection, Tcs_,
+            ChannelHandle, ControlState_, Dock, DockBinding, FrameKind, MuxConnection, Tcs_,
+            HINT_MAIN_RETIRED,
         },
+        flow_ctrl::{Credit, RecvTotal, WindowReport},
         handshake::opts::{BasicOpts, HandshakeOpts},
         x_deps::{abs_cancel, abs_mm, mm_ptr},
     };
@@ -921,5 +968,108 @@ mod tests_ {
             dock,
         );
         drop(binding);
+    }
+
+    /// 测试响应方未裁决句柄被丢弃后的时序：`main_step_` 先回 `REJECT` 再进宽限。
+    /// - 手段：`new_test_bundle_` 建无循环连接；直接 `reserve_inbound_` 登记一条入向
+    ///   待决子流，用 `take_pending_inbound_` 取出并构造响应方 `ChannelHandle`；
+    ///   未裁决就 drop 它（只置 retired 位），先 poll 一次 `park_main_` 拿到提示并
+    ///   回放（复刻主循环的 `Hint` 分支），再跑一轮 `main_step_`。
+    /// - 判断：`main_step_` 之后该 dock 对处于 `WaitClose`（身份已进宽限期），且公共
+    ///   TX 的第一条帧是 `REJECT`——说明 retired 位被 main 落实，并且「先回 `REJECT`、
+    ///   后释放身份」的顺序成立；若提示在 park 处丢失，则两个断言都不会成立。
+    ///
+    /// Test the ordering after a responder handle is dropped before settling.
+    /// Method: build a loop-less connection with `new_test_bundle_`; register a
+    /// pending inbound via `reserve_inbound_`, take it with
+    /// `take_pending_inbound_` and wrap it in a responder `ChannelHandle`; drop it
+    /// unsettled (retired bit only), poll `park_main_` once to obtain the hint and
+    /// replay it (mirroring the main loop's `Hint` arm), then run one `main_step_`.
+    /// Assertion: the dock pair is `WaitClose` after the step and the first public
+    /// TX frame is `REJECT`, proving the retired bit is applied by main and that
+    /// `REJECT` precedes the identity release; a lost hint fails both assertions.
+    #[test]
+    fn drop_pending_responder_sends_reject_() {
+        let (conn, shared) = MuxConnection::<TestMuxConfig_>::new_test_bundle_(
+            HandshakeOpts {
+                basic_opts: BasicOpts::default(),
+            },
+            TestMuxConfig_,
+        );
+        let ctl = conn.core_().control_().clone();
+        let (mut tx_w, mut tx_r) =
+            new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
+                .expect("建公共 TX 环");
+        let (_rx_w, mut rx_r) =
+            new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
+                .expect("建公共 RX 环");
+        let mut scratch = [0u8; 256usize];
+        let mut rx_public_read = MainPublicRead_::new_();
+        let mut tx_public_read = MainPublicRead_::new_();
+        let cancel = NonCancellableToken::new();
+        let local = Dock::new(7u32);
+        let remote = Dock::new(9u32);
+
+        // 造一条响应方待决入向请求：登记 → 标 Pending → 由 listener 侧取走。
+        block_on_ready_(shared.reg_().reserve_inbound_(
+            local,
+            remote,
+            WindowReport::new(0u64 as RecvTotal, 1024u32 as Credit),
+            0u64,
+            512usize,
+            NonCancellableToken::new(),
+        ))
+        .expect("入向登记应当成功");
+        let (_remote, owner, msg_app) =
+            block_on_ready_(shared.reg_().take_pending_inbound_(
+                local,
+                NonCancellableToken::new(),
+            ))
+            .expect("查询待决入向请求应当成功")
+            .expect("应当能取到待决入向请求");
+        let handle = ChannelHandle::new_(conn.clone(), local, remote, owner, msg_app);
+        drop(handle);
+
+        // 复刻主循环：park 取到提示后必须回放，下一轮 `main_step_` 才看得到。
+        let wake = block_on_ready_(park_main_::<TestMuxConfig_, _>(&shared, &ctl, &cancel))
+            .expect("丢弃句柄后 main 应当被唤醒");
+        let MainWake_::Hint(bits) = wake else {
+            panic!("park 应当因提示而返回");
+        };
+        assert_ne!(
+            bits & HINT_MAIN_RETIRED,
+            0u64,
+            "提示里应当含 retired 位"
+        );
+        ctl.raise_main_hint_(bits);
+
+        assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
+            &shared,
+            &ctl,
+            &mut tx_w,
+            &mut rx_r,
+            &mut scratch,
+            &mut rx_public_read,
+            &cancel,
+        )));
+        assert!(
+            block_on_ready_(shared.reg_().is_wait_close_(
+                local,
+                remote,
+                0u64,
+                NonCancellableToken::new(),
+            ))
+            .expect("查询宽限态应当成功"),
+            "响应方句柄丢弃后身份应进入拆流宽限"
+        );
+        let (header, _head_len, _total_len) = try_read_public_frame_(
+            &mut tx_r,
+            &mut tx_public_read,
+            &mut scratch,
+            shared.max_packet_size_(),
+        )
+        .expect("读公共 TX 应当成功")
+        .expect("公共 TX 里应当有一条 REJECT");
+        assert_eq!(header.kind(), FrameKind::Reject, "第一帧应当是 REJECT");
     }
 }
