@@ -100,7 +100,11 @@ where
     type Rt: TrTime + Clone + 'static;
 
     /// 连接内部结构（注册表、事件通道、载荷暂存等）的分配器。
-    type Alloc: AllocatorClone + Send + Sync;
+    ///
+    /// 要求 `'static`：会话内的 `mpmc_chan` 通道把分配器类型嵌进
+    /// `MpmcChan<'static, …>`（外层 `Arc` 与等待 chunk 都用它），因此分配器
+    /// 必须比连接实例活得更久。所有由连接持有的分配器实现都满足这一条。
+    type Alloc: AllocatorClone + Send + Sync + 'static;
 
     /// 流控策略。
     type Policy: TrFlowCtrlPolicy;

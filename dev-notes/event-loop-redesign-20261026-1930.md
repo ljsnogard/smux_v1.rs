@@ -1844,6 +1844,25 @@ connection/
   6. 剩余：`mux_inbox_` / `demux_inbox_` 两条 `Attach` inbox 仍是 `InlineQueue_`，
      下一步同样替换；`WakerSlots_` 方案（T22）据此搁置——请求队列已不需要它。
 
+- 20261027-1500：**P5 第二步：两条 `Attach` inbox 换 `mpmc_chan`**。
+  1. `mux_inbox_` / `demux_inbox_` 从 `InlineQueue_<_, 64>` 换成
+     `mpmc_chan::{Sender, Receiver}`；`MuxChanCfg_` 抽到 `chan_cfg_.rs`，请求队列
+     与两条 inbox 共用同一套调教（连接分配器 + 4 KiB 等待 chunk）。
+  2. `push_*_attach_async_` 用 `send_async().may_cancel_with(cancel)`；
+     `try_push_*` 把 `TrySendError::{Full, Closed}` 都还原成「原样带回」，
+     `poll_*_attach_` 改为 `recv_*_attach_async_`（`RecvAsync` 载体）。
+  3. `park_read_wake_` 与 mux 的 park 各多 pin 一个 `Attach` 的 `RecvFuture`；
+     与事件通道 future 同寿命、跨 poll 持有。
+  4. **公开 trait 约束收紧（需评审）**：`TrConnCfg::Alloc` 增加 `'static`。
+     原因：`MpmcChan<'static, …>` 的 `Sender` / `Receiver` 把分配器类型嵌进类型，
+     连接实例要求分配器活到 `'static`。所有现有实现（`CoreAlloc` 等）满足；但这是
+     公开 trait 的关联类型约束变更。
+  5. `InlineQueue_` / `SlotRing_` / `WakerSlots_` 在**生产路径**已无使用者（只剩
+     `slot_.rs` 自己的单测）；`WakerSlots_ + Busy` 方案正式搁置。它们作为 T22 的
+     清理项待删。
+  6. 验收：lib 373 / inmem 20 / cross_thread 1 / smoke 5 / keepalive 5；
+     clippy 0 error；format 合规（189 文件）。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2056,7 +2075,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列的等待者已改由 `mpmc_chan` 的 Arena 等待队列承担（P5，`WakerSlots_` 搁置）；`PendingFin_` 待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
+| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5，`InlineQueue_` / `WakerSlots_` 生产路径已无使用者、待删）；`PendingFin_` 待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` / `util_` 待 P5 |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 

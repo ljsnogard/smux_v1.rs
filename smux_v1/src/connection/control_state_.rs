@@ -14,7 +14,7 @@
 //! 于是「无上界等待」与「长期运行不产生碎片」同时成立，也不需要给调用方引入
 //! `Busy` 重试契约。
 //!
-//! 通道的外层 `Arc` 与等待 chunk 都用**连接分配器**（[`ControlChanCfg_`]），不落到
+//! 通道的外层 `Arc` 与等待 chunk 都用**连接分配器**（[`MuxChanCfg_`]），不落到
 //! 全局堆：每个连接只有这一条请求通道，分配次数固定、不随并发增长。
 //!
 //! 提示位与请求分开：`HINT_MAIN_*` 只表示「某类事实可能变了」，`main_loop` 一次取走
@@ -22,16 +22,16 @@
 
 use core::{
     alloc::AllocatorClone,
-    marker::PhantomData,
     task::{Context, Poll},
 };
 
 use abs_cancel::{TrCancellationToken, TrMayCancel};
-use mpmc_chan::{MpmcBuf, MpmcChan, RecvAsync, SendError, TrConfig, TryRecvError, WaitSlab4K};
+use mpmc_chan::{MpmcBuf, MpmcChan, RecvAsync, SendError, TryRecvError};
 use mm_ptr::Shared;
 
 use crate::{
     connection::{
+        MuxChanCfg_,
         main_loop::MainRequest_,
         slot_::{HintSlot_, PushErr_},
     },
@@ -44,34 +44,16 @@ pub(crate) const K_MAIN_REQ_CAP: usize = 64usize;
 /// 「有身份被 `Drop` 置了 retired 位」：`main_loop` 扫描并释放。
 pub(crate) const HINT_MAIN_RETIRED: u64 = 1u64 << 0usize;
 
-/// 请求通道的 `mpmc_chan` 调教：连接分配器 + 4 KiB 等待 chunk。
-///
-/// 等待 chunk 取 4 KiB：请求队列的等待者通常只有个位数到数十个，一个 chunk
-/// 已能容纳；比默认 16 KiB 更省，又比逐等待者分配可控。
-pub(crate) struct ControlChanCfg_<A>(PhantomData<A>)
-where
-    A: AllocatorClone + Send + Sync + 'static;
-
-impl<A> TrConfig for ControlChanCfg_<A>
-where
-    A: AllocatorClone + Send + Sync + 'static,
-{
-    type ChanAlloc = A;
-    type ProdWaitSlab = WaitSlab4K<A>;
-    type ConsWaitSlab = WaitSlab4K<A>;
-    const FAST_SPIN: usize = 512usize;
-}
-
 /// 请求通道的缓冲区类型别名（`MpmcBuf` 由 `MpmcChan` 持有）。
 type ControlBuf_<A> = MpmcBuf<MainRequest_<A>, K_MAIN_REQ_CAP>;
 
 /// 请求通道的发送端类型。
 type ControlTx_<A> =
-    mpmc_chan::Sender<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, ControlChanCfg_<A>>;
+    mpmc_chan::Sender<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, MuxChanCfg_<A>>;
 
 /// 请求通道的接收端类型。
 type ControlRx_<A> =
-    mpmc_chan::Receiver<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, ControlChanCfg_<A>>;
+    mpmc_chan::Receiver<'static, MainRequest_<A>, K_MAIN_REQ_CAP, ControlBuf_<A>, MuxChanCfg_<A>>;
 
 /// `main_loop` 的请求等待 future（`RecvAsync` 是参数载体，`into_future` 之后才登记唤醒）。
 pub(crate) type ControlRecvAsync_<'f, A> = RecvAsync<
@@ -80,7 +62,7 @@ pub(crate) type ControlRecvAsync_<'f, A> = RecvAsync<
     'f,
     MainRequest_<A>,
     ControlBuf_<A>,
-    ControlChanCfg_<A>,
+    MuxChanCfg_<A>,
     K_MAIN_REQ_CAP,
 >;
 
@@ -127,7 +109,7 @@ where
     ///
     /// 通道的外层 `Arc` 与缓存用 `alloc` 分配；等待 chunk 在首次 park 时申请。
     pub(crate) fn new_(alloc: A) -> Self {
-        let (tx_, rx_) = MpmcChan::<MainRequest_<A>, K_MAIN_REQ_CAP, _, ControlChanCfg_<A>>::new_in(
+        let (tx_, rx_) = MpmcChan::<MainRequest_<A>, K_MAIN_REQ_CAP, _, MuxChanCfg_<A>>::new_in(
             ControlBuf_::<A>::new(),
             alloc.clone(),
         );

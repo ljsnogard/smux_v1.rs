@@ -192,7 +192,7 @@ const K_MAX_DATA_CHUNK: usize = 16usize * 1024usize;
 #[derive(Clone)]
 pub(crate) struct MuxLoopShared_<A, R, M>
 where
-    A: AllocatorClone + Send + Sync,
+    A: AllocatorClone + Send + Sync + 'static,
     R: TrTime,
     M: TrMetricsSink,
 {
@@ -241,7 +241,7 @@ pub(crate) type MuxShared_<C> = MuxLoopShared_<
 
 impl<A, R, M> MuxLoopShared_<A, R, M>
 where
-    A: AllocatorClone + Send + Sync,
+    A: AllocatorClone + Send + Sync + 'static,
     R: TrTime,
     M: TrMetricsSink,
 {
@@ -269,7 +269,7 @@ where
 
 impl<A, R, M> MuxLoopShared_<A, R, M>
 where
-    A: AllocatorClone + Send + Sync,
+    A: AllocatorClone + Send + Sync + 'static,
     R: TrTime,
     M: TrMetricsSink,
 {
@@ -917,7 +917,7 @@ pub(crate) async fn fail_mux_loop_<A, R, M, K>(
     kind: Option<FrameKind>,
     err: &MuxError,
 ) where
-    A: AllocatorClone + Send + Sync,
+    A: AllocatorClone + Send + Sync + 'static,
     R: TrTime,
     M: TrMetricsSink,
     K: TrCancellationToken,
@@ -2065,7 +2065,7 @@ fn window_update_frame_(pair: (Dock, Dock), report: WindowReport) -> ControlFram
 /// 解复用循环在「传输此刻没字节」时的等待结果。
 enum ReadWake_<A>
 where
-    A: AllocatorClone + Send + Sync,
+    A: AllocatorClone + Send + Sync + 'static,
 {
     /// 传输里来了字节。
     Bytes,
@@ -2122,6 +2122,10 @@ where
     let mut event_fut = core::pin::pin!(events.take_event_async_());
     let mut ring_fut = core::pin::pin!(core::future::IntoFuture::into_future(
         rx_stage.read_async(&demand),
+    ));
+    // `Attach` 通道的接收 future：`RecvAsync` 是参数载体，先转 future 再跨 poll 持有。
+    let mut attach_fut = core::pin::pin!(core::future::IntoFuture::into_future(
+        shared.reg_().recv_read_attach_async_()
     ));
     // 读事件的生产端全部消失 = 连接核心已析构，取消令牌随即触发。此后不再 poll 事件
     // 通道（它已 `Ready(None)` 且会立刻再次就绪），只等传输与取消令牌。
@@ -2195,12 +2199,13 @@ where
             hint_bits = bits;
             return Poll::Ready(());
         }
-        match shared.reg_().poll_read_attach_(cx) {
-            Poll::Ready(Option::Some(attach)) => {
+        match core::future::Future::poll(attach_fut.as_mut(), cx) {
+            Poll::Ready(Result::Ok(attach)) => {
                 taken_attach = Option::Some(attach);
                 return Poll::Ready(());
             }
-            Poll::Ready(Option::None) => {}
+            // 读侧通道关闭（连接收尾）。
+            Poll::Ready(Result::Err(_)) => return Poll::Ready(()),
             Poll::Pending => {}
         }
         Poll::Pending
@@ -2920,6 +2925,10 @@ pub(crate) async fn mux_loop_async_<C, K>(
         //    不轮询传输写半边则「腾出空间」这条唤醒会丢（下游排空方把字节搬走之后没有
         //    任何人通知复用循环，若这里不同时 park 在它上面，drain 就再也不会被触发）。
         let mut taken: Option<WriteEvent_<C::Alloc>> = Option::None;
+        // `Attach` 通道的接收 future：与事件通道一样跨 poll 持有。
+        let mut attach_fut = core::pin::pin!(core::future::IntoFuture::into_future(
+            shared.reg_().recv_write_attach_async_()
+        ));
         let mut need_rescan = false;
         let mut ring_ready = false;
         let mut hint_ready = false;
@@ -2999,14 +3008,14 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     public_ready = true;
                     return Poll::Ready(true);
                 }
-                // `Attach` inbox：有新的环半部要交给本地写表。
-                match shared.reg_().poll_write_attach_(cx) {
-                    Poll::Ready(Option::Some(attach)) => {
+                // `Attach` 通道：有新的环半部要交给本地写表。
+                match core::future::Future::poll(attach_fut.as_mut(), cx) {
+                    Poll::Ready(Result::Ok(attach)) => {
                         taken_attach = Option::Some(attach);
                         return Poll::Ready(true);
                     }
-                    // 写循环自己在退出时才会关闭 inbox；运行期不应看到。
-                    Poll::Ready(Option::None) => return Poll::Ready(false),
+                    // 写侧通道关闭（连接收尾）。
+                    Poll::Ready(Result::Err(_)) => return Poll::Ready(false),
                     Poll::Pending => {}
                 }
                 Poll::Pending
