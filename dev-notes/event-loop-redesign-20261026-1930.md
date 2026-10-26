@@ -1757,6 +1757,17 @@ connection/
   `btreemap_alloc` feature 已删除。验收：lib 371 / inmem 20 / smoke 5 /
   cross_thread 1。
 
+- 20261027-1000：**P5 的 `WakerSlots_` 首次尝试回退**（记录，不落地）。
+  1. 把 `InlineQueue_.free_waiters_` 从 `Vec<Waker>` 换成 `WakerSlots_<16>`
+     （并加 `PushErr_::Busy` 与 `BindError` / `BindingError` / `HandleError` 的
+     `Busy` 变体）。
+  2. `cross_thread_compio` 20 s 超时；诊断到 115 次 `PushErr_::Busy`——跨线程场景
+     的并发等待者远超定容槽（16 / 64 均不足），而既有调用方与测试不重试 `Busy`。
+  3. 结论：设计稿 §12.3 的「等待者上界 16」假设不成立。要落地 P5 的这项，必须先
+     定清楚：(a) 等待者上界与 `Busy` 的公开重试语义；或 (b) 定容槽 + 溢出 `Vec`
+     的混合策略；或 (c) 更大容量并接受内存换无分配。
+  4. 本轮回退，`Vec<Waker>` 保留；工作区停在 `2bb65e1`（registry 四表完成）。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
