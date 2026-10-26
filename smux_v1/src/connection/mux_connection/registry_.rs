@@ -525,7 +525,7 @@ where
     alloc_: A,
 
     /// `local_dock` → dock 级簿记。
-    docks_: BTreeMap<Dock, DockCtx_<A>, A>,
+    docks_: crate::connection::dock_index_::DockBPlusTree_<A, Dock, DockCtx_<A>>,
 
     /// **自动分配曾发出、现已归还、且归还时确实空着**的 dock，**先进先出**，供它优先
     /// 复用。
@@ -618,12 +618,12 @@ where
     /// 不需要 dock 级簿记，条目可以照剪（查询一律走 `bindings_`）。真正需要条目存活
     /// 的是 `bound_` 与 `pending_return_` 两项。
     fn prune_dock_(&mut self, dock: Dock) {
-        let empty = match self.docks_.get(&dock) {
-            Option::Some(ctx) => ctx.is_empty_(),
+        let empty = match self.docks_.get(dock) {
+            Option::Some((_, ctx)) => ctx.is_empty_(),
             Option::None => false,
         };
         if empty {
-            self.docks_.remove(&dock);
+            self.docks_.remove(dock);
         }
     }
 
@@ -659,14 +659,14 @@ where
     /// 再入池，而不是留在池里被一次次空扫。标记本身由 [`DockCtx_::is_empty_`] 兜住，
     /// 不会被 [`RegistryInner_::prune_dock_`] 剪掉。
     fn settle_pending_return_(&mut self, local_dock: Dock) {
-        let pending = match self.docks_.get(&local_dock) {
-            Option::Some(ctx) => ctx.pending_return_,
+        let pending = match self.docks_.get(local_dock) {
+            Option::Some((_, ctx)) => ctx.pending_return_,
             Option::None => false,
         };
         if !pending || self.has_any_identity_(local_dock) {
             return;
         }
-        if let Option::Some(ctx) = self.docks_.get_mut(&local_dock) {
+        if let Option::Some((_, ctx)) = self.docks_.get_mut(local_dock) {
             ctx.pending_return_ = false;
         }
         self.reusable_docks_.push_back(local_dock);
@@ -679,7 +679,7 @@ where
     /// 子流（binding 被丢弃、子流还在跑），或者仍留着拆流宽限期的墓碑——那些 dock
     /// 对调用方都不是可用的临时端口（见模块文档「自动分配 dock」）。
     fn is_free_dock_(&self, local_dock: Dock) -> bool {
-        let bound = self.docks_.get(&local_dock).is_some_and(|ctx| ctx.bound_);
+        let bound = self.docks_.get(local_dock).is_some_and(|(_, ctx)| ctx.bound_);
         !bound && !self.has_any_identity_(local_dock)
     }
 
@@ -710,10 +710,15 @@ where
                 // 入池之后才变脏（见上）：池不做就地摘除，只能消费掉它。
                 continue;
             }
+            if !self.docks_.contains_key(dock) {
+                self.docks_
+                    .insert(dock, DockCtx_::new_(self.alloc_.clone()));
+            }
             let ctx = self
                 .docks_
-                .entry(dock)
-                .or_insert_with(|| DockCtx_::new_(self.alloc_.clone()));
+                .get_mut(dock)
+                .map(|(_, ctx)| ctx)
+                .expect("刚刚补齐 dock 条目");
             ctx.bound_ = true;
             ctx.auto_ = true;
             return Result::Ok(dock);
@@ -726,10 +731,15 @@ where
             if !self.is_free_dock_(dock) {
                 continue;
             }
+            if !self.docks_.contains_key(dock) {
+                self.docks_
+                    .insert(dock, DockCtx_::new_(self.alloc_.clone()));
+            }
             let ctx = self
                 .docks_
-                .entry(dock)
-                .or_insert_with(|| DockCtx_::new_(self.alloc_.clone()));
+                .get_mut(dock)
+                .map(|(_, ctx)| ctx)
+                .expect("刚刚补齐 dock 条目");
             ctx.bound_ = true;
             ctx.auto_ = true;
             return Result::Ok(dock);
@@ -1171,7 +1181,8 @@ where
             CancelToken_::new_(alloc.clone()),
             CancelToken_::new_(alloc.clone()),
         ];
-        let docks_ = BTreeMap::new_in(alloc.clone());
+        let docks_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
+            .expect("2 KiB B+ 树足以容纳 dock 条目");
         let bindings_ = BTreeMap::new_in(alloc.clone());
         let remote_index_ = crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
             .expect("2 KiB B+ 树足以容纳反向索引表项");
@@ -1528,7 +1539,7 @@ where
                 Option::Some(_) => return Result::Err(ReserveErr_::Duplicate),
                 Option::None => {}
             }
-            if let Option::Some(dock) = inner.docks_.get(&local_dock)
+            if let Option::Some((_, dock)) = inner.docks_.get(local_dock)
                 && dock.chan_count_ >= max_dock
             {
                 return Result::Err(ReserveErr_::DockChanLimit);
@@ -1545,10 +1556,16 @@ where
             // 创建时刻只写这一次：子流关闭时用它结算寿命（`metrics` 的
             // `on_channel_closed`），而 `data_millis_` 会被后续活动不断刷新。
             state.set_created_millis_(now_millis);
+            if !inner.docks_.contains_key(local_dock) {
+                inner
+                    .docks_
+                    .insert(local_dock, DockCtx_::new_(inner.alloc_.clone()));
+            }
             let dock = inner
                 .docks_
-                .entry(local_dock)
-                .or_insert_with(|| DockCtx_::new_(inner.alloc_.clone()));
+                .get_mut(local_dock)
+                .map(|(_, ctx)| ctx)
+                .expect("刚刚补齐 dock 条目");
             dock.chan_count_ += 1usize;
             inner.bindings_.insert(
                 (local_dock, remote_dock),
@@ -1590,7 +1607,7 @@ where
             inner.remote_index_.remove((remote_dock, local_dock));
             inner.total_ = inner.total_.saturating_sub(1usize);
             became_idle = inner.total_ == 0usize;
-            if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
+            if let Option::Some((_, dock)) = inner.docks_.get_mut(local_dock) {
                 dock.chan_count_ = dock.chan_count_.saturating_sub(1usize);
             }
             // 这条身份消失后该 dock 可能才空下来（它欠着一次归还）：兑现之。
@@ -1626,7 +1643,7 @@ where
         inner.remote_index_.remove((remote_dock, local_dock));
         inner.total_ = inner.total_.saturating_sub(1usize);
         let became_idle = inner.total_ == 0usize;
-        if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
+        if let Option::Some((_, dock)) = inner.docks_.get_mut(local_dock) {
             dock.chan_count_ = dock.chan_count_.saturating_sub(1usize);
         }
         inner.prune_dock_(local_dock);
@@ -1896,10 +1913,16 @@ where
         if self.is_closing_() {
             return Result::Err(ReserveErr_::Closing);
         }
+        if !inner.docks_.contains_key(local_dock) {
+            inner
+                .docks_
+                .insert(local_dock, DockCtx_::new_(inner.alloc_.clone()));
+        }
         let dock = inner
             .docks_
-            .entry(local_dock)
-            .or_insert_with(|| DockCtx_::new_(inner.alloc_.clone()));
+            .get_mut(local_dock)
+            .map(|(_, ctx)| ctx)
+            .expect("刚刚补齐 dock 条目");
         if dock.bound_ {
             return Result::Err(ReserveErr_::DockInUse);
         }
@@ -1943,7 +1966,7 @@ where
         let inner = &mut *guard;
         let mut was_bound = false;
         let mut was_auto = false;
-        if let Option::Some(dock) = inner.docks_.get_mut(&local_dock) {
+        if let Option::Some((_, dock)) = inner.docks_.get_mut(local_dock) {
             was_bound = dock.bound_;
             was_auto = dock.auto_;
             dock.bound_ = false;
@@ -1952,11 +1975,14 @@ where
         // 而「曾经绑定过」还不足够——只有自动分配发出的那些才由它负责回收。
         if was_bound && was_auto {
             if inner.has_any_identity_(local_dock) {
-                inner
-                    .docks_
-                    .entry(local_dock)
-                    .or_insert_with(|| DockCtx_::new_(inner.alloc_.clone()))
-                    .pending_return_ = true;
+                if !inner.docks_.contains_key(local_dock) {
+                    inner
+                        .docks_
+                        .insert(local_dock, DockCtx_::new_(inner.alloc_.clone()));
+                }
+                if let Option::Some((_, dock)) = inner.docks_.get_mut(local_dock) {
+                    dock.pending_return_ = true;
+                }
             } else {
                 inner.reusable_docks_.push_back(local_dock);
             }
@@ -3259,7 +3285,7 @@ mod tests_ {
                 "解绑时不空的 dock 不该进池（否则池会堆积此刻发不出去的项）：{d:?}"
             );
             assert!(
-                inner.docks_.get(&d).is_some_and(|ctx| ctx.pending_return_),
+                inner.docks_.get(d).is_some_and(|(_, ctx)| ctx.pending_return_),
                 "它应当被记为「欠一次归还」"
             );
         });
@@ -3273,7 +3299,7 @@ mod tests_ {
                 "变空之后它应当被补进池：{d:?}"
             );
             assert!(
-                !inner.docks_.get(&d).is_some_and(|ctx| ctx.pending_return_),
+                !inner.docks_.get(d).is_some_and(|(_, ctx)| ctx.pending_return_),
                 "兑现之后不该再有欠归还标记"
             );
         });

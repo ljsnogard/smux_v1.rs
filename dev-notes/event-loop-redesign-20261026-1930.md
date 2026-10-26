@@ -1750,8 +1750,9 @@ connection/
   `bplus_tree_cmp` `d65e5ec` 为 `BPlusTree` / `BTree` 实现 `Send` / `Sync`
   （约束：`Cfg` / `Allocator` / `K` / `V` 均 `Send + Sync`；`DockTreeCfg_<A>` 与
   我们的键值类型满足）。`remote_index_` / `wait_close_expiry_` 已换
-  `DockBPlusTree_`（值 `()`），`cross_thread_compio` 通过；`bindings_` / `docks_`
-  仍待迁移。验收：lib 371 / inmem 20 / smoke 5 / cross_thread 1。
+  `DockBPlusTree_`（值 `()`），`cross_thread_compio` 通过；`docks_` 已换
+  `DockBPlusTree_<A, Dock, DockCtx_<A>>`；`bindings_` 是最后一张仍用 `BTreeMap`
+  的 registry 表。验收：lib 371 / inmem 20 / smoke 5 / cross_thread 1。
 
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
