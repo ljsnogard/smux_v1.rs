@@ -1630,6 +1630,13 @@ connection/
     `FIN/OPEN` 顺序竞态。
   - **P3.3b 首次尝试已回退**（见下一条记录），工作区停在此处。
 
+- 20261027-0150：**P3.3b 前置：公共 TX 顺序闸门前移**。
+  `mux_loop` 在 `take_write_hint_` **之前**先 `flush_public_chunks_`，因此任何由写提示
+  触发的 `RESET` / `FIN` 都排在已入公共 TX 的 `OPEN` / `ACCEPT` 之后；2.5 的
+  `finalize_entry_` 之前仍保留一次 flush。现有测试（lib 370 / inmem 20 / smoke 5 /
+  cross_thread 1 / keepalive 5）全过；完整的入向迁移（demux 写 RX + main 处理
+  `OPEN/ACCEPT/REJECT`）仍待 P3.3b。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

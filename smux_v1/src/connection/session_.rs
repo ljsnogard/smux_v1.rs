@@ -2634,6 +2634,28 @@ pub(crate) async fn mux_loop_async_<C, K>(
             handle_write_attach_::<C>(attach, &mut *table, &mut pending_fin, &shared);
         }
 
+        // 3. 公共子流优先：先把 TX ring 里的 chunk 搬进传输，再发用户数据。
+        match race_cancel_(
+            &cancel,
+            flush_public_chunks_::<C, _>(
+                &mut tx_stage,
+                &shared,
+                &mut public_tx_r,
+                &mut public_read,
+                &mut scratch[..],
+                &cancel,
+            ),
+        )
+        .await
+        {
+            Option::None => return,
+            Option::Some(Result::Ok(_)) => {}
+            Option::Some(Result::Err(err)) => {
+                fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                return;
+            }
+        }
+
         // 0.1 合并提示：应用侧封口 / 关接收只置位 + 唤醒，不再逐条投事件。
         //
         // 位是**唤醒**而不是事实：事实在各子流状态字里，这里按表扫一次即可补齐。
@@ -2682,28 +2704,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                     return;
                 }
-            }
-        }
-
-        // 3. 公共子流优先：先把 TX ring 里的 chunk 搬进传输，再发用户数据。
-        match race_cancel_(
-            &cancel,
-            flush_public_chunks_::<C, _>(
-                &mut tx_stage,
-                &shared,
-                &mut public_tx_r,
-                &mut public_read,
-                &mut scratch[..],
-                &cancel,
-            ),
-        )
-        .await
-        {
-            Option::None => return,
-            Option::Some(Result::Ok(_)) => {}
-            Option::Some(Result::Err(err)) => {
-                fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-                return;
             }
         }
 
