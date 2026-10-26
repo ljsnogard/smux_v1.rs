@@ -81,8 +81,8 @@ use crate::{
         mux_connection::{K_CLOSE_NONE, K_CLOSE_TIMEOUT},
         session_::MuxShared_,
         signal_::{
-            ControlFrame_, EventSender_, HINT_R_RELEASE, HINT_W_TX_CLOSED, ReadEvent_,
-            WriteEvent_,
+            ControlFrame_, EventSender_, HINT_R_RELEASE, HINT_W_RELEASED, HINT_W_TX_CLOSED,
+            ReadEvent_, WriteEvent_,
         },
         sync_::NotifySlot_,
     },
@@ -422,16 +422,13 @@ where
                 return false;
             }
 
-            // 5. 本地两个循环各自摘掉本地表项：复用循环放弃这条子流（含「欠一条
-            //    FIN」的登记）、并**显式关闭发送环的消费端**（应用随即看到发送方向
-            //    已关闭），解复用循环丢掉接收环写端（应用随即读到 EOF）。
-            if !w_events.try_send_durable_event_(WriteEvent_::LocalAbort {
-                local_dock: local,
-                remote_dock: remote,
-            }) {
-                return false;
-            }
-            // 身份已释放：读循环按 `RELEASED` 位摘表并关接收环写端。
+            // 5. 本地两个循环各自摘掉本地表项：复用循环扫到 `RELEASED` 位后放弃这条
+            //    子流（含「欠一条 FIN」的登记）、并**显式关闭发送环的消费端**（应用
+            //    随即看到发送方向已关闭）；解复用循环丢掉接收环写端（读到 EOF）。
+            //
+            //    不在 `Drop` / 计时循环里直接动本地表：事实位是 `RELEASED`，提示只
+            //    负责唤醒各自的循环（P4：原 `LocalAbort` 一次性事件 → 合并提示）。
+            shared.reg_().raise_write_hint_(HINT_W_RELEASED);
             shared.reg_().raise_read_hint_(HINT_R_RELEASE);
             true
         }

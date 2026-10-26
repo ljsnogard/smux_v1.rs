@@ -146,7 +146,7 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, EventTake_,
-            HINT_R_RELEASE, HINT_W_PEER_CLOSED, HINT_W_RX_CLOSED,
+            HINT_R_RELEASE, HINT_W_PEER_CLOSED, HINT_W_RELEASED, HINT_W_RX_CLOSED,
             HINT_W_TX_CLOSED, ReadAttach_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteAttach_, WriteEvent_,
         },
@@ -623,6 +623,56 @@ where
     }
 }
 
+/// 收尾写表里**身份已释放 / 已中止**的条目（`HINT_W_RELEASED`）。
+///
+/// 替换原来的 `WriteEvent_::LocalAbort`：计时循环拆流时只置 owner 的 `RELEASED` 位
+/// 与合并提示，写循环在这里按表扫描做本地动作——**显式关闭发送环消费端**（应用
+/// 立刻看到发送方向已关闭）、摘写表项、并尝试释放身份。
+///
+/// 与对端 `RESET` 那条路径的区别（`scan_peer_closed_`）：后者**不**关消费端，因为
+/// 协议只要求允许放弃已提交字节，而既有验收（`mux_recv_dropped_dual_`）钉住了
+/// 「对端丢弃接收半边之前写入的字节仍然写得完」。本扫描只处理本端主动拆流。
+async fn scan_write_released_<C, K>(
+    shared: &MuxShared_<C>,
+    table: &mut WriteTable_<C::Alloc>,
+    pending_fin: &mut PendingFin_<C::Alloc>,
+    read_events: &EventSender_<ReadEvent_<C::Alloc>>,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    C::Rt: TrTime + Clone,
+    K: TrCancellationToken,
+{
+    let mut cursor: Option<(Dock, Dock)> = Option::None;
+    loop {
+        let next = match cursor {
+            Option::None => table.keys().next().copied(),
+            Option::Some(last) => table
+                .range((Bound::Excluded(last), Bound::Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        };
+        let Option::Some(pair) = next else {
+            return Result::Ok(());
+        };
+        cursor = Option::Some(pair);
+        let Option::Some((_, entry)) = table.get(pair) else {
+            continue;
+        };
+        if !entry.owner_.is_released_() {
+            continue;
+        }
+        if let Option::Some((_, entry)) = table.get_mut(pair) {
+            entry.reader_.close();
+            entry.owner_.notify_both_progress_();
+        }
+        table.remove(pair);
+        pending_fin.remove(pair);
+        maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
+    }
+}
+
 /// 摘掉「身份已释放」的读表项并关闭接收环写端。
 ///
 /// `buffex` 的环半部被 drop **不会**置位关闭标记：少了显式 `close()`，应用侧正 park
@@ -747,7 +797,7 @@ where
         // 对**优雅关闭**（`close_async` 替应用发起的收尾）它才是必需的——应用手里
         // 那份 `ChannelTx` 可能还在，关掉消费端能让它的下一次写入立刻拿到「发送
         // 方向已关闭」，而不是把字节留在一条再没有读者的环里静默丢掉。
-        // 手法与 `WriteEvent_::LocalAbort` 相同。
+        // 手法与 `scan_write_released_` 的拆流收尾相同。
         entry.reader_.close();
         // `FIN` 已上线：应用侧的 `close_async` 等待者由此醒来并复检成功。
         entry.owner_.notify_tx_progress_();
@@ -2694,6 +2744,27 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 }
             }
         }
+        if hints & HINT_W_RELEASED != 0u64 {
+            match race_cancel_(
+                &cancel,
+                scan_write_released_::<C, _>(
+                    &shared,
+                    &mut *table,
+                    &mut pending_fin,
+                    &read_events,
+                    &cancel,
+                ),
+            )
+            .await
+            {
+                Option::None => return,
+                Option::Some(Result::Ok(())) => {}
+                Option::Some(Result::Err(err)) => {
+                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                    return;
+                }
+            }
+        }
 
         // 1. 先把**已经到达**的事件成批处理掉（非阻塞），**但批有上限**。
         //
@@ -2723,11 +2794,8 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 handle_write_event_::<C, _>(
                         event,
                     &mut tx_stage,
-                    &mut *table,
                     &mut tg_table,
-                    &mut pending_fin,
                     &shared,
-                    &read_events,
                     &cancel,
                     &mut last_ready,
                 ),
@@ -2963,11 +3031,8 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 handle_write_event_::<C, _>(
                         event,
                     &mut tx_stage,
-                    &mut *table,
                     &mut tg_table,
-                    &mut pending_fin,
                     &shared,
-                    &read_events,
                     &cancel,
                     &mut last_ready,
                 ),
@@ -3002,15 +3067,14 @@ pub(crate) async fn mux_loop_async_<C, K>(
 }
 
 /// 处理一条写事件；返回 `Err` 表示连接级失败（调用方负责 `mark_failed_` 并退出）。
-#[allow(clippy::too_many_arguments)]
+///
+/// 只做**事件自身**的动作（写控制帧、置 `last_ready`、telegraph 收支）：本地表的
+/// 扫描收尾已改为提示位驱动（`HINT_W_*`），因此这里不再借用写表。
 async fn handle_write_event_<C, K>(
     event: WriteEvent_<C::Alloc>,
     tx_stage: &mut C::ConnTx,
-    table: &mut WriteTable_<C::Alloc>,
     tg_table: &mut TgWriteTable_<C::Alloc>,
-    pending_fin: &mut PendingFin_<C::Alloc>,
     shared: &MuxShared_<C>,
-    read_events: &EventSender_<ReadEvent_<C::Alloc>>,
     cancel: &K,
     last_ready: &mut Option<(Dock, Dock)>,
 ) -> Result<(), MuxError>
@@ -3036,27 +3100,6 @@ where
             remote_dock,
         } => {
             *last_ready = Option::Some((local_dock, remote_dock));
-        }
-        WriteEvent_::LocalAbort {
-            local_dock,
-            remote_dock,
-        } => {
-            let pair = (local_dock, remote_dock);
-            // 本端主动拆流（空闲超时）：显式关闭发送环的消费端——没有别的执行者会替
-            // 这条路径关它，而应用必须立刻看到发送方向已关闭。理由见事件类型文档。
-            //
-            // 顺带叫醒两侧的等待者：这条路径是**终局**（子流被拆掉），park 在
-            // `ABORT` 上的 `flush_async` / `close_async` 必须醒来按终局返回，而不是
-            // 永远等一条再也不会有进展的环。叫醒放在 `reader_.close()` 之后——判据里
-            // 「消费端已关闭」正是一次有效的事实变化。
-            if let Option::Some((_, entry)) = table.get_mut(pair) {
-                entry.reader_.close();
-                entry.owner_.notify_both_progress_();
-            }
-            table.remove(pair);
-            pending_fin.remove(pair);
-            maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token())
-                .await?;
         }
         // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
         // telegraph（数据报）

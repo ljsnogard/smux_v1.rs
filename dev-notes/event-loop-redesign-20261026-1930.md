@@ -1805,6 +1805,26 @@ connection/
      而不是 `reject_after_open_`。需要新增「`OPEN` 已发」位，留待 P5。
   8. P4 剩余：拆流迁移（`PendingFin_` / `LocalAbort` 改 owner 位 + 扫描）。
 
+- 20261027-1300：**P4 拆流迁移第一步：`LocalAbort` 位化**（按裁决先做这一块，
+  `PendingFin_` / main 发 FIN 留到下一步与 T1 一起做）。
+  1. 新增写提示位 `HINT_W_RELEASED`（`signal_`）：事实是 `ChannelState_` 的
+     `RELEASED`，提示只负责唤醒。
+  2. 计时循环的 `TimerAction_::Abort` 不再投 `WriteEvent_::LocalAbort`，改为置位 +
+     `raise_write_hint_(HINT_W_RELEASED)`（读方向仍 `HINT_R_RELEASE`）。
+  3. mux 新增 `scan_write_released_`：按写表扫描 `is_released_()` 的条目，
+     **显式关闭发送环消费端**、摘写表、`pending_fin.remove`、`maybe_release_`
+     ——与原事件分支的动作一一对应。与 `scan_peer_closed_` 的分界（RESET 不关
+     消费端）保持原注释。
+  4. 删除 `WriteEvent_::LocalAbort` 变体、`handle_write_event_` 的处理分支，以及
+    该函数因此不再使用的三个参数（`table` / `pending_fin` / `read_events`）。
+  5. 覆盖确认：临时探针统计到 `keepalive_compio` 的空闲超时用例会走到
+     `TimerAction_::Abort`（1 次），`inmem` / `smoke` 为 0；`mux_graceful_close_timeout_dual_`
+     走的是**连接关闭**动作（`close_action_`），不经过逐子流 `Abort`。
+  6. 验收：lib 373 / inmem 20 / cross_thread 1 / smoke 5 / keepalive 5；clippy 0
+     error；`format_use_imports.py --check` 全绿。
+  7. P4 剩余：`PendingFin_` → `TX_DRAINED` 位 + main 发 `CLOSE(FIN)`（与 §8.1 / T1
+     绑定，属于关闭状态机主体迁移）。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2017,7 +2037,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化完成（P4）；`WakerSlots_` 待 P5 替换；`PendingFin_` / `LocalAbort` 待 P4 拆流迁移 |
+| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；`WakerSlots_` 待 P5 替换；`PendingFin_` 待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` / `util_` 待 P5 |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 

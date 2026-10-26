@@ -11,7 +11,7 @@
 //!   [`ReadAttach_`]）交给对应循环——每连接一条、容量固定，不受「子流变多 ⇒ 事件
 //!   队列被打满」的影响；
 //! - [`WriteEvent_`] → **写循环**：待写出的控制帧（[`WriteEvent_::Control`]）、
-//!   「某条子流发送环有数据」（[`WriteEvent_::TxReady`]）、拆流（`LocalAbort`）；
+//!   「某条子流发送环有数据」（[`WriteEvent_::TxReady`]）；拆流已位化（见下节）；
 //! - [`ReadEvent_`] → **读循环**：「应用取走了数据，去看看接收水位」
 //!   （[`ReadEvent_::RxConsumed`]）。
 //!
@@ -30,21 +30,24 @@
 //!    只置一个「需要全扫」标志并唤醒消费者。写循环的排空本来就是全表扫描，读循环的
 //!    `rescan_read_` 则按 `RX_CONSUMED` 位 + 环内积压重算窗口。这些事件的信息量只是
 //!    「可能变了」，状态位才是事实来源。
-//! 2. **不可重建的一次性通知**（`Attach` / `Control` / `TgAttach` / `LocalAbort` /
-//!    `TgTxClosed`）：环满时
+//! 2. **不可重建的一次性通知**（`Attach` / `Control` / `TgAttach` / `TgTxClosed`）：环满时
 //!    推进 [`Overflow_::durable_`] 暂存（自旋锁 FIFO），消费者下次取事件时先取它。
-//!    它们携带环半部句柄、控制帧或一次性拆流决定，丢了就真的无法可靠恢复。
+//!    它们携带环半部句柄或控制帧，丢了就真的无法可靠恢复。
 //!
 //! 这样正常路径只走定容环与一次原子读；全扫只在环满的极端情况下发生。`chan-flume`
 //! 后端是无界通道，两条兜底路径都不会被触发（保留它是为了同一提交内 A/B 对比）。
 //!
-//! # 拆流通知正在位化（2026-10-26）
+//! # 拆流通知已位化（2026-10-27）
 //!
 //! `TxClosed` / `RxClosed` / `PeerClosed` / `Release` 已不再走事件通道：收尾事实在
 //! `owner_::ChannelState_` 的状态字（`APP_*` / `PEER_*` / `RELEASED`），生产者只
 //! `raise_` 一个合并提示（`HINT_W_*` / `HINT_R_*`），对应循环醒来后按表扫描并推进
 //! `finalize` / `RESET` / 摘表。这样共享队列里少了每子流四条消息，也不再需要在「满」
-//! 时暂存它们。`LocalAbort` 仍走事件通道（它还要精确摘写侧表项）。
+//! 时暂存它们。
+//!
+//! `LocalAbort` 也已位化：计时循环的拆流动作把 `RELEASED` 位写在 owner 上，只
+//! `raise_` 一个 `HINT_W_RELEASED`；写循环扫本地表，对已释放条目关发送环、
+//! 摘表并尝试释放身份（原事件分支的动作）。
 //!
 //! # 为什么不是一条通道
 //!
@@ -266,21 +269,6 @@ where
         remote_dock: Dock,
     },
 
-    /// **本端计时循环**判定空闲超时：放弃该子流的发送方向、摘掉本地表项。
-    ///
-    /// 与「对端发来 `CLOSE`」那条路径的区别是**谁有权关闭发送环的
-    /// 消费端**：本端主动拆流时没有别的执行者会去关它，因此写循环在这里显式
-    /// `close()`，应用侧才会立刻看到发送方向已关闭（`is_rx_closed()` 为真、写入返回
-    /// `Closing`）。对端 `RESET` 那条路径**不**关——协议只要求「允许放弃已提交字节」，
-    /// 而既有验收（`mux_recv_dropped_dual_`）钉住了「对端丢弃接收半边之前写入的字节
-    /// 仍然写得完」。
-    LocalAbort {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-    },
-
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
     // telegraph（数据报）：与 channel 走**同一套**「环半部上线」模式
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -410,6 +398,12 @@ pub(crate) const HINT_W_RX_CLOSED: u64 = 1u64 << 1usize;
 /// `FIN` 与 `RESET` 的事实同样在各子流状态字（`PEER_FIN` / `PEER_RESET`）上。
 pub(crate) const HINT_W_PEER_CLOSED: u64 = 1u64 << 2usize;
 
+/// 「身份已释放 / 已中止」：写循环据此摘写表项、关发送环消费端。
+///
+/// 事实是 `ChannelState_` 的 `RELEASED` 位；本位只负责把写循环叫醒。替换了原先的
+/// 一次性 `WriteEvent_::LocalAbort`：一条子流至多释放一次，扫描是幂等的。
+pub(crate) const HINT_W_RELEASED: u64 = 1u64 << 3usize;
+
 /// 「身份已释放」：读循环据此摘掉接收表项并关闭接收环写端。
 pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;
 
@@ -417,13 +411,13 @@ pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;
 ///
 /// 事件通道承载两类东西：
 ///
-/// - **不可重建的一次性通知**（`Attach` / `Control` / `TgAttach` / 拆流与释放）：
+/// - **不可重建的一次性通知**（`Attach` / `Control` / `TgAttach`）：
 ///   生产者走 [`EventSender_::try_send_durable_event_`]，满时进入兜底暂存，**绝不丢**；
 /// - **可重建的高频提示**（`TxReady` / `TgReady` / `RxConsumed`）：走
 ///   [`TrEventSender_::try_send_event_`]，满时丢弃并置「需要全扫」标志，由消费者按
 ///   状态位 / 全表排空重建。
 ///
-/// `Attach` 移出到内联 inbox 之后，这条通道只剩控制帧、拆流通知与高频提示；256 在
+/// `Attach` 移出到内联 inbox、拆流与释放位化之后，这条通道只剩控制帧与高频提示；256 在
 /// 256 条并发子流的跨线程用例与三后端 smoke（真实 socket）上均通过。事件枚举 64
 /// 字节，256 容量约 16 KiB/通道（两条共 32 KiB/连接），比原先的 1024 省 96 KiB。
 #[cfg_attr(feature = "chan-flume", allow(dead_code))]
@@ -463,7 +457,7 @@ pub(crate) enum EventTake_<E> {
 ///
 /// 两条路：
 ///
-/// - **可重建事件**（水位 / 拆流提示）：环满时丢弃并置 [`Self::flag_`]，消费者看到
+/// - **可重建事件**（水位提示）：环满时丢弃并置 [`Self::flag_`]，消费者看到
 ///   `Rescan` 后按各子流状态位全扫重建；
 /// - **不可重建事件**（`Attach` / `Control` / `TgAttach`）：环满时推进
 ///   [`Self::durable_`] 暂存，消费者下次取事件时先取它，**绝不丢**。
@@ -595,7 +589,7 @@ impl<E> Clone for EventSender_<E> {
 }
 
 impl<E: Send + 'static> EventSender_<E> {
-    /// 投递一条**不可重建**事件（`Attach` / `Control` / `TgAttach` / 拆流与释放）。
+    /// 投递一条**不可重建**事件（`Attach` / `Control` / `TgAttach`）。
     ///
     /// 与 [`TrEventSender_::try_send_event_`] 的区别：环满时把事件推进兜底暂存，
     /// **不丢弃**。它是同步入口，因此可以在 `Drop` 里调用；暂存本身是自旋锁保护的
