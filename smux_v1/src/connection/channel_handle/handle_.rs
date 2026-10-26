@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
@@ -22,6 +24,8 @@ use crate::{
         signal_::{ControlFrame_, ReadAttach_, SessionEvent_, WriteAttach_, WriteEvent_},
         slot_::PushErr_,
         pending_msg_::PendingMsgApp_,
+        public_channel_::ChunkReadState_,
+        session_::enqueue_frame_,
         util_::read_available_into_vec_,
     },
     flow_ctrl::{
@@ -311,6 +315,11 @@ where
         Self: 'f,
         Rb: 'f + TrBuffRead<C::Data>;
 
+    type MessageAsync<'f, W> = MuxReadMessageAsync<'f, 'f, C, W>
+    where
+        Self: 'f,
+        W: 'f + TrBuffWrite<C::Data>;
+
     fn accept_async<'f, Wb, B, P>(
         &'f mut self,
         welcome: &'f mut Wb,
@@ -339,6 +348,13 @@ where
         Rb: TrBuffRead<C::Data>,
     {
         MuxRejectAsync::new(self, reason)
+    }
+
+    fn read_message_async<'f, W>(&'f mut self, sink: &'f mut W) -> Self::MessageAsync<'f, W>
+    where
+        W: 'f + TrBuffWrite<C::Data>,
+    {
+        MuxReadMessageAsync::new(self, sink)
     }
 }
 
@@ -842,6 +858,54 @@ where
         return Result::Err(HandleError::Cancelled);
     }
     Result::Ok(written)
+}
+
+/// [`TrChannelHandle::read_message_async`] 的 step 函数。
+#[gen_may_cancel_future(MuxReadMessage, pub, new(pub(crate)))]
+async fn mux_read_message_async_<'f, C, W, K>(
+    handle: &'f mut ChannelHandle<C>,
+    sink: &'f mut W,
+    cancel: K,
+) -> Result<usize, HandleError>
+where
+    C: TrConnCfg + 'f,
+
+    W: TrBuffWrite<C::Data> + 'f,
+    K: TrCancellationToken,
+{
+    let cap = handle.conn_.core_().config_().pending_msg_capacity();
+    let mut state = ChunkReadState_::new_message_();
+    let len = loop {
+        if cancel.is_cancelled() {
+            return Result::Err(HandleError::Cancelled);
+        }
+        match handle.msg_.read_prefix_incoming_(&mut state, cap) {
+            Result::Ok(Option::Some(len)) => break len,
+            Result::Ok(Option::None) => {
+                let _ = poll_fn(|cx| handle.msg_.poll_incoming_readable_(cx)).await;
+            }
+            Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::MalformedFrame)),
+        }
+    };
+    if len == 0usize {
+        return Result::Ok(0usize);
+    }
+    let mut buf = alloc::vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < len {
+        match handle
+            .msg_
+            .read_body_incoming_(&mut state, &mut buf[filled..])
+        {
+            Result::Ok(n) if n > 0usize => filled += n,
+            Result::Ok(_) => {
+                let _ = poll_fn(|cx| handle.msg_.poll_incoming_readable_(cx)).await;
+            }
+            Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::MalformedFrame)),
+        }
+    }
+    enqueue_frame_(sink, &buf, cancel.child_token()).await?;
+    Result::Ok(len)
 }
 
 /// 建流**已经发出 `OPEN` 之后**本端放弃裁决（取消）：向对端宣告 `REJECT` 并释放身份。

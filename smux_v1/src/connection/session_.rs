@@ -1009,7 +1009,7 @@ where
 ///
 /// 写半边不可用（对端消失 / 适配器报错）→ [`MuxError::Transport`]（方向为写）；
 /// 被取消 → [`MuxError::Cancelled`]。
-async fn enqueue_frame_<W, K>(
+pub(crate) async fn enqueue_frame_<W, K>(
     tx_stage: &mut W,
     frame: &[u8],
     cancel: K,

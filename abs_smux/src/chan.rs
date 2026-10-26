@@ -71,6 +71,26 @@ where
     ) -> Self::RejectAsync<'f, R>
     where
         R: TrBuffRead<C::Data>;
+
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // Pending message
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    type MessageAsync<'f, W>: TrMayCancel<'f, MayCancelOutput =
+        Result<usize, Self::Err>>
+    where
+        Self: 'f,
+        W: 'f + TrBuffWrite<C::Data>;
+
+    /// 读对端在建流阶段随 `OPEN` / `ACCEPT` 带来的 message。
+    ///
+    /// - 响应方：在 `accept_async` 之前读对端 `OPEN` 的开场消息；
+    /// - 发起方：在 `accept_async` 返回之后读对端 `ACCEPT` 的欢迎信息。
+    ///
+    /// 没有 message（空 `0x0000`）时返回 `0` 且不写 `sink`。
+    fn read_message_async<'f, W>(&'f mut self, sink: &'f mut W) -> Self::MessageAsync<'f, W>
+    where
+        W: 'f + TrBuffWrite<C::Data>;
 }
 
 pub trait TrChannelHalf<C>

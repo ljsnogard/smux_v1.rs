@@ -28,7 +28,13 @@
 // 过渡：P0 阶段只落原语、不接线；接入建流请求后删除本行。
 #![allow(dead_code)]
 
-use core::alloc::AllocatorClone;
+use core::{
+    alloc::AllocatorClone,
+    task::{Context, Poll},
+};
+
+use abs_buff::Demand;
+use abs_cancel::{NonCancellableToken, TrMayCancel};
 
 use mm_ptr::Owned;
 
@@ -37,7 +43,7 @@ use crate::{
         public_channel_::{ChunkReadErr_, ChunkReadState_, ChunkWriteErr_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx, RingBuildErr, new_buffered_channel},
     },
-    x_deps::mm_ptr,
+    x_deps::{abs_buff, abs_cancel, mm_ptr},
 };
 
 /// 每个方向的 message 载荷默认上限（字节）。
@@ -113,6 +119,20 @@ impl PendingMsgApp_ {
         cap: usize,
     ) -> Result<Option<usize>, ChunkReadErr_> {
         PublicChunkIo_::try_read_prefix_(&mut self.rx_, state, cap)
+    }
+
+    /// 等 incoming ring 出现可读字节（不消费）。供 `read_message_async` 的 park 点用。
+    pub(crate) fn poll_incoming_readable_(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let demand = Demand::at_least(1usize);
+        let fut = self
+            .rx_
+            .read_async(&demand)
+            .may_cancel_with(NonCancellableToken::new());
+        let mut fut = core::pin::pin!(fut);
+        match core::future::Future::poll(fut.as_mut(), cx) {
+            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     /// 把 incoming message 的内容读进 `dst`（最多 `state.left_()` 字节）。
