@@ -1704,6 +1704,12 @@ connection/
      这与 `ChannelHandle` 位化失败（上一节）是同一类问题：**main 的手动驱动
      测试缺失**，导致时序只能靠集成测试试错。
 
+- 20261027-0530：**P4 索引迁移：`PendingFin_` 换 2 KiB B 树**。
+  `type PendingFin_<A> = DockSet_<A, (Dock, Dock)>`；初始化用 `DockSet_::new_in`；
+  `insert` 的 bool 语义用 `.is_none()`，`iter` / `range` 适配 `(&K, &V)` item 形态。
+  验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
+  本地表 `WriteTable_` / `ReadTable_` 与 registry 四表仍待迁移。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

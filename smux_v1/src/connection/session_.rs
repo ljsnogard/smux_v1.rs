@@ -424,7 +424,7 @@ type TgWriteTable_<A> = BTreeMap<Dock, TgWriteEntry_<A>, A>;
 /// 分配器参数与两个本地表同源（调用方注入）：它的节点在**首次进入**该集合时分配，
 /// 用全局分配器会让「丢半边 + 额度为 0」这条收尾路径隐式落到全局堆上
 /// （`dev-notes/audit-heap-alloc-20261004-1122.md` N1）。
-type PendingFin_<A> = BTreeSet<(Dock, Dock), A>;
+type PendingFin_<A> = crate::connection::dock_index_::DockSet_<A, (Dock, Dock)>;
 
 /// 处理写循环收到的一条 `Attach`：插入本地写表，并补查那些可能早于 `Attach` 到达的
 /// 一次性事实（应用封口 / 关接收、对端 `CLOSE`）。
@@ -441,7 +441,7 @@ fn handle_write_attach_<C>(
     let rx_closed = owner.is_app_rx_closed_();
     let peer_closed = owner.is_peer_fin_() || owner.is_peer_reset_();
     if tx_closed {
-        pending_fin.insert(pair);
+        pending_fin.insert(pair, ());
     }
     table.insert(
         pair,
@@ -492,7 +492,7 @@ where
     for (pair, entry) in table.iter() {
         if entry.owner_.is_app_tx_closed_()
             && !entry.owner_.is_local_fin_sent_()
-            && pending_fin.insert(*pair)
+            && pending_fin.insert(*pair, ()).is_none()
         {
             #[cfg(feature = "test-loop-probe")]
             crate::connection::loop_probe_::tx_closed_handled_();
@@ -708,14 +708,14 @@ where
         Option::None => {
             #[cfg(feature = "test-loop-probe")]
             crate::connection::loop_probe_::fin_see_unknown_();
-            pending_fin.insert(pair);
+            pending_fin.insert(pair, ());
             return Result::Ok(false);
         }
         // 还有数据没发出去：留在待收尾集合里等额度 / 环推进。
         Option::Some(true) => {
             #[cfg(feature = "test-loop-probe")]
             crate::connection::loop_probe_::fin_see_data_();
-            pending_fin.insert(pair);
+            pending_fin.insert(pair, ());
             return Result::Ok(false);
         }
         Option::Some(false) => {
@@ -2575,8 +2575,10 @@ pub(crate) async fn mux_loop_async_<C, K>(
     let mut public_read = ChunkReadState_::new_();
     // 「发送方向已丢弃、但发送环还没排空（或额度没回来）」的子流：它们还欠对端一条
     // `CLOSE(FIN)`，由下面第 2.5 步在有进展时继续收尾（见 `finalize_entry_`）。
-    let mut pending_fin: PendingFin_<C::Alloc> =
-        BTreeSet::new_in(lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())));
+    let mut pending_fin: PendingFin_<C::Alloc> = crate::connection::dock_index_::DockSet_::new_in(
+        lock_or_exit_!(shared.reg_.allocator_(cancel.child_token())),
+    )
+    .expect("2 KiB B 树足以容纳一个 (Dock, Dock)");
     // park 期间被合并提示唤醒时，把掩码带到这里、在下一轮顶部统一处理。
     let mut pending_hints = 0u64;
     // 环段字节的搬出暂存：`clone_items_from_buff` / `move_items_to_buff` 需要一个
@@ -2791,11 +2793,11 @@ pub(crate) async fn mux_loop_async_<C, K>(
         let mut fin_cursor: Option<(Dock, Dock)> = Option::None;
         loop {
             let next = match fin_cursor {
-                Option::None => pending_fin.iter().next().copied(),
+                Option::None => pending_fin.iter().next().map(|(key, _)| *key),
                 Option::Some(last) => pending_fin
                     .range((Bound::Excluded(last), Bound::Unbounded))
                     .next()
-                    .copied(),
+                    .map(|(key, _)| *key),
             };
             let Option::Some(pair) = next else {
                 break;
