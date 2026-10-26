@@ -1568,7 +1568,7 @@ connection/
 
 | 文档 | 状态 |
 | --- | --- |
-| `event-loop-redesign-20261026-1930.md`（本文） | **设计稿，待评审** |
+| `event-loop-redesign-20261026-1930.md`（本文） | **设计稿（已评审）；P0–P3.3a 已实施，P3.3b 进行中** |
 | `connection-delivery-20261026-1845.md` | 现行：现状矩阵；本文定稿后应把 §3 标为“历史基线” |
 | `event-backpressure-20261026-0514.md` | 现行：位化与内联队列的实施记录；本文的 P4/P5 会取代其阶段 3/4 |
 | `no-vec-audit-20261024-0008.md` | 历史：原则仍有效；本文 §10/§11 是其落地清单 |
@@ -1609,6 +1609,26 @@ connection/
   优化”的问项。
 
 ---
+
+- 20261027-0140：**P0–P3.3a 实施汇总**（逐提交细节见 `git log`）。
+  - **P0**：`tcs_.rs` / `WakerSlots_` / `PublicChunkIo_` / `PendingMsg` /
+    `TimerSignal_` 原语与 22 个单测。
+  - **P1**：`main_loop` 接管 bind / listen / reserve；删除 `ctl_`；定容请求队列 +
+    `Tcs_`；索引树 2 KiB chunk 配置（`tree_config_`）。
+  - **P2**：公共子流两条 ring + 四路唤醒槽；`CLOSE` 全链路（demux 写 RX、main
+    处理、mux 搬 TX）。
+  - **P3.1a**：每 pending channel 一对 message ring（`TrConnCfg` 默认 512）；
+    `reserve_channel_` / `reserve_inbound_` / `take_pending_inbound_` 接线。
+  - **P3.1b**：`SendControl` 统一 `OPEN`/`ACCEPT`/`REJECT` 的发送；mux 先搬公共帧再
+    处理事件；修复 `FIN` 超车 `OPEN` 的启动竞态。
+  - **P3.2**：`Accept`/`Reject` 请求化；`main` 读 message ring 组帧；响应方接管
+    `take_inbound_report_`；删除 `ChannelHandle::message_`。
+  - **P3.3a**：`read_message_async` 公开 API + app 侧读取（main 填充 incoming 待
+    P3.3b）。
+  - 期间修复：`InlineQueue_::poll_pop_` / `HintSlot_::poll_wait_` 的丢唤醒；
+    `park_main_` 把公共 RX 唤醒误判为退出；`mux_auto_dock_allocation_dual_` 的
+    `FIN/OPEN` 顺序竞态。
+  - **P3.3b 首次尝试已回退**（见下一条记录），工作区停在此处。
 
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
