@@ -435,12 +435,15 @@ where
     /// 测试专用构造：只建核心与两条事件通道，**不 spawn 任何循环**。
     ///
     /// 运行时值取自 `config.runtime()`（测试配置给出的是假运行时值，时刻恒为 0）。
-    pub(crate) fn new_test_(opts: HandshakeOpts, config: C) -> Self
-    {
+    pub(crate) fn new_test_(opts: HandshakeOpts, config: C) -> Self {
+        Self::new_test_bundle_(opts, config).0
+    }
+
+    /// 测试专用：同时交出连接与循环共享面，供手动 `main_step_` 驱动。
+    pub(crate) fn new_test_bundle_(opts: HandshakeOpts, config: C) -> (Self, MuxShared_<C>) {
         let rt = config.runtime();
-        MuxConnection {
-            core_: CoreBundle_::build_(&rt, opts, config).core_,
-        }
+        let CoreBundle_ { core_, shared_, .. } = CoreBundle_::build_(&rt, opts, config);
+        (MuxConnection { core_ }, shared_)
     }
 }
 

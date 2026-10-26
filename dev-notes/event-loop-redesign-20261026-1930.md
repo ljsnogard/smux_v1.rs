@@ -1715,6 +1715,14 @@ connection/
   `get_mut` 适配 `(&K, &mut V)`、`remove` 按键值、`iter_mut` item 形态不变。
   验收：lib 371 / inmem 20 / smoke 5；clippy / format 合规。
 
+- 20261027-0630：**P4 测试前置：`main_step_` 与 `new_test_bundle_`**。
+  1. `main_loop_async_` 的循环体抽成 `main_step_`（非阻塞一轮：drain、提示、
+     公共 RX 帧、请求批）；循环只负责 `step + park`，返回 `false` 表示应退出。
+  2. `new_test_bundle_` 同时交出 `MuxConnection` 与 `MuxShared_`，供测试手动驱动；
+     `MainPublicRead_` 提升为 `pub(crate)`。
+  3. 行为不变；lib 371。下一步用它钉住「Drop → reap → unbind / unreserve /
+     REJECT」三条时序，再重试 DockBinding / ChannelHandle 位化。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机

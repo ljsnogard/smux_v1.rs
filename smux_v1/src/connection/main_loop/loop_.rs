@@ -100,60 +100,19 @@ pub(crate) async fn main_loop_async_<C, K>(
             exit_(&ctl);
             return;
         }
-        // 过渡：`Drop` 仍投 `SessionEvent_`（P4 改为 retired 位）。
-        if shared
-            .reg_()
-            .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token())
-            .await
-            .is_err()
+        if !main_step_::<C, _>(
+            &shared,
+            &ctl,
+            &mut public_tx_w,
+            &mut public_rx_r,
+            &mut rx_scratch[..],
+            &mut public_read,
+            &cancel,
+        )
+        .await
         {
             exit_(&ctl);
             return;
-        }
-
-        // 合并提示：目前只有 retired 位（P4 起逐步接入 window-dirty 等）。
-        let hints = ctl.take_main_hint_();
-        if hints & HINT_MAIN_RETIRED != 0u64 {
-            let _ = shared.reg_().reap_retired_(cancel.child_token()).await;
-        }
-
-        // 公共 RX：每轮最多 `K_MAIN_FRAME_BATCH` 条完整帧。
-        for _ in 0..K_MAIN_FRAME_BATCH {
-            match try_read_public_frame_(
-                &mut public_rx_r,
-                &mut public_read,
-                &mut rx_scratch[..],
-                shared.max_packet_size_(),
-            ) {
-                Result::Ok(Option::Some((header, head_len, total_len))) => {
-                    let payload = &rx_scratch[head_len..total_len];
-                    handle_public_frame_::<C, _>(
-                        &shared,
-                        &mut public_tx_w,
-                        &header,
-                        payload,
-                        &cancel,
-                    )
-                    .await;
-                    // 读走一帧就腾出 RX 空间，唤醒可能停在背压上的 demux。
-                    shared.public_().notify_rx_space_();
-                }
-                Result::Ok(Option::None) => break,
-                Result::Err(err) => {
-                    let _ = shared.reg_().mark_failed_(&err, cancel.child_token()).await;
-                    shared.reg_().cancel_loops_();
-                    exit_(&ctl);
-                    return;
-                }
-            }
-        }
-
-        // 请求：每轮最多 `K_MAIN_REQ_BATCH` 条。
-        for _ in 0..K_MAIN_REQ_BATCH {
-            let Some(request) = ctl.try_pop_request_() else {
-                break;
-            };
-            handle_request_::<C, _>(&shared, &mut public_tx_w, request, &cancel).await;
         }
 
         match park_main_::<C, _>(&shared, &ctl, &cancel).await {
@@ -171,6 +130,73 @@ pub(crate) async fn main_loop_async_<C, K>(
             }
         }
     }
+}
+
+/// 非阻塞地跑一轮控制面工作：释放落实、提示、公共 RX 帧、请求批。
+///
+/// 返回 `false` 表示连接应退出（drain 被取消 / 帧解析失败）。测试可手动调用
+/// 本函数驱动 `main_loop` 的状态推进，不必 park。
+pub(crate) async fn main_step_<C, K>(
+    shared: &MuxShared_<C>,
+    ctl: &ControlState_<C::Alloc>,
+    public_tx_w: &mut BufferedTx,
+    public_rx_r: &mut BufferedRx,
+    rx_scratch: &mut [u8],
+    public_read: &mut MainPublicRead_,
+    cancel: &K,
+) -> bool
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    // 过渡：`Drop` 仍投 `SessionEvent_`（P4 改为 retired 位）。
+    if shared
+        .reg_()
+        .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token())
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    // 合并提示：目前只有 retired 位（P4 起逐步接入 window-dirty 等）。
+    let hints = ctl.take_main_hint_();
+    if hints & HINT_MAIN_RETIRED != 0u64 {
+        let _ = shared.reg_().reap_retired_(cancel.child_token()).await;
+    }
+
+    // 公共 RX：每轮最多 `K_MAIN_FRAME_BATCH` 条完整帧。
+    for _ in 0..K_MAIN_FRAME_BATCH {
+        match try_read_public_frame_(
+            public_rx_r,
+            public_read,
+            rx_scratch,
+            shared.max_packet_size_(),
+        ) {
+            Result::Ok(Option::Some((header, head_len, total_len))) => {
+                let payload = &rx_scratch[head_len..total_len];
+                handle_public_frame_::<C, _>(shared, public_tx_w, &header, payload, cancel)
+                    .await;
+                // 读走一帧就腾出 RX 空间，唤醒可能停在背压上的 demux。
+                shared.public_().notify_rx_space_();
+            }
+            Result::Ok(Option::None) => break,
+            Result::Err(err) => {
+                let _ = shared.reg_().mark_failed_(&err, cancel.child_token()).await;
+                shared.reg_().cancel_loops_();
+                return false;
+            }
+        }
+    }
+
+    // 请求：每轮最多 `K_MAIN_REQ_BATCH` 条。
+    for _ in 0..K_MAIN_REQ_BATCH {
+        let Some(request) = ctl.try_pop_request_() else {
+            break;
+        };
+        handle_request_::<C, _>(shared, public_tx_w, request, cancel).await;
+    }
+    true
 }
 
 /// 收尾：关闭队列，并把仍排队的请求以 `Closed` 结束。
@@ -516,7 +542,7 @@ where
 }
 
 /// 公共 RX 的整帧读取进度。
-struct MainPublicRead_ {
+pub(crate) struct MainPublicRead_ {
     /// chunked 前缀 / 内容状态。
     state_: ChunkReadState_,
 
@@ -529,7 +555,7 @@ struct MainPublicRead_ {
 
 impl MainPublicRead_ {
     /// 空状态。
-    fn new_() -> Self {
+    pub(crate) fn new_() -> Self {
         MainPublicRead_ {
             state_: ChunkReadState_::new_(),
             len_: 0usize,
