@@ -1637,6 +1637,20 @@ connection/
   cross_thread 1 / keepalive 5）全过；完整的入向迁移（demux 写 RX + main 处理
   `OPEN/ACCEPT/REJECT`）仍待 P3.3b。
 
+- 20261027-0220：**P3.3b 入向迁移完成**。
+  1. `demux` 对 `OPEN` 只做窗口字段校验后写公共 RX；读表里存在的 `ACCEPT` /
+     `REJECT` 同样写公共 RX（无表项按在途帧静默丢弃）；直接状态推进删除。
+  2. `main` 读整帧（header + payload）：`OPEN` 有 owner → 装窗口、`PEER_OPENED`、
+     唤醒建流、写 incoming；`OPEN` 无 owner → `reserve_inbound_` + 写 incoming，
+     配额 / 重复时回 `REJECT`；`ACCEPT` / `REJECT` → 置 outcome、写 welcome/reason、
+     唤醒。
+  3. `registry_` 新增 `write_msg_incoming_`；`read_message_async` 的 incoming 至此
+     有生产者（响应方读 `OPEN` message、发起方读 `ACCEPT` welcome）。
+  4. 前一条顺序闸门（mux 在写提示前 flush 公共 TX）解决了上一轮的
+     `OPEN -> CLOSE -> OPEN` 超车；`mux_auto_dock_allocation_dual_` 恢复。
+  5. 验收：lib 370 / inmem 20 / smoke 5 / cross_thread 1 / keepalive 5；
+     clippy / format 合规。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -1804,7 +1818,7 @@ value，key 与树结构保持不变。
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 待做 |
-| T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P2 接入 `CLOSE` 写 RX；`OPEN/ACCEPT/REJECT` 与删除本地动作待 P3/P4 |
+| T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P3.3b 完成：`OPEN/ACCEPT/REJECT/CLOSE` 全部写公共 RX，直接状态推进已删 |
 | T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；控制帧 / 关闭 / tick 待 P2–P5 |
 | T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | 待做 |
 | T5 | 删除 `ctl_`；循环数 / 取消令牌覆盖 4 个 | P1 | 完成（`loops_[3]` = main） |
@@ -1831,8 +1845,8 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | P3.1a 完成（登记 / 取出 / 句柄持有）；main 读 ring 组帧待 P3.1b |
 | T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 完成（默认实现 + 建连快照） |
-| T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | `message_` 已删；open message / reason 写 ring 并由 main 读；welcome 仍空（随 `read_message_async` 定语义） |
-| T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | API + app 侧读取完成；main 填充 incoming 与超长策略待 P3.3b |
+| T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | P3.3b 完成：三类载荷都经 message ring；main 写 incoming 供 `read_message_async` 读 |
+| T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | API + 读取 + incoming 填充完成；超长 / `Busy` 策略待 P3.3c |
 
 ### E. 索引（bplus_tree_cmp）
 

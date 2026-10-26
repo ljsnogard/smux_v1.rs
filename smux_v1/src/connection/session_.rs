@@ -140,7 +140,7 @@ use crate::{
         Dock, FrameHeader, FrameKind, MuxError, TrConnCfg, flags,
         frame_::{K_MAX_FRAME_HEADER, encode_header_},
         frame_parser_,
-        mux_connection::{ChannelRegistry_, ReserveErr_},
+        mux_connection::ChannelRegistry_,
         owner_::{ChannelOwner_, TgOwner_},
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChannel_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx},
@@ -859,18 +859,6 @@ where
 ///
 /// 建流状态标志在**原子字**里、通知通道是持久的，因此这一步是纯同步的一次 CAS +
 /// 一次非阻塞投递——不需要取锁，也没有 `await`。
-fn wake_establish_<A>(owner: &ChannelOwner_<A>)
-where
-    A: AllocatorClone,
-{
-    owner.notify_establish_();
-}
-
-/// 内侧循环的连接级失败处理：**取消导致的收尾不算失败**。
-///
-/// 连接被丢弃时 [`MuxCore::drop`](super::mux_connection::core_::MuxCore) 触发取消
-/// 令牌，循环在 await 点上以「取消错误」的形式收到通知并退出——那是正常关闭，
-/// 不应在注册表上留下失败标志（否则收尾路径会伪造出一个假的连接级失败）。
 pub(crate) async fn fail_mux_loop_<A, R, M, K>(
     shared: &MuxLoopShared_<A, R, M>,
     cancel: &K,
@@ -1640,66 +1628,52 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 }
             }
             FrameKind::Open => {
-                let Some(report) = window_report_of_(&header) else {
-                    fail_mux_loop_(&shared, &cancel, Option::Some(kind), &MuxError::MalformedFrame).await;
-                    return;
-                };
-                if let Option::Some(entry) = table.get(&pair) {
-                    // 本端主动发起的子流：这是对端回的 `OPEN`，带上它的接收窗口。
-                    let owner = entry.owner_.clone();
-                    let _ = owner.send_on_report_(report);
-                    owner.set_peer_opened_();
-                    owner.mark_data_(now_millis);
-                    wake_establish_(&owner);
-                } else {
-                    // 入向请求：**只登记，不回帧**。
-                    //
-                    // 本端自己的 `OPEN`（通告本端接收窗口）不能在读循环里发：窗口值
-                    // 取决于调用方在最终裁决（`accept_async`）时给出的接收缓冲容量，
-                    // 而读循环不知道那个容量。因此 `OPEN` 与 `ACCEPT` 都由
-                    // `accept_async` 发出（见 `channel_handle` 模块文档）。
-                    let reserved = shared
-                        .reg_
-                        .reserve_inbound_(
-                            local,
-                            remote,
-                            report,
-                            shared.conn_clock_().now_millis_(),
-                            shared.pending_msg_cap_(),
-                            cancel.child_token(),
-                        )
+                if window_report_of_(&header).is_none() {
+                    fail_mux_loop_(&shared, &cancel, Option::Some(kind), &MuxError::MalformedFrame)
                         .await;
-                    match reserved {
-                        Result::Ok(_) => {}
-                        // 等锁被取消：连接正在收尾，本循环退出。
-                        Result::Err(ReserveErr_::Cancelled) => return,
-                        Result::Err(_) => {
-                            // 配额 / 重复：回 `REJECT`，理由载荷留空。
-                            let _ = events_tx.try_send_durable_event_(WriteEvent_::Control {
-                                frame_: ControlFrame_::with_window_(
-                                    FrameKind::Reject,
-                                    0u8,
-                                    local,
-                                    remote,
-                                    Option::None,
-                                    Vec::new(),
-                                ),
-                            });
-                        }
+                    return;
+                }
+                let (head, head_len) = match encode_header_(&header) {
+                    Result::Ok(value) => value,
+                    Result::Err(err) => {
+                        fail_mux_loop_(&shared, &cancel, Option::Some(kind), &err).await;
+                        return;
                     }
+                };
+                if let Result::Err(err) = write_public_frame_async_::<C, _>(
+                    &mut public_rx_w,
+                    &shared,
+                    &head[..head_len],
+                    bytes,
+                    &cancel,
+                )
+                .await
+                {
+                    fail_mux_loop_(&shared, &cancel, Option::Some(kind), &err).await;
+                    return;
                 }
             }
             FrameKind::Accept | FrameKind::Reject => {
-                if let Option::Some(entry) = table.get(&pair) {
-                    let owner = entry.owner_.clone();
-                    let outcome = if header.kind() == FrameKind::Accept {
-                        crate::connection::owner_::EstablishOutcome_::Accepted
-                    } else {
-                        crate::connection::owner_::EstablishOutcome_::Refused
+                if table.get(&pair).is_some() {
+                    let (head, head_len) = match encode_header_(&header) {
+                        Result::Ok(value) => value,
+                        Result::Err(err) => {
+                            fail_mux_loop_(&shared, &cancel, Option::Some(kind), &err).await;
+                            return;
+                        }
                     };
-                    owner.set_establish_outcome_(outcome);
-                    owner.mark_data_(now_millis);
-                    wake_establish_(&owner);
+                    if let Result::Err(err) = write_public_frame_async_::<C, _>(
+                        &mut public_rx_w,
+                        &shared,
+                        &head[..head_len],
+                        bytes,
+                        &cancel,
+                    )
+                    .await
+                    {
+                        fail_mux_loop_(&shared, &cancel, Option::Some(kind), &err).await;
+                        return;
+                    }
                 }
             }
             FrameKind::Close => {

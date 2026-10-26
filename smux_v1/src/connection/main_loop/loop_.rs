@@ -28,13 +28,14 @@ use crate::{
         frame_::encode_header_,
         frame_parser_::decode_header_sync_,
         main_loop::{EstablishRole_, MainErr_, MainReply_, MainRequest_},
+        owner_::EstablishOutcome_,
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx},
         session_::race_cancel_,
         session_::MuxShared_,
         signal_::{ControlFrame_, HINT_W_PEER_CLOSED},
     },
-    flow_ctrl::RecvTotal,
+    flow_ctrl::{RecvTotal, WindowReport},
     x_deps::{abs_cancel, abs_smux, mm_ptr},
 };
 
@@ -120,8 +121,16 @@ pub(crate) async fn main_loop_async_<C, K>(
                 &mut rx_scratch[..],
                 shared.max_packet_size_(),
             ) {
-                Result::Ok(Option::Some(header)) => {
-                    handle_public_frame_::<C, _>(&shared, &header, &cancel).await;
+                Result::Ok(Option::Some((header, head_len, total_len))) => {
+                    let payload = &rx_scratch[head_len..total_len];
+                    handle_public_frame_::<C, _>(
+                        &shared,
+                        &mut public_tx_w,
+                        &header,
+                        payload,
+                        &cancel,
+                    )
+                    .await;
                     // 读走一帧就腾出 RX 空间，唤醒可能停在背压上的 demux。
                     shared.public_().notify_rx_space_();
                 }
@@ -524,12 +533,14 @@ impl MainPublicRead_ {
 }
 
 /// 尝试从公共 RX 读出一条完整控制帧；不足一帧时返回 `Ok(None)` 并保留进度。
+///
+/// 返回 `(header, head_len, total_len)`；载荷是 `scratch[head_len..total_len]`。
 fn try_read_public_frame_(
     public_rx: &mut BufferedRx,
     read: &mut MainPublicRead_,
     scratch: &mut [u8],
     max_packet_size: usize,
-) -> Result<Option<FrameHeader>, MuxError> {
+) -> Result<Option<(FrameHeader, usize, usize)>, MuxError> {
     if !read.state_.has_chunk_() {
         match PublicChunkIo_::try_read_prefix_(public_rx, &mut read.state_, max_packet_size) {
             Result::Ok(Option::Some(_len)) => {}
@@ -557,38 +568,155 @@ fn try_read_public_frame_(
     let len = read.len_;
     read.len_ = 0usize;
     read.filled_ = 0usize;
-    let (header, _head_len) = decode_header_sync_(&scratch[..len])?;
-    Result::Ok(Option::Some(header))
+    let (header, head_len) = decode_header_sync_(&scratch[..len])?;
+    Result::Ok(Option::Some((header, head_len, len)))
 }
 
-/// 处理一条入向控制帧（P2 先接 `CLOSE`；`OPEN` / `ACCEPT` / `REJECT` 在 P3 接入）。
-async fn handle_public_frame_<C, K>(shared: &MuxShared_<C>, header: &FrameHeader, cancel: &K)
-where
+/// 处理一条入向控制帧（`OPEN` / `ACCEPT` / `REJECT` / `CLOSE`）。
+async fn handle_public_frame_<C, K>(
+    shared: &MuxShared_<C>,
+    public_tx_w: &mut BufferedTx,
+    header: &FrameHeader,
+    payload: &[u8],
+    cancel: &K,
+) where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    if header.kind() != FrameKind::Close {
-        return;
-    }
     let local = header.remote_dock();
     let remote = header.local_dock();
-    let owner = shared
-        .reg_()
-        .channel_owner_(local, remote, cancel.child_token())
-        .await;
-    let Result::Ok(Option::Some(owner)) = owner else {
-        return;
-    };
-    if header.flags() & flags::K_RESET != 0u8 {
-        owner.set_peer_reset_();
-        owner.notify_tx_progress_();
-    } else {
-        owner.set_peer_fin_();
-        owner.notify_rx_progress_();
+    let now_millis = shared.conn_clock_().now_millis_();
+    match header.kind() {
+        FrameKind::Close => {
+            let owner = shared
+                .reg_()
+                .channel_owner_(local, remote, cancel.child_token())
+                .await;
+            let Result::Ok(Option::Some(owner)) = owner else {
+                return;
+            };
+            if header.flags() & flags::K_RESET != 0u8 {
+                owner.set_peer_reset_();
+                owner.notify_tx_progress_();
+            } else {
+                owner.set_peer_fin_();
+                owner.notify_rx_progress_();
+            }
+            owner.mark_data_(now_millis);
+            shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
+        }
+        FrameKind::Open => {
+            let Some(report) = window_report_(header) else {
+                return;
+            };
+            let owner = shared
+                .reg_()
+                .channel_owner_(local, remote, cancel.child_token())
+                .await;
+            match owner {
+                Result::Ok(Option::Some(owner)) => {
+                    let _ = owner.send_on_report_(report);
+                    owner.set_peer_opened_();
+                    owner.mark_data_(now_millis);
+                    owner.notify_establish_();
+                    let _ = shared
+                        .reg_()
+                        .write_msg_incoming_(
+                            local,
+                            remote,
+                            payload,
+                            shared.pending_msg_cap_(),
+                            cancel.child_token(),
+                        )
+                        .await;
+                }
+                Result::Ok(Option::None) => {
+                    let cap = shared.pending_msg_cap_();
+                    match shared
+                        .reg_()
+                        .reserve_inbound_(
+                            local,
+                            remote,
+                            report,
+                            now_millis,
+                            cap,
+                            cancel.child_token(),
+                        )
+                        .await
+                    {
+                        Result::Ok(_) => {
+                            let _ = shared
+                                .reg_()
+                                .write_msg_incoming_(
+                                    local,
+                                    remote,
+                                    payload,
+                                    cap,
+                                    cancel.child_token(),
+                                )
+                                .await;
+                        }
+                        Result::Err(_) => {
+                            let _ = write_control_frame_async_::<C, _>(
+                                public_tx_w,
+                                shared,
+                                &ControlFrame_::with_window_(
+                                    FrameKind::Reject,
+                                    0u8,
+                                    local,
+                                    remote,
+                                    Option::None,
+                                    Vec::new(),
+                                ),
+                                cancel,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Result::Err(_) => {}
+            }
+        }
+        FrameKind::Accept | FrameKind::Reject => {
+            let owner = shared
+                .reg_()
+                .channel_owner_(local, remote, cancel.child_token())
+                .await;
+            let Result::Ok(Option::Some(owner)) = owner else {
+                return;
+            };
+            let outcome = if header.kind() == FrameKind::Accept {
+                EstablishOutcome_::Accepted
+            } else {
+                EstablishOutcome_::Refused
+            };
+            owner.set_establish_outcome_(outcome);
+            owner.mark_data_(now_millis);
+            let _ = shared
+                .reg_()
+                .write_msg_incoming_(
+                    local,
+                    remote,
+                    payload,
+                    shared.pending_msg_cap_(),
+                    cancel.child_token(),
+                )
+                .await;
+            owner.notify_establish_();
+        }
+        _ => {}
     }
-    owner.mark_data_(shared.conn_clock_().now_millis_());
-    // 写循环据此扫描 `PEER_FIN` / `PEER_RESET` 并推进拆流（P4 前仍由旧扫描完成）。
-    shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
+}
+
+/// 从 `OPEN` 帧头取出窗口通告。
+fn window_report_(header: &FrameHeader) -> Option<WindowReport> {
+    let total = header.recv_total()?;
+    let window = header.recv_window()?;
+    if header.is_total_reset() {
+        Option::Some(WindowReport::new_reset(total, window))
+    } else {
+        Option::Some(WindowReport::new(total, window))
+    }
 }
 
 /// 把一条控制帧写进公共 TX ring（背压时 park 等 `tx_space`）。

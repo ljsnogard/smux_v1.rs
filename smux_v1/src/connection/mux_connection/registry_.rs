@@ -1733,6 +1733,31 @@ where
         Result::Ok(Option::Some(out))
     }
 
+    /// 把对端 message 写进该 channel 的 incoming ring（`main_loop` 用）。
+    ///
+    /// 每个方向至多一条；ring 满 / 超长时静默丢弃（P3.3b 的过渡，Q11 的完整策略
+    /// 在 P3.3c 补）。
+    pub(crate) async fn write_msg_incoming_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        body: &[u8],
+        cap: usize,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.root_.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let Option::Some(BindingSlot_::Channel(ctx)) =
+            guard.bindings_.get_mut(&(local_dock, remote_dock))
+        else {
+            return Result::Ok(());
+        };
+        if let Option::Some(msg) = ctx.msg_main_.as_mut() {
+            let _ = msg.write_incoming_(body, cap);
+        }
+        Result::Ok(())
+    }
+
     /// 取走 `local_dock` 上最早的一个待决入向请求（改成 `HandedOut`），返回对端 dock
     /// 与这条子流的共享状态句柄。
     ///
