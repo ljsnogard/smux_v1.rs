@@ -2685,6 +2685,28 @@ pub(crate) async fn mux_loop_async_<C, K>(
             }
         }
 
+        // 3. 公共子流优先：先把 TX ring 里的 chunk 搬进传输，再发用户数据。
+        match race_cancel_(
+            &cancel,
+            flush_public_chunks_::<C, _>(
+                &mut tx_stage,
+                &shared,
+                &mut public_tx_r,
+                &mut public_read,
+                &mut scratch[..],
+                &cancel,
+            ),
+        )
+        .await
+        {
+            Option::None => return,
+            Option::Some(Result::Ok(_)) => {}
+            Option::Some(Result::Err(err)) => {
+                fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                return;
+            }
+        }
+
         // 1. 先把**已经到达**的事件成批处理掉（非阻塞），**但批有上限**。
         //
         // 这一步的顺序很关键：下面第 2 步会 park 在「最近通知过的那条发送环」上；
@@ -2730,28 +2752,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                     return;
                 }
-            }
-        }
-
-        // 3. 公共子流优先：先把 TX ring 里的 chunk 搬进传输，再发用户数据。
-        match race_cancel_(
-            &cancel,
-            flush_public_chunks_::<C, _>(
-                &mut tx_stage,
-                &shared,
-                &mut public_tx_r,
-                &mut public_read,
-                &mut scratch[..],
-                &cancel,
-            ),
-        )
-        .await
-        {
-            Option::None => return,
-            Option::Some(Result::Ok(_)) => {}
-            Option::Some(Result::Err(err)) => {
-                fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-                return;
             }
         }
 

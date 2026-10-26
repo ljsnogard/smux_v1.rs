@@ -1,5 +1,6 @@
 use core::{
     alloc::AllocatorClone,
+    future::poll_fn,
     mem::MaybeUninit,
 };
 
@@ -13,7 +14,8 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        Dock, FrameKind, MuxConnection, MuxError, ReserveErr_, TrConnCfg,
+        Dock, FrameKind, MainErr_, MainReply_, MainRequest_, MuxConnection, MuxError, ReserveErr_,
+        TcsAbandonGuard_, Tcs_, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
         ring_::{RingBuildErr, new_buffered_channel},
@@ -456,7 +458,23 @@ where
         // 发起方：此刻才发 `OPEN`（通告的接收窗口取决于接收环容量）。
         let message = core::mem::take(&mut handle.message_);
         let initial = handle.accepted_initial_window_;
-        send_open_(&conn, local, remote, initial, message);
+        if let Result::Err(err) = send_control_async_(
+            &conn,
+            ControlFrame_::with_window_(
+                FrameKind::Open,
+                0u8,
+                local,
+                remote,
+                Option::Some((0u64 as RecvTotal, initial)),
+                message,
+            ),
+            cancel.child_token(),
+        )
+        .await
+        {
+            handle.settled_ = true;
+            return Result::Err(err);
+        }
         // 对端的 `OPEN` 到达时，读循环会把它的接收窗口写进发送窗口；`ACCEPT` /
         // `REJECT` 到达时唤醒这里。
         let outcome = match wait_establish_(conn.core_().reg_(), &owner, cancel.child_token()).await
@@ -502,24 +520,45 @@ where
         }
         // 响应方：对端 `OPEN` 的窗口通告已在登记时存下（读循环存的）。
         let initial = handle.accepted_initial_window_;
-        // 先回自己的 `OPEN`，再发 `ACCEPT`。
-        send_open_(&conn, local, remote, initial, Vec::new());
-        // `welcome` 的契约本轮按空载荷发出，记为遗留。
+        // `welcome` 的契约本轮仍按空载荷发出（`W: TrBuffWrite` 无法读出内容，
+        // 设计稿 §9.3 的 Q12 在 P3.2 与 `read_message_async` 一起处理）。
         let _ = welcome;
+        // 先回自己的 `OPEN`，再发 `ACCEPT`（welcome 走公共 TX）。
+        if let Result::Err(err) = send_control_async_(
+            &conn,
+            ControlFrame_::with_window_(
+                FrameKind::Open,
+                0u8,
+                local,
+                remote,
+                Option::Some((0u64 as RecvTotal, initial)),
+                Vec::new(),
+            ),
+            cancel.child_token(),
+        )
+        .await
+        {
+            handle.settled_ = true;
+            return Result::Err(err);
+        }
+        if let Result::Err(err) = send_control_async_(
+            &conn,
+            ControlFrame_::with_window_(
+                FrameKind::Accept,
+                0u8,
+                local,
+                remote,
+                Option::None,
+                Vec::new(),
+            ),
+            cancel.child_token(),
+        )
+        .await
+        {
+            handle.settled_ = true;
+            return Result::Err(err);
+        }
         owner.set_establish_settled_();
-        let _ = conn
-            .core_()
-            .w_events_()
-            .try_send_durable_event_(WriteEvent_::Control {
-                frame_: ControlFrame_::with_window_(
-                    FrameKind::Accept,
-                    0u8,
-                    local,
-                    remote,
-                    Option::None,
-                    Vec::new(),
-                ),
-            });
         handle.settled_ = true;
         Result::Ok((tx, rx))
     }
@@ -738,29 +777,42 @@ where
     Result::Ok(())
 }
 
-/// 把 `OPEN` 投给写循环。
-fn send_open_<C>(
+/// 把一条控制帧交给 `main_loop`，由它写进公共 TX ring（背压由请求队列承担）。
+async fn send_control_async_<C, K>(
     conn: &MuxConnection<C>,
-    local: Dock,
-    remote: Dock,
-    window: Credit,
-    payload: Vec<u8>,
-) where
+    frame: ControlFrame_,
+    cancel: K,
+) -> Result<(), HandleError>
+where
     C: TrConnCfg,
+    K: TrCancellationToken,
 {
-    let _ = conn
-        .core_()
-        .w_events_()
-        .try_send_durable_event_(WriteEvent_::Control {
-            frame_: ControlFrame_::with_window_(
-                FrameKind::Open,
-                0u8,
-                local,
-                remote,
-                Option::Some((0u64 as RecvTotal, window)),
-                payload,
-            ),
-        });
+    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let waiter = tcs.clone();
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
+    conn.core_()
+        .control_()
+        .submit_async_(
+            MainRequest_::SendControl {
+                frame,
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
+        .await
+        .map_err(|err| match err {
+            PushErr_::Closed(_) => HandleError::Mux(MuxError::Closed),
+            PushErr_::Cancelled(_) => HandleError::Cancelled,
+        })?;
+    let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
+    match reply {
+        Option::Some(Result::Ok(MainReply_::Unit)) => Result::Ok(()),
+        Option::Some(Result::Err(MainErr_::Mux(err))) => Result::Err(HandleError::Mux(err)),
+        Option::Some(Result::Err(MainErr_::Reserve(_))) | Option::None => {
+            Result::Err(HandleError::Cancelled)
+        }
+        Option::Some(Result::Ok(_)) => Result::Err(HandleError::Mux(MuxError::Closed)),
+    }
 }
 
 /// [`TrChannelHandle::reject_async`] 的 step 函数。
@@ -812,19 +864,19 @@ where
     } else {
         // 响应方：对端正在等裁决，`REJECT` 必须发出去，否则它会一直悬在
         // `wait_establish_` 上。
-        let _ = conn
-            .core_()
-            .w_events_()
-            .try_send_durable_event_(WriteEvent_::Control {
-                frame_: ControlFrame_::with_window_(
-                    FrameKind::Reject,
-                    0u8,
-                    local,
-                    remote,
-                    Option::None,
-                    payload,
-                ),
-            });
+        let _ = send_control_async_(
+            &conn,
+            ControlFrame_::with_window_(
+                FrameKind::Reject,
+                0u8,
+                local,
+                remote,
+                Option::None,
+                payload,
+            ),
+            cancel.child_token(),
+        )
+        .await;
         let _ = conn
             .core_()
             .release_channel_(local, remote, cancel.child_token())

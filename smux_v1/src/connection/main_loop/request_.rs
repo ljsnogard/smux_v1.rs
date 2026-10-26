@@ -14,6 +14,7 @@ use crate::connection::{
     mux_connection::ReserveErr_,
     owner_::{ChannelOwner_, LsnOwner_},
     pending_msg_::PendingMsgApp_,
+    signal_::ControlFrame_,
     tcs_::Tcs_,
 };
 
@@ -46,6 +47,19 @@ where
         reply: Tcs_<MainResult_<A>, A>,
     },
 
+    /// 把一条已组好的控制帧写进公共 TX ring（fire-and-forget）。
+    ///
+    /// P3.1b 的过渡：`OPEN` / `ACCEPT` / `REJECT` 的载荷仍在
+    /// `ControlFrame_::payload_`；P3.2 起改由 `Accept` / `Reject` 请求从 message ring
+    /// 读载荷。没有完成源——写失败（队列关闭 / 帧过大）只记在连接状态上。
+    SendControl {
+        /// 待写出的控制帧。
+        frame: ControlFrame_,
+
+        /// 完成源：帧真正写进公共 TX ring 后完成，调用方据此保证后续帧的顺序。
+        reply: Tcs_<MainResult_<A>, A>,
+    },
+
     /// 为一条子流登记身份（`open_channel_async` 的第一步）。
     ReserveChannel {
         /// 本端 dock。
@@ -64,17 +78,20 @@ where
     A: AllocatorClone + Send + Sync,
 {
     /// 本次请求的完成源。
-    pub(crate) fn reply_(&self) -> &Tcs_<MainResult_<A>, A> {
+    pub(crate) fn reply_(&self) -> Option<&Tcs_<MainResult_<A>, A>> {
         match self {
             MainRequest_::Bind { reply, .. }
             | MainRequest_::Listen { reply, .. }
-            | MainRequest_::ReserveChannel { reply, .. } => reply,
+            | MainRequest_::ReserveChannel { reply, .. }
+            | MainRequest_::SendControl { reply, .. } => Option::Some(reply),
         }
     }
 
     /// 用同一个错误结束本次请求（连接收尾 / 队列关闭时用）。
     pub(crate) fn fail_(self, err: MainErr_) {
-        let _ = self.reply_().set_(Result::Err(err));
+        if let Option::Some(reply) = self.reply_() {
+            let _ = reply.set_(Result::Err(err));
+        }
     }
 }
 
@@ -97,6 +114,10 @@ where
 
     /// 新建的 listener 身份节点。
     Listener(LsnOwner_<A>),
+
+    /// 仅表示「已受理」（P3.2 的 `Accept` / `Reject` 请求使用）。
+    #[allow(dead_code, reason = "P3.2 起由 Accept / Reject 使用")]
+    Unit,
 }
 
 /// `main_loop` 的统一错误。

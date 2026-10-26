@@ -24,12 +24,14 @@ use crate::{
         FrameHeader, FrameKind, MuxError, ReserveErr_, TrConnCfg,
         control_state_::ControlState_,
         flags,
+        frame_::encode_header_,
         frame_parser_::decode_header_sync_,
         main_loop::{MainErr_, MainReply_, MainRequest_},
-        public_channel_::{ChunkReadState_, PublicChunkIo_},
-        ring_::BufferedRx,
+        public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChunkIo_},
+        ring_::{BufferedRx, BufferedTx},
+        session_::race_cancel_,
         session_::MuxShared_,
-        signal_::HINT_W_PEER_CLOSED,
+        signal_::{ControlFrame_, HINT_W_PEER_CLOSED},
     },
     x_deps::{abs_cancel, abs_smux, mm_ptr},
 };
@@ -65,7 +67,7 @@ where
 pub(crate) async fn main_loop_async_<C, K>(
     shared: MuxShared_<C>,
     ctl: ControlState_<C::Alloc>,
-    _public_tx_w: crate::connection::ring_::BufferedTx,
+    mut public_tx_w: BufferedTx,
     mut public_rx_r: BufferedRx,
     cancel: K,
 ) where
@@ -136,12 +138,12 @@ pub(crate) async fn main_loop_async_<C, K>(
             let Some(request) = ctl.try_pop_request_() else {
                 break;
             };
-            handle_request_::<C, _>(&shared, request, &cancel).await;
+            handle_request_::<C, _>(&shared, &mut public_tx_w, request, &cancel).await;
         }
 
         match park_main_::<C, _>(&shared, &ctl, &cancel).await {
             Some(MainWake_::Request(request)) => {
-                handle_request_::<C, _>(&shared, request, &cancel).await;
+                handle_request_::<C, _>(&shared, &mut public_tx_w, request, &cancel).await;
             }
             // 提示已由下一轮顶部的 `take_main_hint_` 取走；这里只需回顶部。
             Some(MainWake_::Hint(_bits)) => {}
@@ -170,7 +172,12 @@ where
 /// 处理一条请求。
 ///
 /// 取身份表写锁是协作式异步获取（可取消）；临界区本身只做一次登记 / 查询，不 `await`。
-async fn handle_request_<C, K>(shared: &MuxShared_<C>, request: MainRequest_<C::Alloc>, cancel: &K)
+async fn handle_request_<C, K>(
+    shared: &MuxShared_<C>,
+    public_tx_w: &mut BufferedTx,
+    request: MainRequest_<C::Alloc>,
+    cancel: &K,
+)
 where
     C: TrConnCfg,
     K: TrCancellationToken,
@@ -187,6 +194,16 @@ where
         return;
     }
     match request {
+        MainRequest_::SendControl { frame, reply } => {
+            match write_control_frame_async_::<C, _>(public_tx_w, shared, &frame, cancel).await {
+                Result::Ok(()) => {
+                    let _ = reply.set_(Result::Ok(MainReply_::Unit));
+                }
+                Result::Err(err) => {
+                    let _ = reply.set_(Result::Err(MainErr_::Mux(err)));
+                }
+            }
+        }
         MainRequest_::Bind { local_dock, reply } => {
             if reply.is_abandoned_() {
                 let _ = reply.set_(Result::Err(MainErr_::Reserve(ReserveErr_::Cancelled)));
@@ -404,4 +421,50 @@ where
     owner.mark_data_(shared.conn_clock_().now_millis_());
     // 写循环据此扫描 `PEER_FIN` / `PEER_RESET` 并推进拆流（P4 前仍由旧扫描完成）。
     shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
+}
+
+/// 把一条控制帧写进公共 TX ring（背压时 park 等 `tx_space`）。
+///
+/// 帧头由 `FrameHeader` + `encode_header_` 重新编码；载荷仍在 `ControlFrame_` 里。
+/// 这是 P3.1b 的过渡：P3.2 起 `OPEN` / `ACCEPT` / `REJECT` 的载荷直接从建流期
+/// message ring 读出，`ControlFrame_::payload_` 只留给 timer / demux 的控制帧。
+async fn write_control_frame_async_<C, K>(
+    public_tx_w: &mut BufferedTx,
+    shared: &MuxShared_<C>,
+    frame: &ControlFrame_,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let header = FrameHeader::new_(
+        frame.kind_(),
+        frame.flags_(),
+        frame.local_dock_(),
+        frame.remote_dock_(),
+        frame.payload_().len(),
+        frame.window_(),
+    );
+    let (head, head_len) = encode_header_(&header).map_err(|_| MuxError::MalformedFrame)?;
+    loop {
+        match PublicChunkIo_::try_write_chunk_(
+            public_tx_w,
+            &head[..head_len],
+            frame.payload_(),
+            shared.max_packet_size_(),
+        ) {
+            Result::Ok(()) => {
+                shared.public_().notify_tx_ready_();
+                return Result::Ok(());
+            }
+            Result::Err(ChunkWriteErr_::WouldBlock) => {
+            }
+            Result::Err(_) => return Result::Err(MuxError::FrameTooLarge),
+        }
+        let wait_space = poll_fn(|cx| shared.public_().poll_tx_space_(cx));
+        if race_cancel_(cancel, wait_space).await.is_none() {
+            return Result::Err(MuxError::Cancelled);
+        }
+    }
 }
