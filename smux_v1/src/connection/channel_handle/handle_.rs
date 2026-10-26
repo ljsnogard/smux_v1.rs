@@ -14,7 +14,7 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        Dock, FrameKind, MainErr_, MainReply_, MainRequest_, MuxConnection, MuxError, ReserveErr_,
+        Dock, EstablishRole_, FrameKind, MainErr_, MainReply_, MainRequest_, MuxConnection, MuxError,
         TcsAbandonGuard_, Tcs_, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
@@ -25,7 +25,7 @@ use crate::{
         util_::read_available_into_vec_,
     },
     flow_ctrl::{
-        Credit, FlowCtrlError, RecvTotal, TrFlowCtrlPolicy,
+        Credit, FlowCtrlError, TrFlowCtrlPolicy,
     },
     metrics::TrMetricsSink,
     x_deps::{abs_buff, abs_cancel, abs_mm, abs_smux, gen_mcf2},
@@ -90,12 +90,6 @@ where
     /// 本端是否为**发起方**（[`open_channel_async`] 产出）。
     is_initiator_: bool,
 
-    /// 发起方暂存的开场消息（响应方恒为空）：`OPEN` 要等 `accept_async` 才发。
-    ///
-    /// P3.1 先保留 `Vec` 作为发送来源；同一份 message 也写进了 `msg_` 的 outgoing
-    /// ring，P3.1b 改由 `main_loop` 从 ring 读走后再删除本字段。
-    message_: Vec<u8>,
-
     /// app 侧建流期 message ring（写 outgoing / 读 incoming）。
     ///
     /// P3.1b 起 `main_loop` 从这里读 `OPEN` message / welcome，应用从 incoming 读
@@ -139,7 +133,6 @@ where
             local_dock_: local_dock,
             remote_dock_: remote_dock,
             is_initiator_: false,
-            message_: Vec::new(),
             msg_,
             accepted_owner_: owner,
             accepted_initial_window_: 0u32 as Credit,
@@ -154,7 +147,6 @@ where
         local_dock: Dock,
         remote_dock: Dock,
         owner: ChannelOwner_<C::Alloc>,
-        message: Vec<u8>,
         msg_: PendingMsgApp_,
     ) -> Self {
         ChannelHandle {
@@ -162,7 +154,6 @@ where
             local_dock_: local_dock,
             remote_dock_: remote_dock,
             is_initiator_: true,
-            message_: message,
             msg_,
             accepted_owner_: owner,
             accepted_initial_window_: 0u32 as Credit,
@@ -392,8 +383,7 @@ where
 
     // 环已经建好（同步、不取锁）；下面**取注册表锁的两步都在可取消的异步上下文里**。
     let (tx, rx) = accepted?;
-    // 建环时若 inbox 满，`Attach` 被带回到 `pending_attach_`；这里在异步上下文里补投
-    // （背压）。补投失败只可能是连接正在收尾或调用方取消。
+    // 建环时若 inbox 满，`Attach` 被带回到 `pending_attach_`；这里在异步上下文里补投。
     if let Option::Some((pending_w, pending_r)) = handle.pending_attach_.take()
         && let Result::Err(err) =
             attach_channel_async_(&conn, pending_w, pending_r, cancel.child_token()).await
@@ -402,13 +392,8 @@ where
         abort_pending_(&conn, local, remote, handle.is_initiator_);
         return Result::Err(err);
     }
-    // 共享状态在登记身份时就建立了，句柄一直在本对象手里；不再有「挂 owner」这一步。
     let owner = handle.accepted_owner_.clone();
 
-    // 0. 建流阶段已经超时：计时循环早已向对端回过 `REJECT` 并释放了身份，这里只需把
-    //    超时结果告诉调用方——不再建流、也不再发 `OPEN` / `ACCEPT`。
-    // 建流阶段已经有结论：**用通知槽里的实际原因回答**，不要一律报 `IdleTimeout`
-    // ——连接级失败牵连在这里必须如实表达（子流级超时只是其中一档）。
     if let Option::Some(reason) = owner.abort_reason_() {
         handle.settled_ = true;
         return Result::Err(HandleError::Mux(reason));
@@ -417,78 +402,47 @@ where
         handle.settled_ = true;
         return Result::Err(HandleError::Mux(MuxError::IdleTimeout));
     }
-
-    // 0.1 取消已经到达：本端此刻还没发出任何建流帧，按角色收尾——发起方撤销本地预留
-    //    （对端不知道这条子流），响应方回 `REJECT`（对端的 `OPEN` 在登记时已经到达，
-    //    它正等裁决）。
     if cancel.is_cancelled() {
         abort_pending_(&conn, local, remote, handle.is_initiator_);
         handle.settled_ = true;
         return Result::Err(HandleError::Cancelled);
     }
 
-    // 1. 对端窗口通告：响应方在登记入向请求时已由读循环存下。
-    if !handle.is_initiator_ {
-        let report = match conn
-            .core_()
-            .take_inbound_report_(local, remote, cancel.child_token())
-            .await
-        {
-            Result::Ok(Option::Some(report)) => report,
-            Result::Err(ReserveErr_::Cancelled) => {
-                // 对端已经在等裁决（它的 `OPEN` 正是登记入向请求的前提）：本端放弃时
-                // 必须回 `REJECT`，否则它会一直悬在 `wait_establish_` 上。
-                abort_pending_(&conn, local, remote, handle.is_initiator_);
-                handle.settled_ = true;
-                return Result::Err(HandleError::Cancelled);
-            }
-            _ => return Result::Err(HandleError::Mux(MuxError::Closed)),
-        };
-        if let Result::Err(err) = owner.send_on_report_(report) {
-            let _ = conn
-                .core_()
-                .release_channel_(local, remote, cancel.child_token())
-                .await;
-            handle.settled_ = true;
-            return Result::Err(HandleError::FlowCtrl(err));
-        }
+    // `welcome` 的契约本轮仍按空载荷发出（`W: TrBuffWrite` 无法读出内容；设计稿
+    // §9.3 的 Q12 在 `read_message_async` 一起处理）。
+    let _ = welcome;
+    let initial = handle.accepted_initial_window_;
+    let role_ = if handle.is_initiator_ {
+        EstablishRole_::Initiator
+    } else {
+        EstablishRole_::Responder
+    };
+    // 把裁决交给 main：它从 message ring 读 `OPEN` message / welcome，组帧并写公共 TX。
+    if let Result::Err(err) = submit_accept_(
+        &conn,
+        local,
+        remote,
+        owner.clone(),
+        role_,
+        initial,
+        cancel.child_token(),
+    )
+    .await
+    {
+        handle.settled_ = true;
+        abort_pending_(&conn, local, remote, handle.is_initiator_);
+        return Result::Err(err);
     }
 
     if handle.is_initiator_ {
-        // 发起方：此刻才发 `OPEN`（通告的接收窗口取决于接收环容量）。
-        let message = core::mem::take(&mut handle.message_);
-        let initial = handle.accepted_initial_window_;
-        if let Result::Err(err) = send_control_async_(
-            &conn,
-            ControlFrame_::with_window_(
-                FrameKind::Open,
-                0u8,
-                local,
-                remote,
-                Option::Some((0u64 as RecvTotal, initial)),
-                message,
-            ),
-            cancel.child_token(),
-        )
-        .await
-        {
-            handle.settled_ = true;
-            return Result::Err(err);
-        }
-        // 对端的 `OPEN` 到达时，读循环会把它的接收窗口写进发送窗口；`ACCEPT` /
-        // `REJECT` 到达时唤醒这里。
         let outcome = match wait_establish_(conn.core_().reg_(), &owner, cancel.child_token()).await
         {
             Result::Ok(outcome) => outcome,
-            // 取消：本端已经发出 `OPEN`，对端可能已经回过 `OPEN` 甚至 `ACCEPT`，
-            // 因此必须主动宣告拒绝，否则两端对这条子流的认知会不一致。
             Result::Err(MuxError::Cancelled) => {
                 reject_after_open_(&conn, local, remote);
                 handle.settled_ = true;
                 return Result::Err(HandleError::Cancelled);
             }
-            // 建流阶段超时（`IdleTimeout`）或连接级失败：对端通知与身份释放都已经由
-            // 计时循环 / 连接收尾完成，这里只把结果交给调用方。
             Result::Err(err) => {
                 handle.settled_ = true;
                 return Result::Err(HandleError::Mux(err));
@@ -511,53 +465,6 @@ where
             }
         }
     } else {
-        // 取消已经到达：绝不能「已经取消却照发 `ACCEPT`」——那会让对端以为建流成功，
-        // 而调用方拿到的却是 `Cancelled`。此刻对端仍停在等裁决上，必须回 `REJECT`。
-        if cancel.is_cancelled() {
-            abort_pending_(&conn, local, remote, false);
-            handle.settled_ = true;
-            return Result::Err(HandleError::Cancelled);
-        }
-        // 响应方：对端 `OPEN` 的窗口通告已在登记时存下（读循环存的）。
-        let initial = handle.accepted_initial_window_;
-        // `welcome` 的契约本轮仍按空载荷发出（`W: TrBuffWrite` 无法读出内容，
-        // 设计稿 §9.3 的 Q12 在 P3.2 与 `read_message_async` 一起处理）。
-        let _ = welcome;
-        // 先回自己的 `OPEN`，再发 `ACCEPT`（welcome 走公共 TX）。
-        if let Result::Err(err) = send_control_async_(
-            &conn,
-            ControlFrame_::with_window_(
-                FrameKind::Open,
-                0u8,
-                local,
-                remote,
-                Option::Some((0u64 as RecvTotal, initial)),
-                Vec::new(),
-            ),
-            cancel.child_token(),
-        )
-        .await
-        {
-            handle.settled_ = true;
-            return Result::Err(err);
-        }
-        if let Result::Err(err) = send_control_async_(
-            &conn,
-            ControlFrame_::with_window_(
-                FrameKind::Accept,
-                0u8,
-                local,
-                remote,
-                Option::None,
-                Vec::new(),
-            ),
-            cancel.child_token(),
-        )
-        .await
-        {
-            handle.settled_ = true;
-            return Result::Err(err);
-        }
         owner.set_establish_settled_();
         handle.settled_ = true;
         Result::Ok((tx, rx))
@@ -777,10 +684,31 @@ where
     Result::Ok(())
 }
 
-/// 把一条控制帧交给 `main_loop`，由它写进公共 TX ring（背压由请求队列承担）。
-async fn send_control_async_<C, K>(
+/// 等一个「只表示受理」的请求完成（`MainReply_::Unit`）。
+async fn wait_unit_<A>(
+    waiter: &Tcs_<Result<MainReply_<A>, MainErr_>, A>,
+) -> Result<(), HandleError>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    match poll_fn(|cx| waiter.poll_wait_(cx)).await {
+        Option::Some(Result::Ok(MainReply_::Unit)) => Result::Ok(()),
+        Option::Some(Result::Err(MainErr_::Mux(err))) => Result::Err(HandleError::Mux(err)),
+        Option::Some(Result::Err(MainErr_::Reserve(_))) | Option::None => {
+            Result::Err(HandleError::Cancelled)
+        }
+        Option::Some(Result::Ok(_)) => Result::Err(HandleError::Mux(MuxError::Closed)),
+    }
+}
+
+/// 提交一次 `Accept` 裁决并等 main 把 `OPEN` / `ACCEPT` 写进公共 TX。
+async fn submit_accept_<C, K>(
     conn: &MuxConnection<C>,
-    frame: ControlFrame_,
+    local: Dock,
+    remote: Dock,
+    owner: ChannelOwner_<C::Alloc>,
+    role_: EstablishRole_,
+    initial_window: Credit,
     cancel: K,
 ) -> Result<(), HandleError>
 where
@@ -793,8 +721,12 @@ where
     conn.core_()
         .control_()
         .submit_async_(
-            MainRequest_::SendControl {
-                frame,
+            MainRequest_::Accept {
+                local_dock: local,
+                remote_dock: remote,
+                owner,
+                role_,
+                initial_window,
                 reply: tcs,
             },
             cancel.child_token(),
@@ -804,15 +736,43 @@ where
             PushErr_::Closed(_) => HandleError::Mux(MuxError::Closed),
             PushErr_::Cancelled(_) => HandleError::Cancelled,
         })?;
-    let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
-    match reply {
-        Option::Some(Result::Ok(MainReply_::Unit)) => Result::Ok(()),
-        Option::Some(Result::Err(MainErr_::Mux(err))) => Result::Err(HandleError::Mux(err)),
-        Option::Some(Result::Err(MainErr_::Reserve(_))) | Option::None => {
-            Result::Err(HandleError::Cancelled)
-        }
-        Option::Some(Result::Ok(_)) => Result::Err(HandleError::Mux(MuxError::Closed)),
-    }
+    wait_unit_(&waiter).await
+}
+
+/// 提交一次 `Reject` 裁决并等 main 写 `REJECT` / 释放身份。
+async fn submit_reject_<C, K>(
+    conn: &MuxConnection<C>,
+    local: Dock,
+    remote: Dock,
+    owner: ChannelOwner_<C::Alloc>,
+    role_: EstablishRole_,
+    cancel: K,
+) -> Result<(), HandleError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let tcs = Tcs_::new_(conn.core_().config_().allocator());
+    let waiter = tcs.clone();
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
+    conn.core_()
+        .control_()
+        .submit_async_(
+            MainRequest_::Reject {
+                local_dock: local,
+                remote_dock: remote,
+                owner,
+                role_,
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
+        .await
+        .map_err(|err| match err {
+            PushErr_::Closed(_) => HandleError::Mux(MuxError::Closed),
+            PushErr_::Cancelled(_) => HandleError::Cancelled,
+        })?;
+    wait_unit_(&waiter).await
 }
 
 /// [`TrChannelHandle::reject_async`] 的 step 函数。
@@ -832,9 +792,6 @@ where
     let local = handle.local_dock_;
     let remote = handle.remote_dock_;
 
-    // 建流阶段已经超时：超时结果优先——此刻「拒绝」已经没有可拒的对象，超时才是
-    // 调用方需要知道的结论。
-    // 同 `accept`：原因取通知槽里的实际值（连接级失败要如实表达）。
     if let Option::Some(reason) = handle.accepted_owner_.abort_reason_() {
         handle.settled_ = true;
         return Result::Err(HandleError::Mux(reason));
@@ -844,8 +801,7 @@ where
         return Result::Err(HandleError::Mux(MuxError::IdleTimeout));
     }
 
-    // 取消只能截断「理由载荷」，**不能**让拒绝本身消失：先记下取消，照常把 `REJECT`
-    // 发出去，最后再把 `Cancelled` 交给调用方。
+    // 取消只能截断「理由载荷」，不能不让拒绝发生：先记下取消，照常裁决。
     let cancelled = cancel.is_cancelled();
     let payload = read_available_into_vec_(
         reason,
@@ -854,33 +810,31 @@ where
     )
     .await;
     let written = payload.len();
-    if handle.is_initiator_ {
-        // 发起方此刻还没发过 `OPEN`（`OPEN` 由 `accept_async` 发出）：撤销本地预留即可，
-        // 对端并不知道这条子流存在。
-        let _ = conn
-            .core_()
-            .unreserve_channel_(local, remote, cancel.child_token())
-            .await;
+    if handle
+        .msg_
+        .write_outgoing_(&payload, conn.core_().config_().pending_msg_capacity())
+        .is_err()
+    {
+        handle.settled_ = true;
+        return Result::Err(HandleError::Mux(MuxError::FrameTooLarge));
+    }
+    let role_ = if handle.is_initiator_ {
+        EstablishRole_::Initiator
     } else {
-        // 响应方：对端正在等裁决，`REJECT` 必须发出去，否则它会一直悬在
-        // `wait_establish_` 上。
-        let _ = send_control_async_(
-            &conn,
-            ControlFrame_::with_window_(
-                FrameKind::Reject,
-                0u8,
-                local,
-                remote,
-                Option::None,
-                payload,
-            ),
-            cancel.child_token(),
-        )
-        .await;
-        let _ = conn
-            .core_()
-            .release_channel_(local, remote, cancel.child_token())
-            .await;
+        EstablishRole_::Responder
+    };
+    if let Result::Err(err) = submit_reject_(
+        &conn,
+        local,
+        remote,
+        handle.accepted_owner_.clone(),
+        role_,
+        cancel.child_token(),
+    )
+    .await
+    {
+        handle.settled_ = true;
+        return Result::Err(err);
     }
     handle.settled_ = true;
     handle.accepted_owner_.set_establish_settled_();

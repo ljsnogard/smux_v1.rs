@@ -55,7 +55,6 @@ use crate::{
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
         sync_::CancelToken_,
     },
-    flow_ctrl::WindowReport,
     handshake::opts::HandshakeOpts,
     metrics::{ConnCloseReason, TrMetricsSink},
     x_deps::abs_cancel,
@@ -283,21 +282,6 @@ where
         self.reg_.reserve_telegraph_(local_dock, cancel).await
     }
 
-    /// 撤销一条尚未露面的子流登记。
-    ///
-    /// 返回值：**本次撤销之后连接上是否已经没有活跃子流**——优雅关闭的收口点据此
-    /// 判断「再没有东西要排空了」（见 `session_::maybe_release_`）。
-    pub(crate) async fn unreserve_channel_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        remote_dock: Dock,
-        cancel: K,
-    ) -> Result<bool, ReserveErr_> {
-        self.reg_
-            .unreserve_channel_(local_dock, remote_dock, cancel)
-            .await
-    }
-
     /// 把一条已露面的子流放进拆流宽限期。
     ///
     /// 返回值同 [`MuxCore::unreserve_channel_`]。
@@ -309,18 +293,6 @@ where
     ) -> Result<bool, ReserveErr_> {
         self.reg_
             .release_channel_(local_dock, remote_dock, self.now_millis_(), cancel)
-            .await
-    }
-
-    /// 取走入向请求保存的对端窗口通告。
-    pub(crate) async fn take_inbound_report_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        remote_dock: Dock,
-        cancel: K,
-    ) -> Result<Option<WindowReport>, ReserveErr_> {
-        self.reg_
-            .take_inbound_report_(local_dock, remote_dock, cancel)
             .await
     }
 

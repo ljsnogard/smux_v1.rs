@@ -17,6 +17,7 @@ use core::{alloc::AllocatorClone, future::poll_fn, pin::pin, task::Poll};
 use abs_cancel::{NonCancellableToken, TrCancellationToken};
 use abs_smux::dock::TrDock;
 
+use alloc::vec::Vec;
 use mm_ptr::Owned;
 
 use crate::{
@@ -26,13 +27,14 @@ use crate::{
         flags,
         frame_::encode_header_,
         frame_parser_::decode_header_sync_,
-        main_loop::{MainErr_, MainReply_, MainRequest_},
+        main_loop::{EstablishRole_, MainErr_, MainReply_, MainRequest_},
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx},
         session_::race_cancel_,
         session_::MuxShared_,
         signal_::{ControlFrame_, HINT_W_PEER_CLOSED},
     },
+    flow_ctrl::RecvTotal,
     x_deps::{abs_cancel, abs_smux, mm_ptr},
 };
 
@@ -285,6 +287,172 @@ where
                     .await;
             }
             let _ = reply.set_(result.map_err(MainErr_::Reserve));
+        }
+        MainRequest_::Accept {
+            local_dock,
+            remote_dock,
+            owner,
+            role_,
+            initial_window,
+            reply,
+        } => {
+            let cap = shared.pending_msg_cap_();
+            let message = match shared
+                .reg_()
+                .read_msg_outgoing_(local_dock, remote_dock, cap, cancel.child_token())
+                .await
+            {
+                Result::Ok(Option::Some(message)) => message,
+                Result::Ok(Option::None) => Vec::new(),
+                Result::Err(_) => {
+                    let _ = reply.set_(Result::Err(MainErr_::Mux(MuxError::Cancelled)));
+                    return;
+                }
+            };
+            let result = match role_ {
+                EstablishRole_::Initiator => {
+                    write_control_frame_async_::<C, _>(
+                        public_tx_w,
+                        shared,
+                        &ControlFrame_::with_window_(
+                            FrameKind::Open,
+                            0u8,
+                            local_dock,
+                            remote_dock,
+                            Option::Some((0u64 as RecvTotal, initial_window)),
+                            message,
+                        ),
+                        cancel,
+                    )
+                    .await
+                }
+                EstablishRole_::Responder => {
+                    // 对端 `OPEN` 的窗口通告在登记时存下；先装进发送窗口。
+                    match shared
+                        .reg_()
+                        .take_inbound_report_(local_dock, remote_dock, cancel.child_token())
+                        .await
+                    {
+                        Result::Ok(Option::Some(report)) => {
+                            if let Result::Err(err) = owner.send_on_report_(report) {
+                                Result::Err(MuxError::FlowCtrl(err))
+                            } else {
+                                let open = write_control_frame_async_::<C, _>(
+                                    public_tx_w,
+                                    shared,
+                                    &ControlFrame_::with_window_(
+                                        FrameKind::Open,
+                                        0u8,
+                                        local_dock,
+                                        remote_dock,
+                                        Option::Some((0u64 as RecvTotal, initial_window)),
+                                        Vec::new(),
+                                    ),
+                                    cancel,
+                                )
+                                .await;
+                                match open {
+                                    Result::Ok(()) => {
+                                        write_control_frame_async_::<C, _>(
+                                            public_tx_w,
+                                            shared,
+                                            &ControlFrame_::with_window_(
+                                                FrameKind::Accept,
+                                                0u8,
+                                                local_dock,
+                                                remote_dock,
+                                                Option::None,
+                                                message,
+                                            ),
+                                            cancel,
+                                        )
+                                        .await
+                                    }
+                                    Result::Err(err) => Result::Err(err),
+                                }
+                            }
+                        }
+                        _ => Result::Err(MuxError::Closed),
+                    }
+                }
+            };
+            match result {
+                Result::Ok(()) => {
+                    if role_ == EstablishRole_::Responder {
+                        owner.set_establish_settled_();
+                    }
+                    let _ = reply.set_(Result::Ok(MainReply_::Unit));
+                }
+                Result::Err(err) => {
+                    let _ = reply.set_(Result::Err(MainErr_::Mux(err)));
+                }
+            }
+        }
+        MainRequest_::Reject {
+            local_dock,
+            remote_dock,
+            owner,
+            role_,
+            reply,
+        } => {
+            let cap = shared.pending_msg_cap_();
+            let reason = match shared
+                .reg_()
+                .read_msg_outgoing_(local_dock, remote_dock, cap, cancel.child_token())
+                .await
+            {
+                Result::Ok(Option::Some(reason)) => reason,
+                Result::Ok(Option::None) => Vec::new(),
+                Result::Err(_) => {
+                    let _ = reply.set_(Result::Err(MainErr_::Mux(MuxError::Cancelled)));
+                    return;
+                }
+            };
+            let result = match role_ {
+                EstablishRole_::Responder => {
+                    let sent = write_control_frame_async_::<C, _>(
+                        public_tx_w,
+                        shared,
+                        &ControlFrame_::with_window_(
+                            FrameKind::Reject,
+                            0u8,
+                            local_dock,
+                            remote_dock,
+                            Option::None,
+                            reason,
+                        ),
+                        cancel,
+                    )
+                    .await;
+                    let _ = shared
+                        .reg_()
+                        .release_channel_(
+                            local_dock,
+                            remote_dock,
+                            shared.conn_clock_().now_millis_(),
+                            cancel.child_token(),
+                        )
+                        .await;
+                    sent
+                }
+                EstablishRole_::Initiator => {
+                    // 发起方还没发过 `OPEN`：对端不知道这条子流，撤销预留即可。
+                    let _ = shared
+                        .reg_()
+                        .unreserve_channel_(local_dock, remote_dock, cancel.child_token())
+                        .await;
+                    Result::Ok(())
+                }
+            };
+            owner.set_establish_settled_();
+            match result {
+                Result::Ok(()) => {
+                    let _ = reply.set_(Result::Ok(MainReply_::Unit));
+                }
+                Result::Err(err) => {
+                    let _ = reply.set_(Result::Err(MainErr_::Mux(err)));
+                }
+            }
         }
     }
 }

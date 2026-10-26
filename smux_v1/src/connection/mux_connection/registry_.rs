@@ -132,7 +132,10 @@
 //! 管理的值。这条区分由一个随每次绑定重置的标记承担（`DockCtx_::auto_`），它同时让
 //! 「只用手动绑定的连接」在解绑路径上零额外分配。
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    vec::Vec,
+};
 use core::{
     alloc::AllocatorClone,
     ops::Bound,
@@ -155,6 +158,7 @@ use crate::{
             new_listener_owner_, new_owner_, new_telegraph_owner_,
         },
         pending_msg_::{PendingMsgApp_, PendingMsgMain_, new_pending_msg_},
+        public_channel_::ChunkReadState_,
         signal_::{ReadAttach_, SessionEvent_, SessionMailbox_, WriteAttach_},
         slot_::{InlineQueue_, PushErr_},
         sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
@@ -1688,6 +1692,45 @@ where
             self.notify_inbound_(local_dock, cancel.child_token()).await?;
         }
         Result::Ok(state)
+    }
+
+    /// 读走 app 写在 outgoing message ring 里的载荷（**不取走** ring）。
+    ///
+    /// `msg_main_` 的读端读 outgoing、写端留给 incoming（`read_message_async` 用），
+    /// 因此这里只借 `as_mut()`，不把整对 ring 取走。
+    pub(crate) async fn read_msg_outgoing_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        cap: usize,
+        cancel: K,
+    ) -> Result<Option<Vec<u8>>, ReserveErr_> {
+        let mut session = self.root_.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let Option::Some(BindingSlot_::Channel(ctx)) =
+            guard.bindings_.get_mut(&(local_dock, remote_dock))
+        else {
+            return Result::Ok(Option::None);
+        };
+        let Option::Some(msg) = ctx.msg_main_.as_mut() else {
+            return Result::Ok(Option::None);
+        };
+        let mut state = ChunkReadState_::new_message_();
+        let len = match msg.read_prefix_outgoing_(&mut state, cap) {
+            Result::Ok(Option::Some(len)) => len,
+            // 没有消息 / 还没写完：按空 message 处理。
+            Result::Ok(Option::None) => return Result::Ok(Option::Some(Vec::new())),
+            Result::Err(_) => return Result::Err(ReserveErr_::Cancelled),
+        };
+        let mut out = alloc::vec![0u8; len];
+        let mut filled = 0usize;
+        while filled < len {
+            match msg.read_body_outgoing_(&mut state, &mut out[filled..]) {
+                Result::Ok(n) if n > 0usize => filled += n,
+                _ => break,
+            }
+        }
+        Result::Ok(Option::Some(out))
     }
 
     /// 取走 `local_dock` 上最早的一个待决入向请求（改成 `HandedOut`），返回对端 dock

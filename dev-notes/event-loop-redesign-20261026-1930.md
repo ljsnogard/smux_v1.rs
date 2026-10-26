@@ -1795,7 +1795,7 @@ value，key 与树结构保持不变。
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | P0 完成 |
-| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 队列 + `Bind`/`Listen`/`ReserveChannel`/`SendControl` 完成；`Accept`/`Reject`/`TakeInbound`/`Close` 待 P3.2/P4 |
+| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 除 `TakeInbound`/`Close`/`OpenTelegraph` 外完成（`Accept`/`Reject` 见 P3.2） |
 | T11 | `MainReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | 待做 |
 
 ### D. 建流期 message ring
@@ -1804,7 +1804,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | P3.1a 完成（登记 / 取出 / 句柄持有）；main 读 ring 组帧待 P3.1b |
 | T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 完成（默认实现 + 建连快照） |
-| T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | ring 已建立、open message 已写入；发送仍读 `Vec`，`message_` 删除待 P3.2 |
+| T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | `message_` 已删；open message / reason 写 ring 并由 main 读；welcome 仍空（随 `read_message_async` 定语义） |
 | T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | 待拍板 Q12/Q11 |
 
 ### E. 索引（bplus_tree_cmp）

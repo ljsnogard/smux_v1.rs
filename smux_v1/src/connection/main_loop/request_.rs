@@ -18,6 +18,18 @@ use crate::connection::{
     tcs_::Tcs_,
 };
 
+use crate::flow_ctrl::Credit;
+
+/// 建流裁决时本端的角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EstablishRole_ {
+    /// 发起方（`open_channel_async` 产出的句柄）。
+    Initiator,
+
+    /// 响应方（listener 产出的入向句柄）。
+    Responder,
+}
+
 /// 一次请求的完整结果：成功时是 [`MainReply_`]，失败时是 [`MainErr_`]。
 pub(crate) type MainResult_<A> = Result<MainReply_<A>, MainErr_>;
 
@@ -52,6 +64,7 @@ where
     /// P3.1b 的过渡：`OPEN` / `ACCEPT` / `REJECT` 的载荷仍在
     /// `ControlFrame_::payload_`；P3.2 起改由 `Accept` / `Reject` 请求从 message ring
     /// 读载荷。没有完成源——写失败（队列关闭 / 帧过大）只记在连接状态上。
+    #[allow(dead_code, reason = "P4/P5 把 timer 的控制帧迁到公共 TX 时使用")]
     SendControl {
         /// 待写出的控制帧。
         frame: ControlFrame_,
@@ -71,6 +84,45 @@ where
         /// 完成源。
         reply: Tcs_<MainResult_<A>, A>,
     },
+
+    /// 最终裁决：建环已完成，main 从 message ring 读载荷并组 `OPEN` / `ACCEPT`。
+    Accept {
+        /// 本端 dock。
+        local_dock: Dock,
+
+        /// 对端 dock。
+        remote_dock: Dock,
+
+        /// 该子流的共享状态句柄。
+        owner: ChannelOwner_<A>,
+
+        /// 本端角色。
+        role_: EstablishRole_,
+
+        /// 本端接收窗口（取自接收环容量）。
+        initial_window: Credit,
+
+        /// 完成源：帧写进公共 TX 后完成。
+        reply: Tcs_<MainResult_<A>, A>,
+    },
+
+    /// 拒绝入向建流；reason 已写进 outgoing message ring。
+    Reject {
+        /// 本端 dock。
+        local_dock: Dock,
+
+        /// 对端 dock。
+        remote_dock: Dock,
+
+        /// 该子流的共享状态句柄。
+        owner: ChannelOwner_<A>,
+
+        /// 本端角色。
+        role_: EstablishRole_,
+
+        /// 完成源。
+        reply: Tcs_<MainResult_<A>, A>,
+    },
 }
 
 impl<A> MainRequest_<A>
@@ -83,7 +135,9 @@ where
             MainRequest_::Bind { reply, .. }
             | MainRequest_::Listen { reply, .. }
             | MainRequest_::ReserveChannel { reply, .. }
-            | MainRequest_::SendControl { reply, .. } => Option::Some(reply),
+            | MainRequest_::SendControl { reply, .. }
+            | MainRequest_::Accept { reply, .. }
+            | MainRequest_::Reject { reply, .. } => Option::Some(reply),
         }
     }
 
