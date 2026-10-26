@@ -17,20 +17,30 @@ use core::{alloc::AllocatorClone, future::poll_fn, pin::pin, task::Poll};
 use abs_cancel::{NonCancellableToken, TrCancellationToken};
 use abs_smux::dock::TrDock;
 
+use mm_ptr::Owned;
+
 use crate::{
     connection::{
-        MuxError, ReserveErr_, TrConnCfg,
+        FrameHeader, FrameKind, MuxError, ReserveErr_, TrConnCfg,
         control_state_::ControlState_,
+        flags,
+        frame_parser_::decode_header_sync_,
         main_loop::{MainErr_, MainReply_, MainRequest_},
+        public_channel_::{ChunkReadState_, PublicChunkIo_},
+        ring_::BufferedRx,
         session_::MuxShared_,
+        signal_::HINT_W_PEER_CLOSED,
     },
-    x_deps::{abs_cancel, abs_smux},
+    x_deps::{abs_cancel, abs_smux, mm_ptr},
 };
 
 /// 每轮最多处理多少条请求。
 ///
 /// 防止「请求源源不断 ⇒ 提示 / 取消饿死」；控制面是冷路径，16 已远高于常见并发。
 pub(crate) const K_MAIN_REQ_BATCH: usize = 16usize;
+
+/// 每轮最多处理多少条公共 RX 控制帧。
+pub(crate) const K_MAIN_FRAME_BATCH: usize = 32usize;
 
 /// `main_loop` 的 park 点被唤醒的原因。
 enum MainWake_<A>
@@ -42,6 +52,9 @@ where
 
     /// 合并提示位（P1 尚无 `HINT_MAIN_*` 使用者）。
     Hint(u64),
+
+    /// 公共 RX 有新的字节（前缀或内容），回顶部继续读。
+    RxReady,
 }
 
 /// 控制面循环本体。
@@ -53,12 +66,29 @@ pub(crate) async fn main_loop_async_<C, K>(
     shared: MuxShared_<C>,
     ctl: ControlState_<C::Alloc>,
     _public_tx_w: crate::connection::ring_::BufferedTx,
-    _public_rx_r: crate::connection::ring_::BufferedRx,
+    mut public_rx_r: BufferedRx,
     cancel: K,
 ) where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
+    // 公共 RX 的整帧暂存：连接一次分配，容量就是一个最大帧。
+    let alloc = match shared.reg_().allocator_(cancel.child_token()).await {
+        Result::Ok(alloc) => alloc,
+        Result::Err(_) => {
+            exit_(&ctl);
+            return;
+        }
+    };
+    let mut rx_scratch: Owned<[u8], C::Alloc> = Owned::new_slice(
+        shared.max_packet_size_(),
+        |_idx, slot| {
+            slot.write(0u8);
+        },
+        alloc,
+    );
+    let mut public_read = MainPublicRead_::new_();
+
     loop {
         if cancel.is_cancelled() {
             exit_(&ctl);
@@ -78,6 +108,29 @@ pub(crate) async fn main_loop_async_<C, K>(
         // 合并提示：P1 只取走，具体位在后续阶段接入。
         let _hints = ctl.take_main_hint_();
 
+        // 公共 RX：每轮最多 `K_MAIN_FRAME_BATCH` 条完整帧。
+        for _ in 0..K_MAIN_FRAME_BATCH {
+            match try_read_public_frame_(
+                &mut public_rx_r,
+                &mut public_read,
+                &mut rx_scratch[..],
+                shared.max_packet_size_(),
+            ) {
+                Result::Ok(Option::Some(header)) => {
+                    handle_public_frame_::<C, _>(&shared, &header, &cancel).await;
+                    // 读走一帧就腾出 RX 空间，唤醒可能停在背压上的 demux。
+                    shared.public_().notify_rx_space_();
+                }
+                Result::Ok(Option::None) => break,
+                Result::Err(err) => {
+                    let _ = shared.reg_().mark_failed_(&err, cancel.child_token()).await;
+                    shared.reg_().cancel_loops_();
+                    exit_(&ctl);
+                    return;
+                }
+            }
+        }
+
         // 请求：每轮最多 `K_MAIN_REQ_BATCH` 条。
         for _ in 0..K_MAIN_REQ_BATCH {
             let Some(request) = ctl.try_pop_request_() else {
@@ -86,12 +139,14 @@ pub(crate) async fn main_loop_async_<C, K>(
             handle_request_::<C, _>(&shared, request, &cancel).await;
         }
 
-        match park_main_(&ctl, &cancel).await {
+        match park_main_::<C, _>(&shared, &ctl, &cancel).await {
             Some(MainWake_::Request(request)) => {
                 handle_request_::<C, _>(&shared, request, &cancel).await;
             }
             // 提示已由下一轮顶部的 `take_main_hint_` 取走；这里只需回顶部。
             Some(MainWake_::Hint(_bits)) => {}
+            // 公共 RX 有新字节：回顶部继续读帧。
+            Some(MainWake_::RxReady) => {}
             // 取消或请求队列关闭：连接正在收尾。
             None => {
                 exit_(&ctl);
@@ -214,16 +269,25 @@ where
 /// park 到「有请求 / 有提示 / 取消」之一。
 ///
 /// 返回 `None` 表示连接正在收尾（取消令牌触发，或请求队列被关闭）。
-async fn park_main_<A, K>(ctl: &ControlState_<A>, cancel: &K) -> Option<MainWake_<A>>
+async fn park_main_<C, K>(
+    shared: &MuxShared_<C>,
+    ctl: &ControlState_<C::Alloc>,
+    cancel: &K,
+) -> Option<MainWake_<C::Alloc>>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnCfg,
     K: TrCancellationToken,
 {
     let cancel_fut = cancel.child_token().cancellation();
     let mut cancel_fut = pin!(cancel_fut);
-    let mut taken: Option<MainWake_<A>> = None;
+    let mut taken: Option<MainWake_<C::Alloc>> = None;
     poll_fn(|cx| {
         if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
+            return Poll::Ready(());
+        }
+        // 公共 RX 有字节（可能只是前缀的一部分）：回顶部按 chunk 协议继续读。
+        if shared.public_().poll_rx_ready_(cx).is_ready() {
+            taken = Some(MainWake_::RxReady);
             return Poll::Ready(());
         }
         match ctl.poll_pop_request_(cx) {
@@ -243,4 +307,95 @@ where
     })
     .await;
     taken
+}
+
+/// 公共 RX 的整帧读取进度。
+struct MainPublicRead_ {
+    /// chunked 前缀 / 内容状态。
+    state_: ChunkReadState_,
+
+    /// 当前 chunk 的声明长度（0 = 还没解析出）。
+    len_: usize,
+
+    /// 已读入暂存的字节数。
+    filled_: usize,
+}
+
+impl MainPublicRead_ {
+    /// 空状态。
+    fn new_() -> Self {
+        MainPublicRead_ {
+            state_: ChunkReadState_::new_(),
+            len_: 0usize,
+            filled_: 0usize,
+        }
+    }
+}
+
+/// 尝试从公共 RX 读出一条完整控制帧；不足一帧时返回 `Ok(None)` 并保留进度。
+fn try_read_public_frame_(
+    public_rx: &mut BufferedRx,
+    read: &mut MainPublicRead_,
+    scratch: &mut [u8],
+    max_packet_size: usize,
+) -> Result<Option<FrameHeader>, MuxError> {
+    if !read.state_.has_chunk_() {
+        match PublicChunkIo_::try_read_prefix_(public_rx, &mut read.state_, max_packet_size) {
+            Result::Ok(Option::Some(_len)) => {}
+            Result::Ok(Option::None) => return Result::Ok(Option::None),
+            Result::Err(_) => return Result::Err(MuxError::MalformedFrame),
+        }
+    }
+    if read.len_ == 0usize {
+        read.len_ = read.state_.left_();
+        read.filled_ = 0usize;
+    }
+    if read.filled_ < read.len_ {
+        let start = read.filled_;
+        let n = PublicChunkIo_::try_read_payload_into_(
+            public_rx,
+            &mut read.state_,
+            &mut scratch[start..read.len_],
+        )
+        .map_err(|_| MuxError::MalformedFrame)?;
+        read.filled_ += n;
+        if read.filled_ < read.len_ {
+            return Result::Ok(Option::None);
+        }
+    }
+    let len = read.len_;
+    read.len_ = 0usize;
+    read.filled_ = 0usize;
+    let (header, _head_len) = decode_header_sync_(&scratch[..len])?;
+    Result::Ok(Option::Some(header))
+}
+
+/// 处理一条入向控制帧（P2 先接 `CLOSE`；`OPEN` / `ACCEPT` / `REJECT` 在 P3 接入）。
+async fn handle_public_frame_<C, K>(shared: &MuxShared_<C>, header: &FrameHeader, cancel: &K)
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    if header.kind() != FrameKind::Close {
+        return;
+    }
+    let local = header.remote_dock();
+    let remote = header.local_dock();
+    let owner = shared
+        .reg_()
+        .channel_owner_(local, remote, cancel.child_token())
+        .await;
+    let Result::Ok(Option::Some(owner)) = owner else {
+        return;
+    };
+    if header.flags() & flags::K_RESET != 0u8 {
+        owner.set_peer_reset_();
+        owner.notify_tx_progress_();
+    } else {
+        owner.set_peer_fin_();
+        owner.notify_rx_progress_();
+    }
+    owner.mark_data_(shared.conn_clock_().now_millis_());
+    // 写循环据此扫描 `PEER_FIN` / `PEER_RESET` 并推进拆流（P4 前仍由旧扫描完成）。
+    shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
 }

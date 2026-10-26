@@ -142,7 +142,7 @@ use crate::{
         frame_parser_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
         owner_::{ChannelOwner_, TgOwner_},
-        public_channel_::PublicChannel_,
+        public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChannel_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx},
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, EventTake_,
@@ -281,6 +281,11 @@ where
     /// 协商出的活跃子流空闲超时（毫秒）。
     pub(crate) fn channel_timeout_millis_(&self) -> u64 {
         self.channel_timeout_millis_
+    }
+
+    /// 协商出的单帧总长上限。
+    pub(crate) fn max_packet_size_(&self) -> usize {
+        self.max_packet_size_
     }
 
     /// 公共报文子流的唤醒槽。
@@ -1096,6 +1101,42 @@ fn map_read_cursor_err_<E>(err: CursorError<E, ()>) -> MuxError {
     }
 }
 
+/// 把一条控制帧的「原始头 + 载荷」写进公共 RX ring（背压时 park 等空间）。
+///
+/// 写之前 `demux_loop` 已经做完帧级 / 路由级合法性初审；这里只负责搬运。返回
+/// `WouldBlock` 时停在 RX 空间上，**不丢帧**（设计稿 §5.8）。
+async fn write_public_frame_async_<C, K>(
+    public_rx_w: &mut BufferedTx,
+    shared: &MuxShared_<C>,
+    head: &[u8],
+    payload: &[u8],
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    loop {
+        match PublicChunkIo_::try_write_chunk_(
+            public_rx_w,
+            head,
+            payload,
+            shared.max_packet_size_(),
+        ) {
+            Result::Ok(()) => {
+                shared.public_().notify_rx_ready_();
+                return Result::Ok(());
+            }
+            Result::Err(ChunkWriteErr_::WouldBlock) => {}
+            Result::Err(_) => return Result::Err(MuxError::FrameTooLarge),
+        }
+        let wait_space = poll_fn(|cx| shared.public_().poll_rx_space_(cx));
+        if race_cancel_(cancel, wait_space).await.is_none() {
+            return Result::Err(MuxError::Cancelled);
+        }
+    }
+}
+
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 解复用循环
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -1218,7 +1259,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
     shared: MuxShared_<C>,
     events: EventReceiver_<ReadEvent_<C::Alloc>>,
     events_tx: EventSender_<WriteEvent_<C::Alloc>>,
-    _public_rx_w: BufferedTx,
+    mut public_rx_w: BufferedTx,
     cancel: K,
 ) where
     C: TrConnCfg,
@@ -1676,6 +1717,27 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     // 拆流记账（移除写侧表项、释放身份）交给复用循环的统一入口。
                     // `PEER_FIN` / `PEER_RESET` 位已经置上，这里只负责唤醒写循环。
                     shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
+                }
+                // 公共子流：把整帧交给 `main_loop` 做协议状态推进。P2 期间上面的
+                // 本地动作仍在（两处都是幂等置位）；P4 删除本循环的直接处理。
+                let (head, head_len) = match encode_header_(&header) {
+                    Result::Ok(value) => value,
+                    Result::Err(err) => {
+                        fail_mux_loop_(&shared, &cancel, Option::Some(kind), &err).await;
+                        return;
+                    }
+                };
+                if let Result::Err(err) = write_public_frame_async_::<C, _>(
+                    &mut public_rx_w,
+                    &shared,
+                    &head[..head_len],
+                    bytes,
+                    &cancel,
+                )
+                .await
+                {
+                    fail_mux_loop_(&shared, &cancel, Option::Some(kind), &err).await;
+                    return;
                 }
             }
             FrameKind::WindowUpdate | FrameKind::Pulse => {
@@ -2418,12 +2480,63 @@ where
 /// 本循环是这条写半边**唯一**的写入者，因此成帧的「头 + 载荷」两段之间不会被别的帧
 /// 插进来；字节到网络的最后一跳由调用方那一侧负责（入向 / 出向泵或适配器的自驱动泵）。
 /// 循环退出时经 [`TxSealGuard_`] 封口，从而唤醒那一侧的排空者。
+/// 把公共 TX ring 里的 chunk 搬进 `ConnTx`（控制帧优先）。
+///
+/// 只搬 payload（`[u16 len]` 前缀已被消费），不重新组帧、不解析帧头。一旦开始一个
+/// chunk 就把它搬完；TX ring 暂时读空时 park 在 `tx_ready` 上，等 `main_loop` 写入。
+/// 返回 `true` 表示本轮至少搬了一段（供诊断）。
+async fn flush_public_chunks_<C, K>(
+    tx_stage: &mut C::ConnTx,
+    shared: &MuxShared_<C>,
+    public_tx_r: &mut BufferedRx,
+    state: &mut ChunkReadState_,
+    scratch: &mut [u8],
+    cancel: &K,
+) -> Result<bool, MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let mut moved = false;
+    loop {
+        if !state.has_chunk_() {
+            match PublicChunkIo_::try_read_prefix_(public_tx_r, state, shared.max_packet_size_()) {
+                Result::Ok(Option::Some(_len)) => {}
+                Result::Ok(Option::None) => {
+                    if moved {
+                        shared.public_().notify_tx_space_();
+                    }
+                    return Result::Ok(moved);
+                }
+                Result::Err(_) => return Result::Err(MuxError::MalformedFrame),
+            }
+        }
+        while state.left_() > 0 {
+            let n = PublicChunkIo_::try_read_payload_into_(public_tx_r, state, scratch)
+                .map_err(|_| MuxError::MalformedFrame)?;
+            if n == 0 {
+                if moved {
+                    shared.public_().notify_tx_space_();
+                }
+                let wait_chunk = poll_fn(|cx| shared.public_().poll_tx_ready_(cx));
+                if race_cancel_(cancel, wait_chunk).await.is_none() {
+                    return Result::Err(MuxError::Cancelled);
+                }
+                continue;
+            }
+            enqueue_frame_(tx_stage, &scratch[..n], cancel.child_token()).await?;
+            moved = true;
+        }
+        shared.public_().notify_tx_space_();
+    }
+}
+
 pub(crate) async fn mux_loop_async_<C, K>(
     tx_stage: C::ConnTx,
     shared: MuxShared_<C>,
     events: EventReceiver_<WriteEvent_<C::Alloc>>,
     read_events: EventSender_<ReadEvent_<C::Alloc>>,
-    _public_tx_r: BufferedRx,
+    mut public_tx_r: BufferedRx,
     cancel: K,
 ) where
     C: TrConnCfg,
@@ -2473,6 +2586,8 @@ pub(crate) async fn mux_loop_async_<C, K>(
         shared: &shared,
     };
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
+    // 公共 TX 的 chunked 读进度。
+    let mut public_read = ChunkReadState_::new_();
     // 「发送方向已丢弃、但发送环还没排空（或额度没回来）」的子流：它们还欠对端一条
     // `CLOSE(FIN)`，由下面第 2.5 步在有进展时继续收尾（见 `finalize_entry_`）。
     let mut pending_fin: PendingFin_<C::Alloc> =
@@ -2607,6 +2722,28 @@ pub(crate) async fn mux_loop_async_<C, K>(
             }
         }
 
+        // 3. 公共子流优先：先把 TX ring 里的 chunk 搬进传输，再发用户数据。
+        match race_cancel_(
+            &cancel,
+            flush_public_chunks_::<C, _>(
+                &mut tx_stage,
+                &shared,
+                &mut public_tx_r,
+                &mut public_read,
+                &mut scratch[..],
+                &cancel,
+            ),
+        )
+        .await
+        {
+            Option::None => return,
+            Option::Some(Result::Ok(_)) => {}
+            Option::Some(Result::Err(err)) => {
+                fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                return;
+            }
+        }
+
         // 2. 尽量把各子流的数据发出去（一次一段），直到没有可发的。
         loop {
             match race_cancel_(
@@ -2719,6 +2856,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
         let mut need_rescan = false;
         let mut ring_ready = false;
         let mut hint_ready = false;
+        let mut public_ready = false;
         let mut taken_attach: Option<WriteAttach_<C::Alloc>> = Option::None;
         let alive = {
             let cancel_fut = cancel.child_token().cancellation();
@@ -2789,6 +2927,11 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     hint_ready = true;
                     return Poll::Ready(true);
                 }
+                // 公共 TX 有新的 chunk：回顶部优先搬运。
+                if shared.public_().poll_tx_ready_(cx).is_ready() {
+                    public_ready = true;
+                    return Poll::Ready(true);
+                }
                 // `Attach` inbox：有新的环半部要交给本地写表。
                 match shared.reg_().poll_write_attach_(cx) {
                     Poll::Ready(Option::Some(attach)) => {
@@ -2848,6 +2991,10 @@ pub(crate) async fn mux_loop_async_<C, K>(
         if hint_ready {
             // 收尾事实变了（排空/发 FIN/RESET）：回顶部按位扫描，不清 `last_ready`
             // ——那条环仍是下一轮值得 park 的目标。
+            continue;
+        }
+        if public_ready {
+            // 公共 TX 有新 chunk：回顶部优先搬运。
             continue;
         }
         last_ready = Option::None;

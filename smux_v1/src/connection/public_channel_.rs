@@ -428,6 +428,145 @@ where
     Result::Ok(())
 }
 
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 公共子流的四路唤醒槽与关闭位
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 公共报文子流的**共享元数据**：四路单等待者唤醒槽 + 两个方向的关闭位。
+///
+/// ring 半部不在这里（按方向由 `main_loop` / `mux_loop` / `demux_loop` 各自独占），
+/// 这里只有「可以动了」的信号与「已经关了」的事实。四路都是单等待者，因此用
+/// [`NotifySlot_`] 的持久位即可，不需要 `Vec<Waker>`。
+///
+/// | 槽 | 方向 | 含义 |
+/// | --- | --- | --- |
+/// | `tx_ready_` | main → mux | TX ring 里出现了完整或部分 chunk |
+/// | `tx_space_` | mux → main | TX ring 腾出了空间 |
+/// | `rx_ready_` | demux → main | RX ring 里出现了字节 |
+/// | `rx_space_` | main → demux | RX ring 腾出了空间 |
+pub(crate) struct PublicChannel_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 共享本体；一次分配，句柄可克隆。
+    inner_: Shared<PublicChannelInner_, A>,
+}
+
+impl<A> Clone for PublicChannel_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        PublicChannel_ {
+            inner_: self.inner_.clone(),
+        }
+    }
+}
+
+/// [`PublicChannel_`] 的共享内容。
+struct PublicChannelInner_ {
+    /// main → mux：TX ring 可读。
+    tx_ready_: NotifySlot_,
+
+    /// mux → main：TX ring 可写。
+    tx_space_: NotifySlot_,
+
+    /// demux → main：RX ring 可读。
+    rx_ready_: NotifySlot_,
+
+    /// main → demux：RX ring 可写。
+    rx_space_: NotifySlot_,
+
+    /// TX 写端已关闭（main 退出）。
+    tx_closed_: AtomicBool,
+
+    /// RX 读端已关闭（main 退出）。
+    rx_closed_: AtomicBool,
+}
+
+impl<A> PublicChannel_<A>
+where
+    A: AllocatorClone + Send + Sync,
+{
+    /// 建一组空唤醒槽（一次 `Shared` 分配）。
+    pub(crate) fn new_(alloc: A) -> Self {
+        PublicChannel_ {
+            inner_: Shared::new(
+                PublicChannelInner_ {
+                    tx_ready_: NotifySlot_::new_(),
+                    tx_space_: NotifySlot_::new_(),
+                    rx_ready_: NotifySlot_::new_(),
+                    rx_space_: NotifySlot_::new_(),
+                    tx_closed_: AtomicBool::new(false),
+                    rx_closed_: AtomicBool::new(false),
+                },
+                alloc,
+            ),
+        }
+    }
+
+    /// main → mux：TX ring 有字节。
+    pub(crate) fn notify_tx_ready_(&self) {
+        self.inner_.tx_ready_.notify_();
+    }
+
+    /// mux 等 TX ring 有字节。
+    pub(crate) fn poll_tx_ready_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner_.tx_ready_.poll_wait_(cx)
+    }
+
+    /// mux → main：TX ring 腾出空间。
+    pub(crate) fn notify_tx_space_(&self) {
+        self.inner_.tx_space_.notify_();
+    }
+
+    /// main 等 TX ring 可写。
+    pub(crate) fn poll_tx_space_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner_.tx_space_.poll_wait_(cx)
+    }
+
+    /// demux → main：RX ring 有字节。
+    pub(crate) fn notify_rx_ready_(&self) {
+        self.inner_.rx_ready_.notify_();
+    }
+
+    /// main 等 RX ring 有字节。
+    pub(crate) fn poll_rx_ready_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner_.rx_ready_.poll_wait_(cx)
+    }
+
+    /// main → demux：RX ring 腾出空间。
+    pub(crate) fn notify_rx_space_(&self) {
+        self.inner_.rx_space_.notify_();
+    }
+
+    /// demux 等 RX ring 可写。
+    pub(crate) fn poll_rx_space_(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner_.rx_space_.poll_wait_(cx)
+    }
+
+    /// main 退出：关闭 TX 写端与 RX 读端，并唤醒两个数据循环。
+    pub(crate) fn close_both_(&self) {
+        self.inner_.tx_closed_.store(true, Ordering::Release);
+        self.inner_.rx_closed_.store(true, Ordering::Release);
+        // 两个「可读 / 可写」槽都可能是对方正在等的：关闭也是一次状态变化。
+        self.inner_.tx_ready_.notify_();
+        self.inner_.rx_ready_.notify_();
+        self.inner_.tx_space_.notify_();
+        self.inner_.rx_space_.notify_();
+    }
+
+    /// TX 写端是否已关闭。
+    pub(crate) fn is_tx_closed_(&self) -> bool {
+        self.inner_.tx_closed_.load(Ordering::Acquire)
+    }
+
+    /// RX 读端是否已关闭。
+    pub(crate) fn is_rx_closed_(&self) -> bool {
+        self.inner_.rx_closed_.load(Ordering::Acquire)
+    }
+}
+
 #[cfg(test)]
 mod tests_ {
     use mm_ptr::{Owned, x_deps::abs_mm::CoreAlloc};
@@ -628,144 +767,5 @@ mod tests_ {
             assert!(PublicChunkIo_::ring_capacity_(max) >= 2usize + max);
         }
         assert_eq!(PublicChunkIo_::ring_capacity_(4096usize), 8196usize);
-    }
-}
-
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// 公共子流的四路唤醒槽与关闭位
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-/// 公共报文子流的**共享元数据**：四路单等待者唤醒槽 + 两个方向的关闭位。
-///
-/// ring 半部不在这里（按方向由 `main_loop` / `mux_loop` / `demux_loop` 各自独占），
-/// 这里只有「可以动了」的信号与「已经关了」的事实。四路都是单等待者，因此用
-/// [`NotifySlot_`] 的持久位即可，不需要 `Vec<Waker>`。
-///
-/// | 槽 | 方向 | 含义 |
-/// | --- | --- | --- |
-/// | `tx_ready_` | main → mux | TX ring 里出现了完整或部分 chunk |
-/// | `tx_space_` | mux → main | TX ring 腾出了空间 |
-/// | `rx_ready_` | demux → main | RX ring 里出现了字节 |
-/// | `rx_space_` | main → demux | RX ring 腾出了空间 |
-pub(crate) struct PublicChannel_<A>
-where
-    A: AllocatorClone + Send + Sync,
-{
-    /// 共享本体；一次分配，句柄可克隆。
-    inner_: Shared<PublicChannelInner_, A>,
-}
-
-impl<A> Clone for PublicChannel_<A>
-where
-    A: AllocatorClone + Send + Sync,
-{
-    fn clone(&self) -> Self {
-        PublicChannel_ {
-            inner_: self.inner_.clone(),
-        }
-    }
-}
-
-/// [`PublicChannel_`] 的共享内容。
-struct PublicChannelInner_ {
-    /// main → mux：TX ring 可读。
-    tx_ready_: NotifySlot_,
-
-    /// mux → main：TX ring 可写。
-    tx_space_: NotifySlot_,
-
-    /// demux → main：RX ring 可读。
-    rx_ready_: NotifySlot_,
-
-    /// main → demux：RX ring 可写。
-    rx_space_: NotifySlot_,
-
-    /// TX 写端已关闭（main 退出）。
-    tx_closed_: AtomicBool,
-
-    /// RX 读端已关闭（main 退出）。
-    rx_closed_: AtomicBool,
-}
-
-impl<A> PublicChannel_<A>
-where
-    A: AllocatorClone + Send + Sync,
-{
-    /// 建一组空唤醒槽（一次 `Shared` 分配）。
-    pub(crate) fn new_(alloc: A) -> Self {
-        PublicChannel_ {
-            inner_: Shared::new(
-                PublicChannelInner_ {
-                    tx_ready_: NotifySlot_::new_(),
-                    tx_space_: NotifySlot_::new_(),
-                    rx_ready_: NotifySlot_::new_(),
-                    rx_space_: NotifySlot_::new_(),
-                    tx_closed_: AtomicBool::new(false),
-                    rx_closed_: AtomicBool::new(false),
-                },
-                alloc,
-            ),
-        }
-    }
-
-    /// main → mux：TX ring 有字节。
-    pub(crate) fn notify_tx_ready_(&self) {
-        self.inner_.tx_ready_.notify_();
-    }
-
-    /// mux 等 TX ring 有字节。
-    pub(crate) fn poll_tx_ready_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.inner_.tx_ready_.poll_wait_(cx)
-    }
-
-    /// mux → main：TX ring 腾出空间。
-    pub(crate) fn notify_tx_space_(&self) {
-        self.inner_.tx_space_.notify_();
-    }
-
-    /// main 等 TX ring 可写。
-    pub(crate) fn poll_tx_space_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.inner_.tx_space_.poll_wait_(cx)
-    }
-
-    /// demux → main：RX ring 有字节。
-    pub(crate) fn notify_rx_ready_(&self) {
-        self.inner_.rx_ready_.notify_();
-    }
-
-    /// main 等 RX ring 有字节。
-    pub(crate) fn poll_rx_ready_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.inner_.rx_ready_.poll_wait_(cx)
-    }
-
-    /// main → demux：RX ring 腾出空间。
-    pub(crate) fn notify_rx_space_(&self) {
-        self.inner_.rx_space_.notify_();
-    }
-
-    /// demux 等 RX ring 可写。
-    pub(crate) fn poll_rx_space_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.inner_.rx_space_.poll_wait_(cx)
-    }
-
-    /// main 退出：关闭 TX 写端与 RX 读端，并唤醒两个数据循环。
-    pub(crate) fn close_both_(&self) {
-        self.inner_.tx_closed_.store(true, Ordering::Release);
-        self.inner_.rx_closed_.store(true, Ordering::Release);
-        // 两个「可读 / 可写」槽都可能是对方正在等的：关闭也是一次状态变化。
-        self.inner_.tx_ready_.notify_();
-        self.inner_.rx_ready_.notify_();
-        self.inner_.tx_space_.notify_();
-        self.inner_.rx_space_.notify_();
-    }
-
-    /// TX 写端是否已关闭。
-    pub(crate) fn is_tx_closed_(&self) -> bool {
-        self.inner_.tx_closed_.load(Ordering::Acquire)
-    }
-
-    /// RX 读端是否已关闭。
-    pub(crate) fn is_rx_closed_(&self) -> bool {
-        self.inner_.rx_closed_.load(Ordering::Acquire)
     }
 }
