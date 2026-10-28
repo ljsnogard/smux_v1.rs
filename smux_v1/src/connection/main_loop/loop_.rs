@@ -17,11 +17,9 @@ use core::{future::poll_fn, pin::pin, task::Poll};
 use abs_cancel::{NonCancellableToken, TrCancellationToken};
 use abs_smux::dock::TrDock;
 
-use alloc::vec::Vec;
-
 use crate::{
     connection::{
-        FrameHeader, FrameKind, MuxError, ReserveErr_, TrConnCfg,
+        FrameHeader, FrameKind, MuxError, ReadOutgoingErr_, ReserveErr_, TrConnCfg,
         control_state_::ControlState_,
         flags,
         frame_::encode_header_,
@@ -95,6 +93,28 @@ pub(crate) async fn main_loop_async_<C, K>(
     let mut rx_scratch = rx_scratch_retain
         .try_owning()
         .expect("刚分配的暂存应当可独占");
+
+    // 建流期 message 缓冲：每次 `OPEN` / `ACCEPT` / `REJECT` 都要从 message ring
+    // 读一条载荷；它属于**重复性**临时分配。这里先借用连接级 Scope 分配一块固定
+    // 缓冲（整条连接只分配一次），避免每请求一个全局 `Vec`；每循环 Scope 留给
+    // 后面的每轮临时对象（见 `dev-notes/alloc-ownership-20261029-0230.md`）。
+    let msg_cap = shared.pending_msg_cap_();
+    // `cap == 0` 时仍分配 1 字节，避免零长度布局；实际可用切片仍是 `[..0]`。
+    let msg_retain = match crate::connection::alloc_zeroed_bytes_async_(
+        shared.reg_().scope_(),
+        msg_cap.max(1usize),
+    )
+    .await
+    {
+        Result::Ok(retain) => retain,
+        Result::Err(_) => {
+            exit_(&ctl);
+            return;
+        }
+    };
+    let mut msg_buf = msg_retain
+        .try_owning()
+        .expect("刚分配的 message 缓冲应当可独占");
     let mut public_read = MainPublicRead_::new_();
 
     loop {
@@ -108,6 +128,7 @@ pub(crate) async fn main_loop_async_<C, K>(
             &mut public_tx_w,
             &mut public_rx_r,
             &mut rx_scratch[..],
+            &mut msg_buf[..msg_cap],
             &mut public_read,
             &cancel,
         )
@@ -119,7 +140,14 @@ pub(crate) async fn main_loop_async_<C, K>(
 
         match park_main_::<C, _>(&shared, &ctl, &cancel).await {
             Some(MainWake_::Request(request)) => {
-                handle_request_::<C, _>(&shared, &mut public_tx_w, request, &cancel).await;
+                handle_request_::<C, _>(
+                    &shared,
+                    &mut public_tx_w,
+                    request,
+                    &mut msg_buf[..msg_cap],
+                    &cancel,
+                )
+                .await;
             }
             // `park_main_` 在 poll 时**已经取走**提示位（`HintSlot_::poll_wait_` 是
             // 「取出并返回」语义）；这里必须放回去，否则下一轮 `main_step_` 的
@@ -142,12 +170,17 @@ pub(crate) async fn main_loop_async_<C, K>(
 ///
 /// 返回 `false` 表示连接应退出（drain 被取消 / 帧解析失败）。测试可手动调用
 /// 本函数驱动 `main_loop` 的状态推进，不必 park。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "驱动一轮控制面需要全部循环状态（含两块暂存与请求缓冲）"
+)]
 pub(crate) async fn main_step_<C, K>(
     shared: &MuxShared_<C>,
     ctl: &ControlState_<crate::connection::ConnAllocCfg_<C>>,
     public_tx_w: &mut BufferedTx,
     public_rx_r: &mut BufferedRx,
     rx_scratch: &mut [u8],
+    msg_buf: &mut [u8],
     public_read: &mut MainPublicRead_,
     cancel: &K,
 ) -> bool
@@ -201,7 +234,7 @@ where
         let Some(request) = ctl.try_pop_request_() else {
             break;
         };
-        handle_request_::<C, _>(shared, public_tx_w, request, cancel).await;
+        handle_request_::<C, _>(shared, public_tx_w, request, msg_buf, cancel).await;
     }
     true
 }
@@ -224,6 +257,7 @@ async fn handle_request_<C, K>(
     shared: &MuxShared_<C>,
     public_tx_w: &mut BufferedTx,
     request: MainLoopRequest_<crate::connection::ConnAllocCfg_<C>>,
+    msg_buf: &mut [u8],
     cancel: &K,
 )
 where
@@ -245,7 +279,7 @@ where
     reap_retired_and_release_::<C, _>(shared, public_tx_w, cancel).await;
     match request {
         MainLoopRequest_::SendControl { frame, reply } => {
-            match write_control_frame_async_::<C, _>(public_tx_w, shared, &frame, cancel).await {
+            match write_control_frame_async_::<C, _>(public_tx_w, shared, &frame, &[], cancel).await {
                 Result::Ok(()) => {
                     let _ = reply.set_(Result::Ok(MainLoopReply_::Unit));
                 }
@@ -344,19 +378,23 @@ where
             initial_window,
             reply,
         } => {
-            let cap = shared.pending_msg_cap_();
-            let message = match shared
+            let msg_len = match shared
                 .reg_()
-                .read_msg_outgoing_(local_dock, remote_dock, cap, cancel.child_token())
+                .read_msg_outgoing_into_(local_dock, remote_dock, msg_buf, cancel.child_token())
                 .await
             {
-                Result::Ok(Option::Some(message)) => message,
-                Result::Ok(Option::None) => Vec::new(),
-                Result::Err(_) => {
+                Result::Ok(Option::Some(len)) => len,
+                Result::Ok(Option::None) => 0usize,
+                Result::Err(ReadOutgoingErr_::TooLarge) => {
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Mux(MuxError::FrameTooLarge)));
+                    return;
+                }
+                Result::Err(ReadOutgoingErr_::Cancelled) => {
                     let _ = reply.set_(Result::Err(MainLoopErr_::Mux(MuxError::Cancelled)));
                     return;
                 }
             };
+            let message = &msg_buf[..msg_len];
             let result = match role_ {
                 EstablishRole_::Initiator => {
                     write_control_frame_async_::<C, _>(
@@ -368,8 +406,8 @@ where
                             local_dock,
                             remote_dock,
                             Option::Some((0u64 as RecvTotal, initial_window)),
-                            message,
                         ),
+                        message,
                         cancel,
                     )
                     .await
@@ -394,8 +432,8 @@ where
                                         local_dock,
                                         remote_dock,
                                         Option::Some((0u64 as RecvTotal, initial_window)),
-                                        Vec::new(),
                                     ),
+                                    &[],
                                     cancel,
                                 )
                                 .await;
@@ -410,8 +448,8 @@ where
                                                 local_dock,
                                                 remote_dock,
                                                 Option::None,
-                                                message,
                                             ),
+                                            message,
                                             cancel,
                                         )
                                         .await
@@ -443,19 +481,23 @@ where
             role_,
             reply,
         } => {
-            let cap = shared.pending_msg_cap_();
-            let reason = match shared
+            let reason_len = match shared
                 .reg_()
-                .read_msg_outgoing_(local_dock, remote_dock, cap, cancel.child_token())
+                .read_msg_outgoing_into_(local_dock, remote_dock, msg_buf, cancel.child_token())
                 .await
             {
-                Result::Ok(Option::Some(reason)) => reason,
-                Result::Ok(Option::None) => Vec::new(),
-                Result::Err(_) => {
+                Result::Ok(Option::Some(len)) => len,
+                Result::Ok(Option::None) => 0usize,
+                Result::Err(ReadOutgoingErr_::TooLarge) => {
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Mux(MuxError::FrameTooLarge)));
+                    return;
+                }
+                Result::Err(ReadOutgoingErr_::Cancelled) => {
                     let _ = reply.set_(Result::Err(MainLoopErr_::Mux(MuxError::Cancelled)));
                     return;
                 }
             };
+            let reason = &msg_buf[..reason_len];
             let result = match role_ {
                 EstablishRole_::Responder => {
                     let sent = write_control_frame_async_::<C, _>(
@@ -467,8 +509,8 @@ where
                             local_dock,
                             remote_dock,
                             Option::None,
-                            reason,
                         ),
+                        reason,
                         cancel,
                     )
                     .await;
@@ -715,8 +757,8 @@ async fn handle_public_frame_<C, K>(
                                     local,
                                     remote,
                                     Option::None,
-                                    Vec::new(),
                                 ),
+                                &[],
                                 cancel,
                             )
                             .await;
@@ -793,6 +835,7 @@ async fn reap_retired_and_release_<C, K>(
             public_tx_w,
             shared,
             &ControlFrame_::plain_(FrameKind::Reject, 0u8, local_dock, remote_dock),
+            &[],
             cancel,
         )
         .await;
@@ -810,13 +853,14 @@ async fn reap_retired_and_release_<C, K>(
 
 /// 把一条控制帧写进公共 TX ring（背压时 park 等 `tx_space`）。
 ///
-/// 帧头由 `FrameHeader` + `encode_header_` 重新编码；载荷仍在 `ControlFrame_` 里。
-/// 这是 P3.1b 的过渡：P3.2 起 `OPEN` / `ACCEPT` / `REJECT` 的载荷直接从建流期
-/// message ring 读出，`ControlFrame_::payload_` 只留给 timer / demux 的控制帧。
+/// 帧头由 `FrameHeader` + `encode_header_` 重新编码；`payload` 是 `OPEN` / `ACCEPT` /
+/// `REJECT` 从建流期 message ring 读出的载荷，其它控制帧传空切片。载荷不再挂在
+/// `ControlFrame_` 上，避免为每条控制帧持有一个 `Vec<u8>`。
 async fn write_control_frame_async_<C, K>(
     public_tx_w: &mut BufferedTx,
     shared: &MuxShared_<C>,
     frame: &ControlFrame_,
+    payload: &[u8],
     cancel: &K,
 ) -> Result<(), MuxError>
 where
@@ -828,7 +872,7 @@ where
         frame.flags_(),
         frame.local_dock_(),
         frame.remote_dock_(),
-        frame.payload_().len(),
+        payload.len(),
         frame.window_(),
     );
     let (head, head_len) = encode_header_(&header).map_err(|_| MuxError::MalformedFrame)?;
@@ -836,7 +880,7 @@ where
         match PublicChunkIo_::try_write_chunk_(
             public_tx_w,
             &head[..head_len],
-            frame.payload_(),
+            payload,
             shared.max_packet_size_(),
         ) {
             Result::Ok(()) => {
@@ -918,8 +962,17 @@ mod tests_ {
             NonCancellableToken::new(),
         ));
         assert!(submitted.is_ok(), "Bind 请求应能入队");
+        // 本辅助只驱动 Bind，不读 message；给 `main_step_` 一个足够的栈上缓冲。
+        let mut msg_buf = [0u8; 512usize];
         assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
-            shared, ctl, tx_w, rx_r, scratch, public_read, &cancel
+            shared,
+            ctl,
+            tx_w,
+            rx_r,
+            scratch,
+            &mut msg_buf,
+            public_read,
+            &cancel
         )));
         let reply = block_on_ready_(core::future::poll_fn(|cx| waiter.poll_wait_(cx)))
             .expect("Bind 请求应完成")
@@ -1056,12 +1109,15 @@ mod tests_ {
         );
         ctl.raise_main_hint_(bits);
 
+        // 本用例驱动的是 retired → REJECT，不需要读 message ring；给一个栈上缓冲。
+        let mut msg_buf = [0u8; 512usize];
         assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
             &shared,
             &ctl,
             &mut tx_w,
             &mut rx_r,
             &mut scratch,
+            &mut msg_buf,
             &mut rx_public_read,
             &cancel,
         )));

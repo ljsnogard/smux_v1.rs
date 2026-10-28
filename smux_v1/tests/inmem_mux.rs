@@ -66,6 +66,7 @@ use abs_art::TrLocalScope;
 // 真正支持计时的后端上；`LocalScope` 只能由运行时值经 `local_scope()` 交出。
 use abs_art_facade::Runtime;
 use abs_smux::{
+    chan::TrChannelHandle,
     conn::{TrChannelListener, TrConnection, TrDockBinding},
 };
 use buffex::x_deps::{
@@ -116,6 +117,126 @@ async fn mux_small_inmem_dual_() {
     scope.run_until(scenario).await;
 }
 single_runtime_test_!(mux_small_inmem_dual_);
+
+/// 测试目标：建流期 `OPEN` message 原样送达，且 `read_message_async` 能分块写进
+/// 调用方 sink；welcome 当前按空载荷送达（发送侧受 `accept_async` 的
+/// `TrBuffWrite` 形状限制，P3.3c 再补非空 welcome）。
+///
+/// - 手段：A 以 `b"hello"` 发起子流；B 在 `accept` 前用 `read_message_async` 读
+///   `OPEN` message；B 以空 welcome `accept`；A `accept` 完成后用
+///   `read_message_async` 读 welcome。整个场景由 `scope.run_until` 驱动。
+/// - 判断：B 读到 `hello`；A 读到的 welcome 长度为 0（空 message）。
+///
+/// Test goal: the OPEN message round-trips through the pending message rings, and
+/// `read_message_async` streams into a caller sink; the welcome is currently empty
+/// because `accept_async` takes a `TrBuffWrite` (non-empty welcome is P3.3c work).
+/// Method: A opens with `b"hello"`; B reads it before accept and accepts with an
+/// empty welcome; A reads the welcome after accept.
+/// Assertion: B reads `hello`; A reads an empty welcome (length 0).
+async fn run_message_scenario_<RA, WA, RB, WB, S, RT>(
+    rt: &RT,
+    scope: &S,
+    tx_a: WA,
+    rx_a: RA,
+    tx_b: WB,
+    rx_b: RB,
+) where
+    RA: TrBuffRead<u8> + TrConsumerState + 'static,
+    WA: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
+    RB: TrBuffRead<u8> + TrConsumerState + 'static,
+    WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
+    S: common::TrSmokeScope + Clone + 'static,
+    RT: common::TrSmokeRt,
+{
+    let (conn_a, conn_b) = common::connect_pair_::<
+        common::SmokeMuxConfig<WA, RA, RT>,
+        common::SmokeMuxConfig<WB, RB, RT>,
+        RA,
+        WA,
+        RB,
+        WB,
+        S,
+    >(rt, scope, tx_a, rx_a, tx_b, rx_b)
+    .await;
+
+    let dock_b = Dock::new(1u32);
+    let mut listener = conn_b
+        .bind_async(dock_b)
+        .await
+        .expect("B 侧绑定监听 dock 应当成功")
+        .listen_async_default()
+        .await
+        .expect("B 侧建立 listener 应当成功");
+
+    let dock_a = Dock::new(0x2001u32);
+    let mut open_message: &[u8] = b"hello";
+    let mut handle = conn_a
+        .bind_async(dock_a)
+        .await
+        .expect("A 侧绑定发起 dock 应当成功")
+        .open_channel_async(dock_b, &mut open_message)
+        .await
+        .expect("A 侧发起子流应当成功");
+
+    let (opened, incoming) = futures::join!(
+        async {
+            let mut empty: [u8; 0] = [];
+            let mut welcome: &mut [u8] = &mut empty[..];
+            handle
+                .accept_async_closure(&mut welcome, || {
+                    (
+                        crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY),
+                        crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY),
+                    )
+                })
+                .await
+        },
+        async {
+            let mut incoming_handle = listener
+                .income_async()
+                .await
+                .expect("B 侧应当取到入向建流请求");
+            let mut got = [0u8; 16usize];
+            let mut sink: &mut [u8] = &mut got[..];
+            let n = incoming_handle
+                .read_message_async(&mut sink)
+                .await
+                .expect("B 侧读 OPEN message 应当成功");
+            assert_eq!(&got[..n], b"hello", "OPEN message 应原样送达");
+            let mut empty: [u8; 0] = [];
+            let mut welcome: &mut [u8] = &mut empty[..];
+            incoming_handle
+                .accept_async_closure(&mut welcome, || {
+                    (
+                        crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY),
+                        crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY),
+                    )
+                })
+                .await
+        },
+    );
+    opened.expect("A 侧最终裁决应当成功");
+    incoming.expect("B 侧最终裁决应当成功");
+
+    let mut got = [0u8; 16usize];
+    let mut sink: &mut [u8] = &mut got[..];
+    let n = handle
+        .read_message_async(&mut sink)
+        .await
+        .expect("A 侧读 welcome 应当成功");
+    assert_eq!(n, 0usize, "当前 welcome 按空载荷发出");
+}
+
+async fn mux_message_inmem_dual_() {
+    let (a_tx, b_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+    let (b_tx, a_rx) = common::make_passive_ring_(common::K_NET_BUFFER_SIZE);
+
+    let rt = current_rt_();
+    let scope = rt.local_scope();
+    let scenario = run_message_scenario_(&rt, &scope, a_tx, a_rx, b_tx, b_rx);
+    scope.run_until(scenario).await;
+}
+single_runtime_test_!(mux_message_inmem_dual_);
 
 /// 测试目标：**传输环取到环原语的下限（1 字节）**时，握手 + 建流 + 双向收发仍全部成功。
 ///

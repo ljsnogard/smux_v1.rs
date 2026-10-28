@@ -1934,6 +1934,23 @@ connection/
      tokio（inmem 20 / cross_thread 1 / smoke 5）；smol（同左）；`alloc_count` 1；
      clippy 0 error；`format_use_imports.py --check` 189 文件全绿。
 
+- 20261029-0245：**分配器清理 R2：建流期 message 路径去 Global / T23**。
+  1. `ControlFrame_` 删除 `payload_: Vec<u8>` 与 `payload_()`，改为 `Copy` 的纯帧头；
+     `OPEN` / `ACCEPT` / `REJECT` 载荷由 `main_loop::write_control_frame_async_` 的
+     独立 `&[u8]` 参数携带（T23 完成）。
+  2. `read_msg_outgoing_` 换成 `read_msg_outgoing_into_`：写入 `main_loop` 从连接级
+     Scope 一次分配、每请求复用的固定缓冲；超长在**读正文前**返回
+     `ReadOutgoingErr_::TooLarge`。
+  3. `read_message_async` 改为 1 KiB 栈上分块，逐块 `enqueue_frame_` 写 sink，不再
+     先分配整条 `Vec<u8>`。
+  4. `main_step_` / `handle_request_` 增加 `msg_buf` 参数；`main_loop` 启动时分配
+     `pending_msg_capacity` 大小的缓冲。
+  5. 新增单测 `read_outgoing_into_buffer_rejects_overlong` 与集成测试
+     `mux_message_inmem_dual_`（`OPEN` message 非空；welcome 仍为空载荷，受
+     `accept_async` 的 `TrBuffWrite` 形状限制，P3.3c 待办）。
+  6. 验收：lib **365** / inmem **21**（compio / tokio / smol）/ smoke 5 /
+     `alloc_count` 1；基线不变（绑定 + 监听：全局 11 / 注入 33）。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2129,7 +2146,7 @@ value，key 与树结构保持不变。
 | T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | P3.1a 完成（登记 / 取出 / 句柄持有）；main 读 ring 组帧待 P3.1b |
 | T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 完成（默认实现 + 建连快照） |
 | T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | P3.3b 完成：三类载荷都经 message ring；main 写 incoming 供 `read_message_async` 读 |
-| T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | API + 读取 + incoming 填充完成；超长 / `Busy` 策略待 P3.3c |
+| T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | API + streaming 读取 + incoming 填充完成；`OPEN` message 集成用例已加；非空 welcome / `MessageTooLong` 错误面待 P3.3c |
 
 ### E. 索引（bplus_tree_cmp）
 
@@ -2147,7 +2164,7 @@ value，key 与树结构保持不变。
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 仍待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
-| T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` / `util_` 待 P5 |
+| T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` 已删（R2，改独立切片）；`util_` 待 P5 |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 
 ### G. 测试与验收

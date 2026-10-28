@@ -2091,7 +2091,6 @@ fn window_update_frame_(pair: (Dock, Dock), report: WindowReport) -> ControlFram
         pair.0,
         pair.1,
         Option::Some((report.recv_total(), report.window())),
-        Vec::new(),
     )
 }
 
@@ -3533,17 +3532,19 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
+    // 这条路径只写**无载荷**控制帧（CLOSE / WINDOW_UPDATE 等）；`OPEN` / `ACCEPT` /
+    // `REJECT` 的载荷由 `main_loop` 直接交给公共 TX，不经过事件通道。
+    let payload: &[u8] = &[];
     let header = FrameHeader::new_(
         frame.kind_(),
         frame.flags_(),
         frame.local_dock_(),
         frame.remote_dock_(),
-        frame.payload_().len(),
+        payload.len(),
         frame.window_(),
     );
     // 帧头进栈上定长缓冲；帧总长上限的判定与「拼成整帧」时同义。
     let (head, head_len) = encode_header_(&header)?;
-    let payload = frame.payload_();
     if head_len + payload.len() > max_packet_size {
         return Result::Err(MuxError::FrameTooLarge);
     }

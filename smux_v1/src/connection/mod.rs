@@ -672,7 +672,7 @@ pub(crate) use scope_::alloc_zeroed_bytes_async_;
 pub(crate) use scope_::new_test_scope_;
 pub(crate) use main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_, main_loop_async_};
 pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
-pub(crate) use mux_connection::ReserveErr_;
+pub(crate) use mux_connection::{ReadOutgoingErr_, ReserveErr_};
 pub(crate) use slot_::PushErr_;
 pub use ring_::{
     BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff_, MuxChanBuffOwnedBy, RingBuildErr,
