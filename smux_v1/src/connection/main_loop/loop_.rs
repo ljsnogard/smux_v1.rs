@@ -31,12 +31,14 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         session_::race_cancel_,
         session_::MuxShared_,
-        HINT_MAIN_RESET, HINT_MAIN_RETIRED, HINT_MAIN_TX_DRAINED,
+        HINT_MAIN_RELEASE, HINT_MAIN_RESET, HINT_MAIN_RETIRED, HINT_MAIN_TX_DRAINED,
         signal_::{
-            ControlFrame_, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED, HINT_W_RESET_ENQUEUED,
+            ControlFrame_, HINT_R_RELEASE, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED,
+            HINT_W_RELEASED, HINT_W_RESET_ENQUEUED,
         },
     },
     flow_ctrl::{RecvTotal, WindowReport},
+    metrics::{ChannelCloseReason, TrMetricsSink},
     x_deps::{abs_cancel, abs_smux},
 };
 
@@ -219,6 +221,12 @@ where
         let _ = shared.reg_().mark_failed_(&err, cancel.child_token()).await;
         shared.reg_().cancel_loops_();
         return false;
+    }
+    // 身份释放放在最后：本轮的 `CLOSE(FIN)` / `CLOSE(RESET)` 已经进公共 TX ring，
+    // 释放扫描看到的是最新状态。判据由 `claim_release_` 的一次性 CAS 给出，因此写
+    // 循环重复 raise 本提示不会重复释放。
+    if hints & HINT_MAIN_RELEASE != 0u64 {
+        flush_releasable_::<C, _>(shared, cancel).await;
     }
 
     // 公共 RX：每轮最多 `K_MAIN_FRAME_BATCH` 条完整帧。
@@ -940,6 +948,74 @@ where
     Result::Ok(())
 }
 
+/// 释放所有「两个方向都已在协议层收尾」的子流身份（T1 的收口动作）。
+///
+/// # 为什么在 main
+///
+/// 注册表身份的唯一写者是 `main_loop`；写循环只把本地表 / 半部收干净、置位并
+/// raise [`HINT_MAIN_RELEASE`]，不再自己取注册表写锁。判据与「恰好一次」的语义都在
+/// [`ChannelRegistry_::release_done_channels_`] 内部（`claim_release_` 的一次性 CAS），
+/// 因此这里的重复调用没有副作用。
+///
+/// # 释放之后要唤醒谁
+///
+/// - 读循环按 `RELEASED` 位摘本地读表并关接收环写端（`HINT_R_RELEASE`）；
+/// - 写循环按同一位摘本地写表、关发送环消费端（`HINT_W_RELEASED`）；
+/// - 应用侧的 `flush_async` / `close_async` 等待者由 `notify_both_progress_` 叫醒。
+///
+/// 「最后一条活跃子流与对端双向收尾」时的连接收尾也在这里：`became_idle` 只有
+/// `main_loop` 看得到（它是唯一写者），因此不再需要 `maybe_release_` 在复用循环里
+/// 顺手 `cancel_loops_`。
+///
+/// [`ChannelRegistry_::release_done_channels_`]:
+///     crate::connection::ChannelRegistry_::release_done_channels_
+async fn flush_releasable_<C, K>(shared: &MuxShared_<C>, cancel: &K)
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let now_millis = shared.conn_clock_().now_millis_();
+    let Result::Ok((released, became_idle)) = shared
+        .reg_()
+        .release_done_channels_(now_millis, cancel.child_token())
+        .await
+    else {
+        return;
+    };
+    // 「本次确实释放过」才可能触发连接收尾：与旧的 `maybe_release_` 行为一致，
+    // 不在空扫描上做判断（closing + 无活跃子流的情形由计时循环兜底）。
+    let did_release = !released.is_empty();
+    for (pair, owner) in released {
+        // 身份已释放：两侧循环据此摘本地表并关环半部。事实是 `RELEASED` 位，
+        // 提示只负责唤醒。
+        shared.reg_().raise_read_hint_(HINT_R_RELEASE);
+        shared.reg_().raise_write_hint_(HINT_W_RELEASED);
+        // 两个方向都不会再有新的进展：等待中的 `TrBuffFlush` / `close_async` 必须醒来
+        // 并按终局复检（否则它们会永远 park 在一条已经从注册表消失的子流上）。
+        owner.notify_both_progress_();
+        // 上报子流关闭（正常协议收尾）。`claim_release_` 是一次性的 CAS，因此这里
+        // **恰好上报一次**；超时与建流超时两条路径不经过本函数，各自在 `timer_` 里上报。
+        shared.metrics_().on_channel_closed(
+            pair.0,
+            pair.1,
+            ChannelCloseReason::Fin,
+            now_millis.saturating_sub(owner.created_millis_()),
+        );
+    }
+    // **优雅关闭的收口点**：连接处于等待关闭，而这是最后一条活跃子流——它与对端
+    // 双向收尾意味着连接上再也没有需要排空的东西，此刻就收尾。
+    //
+    // 收尾幂等（取消令牌是幂等操作），计时循环在它自己的扫描里也可能同时发现
+    // 「可以收尾」——两边谁先看到谁做。放在这里而不是全交给计时循环，是因为延迟
+    // 敏感：计时循环可能正睡在一个较远的期限上。
+    if did_release && became_idle && shared.reg_().is_closing_() {
+        // 本版没有写泵：复用循环成帧时直接写进传输，因此收尾就是「几个循环一起
+        // 取消」——连接内部没有任何还压着字节的环要排空（见
+        // `ChannelRegistry_::cancel_loops_` 的文档）。
+        shared.reg_().cancel_loops_();
+    }
+}
+
 /// 把一条控制帧写进公共 TX ring（背压时 park 等 `tx_space`）。
 ///
 /// 帧头由 `FrameHeader` + `encode_header_` 重新编码；`payload` 是 `OPEN` / `ACCEPT` /
@@ -1003,7 +1079,7 @@ mod tests_ {
             session_::MuxShared_,
             test_support_::TestMuxConfig_,
             ChannelHandle, ControlState_, Dock, DockBinding, FrameKind, MuxConnection, Tcs_,
-            HINT_MAIN_RETIRED,
+            HINT_MAIN_RELEASE, HINT_MAIN_RETIRED,
         },
         flow_ctrl::{Credit, RecvTotal, WindowReport},
         handshake::opts::{BasicOpts, HandshakeOpts},
@@ -1229,5 +1305,175 @@ mod tests_ {
         .expect("读公共 TX 应当成功")
         .expect("公共 TX 里应当有一条 REJECT");
         assert_eq!(header.kind(), FrameKind::Reject, "第一帧应当是 REJECT");
+    }
+
+    /// 测试 main 在 `HINT_MAIN_RELEASE` 上释放「两个方向都收尾」的子流身份。
+    /// - 手段：`new_test_bundle_` 建无循环连接；`reserve_channel_` 登记一条子流并拿到
+    ///   owner；手动置上两个方向的收尾位（`LOCAL_FIN_SENT` + `APP_RX_CLOSED`，并把
+    ///   `LOCAL_RESET_FLUSHED` 一起置上以表示 RESET 已上线）；raise
+    ///   `HINT_MAIN_RELEASE` 后跑一轮 `main_step_`。
+    /// - 判断：`owner.is_released_()` 为真、注册表里该 dock 对进入 `WaitClose`，说明
+    ///   身份释放确实由 main 落实（写循环不再持有这条职责）；`claim_release_` 的第二
+    ///   次调用返回假，说明「恰好一次」的闸门仍然有效。
+    ///
+    /// Test that main releases a fully-closed channel identity on
+    /// `HINT_MAIN_RELEASE`.
+    /// Method: build a loop-less connection with `new_test_bundle_`, register a
+    /// channel through `reserve_channel_`, set both directions' completion bits
+    /// (`LOCAL_FIN_SENT` + `APP_RX_CLOSED`, plus `LOCAL_RESET_FLUSHED` to model an
+    /// already-flushed RESET), raise `HINT_MAIN_RELEASE` and run one `main_step_`.
+    /// Assertion: `owner.is_released_()` holds and the dock pair is `WaitClose`,
+    /// proving main performs the release; a second `claim_release_` returns false,
+    /// proving the exactly-once gate is intact.
+    #[test]
+    fn step_releases_done_channel_() {
+        let (conn, shared) = MuxConnection::<TestMuxConfig_>::new_test_bundle_(
+            HandshakeOpts {
+                basic_opts: BasicOpts::default(),
+            },
+            TestMuxConfig_,
+        );
+        let ctl = conn.core_().control_().clone();
+        let (mut tx_w, _tx_r) =
+            new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
+                .expect("建公共 TX 环");
+        let (_rx_w, mut rx_r) =
+            new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
+                .expect("建公共 RX 环");
+        let mut scratch = [0u8; 256usize];
+        let mut msg_buf = [0u8; 512usize];
+        let mut public_read = MainPublicRead_::new_();
+        let cancel = NonCancellableToken::new();
+        let local = Dock::new(7u32);
+        let remote = Dock::new(9u32);
+
+        let (owner, _msg) = block_on_ready_(shared.reg_().reserve_channel_(
+            local,
+            remote,
+            0u64,
+            512usize,
+            NonCancellableToken::new(),
+        ))
+        .expect("登记子流身份应当成功");
+        assert!(!owner.is_released_(), "刚登记的身份不应已释放");
+        // 两个方向都收尾：发送方向（FIN 已上线）+ 接收方向（应用关读、RESET 已上线）。
+        owner.set_local_fin_sent_();
+        owner.set_app_rx_closed_();
+        owner.set_local_reset_flushed_();
+        ctl.raise_main_hint_(HINT_MAIN_RELEASE);
+        assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
+            &shared,
+            &ctl,
+            &mut tx_w,
+            &mut rx_r,
+            &mut scratch,
+            &mut msg_buf,
+            &mut public_read,
+            &cancel,
+        )));
+        assert!(owner.is_released_(), "main 应当释放已完成收尾的身份");
+        assert!(
+            block_on_ready_(shared.reg_().is_wait_close_(
+                local,
+                remote,
+                0u64,
+                NonCancellableToken::new(),
+            ))
+            .expect("查询宽限态应当成功"),
+            "释放后的身份应处于拆流宽限期"
+        );
+        assert!(
+            !owner.claim_release_(),
+            "释放闸门只允许认领一次，重复扫描不得再次成功"
+        );
+    }
+
+    /// 测试「应用关读但 RESET 还没上线」的子流不会被 main 提前释放。
+    /// - 手段：`new_test_bundle_` + `reserve_channel_` 登记身份；置
+    ///   `LOCAL_FIN_SENT` + `APP_RX_CLOSED`，**不**置 `LOCAL_RESET_FLUSHED`；raise
+    ///   `HINT_MAIN_RELEASE` 跑一轮 `main_step_`，然后再置 `LOCAL_RESET_FLUSHED` 跑第二轮。
+    /// - 判断：第一轮之后身份仍在活跃表（未 `RELEASED`、非 `WaitClose`），第二轮之后
+    ///   才释放——保证 `CLOSE(RESET)` 不会因为身份先被摘掉而丢掉。
+    ///
+    /// Test that a channel whose RESET is still pending is not released early.
+    /// Method: register an identity, set `LOCAL_FIN_SENT` + `APP_RX_CLOSED` but
+    /// leave `LOCAL_RESET_FLUSHED` unset; run one `main_step_`, then set the RESET
+    /// bit and run a second step.
+    /// Assertion: after the first step the identity is still active (not
+    /// `RELEASED`, not `WaitClose`); only the second step releases it, so the
+    /// pending `CLOSE(RESET)` cannot be dropped.
+    #[test]
+    fn step_waits_for_reset_before_release_() {
+        let (conn, shared) = MuxConnection::<TestMuxConfig_>::new_test_bundle_(
+            HandshakeOpts {
+                basic_opts: BasicOpts::default(),
+            },
+            TestMuxConfig_,
+        );
+        let ctl = conn.core_().control_().clone();
+        let (mut tx_w, _tx_r) =
+            new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
+                .expect("建公共 TX 环");
+        let (_rx_w, mut rx_r) =
+            new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
+                .expect("建公共 RX 环");
+        let mut scratch = [0u8; 256usize];
+        let mut msg_buf = [0u8; 512usize];
+        let mut public_read = MainPublicRead_::new_();
+        let cancel = NonCancellableToken::new();
+        let local = Dock::new(11u32);
+        let remote = Dock::new(13u32);
+
+        let (owner, _msg) = block_on_ready_(shared.reg_().reserve_channel_(
+            local,
+            remote,
+            0u64,
+            512usize,
+            NonCancellableToken::new(),
+        ))
+        .expect("登记子流身份应当成功");
+        owner.set_local_fin_sent_();
+        owner.set_app_rx_closed_();
+
+        ctl.raise_main_hint_(HINT_MAIN_RELEASE);
+        assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
+            &shared,
+            &ctl,
+            &mut tx_w,
+            &mut rx_r,
+            &mut scratch,
+            &mut msg_buf,
+            &mut public_read,
+            &cancel,
+        )));
+        assert!(
+            !owner.is_released_(),
+            "RESET 尚未上线时不得释放身份（否则 RESET 会丢）"
+        );
+        assert!(
+            !block_on_ready_(shared.reg_().is_wait_close_(
+                local,
+                remote,
+                0u64,
+                NonCancellableToken::new(),
+            ))
+            .expect("查询宽限态应当成功"),
+            "身份应当仍在活跃表里"
+        );
+
+        // RESET 上线之后，下一次提示才允许释放。
+        owner.set_local_reset_flushed_();
+        ctl.raise_main_hint_(HINT_MAIN_RELEASE);
+        assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
+            &shared,
+            &ctl,
+            &mut tx_w,
+            &mut rx_r,
+            &mut scratch,
+            &mut msg_buf,
+            &mut public_read,
+            &cancel,
+        )));
+        assert!(owner.is_released_(), "RESET 上线后应当释放身份");
     }
 }

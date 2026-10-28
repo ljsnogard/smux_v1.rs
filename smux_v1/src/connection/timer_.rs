@@ -398,9 +398,9 @@ where
                 // 而不是继续 park 在一条再也不会被排空的环上。原因（`IdleTimeout`）
                 // 已由计时循环在认领动作时发布，因此这里顺序无关。
                 owner.notify_both_progress_();
-                // 上报子流关闭（空闲超时）。这条路径**不经过** `maybe_release_`——它
-                // 直接释放身份，因此关闭回调只能在这里发（见 [`crate::metrics`] 模块
-                // 文档的插入点说明）。
+                // 上报子流关闭（空闲超时）。这条路径**不经过** `claim_release_` 的
+                // 正常收尾扫描——它直接释放身份，因此关闭回调只能在这里发（见
+                // [`crate::metrics`] 模块文档的插入点说明）。
                 let now_millis = shared.conn_clock_().now_millis_();
                 shared.metrics_().on_channel_closed(
                     local,
@@ -475,7 +475,7 @@ where
                 owner.set_establish_settled_();
                 owner.notify_establish_();
                 // 上报子流关闭（**建流未裁决**即超时）：与 `Abort` 同理，这条路径不经过
-                // `maybe_release_`。
+                // 正常收尾扫描。
                 let now_millis = shared.conn_clock_().now_millis_();
                 shared.metrics_().on_channel_closed(
                     local,

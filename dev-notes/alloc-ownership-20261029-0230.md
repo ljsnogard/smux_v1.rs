@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -199,6 +199,44 @@ P3.3c / P4 / P5 的清理依据。
 8. **T1 剩余**：mux 仍通过 `maybe_release_` 做本地表释放，并仍处理 timer 的
    `WriteEvent_::Control`（PULSE 等）；这两块留 R8。
 
+## 4.7 第 8 轮实施记录（身份释放迁到 main）
+
+1. `ControlState_` 新增 `HINT_MAIN_RELEASE`（bit 3）：写循环完成本地动作后只 raise 它，
+   不再自己取注册表写锁做身份释放。
+2. `ChannelRegistry_::release_done_channels_`：在**同一把写锁**内遍历 `bindings_`，
+   对每条 `Channel` 记录尝试 [`ChannelState_::claim_release_`] 的一次性 CAS，成功者
+   当场转成 `WaitClose` 宽限态；返回 `(释放列表, 活跃子流是否归零)`。认领与转宽限态
+   同锁完成——分两次取锁时「CAS 成功、释放失败」会把子流永久卡在活跃表里
+   （`claim_release_` 不会再成功，也没有别的路径替它转宽限态）。
+3. 释放扫描**跳过**「应用已关读、但 `LOCAL_RESET_FLUSHED` 尚未置位」的子流：`RESET`
+   帧由 main 写进公共 TX ring，写循环刷空后才置位；提前释放会让
+   `scan_reset_pending_` 再也看不到该子流，`CLOSE(RESET)` 永久丢失。
+4. `main_loop::flush_releasable_` 承接原 `maybe_release_` 的全部副作用：
+   `HINT_R_RELEASE` / `HINT_W_RELEASED` 唤醒两侧循环、`notify_both_progress_` 唤醒
+   应用等待者、`Fin` 的 `on_channel_closed` **恰好一次**上报，以及
+   `became_idle && is_closing` 时的连接收尾（`cancel_loops_`）。
+5. 删除 `session_::maybe_release_` 与只被它使用的 `lock_or_fail_` 宏；四个扫描
+   （`scan_peer_closed_` / `scan_write_released_` / `scan_fin_enqueued_` /
+   `scan_reset_enqueued_`）降为**同步函数**，只做本地表 / 环半部动作 + 置位 + raise
+   提示。四个扫描里「表项已摘、owner 仍在注册表」的兜底路径由 main 的注册表全表扫描
+   自然覆盖，不再需要按 pair 反查 `channel_owner_`。
+6. `mux_loop_async_` 去掉读事件通道参数（`read_events`）：写循环不再向读循环投事件，
+   启动处（`mux_connection::conn_`）同步少传一份 `EventSender_`。
+7. 新增两条单测：`step_releases_done_channel_`（main 释放、二次 `claim_release_` 必须
+   失败）、`step_waits_for_reset_before_release_`（欠 RESET 时两轮之间不得提前释放）。
+8. 分配归属：释放扫描的返回列表用 `C::RegistryAlloc`，空列表不分配；只有**确实有
+   释放**时才产生一次 `Vec` 分配。实测拆流阶段注入 **14 → 24**（8 条子流各一批），
+   全局仍为 **0**；绑定 + 监听（全局 4 / 注入 40）、建流（全局 0）与稳态搬运
+   （注入 0）不变。`tests/alloc_count.rs` 的拆流阶段只打印、不设上限断言（次数随
+   「一批释放几条」变化，不是结构性不变量），已在注释里写明原因。
+9. **T1 仍未完全完成**：mux 仍处理 timer 的 `WriteEvent_::Control`（`PULSE`、空闲
+   拆流的 `FIN` / `RESET`、建流超时的 `REJECT`），也仍在每轮调用
+   `drain_session_events_`（`SessionMailbox_` 的投递不带唤醒，需要和事件通道一起在
+   R9/P5 清理）。timer 控制帧走 main 属于 R9 的 timer 收缩（T4）。
+10. 验收：lib **367**（原 365 + 新增 2）；`inmem_mux` **21**（compio / tokio / smol）；
+    `keepalive_compio` 5；`smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；
+    doc 12；clippy 干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -209,8 +247,8 @@ P3.3c / P4 / P5 的清理依据。
 | R5（已完成） | 删除 `PendingFin_`；FIN 重试先折进 `drain_once_` 的表扫描 |
 | R6（已完成） | `TX_DRAINED` / `FIN_ENQUEUED`；main 发 `CLOSE(FIN)`；mux 在公共 TX 刷空后确认上线 |
 | R7（已完成） | 把 `CLOSE(RESET)` 迁到 main；删除 `flush_rx_closed_` / `HINT_W_RX_CLOSED` / `control_close_via_` |
-| R8（T1 尾） | 把 `maybe_release_` 本地表释放与 timer 控制帧也迁出 mux，完成 T1 |
-| R9（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
+| R8（已完成） | 身份释放（`claim_release_` / `release_channel_` / 关闭上报 / 连接收尾）迁到 `main_loop::flush_releasable_`；mux 只置位 + raise `HINT_MAIN_RELEASE` |
+| R9（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩（`PULSE` / 空闲拆流的 `FIN`/`RESET` / 建流超时 `REJECT` 改由 main 组帧）；全局分配基线重定 |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：

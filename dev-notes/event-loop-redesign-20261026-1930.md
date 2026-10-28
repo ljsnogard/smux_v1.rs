@@ -1051,6 +1051,11 @@ impl<const N: usize> WakerSlots_<N> {
 - 调 `maybe_release_` / `release_channel_` / `unreserve_channel_`；
 - 维护 `PendingFin_`（`BTreeSet`）——用 owner 的 `TX_DRAINED` 位 + 本地表扫描替代。
 
+> **落地状态（R8）**：`FIN`（R6）/ `RESET`（R7）/ 身份释放（R8）已全部移出
+> `mux_loop`——释放由 `main_loop::flush_releasable_` 在 `HINT_MAIN_RELEASE` 上执行，
+> 写循环只做本地表 / 半部动作、置位与 raise 提示。**尚未完成**的是 `PULSE` 等 timer
+> 控制帧（仍走 `WriteEvent_::Control` → `write_control_blocking_`），留 R9/T4。
+
 **数据帧成帧**保留在 `mux_loop`：它从发送环取段、写 `FrameHeader`（`Data`）、复制载荷。
 这是“把子流荷载报文通过 Tx 发送出去”，属于数据搬运；不涉及协议决策。
 
@@ -1177,6 +1182,7 @@ main，demux 用只读方法取读锁。取锁是协作式异步获取（可能�
 | `HINT_MAIN_TX_CLOSED` | main | 应用丢了发送半边，准备 `TX_DRAINED` 后发 FIN |
 | `HINT_MAIN_RX_CLOSED` | main | 应用丢了接收半边，组 `CLOSE(RESET)` |
 | `HINT_MAIN_TX_DRAINED` | main | mux 已排空某子流，可以发 `CLOSE(FIN)` |
+| `HINT_MAIN_RELEASE` | main | 有子流两个方向都收尾，扫身份表释放（`claim_release_` 一次性 CAS） |
 | `HINT_MAIN_CLOSE` | main | 连接进入等待关闭 / 关闭请求 |
 | `HINT_MAIN_TIMER` | main | `timer_loop` 到期；main 执行 `tick_` |
 
@@ -1993,6 +1999,28 @@ connection/
   7. **T1 剩余**：mux 仍通过 `maybe_release_` 做本地表释放，并仍处理 timer 的
      `WriteEvent_::Control`。
 
+- 20261029-0740：**R8：身份释放迁到 main（T1 第 1 步完成）**。
+  1. `ControlState_` 新增 `HINT_MAIN_RELEASE`；写循环的四个扫描在完成本地动作后只
+     raise 它，不再取注册表写锁、不再调 `maybe_release_`。
+  2. 注册表新增 `release_done_channels_`：同一把写锁内对每条 `Channel` 尝试
+     `claim_release_` 的一次性 CAS，成功者当场转 `WaitClose` 宽限态，返回
+     `(释放列表, became_idle)`；「表项已摘、owner 仍在注册表」的兜底路径由全表扫描
+     自然覆盖。
+  3. `main_loop::flush_releasable_` 承接原 `maybe_release_` 的全部副作用：双向唤醒提示、
+     `notify_both_progress_`、`Fin` 的 `on_channel_closed`（恰好一次）、
+     `became_idle && is_closing` 时 `cancel_loops_`。
+  4. **RESET 顺序**：释放扫描跳过「应用关读但 `LOCAL_RESET_FLUSHED` 未置位」的子流，
+     否则 `WaitClose` 会让 `scan_reset_pending_` 再也看不到它，`RESET` 丢失。
+  5. 四个扫描降为同步函数；删除 `maybe_release_` / `lock_or_fail_`；
+     `mux_loop_async_` 去掉 `read_events` 参数。
+  6. 新增单测 `step_releases_done_channel_` / `step_waits_for_reset_before_release_`。
+  7. 验收：lib **367** / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1 / doc 12；clippy / format 干净。
+  8. **T1 仍未完全完成**：mux 仍处理 timer 的 `WriteEvent_::Control`（`PULSE`、
+     空闲拆流的 `FIN`/`RESET`、建流超时的 `REJECT`），并在每轮调用
+     `drain_session_events_`（`SessionMailbox_` 投递不带唤醒）。两者都留 R9/P5
+     （timer 收缩 T4 + 事件通道清理 T8/T24）。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2159,7 +2187,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 部分完成（R6：FIN；R7：RESET；mux 仍通过 `maybe_release_` 做本地表释放、仍处理 timer 的 `WriteEvent_::Control`，T1 剩余） |
+| T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 接近完成（R6：FIN；R7：RESET；R8：身份释放迁 `main_loop::flush_releasable_`。剩余：mux 仍处理 timer 的 `WriteEvent_::Control`，留 R9/T4） |
 | T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P3.3b 完成：`OPEN/ACCEPT/REJECT/CLOSE` 全部写公共 RX，直接状态推进已删 |
 | T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；P2–P3 完成控制帧组帧与建流裁决；关闭推进 / tick 待 P5 |
 | T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | 待做 |
