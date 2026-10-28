@@ -392,8 +392,6 @@ pub(crate) enum SessionEvent_ {
 pub(crate) const HINT_W_TX_CLOSED: u64 = 1u64 << 0usize;
 
 /// 「应用已丢弃接收半边」：写循环据此发 `CLOSE(RESET)` 并关闭接收环。
-pub(crate) const HINT_W_RX_CLOSED: u64 = 1u64 << 1usize;
-
 /// 「对端发来 `CLOSE`」：写循环据此丢弃发送方向 / 推进身份释放。
 ///
 /// `FIN` 与 `RESET` 的事实同样在各子流状态字（`PEER_FIN` / `PEER_RESET`）上。
@@ -407,6 +405,9 @@ pub(crate) const HINT_W_RELEASED: u64 = 1u64 << 3usize;
 
 /// 「`main_loop` 已把 `CLOSE(FIN)` 写进公共 TX ring」：写循环在刷出后确认上线。
 pub(crate) const HINT_W_FIN_ENQUEUED: u64 = 1u64 << 4usize;
+
+/// 「main 已把 `CLOSE(RESET)` 写进公共 TX ring」：写循环在刷出后确认上线。
+pub(crate) const HINT_W_RESET_ENQUEUED: u64 = 1u64 << 5usize;
 
 /// 「身份已释放」：读循环据此摘掉接收表项并关闭接收环写端。
 pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;

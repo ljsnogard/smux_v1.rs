@@ -666,7 +666,9 @@ pub(crate) type ConnCoreAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::CoreAl
 
 /// 公共报文子流（`PublicChannel_` 与两条 ring）的分配器投影。
 pub(crate) type ConnPublicAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::PublicAlloc;
-pub(crate) use control_state_::{ControlState_, HINT_MAIN_RETIRED, HINT_MAIN_TX_DRAINED};
+pub(crate) use control_state_::{
+    ControlState_, HINT_MAIN_RESET, HINT_MAIN_RETIRED, HINT_MAIN_TX_DRAINED,
+};
 pub(crate) use scope_::alloc_zeroed_bytes_async_;
 #[cfg(test)]
 pub(crate) use scope_::new_test_scope_;

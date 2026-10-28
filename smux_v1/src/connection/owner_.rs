@@ -102,6 +102,9 @@ const TX_DRAINED: usize = 1usize << 19usize;
 /// `main_loop` 已把 `CLOSE(FIN)` 写进公共 TX ring，等待复用循环在刷出后确认上线。
 const FIN_ENQUEUED: usize = 1usize << 20usize;
 
+/// `main_loop` 已把 `CLOSE(RESET)` 写进公共 TX ring，等待复用循环确认上线。
+const RESET_ENQUEUED: usize = 1usize << 21usize;
+
 /// 本端已发出 `CLOSE(RESET)`：不再接收数据。
 const LOCAL_RESET_SENT: usize = 1usize << 3usize;
 
@@ -853,6 +856,21 @@ impl ChannelState_ {
         let _ = self
             .flags_
             .try_spin_compare_exchange_weak(|_| true, |value| value | PEER_RESET);
+    }
+
+    /// 记录「main 已把 `CLOSE(RESET)` 写进公共 TX ring」；返回是否首次置位。
+    pub(crate) fn set_reset_enqueued_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| !has_flag_(value, RESET_ENQUEUED),
+                |value| value | RESET_ENQUEUED,
+            )
+            .is_succ()
+    }
+
+    /// main 是否已把 `CLOSE(RESET)` 写进公共 TX ring。
+    pub(crate) fn is_reset_enqueued_(&self) -> bool {
+        has_flag_(self.flags_.value(), RESET_ENQUEUED)
     }
 
     /// 记录「本端发出的 `CLOSE(RESET)` 已上线」（写循环在写出成功后调用）。

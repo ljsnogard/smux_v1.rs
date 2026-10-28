@@ -145,7 +145,7 @@ use crate::{
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, EventTake_,
             HINT_R_RELEASE, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED, HINT_W_RELEASED,
-            HINT_W_RX_CLOSED, ReadAttach_, ReadEvent_, TrEventReceiver_,
+            HINT_W_RESET_ENQUEUED, ReadAttach_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteAttach_, WriteEvent_,
         },
         telegraph::TgRecvCtx_,
@@ -490,7 +490,9 @@ fn handle_write_attach_<C>(
         },
     );
     if rx_closed {
-        shared.reg_().raise_write_hint_(HINT_W_RX_CLOSED);
+        shared
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RESET);
     }
     if peer_closed {
         shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
@@ -515,69 +517,6 @@ where
             writer_,
         },
     );
-}
-
-/// 对每条「应用已丢弃接收半边」的子流补一次 `CLOSE(RESET)`。
-///
-/// 与原 `RxClosed` 事件分支同序：认领发送权 → 整帧写出 → 置「已上线」位 → 唤醒应用侧
-/// 接收方向 → 上报 → 尝试释放身份。认领（`claim_local_reset_`）保证同一条至多写一次。
-async fn flush_rx_closed_<C, K>(
-    tx_stage: &mut C::ConnTx,
-    shared: &MuxShared_<C>,
-    table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
-    cancel: &K,
-) -> Result<(), MuxError>
-where
-    C: TrConnCfg,
-    C::Rt: TrTime + Clone,
-    K: TrCancellationToken,
-{
-    // 游标推进而不是收集 `Vec`：热路径上不引入堆分配，也不跨 `await` 持有表借用。
-    let mut cursor: Option<(Dock, Dock)> = Option::None;
-    loop {
-        let next = match cursor {
-            Option::None => table.keys().next().copied(),
-            Option::Some(last) => table
-                .range((Bound::Excluded(last), Bound::Unbounded))
-                .next()
-                .map(|(key, _)| *key),
-        };
-        let Option::Some(pair) = next else {
-            return Result::Ok(());
-        };
-        cursor = Option::Some(pair);
-        let Some((_, entry)) = table.get(pair) else {
-            continue;
-        };
-        let owner = entry.owner_.clone();
-        if !owner.is_app_rx_closed_() || owner.is_local_reset_flushed_() {
-            continue;
-        }
-        // FIN 已经进公共 TX ring、但还没确认上线：先等它上线，再发 RESET。
-        // 否则 RESET（写循环直接写 `ConnTx`）会越过 FIN（公共 TX ring），对端先看到
-        // RESET、后看到 FIN，接收方向就少了一次 `peer_fin` 的释放触发点。
-        if owner.is_app_tx_closed_() && !owner.is_local_fin_sent_() {
-            continue;
-        }
-        if !owner.claim_local_reset_() {
-            continue;
-        }
-        control_close_via_::<C, _>(
-            tx_stage,
-            shared,
-            shared.max_packet_size_,
-            pair.0,
-            pair.1,
-            true,
-            cancel.child_token(),
-        )
-        .await?;
-        owner.set_local_reset_flushed_();
-        owner.notify_rx_progress_();
-        shared.metrics_().on_reset(pair.0, pair.1, false);
-        maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
-    }
 }
 
 /// 推进「对端已发来 `CLOSE`」的拆流记账。
@@ -728,11 +667,63 @@ where
         owner.set_local_fin_sent_();
         #[cfg(feature = "test-loop-probe")]
         crate::connection::loop_probe_::local_fin_sent_();
+        // FIN 已上线；此前因「等 FIN」被跳过的 RESET 现在可以发了。
+        shared
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RESET);
         if let Option::Some((_, entry)) = table.get_mut(pair) {
             entry.reader_.close();
             entry.fin_sent_ = true;
             entry.owner_.notify_tx_progress_();
         }
+        maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
+        if table
+            .get(pair)
+            .map(|(_, entry)| entry.owner_.is_released_())
+            .unwrap_or(false)
+        {
+            table.remove(pair);
+        }
+    }
+}
+
+/// 确认 main 写进公共 TX ring 的 `CLOSE(RESET)` 已经上线。
+///
+/// 调用点保证公共 TX ring 已刷空；此时 `RESET_ENQUEUED` 的条目可以置
+/// `LOCAL_RESET_FLUSHED`、唤醒 `ChannelRx::close_async` 等待者并尝试释放身份。
+async fn scan_reset_enqueued_<C, K>(
+    shared: &MuxShared_<C>,
+    table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
+    read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    C::Rt: TrTime + Clone,
+    K: TrCancellationToken,
+{
+    let mut cursor: Option<(Dock, Dock)> = Option::None;
+    loop {
+        let next = match cursor {
+            Option::None => table.keys().next().copied(),
+            Option::Some(last) => table
+                .range((Bound::Excluded(last), Bound::Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        };
+        let Option::Some(pair) = next else {
+            return Result::Ok(());
+        };
+        cursor = Option::Some(pair);
+        let Option::Some((_, entry)) = table.get(pair) else {
+            continue;
+        };
+        if !entry.owner_.is_reset_enqueued_() || entry.owner_.is_local_reset_flushed_() {
+            continue;
+        }
+        let owner = entry.owner_.clone();
+        owner.set_local_reset_flushed_();
+        owner.notify_rx_progress_();
         maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
         if table
             .get(pair)
@@ -2686,25 +2677,23 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 pending_hints |= HINT_W_FIN_ENQUEUED;
             }
         }
-        if hints & HINT_W_RX_CLOSED != 0u64 {
-            match race_cancel_(
-                &cancel,
-                flush_rx_closed_::<C, _>(
-                    &mut tx_stage,
-                    &shared,
-                    &mut *table,
-                    &read_events,
+        if hints & HINT_W_RESET_ENQUEUED != 0u64 {
+            if public_tx_r.ring_state().data_size() == 0usize {
+                match race_cancel_(
                     &cancel,
-                ),
-            )
-            .await
-            {
-                Option::None => return,
-                Option::Some(Result::Ok(())) => {}
-                Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-                    return;
+                    scan_reset_enqueued_::<C, _>(&shared, &mut *table, &read_events, &cancel),
+                )
+                .await
+                {
+                    Option::None => return,
+                    Option::Some(Result::Ok(())) => {}
+                    Option::Some(Result::Err(err)) => {
+                        fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                        return;
+                    }
                 }
+            } else {
+                pending_hints |= HINT_W_RESET_ENQUEUED;
             }
         }
         if hints & HINT_W_PEER_CLOSED != 0u64 {
@@ -3386,29 +3375,6 @@ where
         }
     }
     Result::Ok(())
-}
-
-/// 发一条 `CLOSE`。用独立的 helper 以便在事件处理里直接 await。
-async fn control_close_via_<C, K>(
-    tx_stage: &mut C::ConnTx,
-    shared: &MuxShared_<C>,
-    max_packet_size: usize,
-    local_dock: Dock,
-    remote_dock: Dock,
-    reset: bool,
-    cancel: K,
-) -> Result<(), MuxError>
-where
-    C: TrConnCfg,
-    K: TrCancellationToken,
-{
-    let frame = ControlFrame_::plain_(
-        FrameKind::Close,
-        if reset { flags::K_RESET } else { flags::K_FIN },
-        local_dock,
-        remote_dock,
-    );
-    write_control_blocking_::<C, _>(tx_stage, shared, max_packet_size, &frame, &cancel).await
 }
 
 /// 把控制帧写进传输写半边（分块；空间不足时 park 等下游排空方腾出空间）。
