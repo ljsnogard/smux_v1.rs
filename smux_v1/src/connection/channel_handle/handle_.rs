@@ -707,7 +707,7 @@ where
 
 /// 等一个「只表示受理」的请求完成（`MainReply_::Unit`）。
 async fn wait_unit_<C>(
-    waiter: &Tcs_<Result<MainLoopReply_<C>, MainLoopErr_>, C>,
+    waiter: &Tcs_<Result<MainLoopReply_<C>, MainLoopErr_>>,
 ) -> Result<(), HandleError>
 where
     C: TrConnAllocCfg + 'static,
@@ -736,7 +736,10 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::Closed)),
+    };
     let waiter = tcs.clone();
     let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
@@ -773,7 +776,10 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::Closed)),
+    };
     let waiter = tcs.clone();
     let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()

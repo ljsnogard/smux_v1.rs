@@ -505,7 +505,10 @@ where
         return Result::Err(BindError::Mux(MuxError::Closed));
     }
     // 一次请求 + 完成源：登记动作由 `main_loop`（身份表唯一写者）执行。
-    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(BindError::Mux(MuxError::Closed)),
+    };
     let waiter = tcs.clone();
     // 等待方取消 / 丢弃 future 时放弃结果；`main_loop` 在登记前后都会检查
     // `is_abandoned_()`，已放弃就回滚刚登记的身份（见 `main_loop::loop_`）。

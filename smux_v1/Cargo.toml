@@ -34,6 +34,7 @@ mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2
 # - `chan-flume` feature：切回旧的 `flume` 实现，用于 A/B 对比。
 # 包名是 `mpmc-chan`，依赖名取 `mpmc_chan` 以便源码里写 `mpmc_chan::...`。
 mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs", package = "mpmc-chan", optional = true }
+sw-scope = { path = "../../sw-scope" }
 
 crc = { version = "3.4.*" }
 flume = { version = "0.12.*", optional = true }

@@ -222,9 +222,10 @@ mod tests_ {
     #[test]
     fn control_state_is_fifo_and_closes_() {
         let cfg = SingleConnAllocCfg::default();
+        let scope = crate::x_deps::sw_scope::Scope::new();
         let ctl = ControlState_::<SingleConnAllocCfg>::new_(cfg);
         for dock in [1u32, 2u32] {
-            let reply = Tcs_::new_(cfg);
+            let reply = futures::executor::block_on(Tcs_::new_(&scope)).expect("测试域可用");
             assert!(
                 futures::executor::block_on(ctl.submit_async_(
                     MainLoopRequest_::Bind {
@@ -248,7 +249,7 @@ mod tests_ {
         assert!(ctl.try_pop_request_().is_none());
 
         ctl.close_requests_();
-        let reply = Tcs_::new_(cfg);
+        let reply = futures::executor::block_on(Tcs_::new_(&scope)).expect("测试域可用");
         let err = futures::executor::block_on(ctl.submit_async_(
             MainLoopRequest_::Bind {
                 local_dock: Dock::new(3u32),

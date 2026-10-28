@@ -46,7 +46,7 @@ where
         local_dock: Dock,
 
         /// 完成源。
-        reply: Tcs_<MainLoopResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>>,
     },
 
     /// 登记 listener 身份。
@@ -58,7 +58,7 @@ where
         reserve: usize,
 
         /// 完成源。
-        reply: Tcs_<MainLoopResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>>,
     },
 
     /// 把一条已组好的控制帧写进公共 TX ring（fire-and-forget）。
@@ -72,7 +72,7 @@ where
         frame: ControlFrame_,
 
         /// 完成源：帧真正写进公共 TX ring 后完成，调用方据此保证后续帧的顺序。
-        reply: Tcs_<MainLoopResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>>,
     },
 
     /// 为一条子流登记身份（`open_channel_async` 的第一步）。
@@ -84,7 +84,7 @@ where
         remote_dock: Dock,
 
         /// 完成源。
-        reply: Tcs_<MainLoopResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>>,
     },
 
     /// 最终裁决：建环已完成，main 从 message ring 读载荷并组 `OPEN` / `ACCEPT`。
@@ -105,7 +105,7 @@ where
         initial_window: Credit,
 
         /// 完成源：帧写进公共 TX 后完成。
-        reply: Tcs_<MainLoopResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>>,
     },
 
     /// 拒绝入向建流；reason 已写进 outgoing message ring。
@@ -123,7 +123,7 @@ where
         role_: EstablishRole_,
 
         /// 完成源。
-        reply: Tcs_<MainLoopResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>>,
     },
 }
 
@@ -132,7 +132,7 @@ where
     C: TrConnAllocCfg + 'static,
 {
     /// 本次请求的完成源。
-    pub(crate) fn reply_(&self) -> Option<&Tcs_<MainLoopResult_<C>, C>> {
+    pub(crate) fn reply_(&self) -> Option<&Tcs_<MainLoopResult_<C>>> {
         match self {
             MainLoopRequest_::Bind { reply, .. }
             | MainLoopRequest_::Listen { reply, .. }

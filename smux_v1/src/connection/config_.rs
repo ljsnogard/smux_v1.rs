@@ -58,6 +58,11 @@ pub trait TrMuxAllocConfig {
 /// - [`Self::ChanOwnerAlloc`]：身份节点（`ChannelOwner_` / `DockBinding_` 等）；
 /// - [`Self::MpmcAlloc`]：会话内 `mpmc_chan` 通道（外层 `Arc` + 等待 chunk）。
 ///
+/// **临时对象不走这里**：请求完成源（`Tcs_`）与循环暂存（`Owned<[u8]>`）已改由
+/// 连接级 `sw_scope::Scope` 分配，见 `connection::scope_` 与
+/// `dev-notes/sw-scope-20261028-2130.md`。剩下的项都服务于要求 `Allocator` /
+/// `AllocatorClone` 的第三方结构，或连接级 `Shared`。
+///
 /// 本 trait **不要求 `'static`**；只有 [`Self::MpmcAlloc`] 的 GAT 在 `'a` 上带
 /// 生命周期约束——通道把分配器类型嵌进 `MpmcChan<'static, …>`，需要
 /// `MpmcAlloc<'static>: 'static`，但这条需求停在通道这一层。以后新增分配器用途时
@@ -71,20 +76,11 @@ where
     where
         Self: 'a;
 
-    /// 请求完成源（`Tcs_`）的分配器。
-    type TcsAlloc: AllocatorClone + Send + Sync + 'static;
-
     /// `Attach` 交接（`WriteAttach_` / `ReadAttach_`）的分配器。
     type AttachAlloc: AllocatorClone + Send + Sync + 'static;
 
     /// 数据面本地表（`WriteTable_` / `ReadTable_` / `PendingFin_` / telegraph 表）的分配器。
     type LocalTableAlloc: AllocatorClone + Send + Sync + 'static;
-
-    /// 事件通道（`WriteEvent_` / `ReadEvent_`）的分配器。
-    type EventAlloc: AllocatorClone + Send + Sync + 'static;
-
-    /// 循环暂存（`Owned<[u8]>`）的分配器。
-    type ScratchAlloc: AllocatorClone + Send + Sync + 'static;
 
     /// 连接核心 / 共享量 / 取消令牌的分配器。
     type CoreAlloc: AllocatorClone + Send + Sync + 'static;
@@ -101,20 +97,11 @@ where
     /// 取通道分配器的一个实例（交给 `MpmcChan::new_in`）。
     fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static>;
 
-    /// 取请求完成源分配器的实例。
-    fn tcs_alloc(&self) -> Self::TcsAlloc;
-
     /// 取 `Attach` 分配器的实例。
     fn attach_alloc(&self) -> Self::AttachAlloc;
 
     /// 取本地表分配器的实例。
     fn local_table_alloc(&self) -> Self::LocalTableAlloc;
-
-    /// 取事件通道分配器的实例。
-    fn event_alloc(&self) -> Self::EventAlloc;
-
-    /// 取循环暂存分配器的实例。
-    fn scratch_alloc(&self) -> Self::ScratchAlloc;
 
     /// 取连接核心分配器的实例。
     fn core_alloc(&self) -> Self::CoreAlloc;
@@ -142,11 +129,8 @@ where
     A: 'static + AllocatorClone + Default + Send + Sync,
 {
     type MpmcAlloc<'a> = A;
-    type TcsAlloc = A;
     type AttachAlloc = A;
     type LocalTableAlloc = A;
-    type EventAlloc = A;
-    type ScratchAlloc = A;
     type CoreAlloc = A;
     type PublicAlloc = A;
 
@@ -162,23 +146,11 @@ where
         A::default()
     }
 
-    fn tcs_alloc(&self) -> Self::TcsAlloc {
-        A::default()
-    }
-
     fn attach_alloc(&self) -> Self::AttachAlloc {
         A::default()
     }
 
     fn local_table_alloc(&self) -> Self::LocalTableAlloc {
-        A::default()
-    }
-
-    fn event_alloc(&self) -> Self::EventAlloc {
-        A::default()
-    }
-
-    fn scratch_alloc(&self) -> Self::ScratchAlloc {
         A::default()
     }
 

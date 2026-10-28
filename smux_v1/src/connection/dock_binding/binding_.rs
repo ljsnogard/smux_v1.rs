@@ -226,7 +226,10 @@ where
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
     // 一次请求 + 完成源：登记由 `main_loop` 执行（它是身份表唯一写者）。
-    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(BindingError::Closed),
+    };
     let waiter = tcs.clone();
     let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
@@ -285,7 +288,10 @@ where
         return Result::Err(BindingError::ReservedDock);
     }
     // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）：由 `main_loop` 执行。
-    let tcs = Tcs_::new_(conn.core_().config_().alloc_cfg());
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(BindingError::Closed),
+    };
     let waiter = tcs.clone();
     let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()

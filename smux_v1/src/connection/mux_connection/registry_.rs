@@ -149,6 +149,7 @@ use atomic_sync::{
 };
 use mm_ptr::Shared;
 use mpmc_chan::{MpmcBuf, MpmcChan, RecvAsync, SendError, TryRecvError, TrySendError};
+use sw_scope::Scope;
 
 use crate::{
     connection::{
@@ -159,6 +160,7 @@ use crate::{
         },
         pending_msg_::{PendingMsgApp_, PendingMsgMain_, new_pending_msg_},
         public_channel_::ChunkReadState_,
+        scope_::new_conn_scope_,
         signal_::{ReadAttach_, SessionEvent_, SessionMailbox_, WriteAttach_},
         slot_::PushErr_,
         sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
@@ -168,7 +170,7 @@ use crate::{
     handshake::opts::BasicOpts,
     metrics::ConnCloseReason,
     time::millis_of_,
-    x_deps::{abs_cancel, abs_sync::may_break::TrMayBreak},
+    x_deps::{abs_cancel, abs_sync::may_break::TrMayBreak, sw_scope},
 };
 
 /// 对端主动关闭。
@@ -529,10 +531,6 @@ where
 
     /// 数据面本地表分配器（循环建本地表时经 [`ChannelRegistry_::local_table_alloc_`] 取）。
     table_alloc_: C::LocalTableAlloc,
-
-    /// 循环暂存分配器（循环建 `Owned<[u8]>` 暂存时经
-    /// [`ChannelRegistry_::scratch_alloc_`] 取）。
-    scratch_alloc_: C::ScratchAlloc,
 
     /// `local_dock` → dock 级簿记。
     docks_: crate::connection::dock_index_::DockBPlusTree_<C::RegistryAlloc, Dock, DockCtx_<C>>,
@@ -1217,6 +1215,12 @@ where
     /// 正是这一点）。
     loops_: [CancelToken_<C::CoreAlloc>; 4],
 
+    /// 连接级临时对象域（`Tcs_` / 循环暂存）。
+    ///
+    /// **放在锁外**：`Scope` 自己有一把域锁，不参与注册表的读写锁；`Tcs_` 的创建
+    /// 频率高于注册表写锁，放进来只会把两把锁串在一起。
+    scope_: Scope,
+
     /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
     ///
     /// 它内部已经是共享句柄（`mpmc_chan` 的 `Sender` / `Receiver` + 溢出 `Arc`），
@@ -1233,6 +1237,8 @@ where
             // 根对象只做一次引用计数：锁外状态与锁内的表都指向同一份。
             root_: self.root_.clone(),
             loops_: self.loops_.clone(),
+            // 域句柄按值克隆：只增加句柄计数，不复制域内的对象。
+            scope_: self.scope_.clone(),
             // 邮箱按值克隆：生产端共享同一条队列，消费端因此有**多个** drain 者。
             mailbox_: self.mailbox_.clone(),
         }
@@ -1253,14 +1259,9 @@ where
         Result::Ok(guard.table_alloc_.clone())
     }
 
-    /// 取**循环暂存**的分配器（`Owned<[u8]>` 整帧 / 载荷暂存）。
-    pub(crate) async fn scratch_alloc_<K: TrCancellationToken>(
-        &self,
-        cancel: K,
-    ) -> Result<C::ScratchAlloc, ReserveErr_> {
-        let mut session = self.root_.inner_.acquire_session();
-        let guard = acquire_read_(&mut session, cancel).await?;
-        Result::Ok(guard.scratch_alloc_.clone())
+    /// 取**连接级临时对象域**的句柄（`Tcs_` 与循环暂存从这里分配）。
+    pub(crate) fn scope_(&self) -> &Scope {
+        &self.scope_
     }
 
     /// 建立注册表：分配根对象与四本索引，并为四个循环建好取消令牌。
@@ -1277,9 +1278,11 @@ where
         let alloc = cfg.registry_alloc();
         let owner_alloc = cfg.chan_owner_alloc();
         let table_alloc = cfg.local_table_alloc();
-        let scratch_alloc = cfg.scratch_alloc();
         let attach_alloc = cfg.attach_alloc();
         let core_alloc = cfg.core_alloc();
+        // 连接级临时对象域：池分配器取注入的结构分配器，对象因此仍落在调用方
+        // 选定的分配器上（域实体本身走 sw-scope 默认 root 的全局分配，每连接一次）。
+        let scope_ = new_conn_scope_(alloc.clone());
         let loops = [
             // 0：解复用（transport Rx → 各子流接收环）
             // 1：复用（各子流发送环 → transport Tx）
@@ -1323,7 +1326,6 @@ where
                         alloc_: alloc.clone(),
                         owner_alloc_: owner_alloc,
                         table_alloc_: table_alloc,
-                        scratch_alloc_: scratch_alloc,
                         docks_,
                         reusable_docks_: VecDeque::new_in(alloc.clone()),
                         next_fresh_dock_: Dock::new(K_FIRST_AUTO_DOCK),
@@ -1337,6 +1339,7 @@ where
                 alloc,
             ),
             loops_: loops,
+            scope_,
             mailbox_: SessionMailbox_::new_(),
         }
     }

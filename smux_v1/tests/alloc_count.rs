@@ -496,27 +496,27 @@ where
     let bind_global = Usage_::since_(global_usage_(), g0);
     let bind_injected = Usage_::since_(injected_usage_(), i0);
     report_("绑定 + 监听", bind_global, bind_injected);
-    // 身份节点（`Shared<DockBinding_>`）、完成源（`Tcs_`）与请求通道的等待节点都走
-    // **注入**分配器，因此注入侧随 dock 数线性增长；全局侧只钉一个量级上限。
+    // 身份节点（`Shared<DockBinding_>`）与请求通道的等待节点都走**注入**分配器；
+    // 完成源（`Tcs_`）自 `feat/sw-scope` 起改走连接级 `sw_scope::Scope`，它在域内
+    // **按池**向注入分配器要内存，不再每请求一次。因此注入侧的线性增长项少了一项，
+    // 全局侧只钉一个量级上限。
     //
-    // # 基线为什么是 11 / 52（而旧注释写的是 1 / 11）
+    // # 基线为什么是 11 / 33（旧注释写的是 1 / 11，上一版是 11 / 52）
     //
     // 请求队列从内联队列换成 `mpmc_chan`（`fd3aa1c`）之后，每次请求的 park / 唤醒
     // 会在 4 KiB 等待 chunk 里登记节点，注入分配数随之上升；旧基线（11 次）是内联
-    // 队列时代的数字。本文件在 `11c19e5` 之后因配置 trait 新增 GAT 而未再编译过，
-    // 因此这组数字一直没被重新测量。**本次迁移在 `de6b699`（迁移前）与迁移后各测
-    // 一次，结果完全一致**（全局 11 / 65648 B，注入 52 / 97888 B），说明
-    // 「类型参数改为分配器配置」没有改变任何分配行为；这里只是把陈旧基线更新为
-    // 实测值。逐笔归因（那 11 次全局分配来自哪条路径）仍是待办，见 dev-notes。
+    // 队列时代的数字。`Tcs_` 迁入 Scope 后，完成源从「每请求一次 `Shared::new_in`」
+    // 变成「Scope 强池按块分配」，注入次数从 52 降到 33。逐笔归因（那 11 次全局
+    // 分配来自哪条路径）仍是待办，见 dev-notes。
     assert!(
         bind_global.allocs_ <= 16usize,
         "绑定 + 监听阶段发生了 {} 次全局分配（9 个 dock）——listener 通知可能又回到了堆上",
         bind_global.allocs_
     );
     assert_eq!(
-        bind_injected.allocs_, 52usize,
-        "9 个 dock（1 binding + 8 listener）实测 52 次注入分配（身份节点 + 完成源 + \
-         请求通道等待节点），实际 {}",
+        bind_injected.allocs_, 33usize,
+        "9 个 dock（1 binding + 8 listener）实测 33 次注入分配（身份节点 + 请求通道\
+         等待节点 + Scope 池块），实际 {}",
         bind_injected.allocs_
     );
 

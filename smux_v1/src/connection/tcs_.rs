@@ -19,9 +19,12 @@
 //!
 //! # 分配
 //!
-//! 每次 `new_` 一次 `Shared::new`（等价于一次 `Box`），走调用方注入的分配器。
-//! 这是本方案明确允许的堆分配（设计稿 §7.5 / Q5）；后续换池化时只改 `new_` /
-//! `Drop` 两个点。
+//! `Tcs_` 本体（`TcsInner_`）放在**连接级临时对象域**（`sw_scope::Scope`）里，用
+//! `Retain<TcsInner_<T>>` 当句柄。一次请求一次放入，生命周期远短于子流；域随连接
+//! 关闭显式清盘。理由与边界见 `dev-notes/sw-scope-20261028-2130.md` §4.1。
+//!
+//! 每次访问都先 `try_sharing()` 借出视图：视图本身不存储，避免把借用生命周期塞进
+//! 请求结构；代价是每次访问一次状态 CAS（请求路径不是每帧热路径）。
 //!
 //! # 为什么 `state_` 与 `waker_` 用两把锁
 //!
@@ -30,9 +33,6 @@
 //! 「检查到 `Pending` 之后、登记之前」发生的 `set_` 不会丢唤醒：那一侧取走的是
 //! `None`（或旧 waker），而复检会看到 `Done` 并立刻返回 `Ready`。
 
-// 过渡：P0 阶段只落原语、不接线；接入请求通道后删除本行。
-#![allow(dead_code)]
-
 use core::{
     fmt,
     task::{Context, Poll, Waker},
@@ -40,29 +40,20 @@ use core::{
 
 use abs_sync::may_break::TrMayBreak;
 use atomic_sync::mutex::preemptive::SpinningMutexOwned;
-use mm_ptr::Shared;
+use sw_scope::{Retain, Scope, ScopeError};
 
-use crate::{
-    connection::TrConnAllocCfg,
-    x_deps::{abs_sync, atomic_sync, mm_ptr},
-};
+use crate::x_deps::{abs_sync, atomic_sync, sw_scope};
 
 /// 一次请求的完成源。
 ///
-/// 句柄可克隆：调用方持一份等待，`main_loop` 持一份 `set_`。克隆只增加
-/// `Shared` 的强引用计数，不复制结果。
-pub(crate) struct Tcs_<T, C>
-where
-    C: TrConnAllocCfg + 'static,
-{
-    /// 完成源本体。
-    inner_: Shared<TcsInner_<T>, C::TcsAlloc>,
+/// 句柄可克隆：调用方持一份等待，`main_loop` 持一份 `set_`。克隆只增加 `Retain`
+/// 的弱计数，不复制结果。
+pub(crate) struct Tcs_<T> {
+    /// 完成源本体（域内对象）。
+    inner_: Retain<TcsInner_<T>>,
 }
 
-impl<T, C> Clone for Tcs_<T, C>
-where
-    C: TrConnAllocCfg + 'static,
-{
+impl<T> Clone for Tcs_<T> {
     fn clone(&self) -> Self {
         Tcs_ {
             inner_: self.inner_.clone(),
@@ -70,10 +61,7 @@ where
     }
 }
 
-impl<T, C> fmt::Debug for Tcs_<T, C>
-where
-    C: TrConnAllocCfg + 'static,
-{
+impl<T> fmt::Debug for Tcs_<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tcs_")
             .field("state", &self.state_name_())
@@ -105,30 +93,33 @@ enum TcsState_<T> {
     Abandoned,
 }
 
-impl<T, C> Tcs_<T, C>
-where
-    C: TrConnAllocCfg + 'static,
-{
-    /// 建一个尚未完成的完成源（一次 `Shared` 分配）。
-    pub(crate) fn new_(cfg: C) -> Self {
-        Tcs_ {
-            inner_: Shared::new(
-                TcsInner_ {
-                    state_: SpinningMutexOwned::new_owned(TcsState_::Pending),
-                    waker_: SpinningMutexOwned::new_owned(Option::None),
-                },
-                cfg.tcs_alloc(),
-            ),
-        }
+impl<T> Tcs_<T> {
+    /// 在连接级临时对象域里建一个尚未完成的完成源。
+    ///
+    /// # Errors
+    ///
+    /// 域已关闭（连接正在收尾）或池分配失败时返回 [`ScopeError`]。
+    pub(crate) async fn new_(scope: &Scope) -> Result<Self, ScopeError> {
+        let inner_ = scope
+            .put_async(TcsInner_ {
+                state_: SpinningMutexOwned::new_owned(TcsState_::Pending),
+                waker_: SpinningMutexOwned::new_owned(Option::None),
+            })
+            .await?;
+        Result::Ok(Tcs_ { inner_ })
     }
 
-    /// 提交结果；返回 `false` 表示等待方已放弃 / 值已被取走，结果被丢弃。
+    /// 提交结果；返回 `false` 表示等待方已放弃 / 值已被取走 / 域已清盘，结果被丢弃。
     ///
     /// 本方法不唤醒、不 `await`；唤醒在锁外做。重复调用是安全的（第二次起返回
     /// `false`），因此 `main_loop` 不必额外记录“是否已答复”。
     pub(crate) fn set_(&self, value: T) -> bool {
+        let Option::Some(inner) = self.inner_.try_sharing() else {
+            // 域已清盘：没有等待者能收到结果，按“已放弃”丢弃。
+            return false;
+        };
         let accepted = {
-            let mut session = self.inner_.state_.lock_session();
+            let mut session = inner.state_.lock_session();
             let mut guard = session
                 .lock()
                 .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -141,7 +132,7 @@ where
             }
         };
         if accepted {
-            self.wake_waiter_();
+            Self::wake_waiter_(&inner);
         }
         accepted
     }
@@ -150,17 +141,21 @@ where
     ///
     /// 登记 waker 之后**复检**状态，因此不会丢唤醒（见模块文档）。
     pub(crate) fn poll_wait_(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if let Option::Some(value) = self.take_done_() {
+        let Option::Some(inner) = self.inner_.try_sharing() else {
+            // 域已清盘：完成源已失效，等价于等待方被取消。
+            return Poll::Ready(Option::None);
+        };
+        if let Option::Some(value) = Self::take_done_(&inner) {
             return Poll::Ready(Option::Some(value));
         }
-        if self.is_finished_() {
+        if Self::is_finished_(&inner) {
             return Poll::Ready(Option::None);
         }
-        self.register_waker_(cx);
-        if let Option::Some(value) = self.take_done_() {
+        Self::register_waker_(&inner, cx);
+        if let Option::Some(value) = Self::take_done_(&inner) {
             return Poll::Ready(Option::Some(value));
         }
-        if self.is_finished_() {
+        if Self::is_finished_(&inner) {
             return Poll::Ready(Option::None);
         }
         Poll::Pending
@@ -169,10 +164,13 @@ where
     /// 等待方放弃：把 `Pending` 置为 `Abandoned`，并清掉已登记的 waker。
     ///
     /// 已 `Done` 的结果保持原样（随最后一个句柄一起释放）；这样“先取到值、再丢弃
-    /// future”不会把值提前丢掉。
+    /// future”不会把值提前丢掉。域已清盘时无事可做。
     pub(crate) fn abandon_(&self) {
+        let Option::Some(inner) = self.inner_.try_sharing() else {
+            return;
+        };
         let changed = {
-            let mut session = self.inner_.state_.lock_session();
+            let mut session = inner.state_.lock_session();
             let mut guard = session
                 .lock()
                 .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -184,13 +182,13 @@ where
             }
         };
         if changed {
-            self.clear_waker_();
+            Self::clear_waker_(&inner);
         }
     }
 
     /// 是否已经没有可交付的结果（已被取走或已被放弃）。
-    fn is_finished_(&self) -> bool {
-        let mut session = self.inner_.state_.lock_session();
+    fn is_finished_(inner: &TcsInner_<T>) -> bool {
+        let mut session = inner.state_.lock_session();
         let guard = session
             .lock()
             .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -199,7 +197,10 @@ where
 
     /// 等待方是否已经放弃。
     pub(crate) fn is_abandoned_(&self) -> bool {
-        let mut session = self.inner_.state_.lock_session();
+        let Option::Some(inner) = self.inner_.try_sharing() else {
+            return true;
+        };
+        let mut session = inner.state_.lock_session();
         let guard = session
             .lock()
             .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -207,8 +208,8 @@ where
     }
 
     /// 取走已就绪的结果（`Done -> Taken`）。
-    fn take_done_(&self) -> Option<T> {
-        let mut session = self.inner_.state_.lock_session();
+    fn take_done_(inner: &TcsInner_<T>) -> Option<T> {
+        let mut session = inner.state_.lock_session();
         let mut guard = session
             .lock()
             .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -223,8 +224,8 @@ where
     }
 
     /// 登记等待者（同一个 waker 不重复 clone）。
-    fn register_waker_(&self, cx: &mut Context<'_>) {
-        let mut session = self.inner_.waker_.lock_session();
+    fn register_waker_(inner: &TcsInner_<T>, cx: &mut Context<'_>) {
+        let mut session = inner.waker_.lock_session();
         let mut guard = session
             .lock()
             .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -238,9 +239,9 @@ where
     }
 
     /// 取走并唤醒等待者（锁外 `wake`）。
-    fn wake_waiter_(&self) {
+    fn wake_waiter_(inner: &TcsInner_<T>) {
         let waker = {
-            let mut session = self.inner_.waker_.lock_session();
+            let mut session = inner.waker_.lock_session();
             let mut guard = session
                 .lock()
                 .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -252,8 +253,8 @@ where
     }
 
     /// 丢弃已登记的等待者（放弃路径不需要再唤醒它）。
-    fn clear_waker_(&self) {
-        let mut session = self.inner_.waker_.lock_session();
+    fn clear_waker_(inner: &TcsInner_<T>) {
+        let mut session = inner.waker_.lock_session();
         let mut guard = session
             .lock()
             .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -262,7 +263,10 @@ where
 
     /// 状态名（仅用于 `Debug`；不要求 `T: Debug`）。
     fn state_name_(&self) -> &'static str {
-        let mut session = self.inner_.state_.lock_session();
+        let Option::Some(inner) = self.inner_.try_sharing() else {
+            return "closed";
+        };
+        let mut session = inner.state_.lock_session();
         let guard = session
             .lock()
             .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
@@ -280,28 +284,19 @@ where
 /// API future 在提交请求后把等待句柄包进本守卫：调用方取消 / 丢弃 future 时，
 /// `main_loop` 仍会完成协议动作，但 `set_` 会发现没人要而丢弃结果——不会把结果
 /// 泄漏到已放弃的等待方，也不会让 `main_loop` 卡在答复上。
-pub(crate) struct TcsAbandonGuard_<'a, T, C>
-where
-    C: TrConnAllocCfg + 'static,
-{
+pub(crate) struct TcsAbandonGuard_<'a, T> {
     /// 被守卫的等待句柄。
-    tcs_: &'a Tcs_<T, C>,
+    tcs_: &'a Tcs_<T>,
 }
 
-impl<'a, T, C> TcsAbandonGuard_<'a, T, C>
-where
-    C: TrConnAllocCfg + 'static,
-{
+impl<'a, T> TcsAbandonGuard_<'a, T> {
     /// 守卫一个等待句柄。
-    pub(crate) fn new_(tcs_: &'a Tcs_<T, C>) -> Self {
+    pub(crate) fn new_(tcs_: &'a Tcs_<T>) -> Self {
         TcsAbandonGuard_ { tcs_ }
     }
 }
 
-impl<T, C> Drop for TcsAbandonGuard_<'_, T, C>
-where
-    C: TrConnAllocCfg + 'static,
-{
+impl<T> Drop for TcsAbandonGuard_<'_, T> {
     fn drop(&mut self) {
         self.tcs_.abandon_();
     }
@@ -316,6 +311,9 @@ mod tests_ {
         },
         task::{Context, Wake},
     };
+
+    use futures::executor::block_on;
+    use sw_scope::Scope;
 
     use super::*;
 
@@ -342,6 +340,11 @@ mod tests_ {
         (Waker::from(probe.clone()), probe)
     }
 
+    /// 在测试域里建一个完成源。
+    fn new_tcs_<T>(scope: &Scope) -> Tcs_<T> {
+        block_on(Tcs_::<T>::new_(scope)).expect("测试域应当可用")
+    }
+
     /// 测试 `set_` 之后 `poll_wait_` 取到值，且第二次 poll 不再交出。
     /// - 手段：建 `Tcs_<u32>`，`set_(7)` 后用固定 waker 的 `Context` poll 两次。
     /// - 判断：第一次返回 `Ready(Some(7))`；第二次返回 `Ready(None)`（已 `Taken`）。
@@ -351,9 +354,8 @@ mod tests_ {
     /// Assertion: first poll is `Ready(Some(7))`; second is `Ready(None)`.
     #[test]
     fn tcs_set_then_poll_takes_value_once_() {
-        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
-            crate::connection::SingleConnAllocCfg::default(),
-        );
+        let scope = Scope::new();
+        let tcs = new_tcs_::<u32>(&scope);
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
 
@@ -375,9 +377,8 @@ mod tests_ {
     /// Assertion: `Pending` first; wake count increases; `Ready(Some(9))` last.
     #[test]
     fn tcs_set_wakes_pending_waiter_() {
-        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
-            crate::connection::SingleConnAllocCfg::default(),
-        );
+        let scope = Scope::new();
+        let tcs = new_tcs_::<u32>(&scope);
         let (waker, probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
 
@@ -409,9 +410,8 @@ mod tests_ {
         }
 
         let count = Arc::new(AtomicUsize::new(0usize));
-        let tcs = Tcs_::<DropProbe_, crate::connection::SingleConnAllocCfg>::new_(
-            crate::connection::SingleConnAllocCfg::default(),
-        );
+        let scope = Scope::new();
+        let tcs = new_tcs_::<DropProbe_>(&scope);
         tcs.abandon_();
         assert!(!tcs.set_(DropProbe_ {
             count_: count.clone(),
@@ -429,9 +429,8 @@ mod tests_ {
     /// Assertion: `Ready(Some(11))`; a second `set_` returns false.
     #[test]
     fn tcs_clone_shares_state_() {
-        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
-            crate::connection::SingleConnAllocCfg::default(),
-        );
+        let scope = Scope::new();
+        let tcs = new_tcs_::<u32>(&scope);
         let other = tcs.clone();
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
@@ -454,9 +453,8 @@ mod tests_ {
     /// Assertion: `is_abandoned_()` is true; a later `set_(1)` returns false.
     #[test]
     fn tcs_abandon_guard_abandons_on_drop_() {
-        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
-            crate::connection::SingleConnAllocCfg::default(),
-        );
+        let scope = Scope::new();
+        let tcs = new_tcs_::<u32>(&scope);
         {
             let _guard = TcsAbandonGuard_::new_(&tcs);
         }
@@ -473,9 +471,8 @@ mod tests_ {
     /// Assertion: not abandoned; `Ready(Some(13))`.
     #[test]
     fn tcs_abandon_after_set_keeps_value_() {
-        let tcs = Tcs_::<u32, crate::connection::SingleConnAllocCfg>::new_(
-            crate::connection::SingleConnAllocCfg::default(),
-        );
+        let scope = Scope::new();
+        let tcs = new_tcs_::<u32>(&scope);
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
 
@@ -486,5 +483,25 @@ mod tests_ {
             tcs.poll_wait_(&mut cx),
             Poll::Ready(Option::Some(13u32))
         ));
+    }
+
+    /// 测试域关闭后完成源失效：`set_` 返回 `false`，`poll_wait_` 返回 `Ready(None)`。
+    /// - 手段：`Scope::new()` 建完成源，`close()` 域，再访问完成源。
+    /// - 判断：`set_` 为假；`poll_wait_` 为 `Ready(None)`；`is_abandoned_` 为真。
+    ///
+    /// Test goal: a closed domain makes the source fail closed.
+    /// Method: create the source, `close()` the domain, then touch the source.
+    /// Assertion: `set_` is false; `poll_wait_` is `Ready(None)`; `is_abandoned_` is true.
+    #[test]
+    fn tcs_closed_scope_reports_cancelled_() {
+        let scope = Scope::new();
+        let tcs = new_tcs_::<u32>(&scope);
+        let (waker, _probe) = counting_waker_();
+        let mut cx = Context::from_waker(&waker);
+
+        scope.close();
+        assert!(!tcs.set_(1u32));
+        assert!(matches!(tcs.poll_wait_(&mut cx), Poll::Ready(Option::None)));
+        assert!(tcs.is_abandoned_());
     }
 }

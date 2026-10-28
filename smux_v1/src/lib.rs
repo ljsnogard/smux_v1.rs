@@ -70,5 +70,9 @@ pub mod x_deps {
     pub use mm_ptr;
     pub use mm_ptr::x_deps::abs_mm;
 
+    /// 临时对象的域分配器（见 `connection::scope_` 与
+    /// `dev-notes/sw-scope-20261028-2130.md`）。
+    pub use sw_scope;
+
     pub use crc;
 }

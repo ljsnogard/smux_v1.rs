@@ -617,6 +617,7 @@ mod owner_;
 mod pending_msg_;
 mod public_channel_;
 pub(crate) mod ring_;
+mod scope_;
 mod session_;
 mod signal_;
 mod slot_;
@@ -660,16 +661,13 @@ pub(crate) type ConnAlloc_<C> =
 pub(crate) type ConnChanOwnerAlloc_<C> =
     <ConnAllocCfg_<C> as TrMuxAllocConfig>::ChanOwnerAlloc;
 
-/// 循环暂存（`Owned<[u8]>`）的分配器投影。
-pub(crate) type ConnScratchAlloc_<C> =
-    <ConnAllocCfg_<C> as TrConnAllocCfg>::ScratchAlloc;
-
 /// 连接核心 / 共享量 / 取消令牌的分配器投影。
 pub(crate) type ConnCoreAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::CoreAlloc;
 
 /// 公共报文子流（`PublicChannel_` 与两条 ring）的分配器投影。
 pub(crate) type ConnPublicAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::PublicAlloc;
 pub(crate) use control_state_::{ControlState_, HINT_MAIN_RETIRED};
+pub(crate) use scope_::alloc_zeroed_bytes_async_;
 pub(crate) use main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_, main_loop_async_};
 pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
 pub(crate) use mux_connection::ReserveErr_;

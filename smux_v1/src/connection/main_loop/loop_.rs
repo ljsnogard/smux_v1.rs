@@ -18,7 +18,6 @@ use abs_cancel::{NonCancellableToken, TrCancellationToken};
 use abs_smux::dock::TrDock;
 
 use alloc::vec::Vec;
-use mm_ptr::Owned;
 
 use crate::{
     connection::{
@@ -38,7 +37,7 @@ use crate::{
         signal_::{ControlFrame_, HINT_W_PEER_CLOSED},
     },
     flow_ctrl::{RecvTotal, WindowReport},
-    x_deps::{abs_cancel, abs_smux, mm_ptr},
+    x_deps::{abs_cancel, abs_smux},
 };
 
 /// 每轮最多处理多少条请求。
@@ -79,21 +78,23 @@ pub(crate) async fn main_loop_async_<C, K>(
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    // 公共 RX 的整帧暂存：连接一次分配，容量就是一个最大帧。
-    let alloc = match shared.reg_().scratch_alloc_(cancel.child_token()).await {
-        Result::Ok(alloc) => alloc,
+    // 公共 RX 的整帧暂存：连接一次分配，容量就是一个最大帧。走连接级临时对象域，
+    // 不再为它单独配置分配器（见 `dev-notes/sw-scope-20261028-2130.md`）。
+    let rx_scratch_retain = match crate::connection::alloc_zeroed_bytes_async_(
+        shared.reg_().scope_(),
+        shared.max_packet_size_(),
+    )
+    .await
+    {
+        Result::Ok(retain) => retain,
         Result::Err(_) => {
             exit_(&ctl);
             return;
         }
     };
-    let mut rx_scratch: Owned<[u8], crate::connection::ConnScratchAlloc_<C>> = Owned::new_slice(
-        shared.max_packet_size_(),
-        |_idx, slot| {
-            slot.write(0u8);
-        },
-        alloc,
-    );
+    let mut rx_scratch = rx_scratch_retain
+        .try_owning()
+        .expect("刚分配的暂存应当可独占");
     let mut public_read = MainPublicRead_::new_();
 
     loop {
@@ -906,7 +907,8 @@ mod tests_ {
         dock: Dock,
     ) -> DockBinding<TestMuxConfig_> {
         let cancel = NonCancellableToken::new();
-        let tcs = Tcs_::new_(crate::connection::SingleConnAllocCfg::default());
+        let scope = crate::x_deps::sw_scope::Scope::new();
+        let tcs = block_on_ready_(Tcs_::new_(&scope)).expect("测试域可用");
         let waiter = tcs.clone();
         let submitted = block_on_ready_(ctl.submit_async_(
             MainLoopRequest_::Bind {

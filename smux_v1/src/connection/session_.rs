@@ -132,7 +132,6 @@ use abs_buff::{
 use abs_cancel::{TrCancellationToken, TrMayCancel};
 use anylr::SomeOf;
 use buffex::ring::ConsumerError;
-use mm_ptr::Owned;
 
 use crate::{
     connection::{
@@ -757,7 +756,7 @@ async fn finalize_entry_<C, K>(
     tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    scratch: &mut Owned<[u8], crate::connection::ConnScratchAlloc_<C>>,
+    scratch: &mut [u8],
     pending_fin: &mut PendingFin_<crate::connection::ConnAllocCfg_<C>>,
     read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     pair: (Dock, Dock),
@@ -1377,13 +1376,13 @@ pub(crate) async fn demux_loop_async_<C, K>(
 
     // 控制帧的暂存：只用于「帧头解析完成、载荷已经整块在环上」之后的取载荷。
     // 连接级环本身已经是暂存，因此这里只需要容纳**一帧**的最大载荷。
-    let mut payload = Owned::new_slice(
+    let payload_retain = lock_or_exit_!(crate::connection::alloc_zeroed_bytes_async_(
+        shared.reg_.scope_(),
         shared.max_packet_size_,
-        |_idx, slot| {
-            slot.write(0u8);
-        },
-        lock_or_exit_!(shared.reg_.scratch_alloc_(cancel.child_token())),
-    );
+    ));
+    let mut payload = payload_retain
+        .try_owning()
+        .expect("刚分配的载荷暂存应当可独占");
 
     loop {
         if cancel.is_cancelled() {
@@ -2683,15 +2682,15 @@ pub(crate) async fn mux_loop_async_<C, K>(
     // park 期间被合并提示唤醒时，把掩码带到这里、在下一轮顶部统一处理。
     let mut pending_hints = 0u64;
     // 环段字节的搬出暂存：`clone_items_from_buff` / `move_items_to_buff` 需要一个
-    // 连续切片作为中间落点（段本身不能作为 `write_all_async_` 的源）。走调用方注入
-    // 的分配器（`mm_ptr::Owned`），整条连接只分配一次。
-    let mut scratch: Owned<[u8], crate::connection::ConnScratchAlloc_<C>> = Owned::new_slice(
+    // 连续切片作为中间落点（段本身不能作为 `write_all_async_` 的源）。走连接级临时
+    // 对象域，整条连接只分配一次。
+    let scratch_retain = lock_or_exit_!(crate::connection::alloc_zeroed_bytes_async_(
+        shared.reg_.scope_(),
         K_MAX_DATA_CHUNK,
-        |_idx, slot| {
-            slot.write(0u8);
-        },
-        lock_or_exit_!(shared.reg_.scratch_alloc_(cancel.child_token())),
-    );
+    ));
+    let mut scratch = scratch_retain
+        .try_owning()
+        .expect("刚分配的搬出暂存应当可独占");
 
     loop {
         #[cfg(feature = "test-loop-probe")]
@@ -2858,7 +2857,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                         &mut tx_stage,
                     &shared,
                     &mut *table,
-                    &mut scratch,
+                    &mut scratch[..],
                     &cancel,
                 ),
             )
@@ -2928,7 +2927,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &mut tx_stage,
                     &shared,
                     &mut *table,
-                    &mut scratch,
+                    &mut scratch[..],
                     &mut pending_fin,
                     &read_events,
                     pair,
@@ -3570,7 +3569,7 @@ async fn flush_entry_<C, K>(
     tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    scratch: &mut Owned<[u8], crate::connection::ConnScratchAlloc_<C>>,
+    scratch: &mut [u8],
     pair: (Dock, Dock),
     cancel: &K,
 ) -> Result<(), MuxError>
@@ -3602,7 +3601,7 @@ async fn drain_once_<C, K>(
     tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    scratch: &mut Owned<[u8], crate::connection::ConnScratchAlloc_<C>>,
+    scratch: &mut [u8],
     cancel: &K,
 ) -> Result<bool, MuxError>
 where
@@ -3648,7 +3647,7 @@ async fn drain_one_<C, K>(
     tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    scratch: &mut Owned<[u8], crate::connection::ConnScratchAlloc_<C>>,
+    scratch: &mut [u8],
     pair: (Dock, Dock),
     cancel: &K,
 ) -> Result<bool, MuxError>

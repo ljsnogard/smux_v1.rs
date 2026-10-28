@@ -52,6 +52,7 @@ use crate::{
         mux_connection::{ChannelRegistry_, ReserveErr_},
         owner_::{ChannelOwner_, TgOwner_},
         pending_msg_::PendingMsgApp_,
+        scope_::close_conn_scope_,
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
         sync_::CancelToken_,
     },
@@ -373,5 +374,12 @@ where
             crate::connection::loop_probe_::note_core_entered_close_();
             self.reg_.notify_timer_();
         }
+
+        // 关闭连接级临时对象域：拒绝后续放入，并尝试清盘本域对象。`try_flush_` 用
+        // `try_write`（非阻塞），因此本函数仍满足「不取锁、不阻塞」的硬纪律；仍有
+        // `Owning` / `Sharing` 视图的对象会跳过，等视图释放后重试。
+        //
+        // 放在最后：状态推进与指标上报必须先完成，清盘只负责归还临时内存。
+        close_conn_scope_(self.reg_.scope_());
     }
 }
