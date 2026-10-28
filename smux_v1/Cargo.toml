@@ -32,8 +32,9 @@ mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2
 # 通道实现二选一（见 `signal_` / `sync_` 模块文档）：
 # - 默认：`mpmc_chan`（定容 + 全扫兜底）；
 # - `chan-flume` feature：切回旧的 `flume` 实现，用于 A/B 对比。
-# 包名是 `mpmc-chan`，依赖名取 `mpmc_chan` 以便源码里写 `mpmc_chan::...`。
-mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs", package = "mpmc-chan", optional = true }
+# 上游包名已从 `mpmc-chan` 改为 `mpmc_chan`（c03d41c），依赖键与包名一致，
+# 因此不再写 `package = "mpmc-chan"`；源码里的 `mpmc_chan::...` 不受影响。
+mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs", optional = true }
 sw-scope = { path = "../../sw-scope" }
 
 crc = { version = "3.4.*" }
