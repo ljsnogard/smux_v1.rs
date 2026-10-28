@@ -1951,6 +1951,18 @@ connection/
   6. 验收：lib **365** / inmem **21**（compio / tokio / smol）/ smoke 5 /
      `alloc_count` 1；基线不变（绑定 + 监听：全局 11 / 注入 33）。
 
+- 20261029-0450：**R5：删除 `PendingFin_`**。
+  1. `PendingFin_`（`LocalTableAlloc` 上的 B 树）与 `scan_tx_closed_` 删除；半关闭的
+     `FIN` 重试折进 `drain_once_` 的每轮本地表扫描：对
+     `APP_TX_CLOSED && !LOCAL_FIN_SENT` 的条目直接 `finalize_entry_`。
+  2. 阻塞条目（环里还有数据 / 额度不足 / 段借不出来）不登记集合，下一轮重扫时再试；
+     不会饿死后面的条目。
+  3. 删除 `pending_fin` 全部参数与 `tx_closed_handled_` probe。
+  4. 验收：lib 365 / inmem 21 / keepalive 5 / smoke 5 / cross_thread 1 /
+     `alloc_count` 1（建流全局 1→0、拆流注入 6→4）。
+  5. **FIN 仍由 mux 直接写 `ConnTx`**；`TX_DRAINED` 位与「main 发 FIN / T1」仍待 R6，
+     因为 public TX 的 FIN 完成语义尚未定义。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2117,7 +2129,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 待做 |
+| T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 待做（R5 已删除 `PendingFin_`，但 FIN 仍由 mux 直接写 `ConnTx`；`TX_DRAINED` / main FIN 待 R6） |
 | T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P3.3b 完成：`OPEN/ACCEPT/REJECT/CLOSE` 全部写公共 RX，直接状态推进已删 |
 | T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；P2–P3 完成控制帧组帧与建流裁决；关闭推进 / tick 待 P5 |
 | T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | 待做 |
@@ -2163,7 +2175,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 仍待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
+| T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 已删（R5，FIN 重试折进 `drain_once_` 表扫描）；`TX_DRAINED` / main FIN 仍待 R6 |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` 已删（R2，改独立切片）；`util_` 已改有界切片（R3） |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 
