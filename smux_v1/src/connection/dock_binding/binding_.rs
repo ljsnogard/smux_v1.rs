@@ -14,7 +14,7 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        ChannelHandle, Dock, MainErr_, MainReply_, MainRequest_, MuxConnection, MuxError,
+        ChannelHandle, Dock, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError,
         PushErr_, ReserveErr_, TcsAbandonGuard_, Tcs_, TrConnCfg,
         channel_listener::ChannelListener,
         util_::read_available_into_vec_,
@@ -232,7 +232,7 @@ where
     conn.core_()
         .control_()
         .submit_async_(
-            MainRequest_::Listen {
+            MainLoopRequest_::Listen {
                 local_dock: local,
                 reserve,
                 reply: tcs,
@@ -246,11 +246,11 @@ where
         })?;
     let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
     match reply {
-        Option::Some(Result::Ok(MainReply_::Listener(rec))) => {
+        Option::Some(Result::Ok(MainLoopReply_::Listener(rec))) => {
             Result::Ok(ChannelListener::new_(conn, local, rec))
         }
-        Option::Some(Result::Err(MainErr_::Reserve(err))) => Result::Err(map_reserve_err_(err)),
-        Option::Some(Result::Err(MainErr_::Mux(err))) => Result::Err(BindingError::Mux(err)),
+        Option::Some(Result::Err(MainLoopErr_::Reserve(err))) => Result::Err(map_reserve_err_(err)),
+        Option::Some(Result::Err(MainLoopErr_::Mux(err))) => Result::Err(BindingError::Mux(err)),
         Option::Some(Result::Ok(_)) | Option::None => Result::Err(BindingError::Closed),
     }
 }
@@ -291,7 +291,7 @@ where
     conn.core_()
         .control_()
         .submit_async_(
-            MainRequest_::ReserveChannel {
+            MainLoopRequest_::ReserveChannel {
                 local_dock: local,
                 remote_dock,
                 reply: tcs,
@@ -305,11 +305,11 @@ where
         })?;
     let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
     let (owner, mut msg_) = match reply {
-        Option::Some(Result::Ok(MainReply_::Channel { owner, msg_ })) => (owner, msg_),
-        Option::Some(Result::Err(MainErr_::Reserve(err))) => {
+        Option::Some(Result::Ok(MainLoopReply_::Channel { owner, msg_ })) => (owner, msg_),
+        Option::Some(Result::Err(MainLoopErr_::Reserve(err))) => {
             return Result::Err(map_reserve_err_(err));
         }
-        Option::Some(Result::Err(MainErr_::Mux(err))) => {
+        Option::Some(Result::Err(MainLoopErr_::Mux(err))) => {
             return Result::Err(BindingError::Mux(err));
         }
         Option::Some(Result::Ok(_)) | Option::None => {

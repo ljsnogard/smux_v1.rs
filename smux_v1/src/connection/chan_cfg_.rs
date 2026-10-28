@@ -16,11 +16,11 @@ use mpmc_chan::{TrConfig, WaitSlab4K};
 /// 会话内通道的 `mpmc_chan` 调教：连接分配器 + 4 KiB 等待 chunk。
 ///
 /// 只作为 [`mpmc_chan::MpmcChan`] 的类型参数使用，不实例化。
-pub(crate) struct MuxChanCfg_<A>(PhantomData<A>)
+pub(crate) struct MpmcChanCfg_<A>(PhantomData<A>)
 where
     A: AllocatorClone + Send + Sync;
 
-impl<A> TrConfig for MuxChanCfg_<A>
+impl<A> TrConfig for MpmcChanCfg_<A>
 where
     A: AllocatorClone + Send + Sync,
 {

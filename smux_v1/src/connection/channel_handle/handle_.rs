@@ -16,7 +16,7 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        Dock, EstablishRole_, FrameKind, MainErr_, MainReply_, MainRequest_, MuxConnection, MuxError,
+        Dock, EstablishRole_, FrameKind, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError,
         TcsAbandonGuard_, Tcs_, TrConnAllocCfg, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
@@ -707,15 +707,15 @@ where
 
 /// 等一个「只表示受理」的请求完成（`MainReply_::Unit`）。
 async fn wait_unit_<C>(
-    waiter: &Tcs_<Result<MainReply_<C>, MainErr_>, C>,
+    waiter: &Tcs_<Result<MainLoopReply_<C>, MainLoopErr_>, C>,
 ) -> Result<(), HandleError>
 where
     C: TrConnAllocCfg + 'static,
 {
     match poll_fn(|cx| waiter.poll_wait_(cx)).await {
-        Option::Some(Result::Ok(MainReply_::Unit)) => Result::Ok(()),
-        Option::Some(Result::Err(MainErr_::Mux(err))) => Result::Err(HandleError::Mux(err)),
-        Option::Some(Result::Err(MainErr_::Reserve(_))) | Option::None => {
+        Option::Some(Result::Ok(MainLoopReply_::Unit)) => Result::Ok(()),
+        Option::Some(Result::Err(MainLoopErr_::Mux(err))) => Result::Err(HandleError::Mux(err)),
+        Option::Some(Result::Err(MainLoopErr_::Reserve(_))) | Option::None => {
             Result::Err(HandleError::Cancelled)
         }
         Option::Some(Result::Ok(_)) => Result::Err(HandleError::Mux(MuxError::Closed)),
@@ -742,7 +742,7 @@ where
     conn.core_()
         .control_()
         .submit_async_(
-            MainRequest_::Accept {
+            MainLoopRequest_::Accept {
                 local_dock: local,
                 remote_dock: remote,
                 owner,
@@ -779,7 +779,7 @@ where
     conn.core_()
         .control_()
         .submit_async_(
-            MainRequest_::Reject {
+            MainLoopRequest_::Reject {
                 local_dock: local,
                 remote_dock: remote,
                 owner,

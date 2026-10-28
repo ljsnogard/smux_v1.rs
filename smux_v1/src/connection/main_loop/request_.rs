@@ -33,10 +33,10 @@ pub(crate) enum EstablishRole_ {
 }
 
 /// 一次请求的完整结果：成功时是 [`MainReply_`]，失败时是 [`MainErr_`]。
-pub(crate) type MainResult_<C> = Result<MainReply_<C>, MainErr_>;
+pub(crate) type MainLoopResult_<C> = Result<MainLoopReply_<C>, MainLoopErr_>;
 
 /// 送到 `main_loop` 的一条请求。
-pub(crate) enum MainRequest_<C>
+pub(crate) enum MainLoopRequest_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
@@ -46,7 +46,7 @@ where
         local_dock: Dock,
 
         /// 完成源。
-        reply: Tcs_<MainResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>, C>,
     },
 
     /// 登记 listener 身份。
@@ -58,7 +58,7 @@ where
         reserve: usize,
 
         /// 完成源。
-        reply: Tcs_<MainResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>, C>,
     },
 
     /// 把一条已组好的控制帧写进公共 TX ring（fire-and-forget）。
@@ -72,7 +72,7 @@ where
         frame: ControlFrame_,
 
         /// 完成源：帧真正写进公共 TX ring 后完成，调用方据此保证后续帧的顺序。
-        reply: Tcs_<MainResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>, C>,
     },
 
     /// 为一条子流登记身份（`open_channel_async` 的第一步）。
@@ -84,7 +84,7 @@ where
         remote_dock: Dock,
 
         /// 完成源。
-        reply: Tcs_<MainResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>, C>,
     },
 
     /// 最终裁决：建环已完成，main 从 message ring 读载荷并组 `OPEN` / `ACCEPT`。
@@ -105,7 +105,7 @@ where
         initial_window: Credit,
 
         /// 完成源：帧写进公共 TX 后完成。
-        reply: Tcs_<MainResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>, C>,
     },
 
     /// 拒绝入向建流；reason 已写进 outgoing message ring。
@@ -123,28 +123,28 @@ where
         role_: EstablishRole_,
 
         /// 完成源。
-        reply: Tcs_<MainResult_<C>, C>,
+        reply: Tcs_<MainLoopResult_<C>, C>,
     },
 }
 
-impl<C> MainRequest_<C>
+impl<C> MainLoopRequest_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
     /// 本次请求的完成源。
-    pub(crate) fn reply_(&self) -> Option<&Tcs_<MainResult_<C>, C>> {
+    pub(crate) fn reply_(&self) -> Option<&Tcs_<MainLoopResult_<C>, C>> {
         match self {
-            MainRequest_::Bind { reply, .. }
-            | MainRequest_::Listen { reply, .. }
-            | MainRequest_::ReserveChannel { reply, .. }
-            | MainRequest_::SendControl { reply, .. }
-            | MainRequest_::Accept { reply, .. }
-            | MainRequest_::Reject { reply, .. } => Option::Some(reply),
+            MainLoopRequest_::Bind { reply, .. }
+            | MainLoopRequest_::Listen { reply, .. }
+            | MainLoopRequest_::ReserveChannel { reply, .. }
+            | MainLoopRequest_::SendControl { reply, .. }
+            | MainLoopRequest_::Accept { reply, .. }
+            | MainLoopRequest_::Reject { reply, .. } => Option::Some(reply),
         }
     }
 
     /// 用同一个错误结束本次请求（连接收尾 / 队列关闭时用）。
-    pub(crate) fn fail_(self, err: MainErr_) {
+    pub(crate) fn fail_(self, err: MainLoopErr_) {
         if let Option::Some(reply) = self.reply_() {
             let _ = reply.set_(Result::Err(err));
         }
@@ -152,7 +152,7 @@ where
 }
 
 /// `main_loop` 的统一结果。
-pub(crate) enum MainReply_<C>
+pub(crate) enum MainLoopReply_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
@@ -185,7 +185,7 @@ where
 
 /// `main_loop` 的统一错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MainErr_ {
+pub(crate) enum MainLoopErr_ {
     /// 注册表预留 / 配额 / 关闭状态失败。
     Reserve(ReserveErr_),
 

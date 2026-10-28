@@ -9,4 +9,4 @@ mod loop_;
 mod request_;
 
 pub(crate) use loop_::main_loop_async_;
-pub(crate) use request_::{EstablishRole_, MainErr_, MainReply_, MainRequest_};
+pub(crate) use request_::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_};

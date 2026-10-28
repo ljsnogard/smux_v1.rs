@@ -13,7 +13,7 @@ use mm_ptr::{Owned, Shared};
 
 use crate::{
     connection::{
-        BufferedRx, BufferedTx, ControlState_, Dock, MainErr_, MainReply_, MainRequest_, MuxError,
+        BufferedRx, BufferedTx, ControlState_, Dock, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxError,
         PushErr_, TrConnAllocCfg, TrConnCfg, TcsAbandonGuard_, Tcs_,
         dock_binding::DockBinding,
         main_loop_async_,
@@ -513,7 +513,7 @@ where
     conn.core_()
         .control_()
         .submit_async_(
-            MainRequest_::Bind {
+            MainLoopRequest_::Bind {
                 local_dock,
                 reply: tcs,
             },
@@ -526,24 +526,24 @@ where
         })?;
     let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
     match reply {
-        Option::Some(Result::Ok(MainReply_::Dock { dock, unbind_ })) => {
+        Option::Some(Result::Ok(MainLoopReply_::Dock { dock, unbind_ })) => {
             Result::Ok(DockBinding::new_(conn.clone(), dock, unbind_))
         }
-        Option::Some(Result::Err(MainErr_::Reserve(ReserveErr_::DockInUse))) => {
+        Option::Some(Result::Err(MainLoopErr_::Reserve(ReserveErr_::DockInUse))) => {
             Result::Err(BindError::DockInUse)
         }
         // 连接已经进入优雅关闭：不再接受任何新 binding。用连接级 `Closed` 表达——
         // 「这条连接不再提供服务」正是调用方此刻的处境，它不必区分「dock 被占」
         // 与「连接在关」这两种在关闭语义下都无法补救的情形。
-        Option::Some(Result::Err(MainErr_::Reserve(ReserveErr_::Closing))) => {
+        Option::Some(Result::Err(MainLoopErr_::Reserve(ReserveErr_::Closing))) => {
             Result::Err(BindError::Mux(MuxError::Closed))
         }
-        Option::Some(Result::Err(MainErr_::Reserve(ReserveErr_::Cancelled))) => {
+        Option::Some(Result::Err(MainLoopErr_::Reserve(ReserveErr_::Cancelled))) => {
             Result::Err(BindError::Cancelled)
         }
-        Option::Some(Result::Err(MainErr_::Mux(err))) => Result::Err(BindError::Mux(err)),
+        Option::Some(Result::Err(MainLoopErr_::Mux(err))) => Result::Err(BindError::Mux(err)),
         // 其他预留原因 / 非 Dock 结果：绑定路径不该出现，保守映射为关闭。
-        Option::Some(Result::Err(MainErr_::Reserve(_)))
+        Option::Some(Result::Err(MainLoopErr_::Reserve(_)))
         | Option::Some(Result::Ok(_))
         | Option::None => Result::Err(BindError::Mux(MuxError::Closed)),
     }

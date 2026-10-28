@@ -646,7 +646,7 @@ pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
-pub(crate) use chan_cfg_::MuxChanCfg_;
+pub(crate) use chan_cfg_::MpmcChanCfg_;
 
 /// 连接配置对应的分配器配置类型。
 pub(crate) type ConnAllocCfg_<C> = <C as TrConnCfg>::AllocCfg<'static>;
@@ -670,7 +670,7 @@ pub(crate) type ConnCoreAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::CoreAl
 /// 公共报文子流（`PublicChannel_` 与两条 ring）的分配器投影。
 pub(crate) type ConnPublicAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::PublicAlloc;
 pub(crate) use control_state_::{ControlState_, HINT_MAIN_RETIRED};
-pub(crate) use main_loop::{EstablishRole_, MainErr_, MainReply_, MainRequest_, main_loop_async_};
+pub(crate) use main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_, main_loop_async_};
 pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
 pub(crate) use mux_connection::ReserveErr_;
 pub(crate) use slot_::PushErr_;

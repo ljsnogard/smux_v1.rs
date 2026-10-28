@@ -27,7 +27,7 @@ use crate::{
         flags,
         frame_::encode_header_,
         frame_parser_::decode_header_sync_,
-        main_loop::{EstablishRole_, MainErr_, MainReply_, MainRequest_},
+        main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_},
         TrConnAllocCfg,
         owner_::EstablishOutcome_,
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChunkIo_},
@@ -55,7 +55,7 @@ where
     C: TrConnAllocCfg + 'static,
 {
     /// 队列里取到一条请求。
-    Request(MainRequest_<C>),
+    Request(MainLoopRequest_<C>),
 
     /// 合并提示位（P1 尚无 `HINT_MAIN_*` 使用者）。
     Hint(u64),
@@ -212,7 +212,7 @@ where
 {
     ctl.close_requests_();
     while let Some(request) = ctl.try_pop_request_() {
-        request.fail_(MainErr_::Mux(MuxError::Closed));
+        request.fail_(MainLoopErr_::Mux(MuxError::Closed));
     }
 }
 
@@ -222,7 +222,7 @@ where
 async fn handle_request_<C, K>(
     shared: &MuxShared_<C>,
     public_tx_w: &mut BufferedTx,
-    request: MainRequest_<crate::connection::ConnAllocCfg_<C>>,
+    request: MainLoopRequest_<crate::connection::ConnAllocCfg_<C>>,
     cancel: &K,
 )
 where
@@ -237,25 +237,25 @@ where
         .await
         .is_err()
     {
-        request.fail_(MainErr_::Mux(MuxError::Cancelled));
+        request.fail_(MainLoopErr_::Mux(MuxError::Cancelled));
         return;
     }
     // 同一轮合并的 retired 释放先落实：保证「丢弃后立刻重听」看到的是已释放。
     reap_retired_and_release_::<C, _>(shared, public_tx_w, cancel).await;
     match request {
-        MainRequest_::SendControl { frame, reply } => {
+        MainLoopRequest_::SendControl { frame, reply } => {
             match write_control_frame_async_::<C, _>(public_tx_w, shared, &frame, cancel).await {
                 Result::Ok(()) => {
-                    let _ = reply.set_(Result::Ok(MainReply_::Unit));
+                    let _ = reply.set_(Result::Ok(MainLoopReply_::Unit));
                 }
                 Result::Err(err) => {
-                    let _ = reply.set_(Result::Err(MainErr_::Mux(err)));
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Mux(err)));
                 }
             }
         }
-        MainRequest_::Bind { local_dock, reply } => {
+        MainLoopRequest_::Bind { local_dock, reply } => {
             if reply.is_abandoned_() {
-                let _ = reply.set_(Result::Err(MainErr_::Reserve(ReserveErr_::Cancelled)));
+                let _ = reply.set_(Result::Err(MainLoopErr_::Reserve(ReserveErr_::Cancelled)));
                 return;
             }
             let result = if local_dock.is_unspecified() {
@@ -263,56 +263,56 @@ where
                     .reg_()
                     .bind_any_dock_(cancel.child_token())
                     .await
-                    .map(|(dock, unbind_)| MainReply_::Dock { dock, unbind_ })
+                    .map(|(dock, unbind_)| MainLoopReply_::Dock { dock, unbind_ })
             } else {
                 shared
                     .reg_()
                     .bind_dock_(local_dock, cancel.child_token())
                     .await
-                    .map(|(dock, unbind_)| MainReply_::Dock { dock, unbind_ })
+                    .map(|(dock, unbind_)| MainLoopReply_::Dock { dock, unbind_ })
             };
             // 登记之后才发现等待方已放弃：**回滚刚登记的身份**，否则这个 dock 会
             // 永久占住（没有句柄能解绑它）。回滚用不可取消令牌：它是收尾动作。
             if reply.is_abandoned_()
-                && let Result::Ok(MainReply_::Dock { dock, .. }) = &result
+                && let Result::Ok(MainLoopReply_::Dock { dock, .. }) = &result
             {
                 let _ = shared
                     .reg_()
                     .unbind_dock_(*dock, NonCancellableToken::new())
                     .await;
             }
-            let _ = reply.set_(result.map_err(MainErr_::Reserve));
+            let _ = reply.set_(result.map_err(MainLoopErr_::Reserve));
         }
-        MainRequest_::Listen {
+        MainLoopRequest_::Listen {
             local_dock,
             reserve: _reserve,
             reply,
         } => {
             // `reserve` 仍未用于预分配：入向通知目前内联在身份节点里。
             if reply.is_abandoned_() {
-                let _ = reply.set_(Result::Err(MainErr_::Reserve(ReserveErr_::Cancelled)));
+                let _ = reply.set_(Result::Err(MainLoopErr_::Reserve(ReserveErr_::Cancelled)));
                 return;
             }
             let result = shared
                 .reg_()
                 .reserve_listener_(local_dock, cancel.child_token())
                 .await
-                .map(MainReply_::Listener);
+                .map(MainLoopReply_::Listener);
             if reply.is_abandoned_() {
                 let _ = shared
                     .reg_()
                     .release_listener_(local_dock, NonCancellableToken::new())
                     .await;
             }
-            let _ = reply.set_(result.map_err(MainErr_::Reserve));
+            let _ = reply.set_(result.map_err(MainLoopErr_::Reserve));
         }
-        MainRequest_::ReserveChannel {
+        MainLoopRequest_::ReserveChannel {
             local_dock,
             remote_dock,
             reply,
         } => {
             if reply.is_abandoned_() {
-                let _ = reply.set_(Result::Err(MainErr_::Reserve(ReserveErr_::Cancelled)));
+                let _ = reply.set_(Result::Err(MainLoopErr_::Reserve(ReserveErr_::Cancelled)));
                 return;
             }
             let now_millis = shared.conn_clock_().now_millis_();
@@ -326,16 +326,16 @@ where
                     cancel.child_token(),
                 )
                 .await
-                .map(|(owner, msg_)| MainReply_::Channel { owner, msg_ });
+                .map(|(owner, msg_)| MainLoopReply_::Channel { owner, msg_ });
             if reply.is_abandoned_() {
                 let _ = shared
                     .reg_()
                     .unreserve_channel_(local_dock, remote_dock, NonCancellableToken::new())
                     .await;
             }
-            let _ = reply.set_(result.map_err(MainErr_::Reserve));
+            let _ = reply.set_(result.map_err(MainLoopErr_::Reserve));
         }
-        MainRequest_::Accept {
+        MainLoopRequest_::Accept {
             local_dock,
             remote_dock,
             owner,
@@ -352,7 +352,7 @@ where
                 Result::Ok(Option::Some(message)) => message,
                 Result::Ok(Option::None) => Vec::new(),
                 Result::Err(_) => {
-                    let _ = reply.set_(Result::Err(MainErr_::Mux(MuxError::Cancelled)));
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Mux(MuxError::Cancelled)));
                     return;
                 }
             };
@@ -428,14 +428,14 @@ where
                     if role_ == EstablishRole_::Responder {
                         owner.set_establish_settled_();
                     }
-                    let _ = reply.set_(Result::Ok(MainReply_::Unit));
+                    let _ = reply.set_(Result::Ok(MainLoopReply_::Unit));
                 }
                 Result::Err(err) => {
-                    let _ = reply.set_(Result::Err(MainErr_::Mux(err)));
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Mux(err)));
                 }
             }
         }
-        MainRequest_::Reject {
+        MainLoopRequest_::Reject {
             local_dock,
             remote_dock,
             owner,
@@ -451,7 +451,7 @@ where
                 Result::Ok(Option::Some(reason)) => reason,
                 Result::Ok(Option::None) => Vec::new(),
                 Result::Err(_) => {
-                    let _ = reply.set_(Result::Err(MainErr_::Mux(MuxError::Cancelled)));
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Mux(MuxError::Cancelled)));
                     return;
                 }
             };
@@ -494,10 +494,10 @@ where
             owner.set_establish_settled_();
             match result {
                 Result::Ok(()) => {
-                    let _ = reply.set_(Result::Ok(MainReply_::Unit));
+                    let _ = reply.set_(Result::Ok(MainLoopReply_::Unit));
                 }
                 Result::Err(err) => {
-                    let _ = reply.set_(Result::Err(MainErr_::Mux(err)));
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Mux(err)));
                 }
             }
         }
@@ -864,7 +864,7 @@ mod tests_ {
     use super::{main_step_, park_main_, try_read_public_frame_, MainPublicRead_, MainWake_};
     use crate::{
         connection::{
-            main_loop::{MainReply_, MainRequest_},
+            main_loop::{MainLoopReply_, MainLoopRequest_},
             ring_::{new_buffered_channel, BufferedRx, BufferedTx},
             session_::MuxShared_,
             test_support_::TestMuxConfig_,
@@ -909,7 +909,7 @@ mod tests_ {
         let tcs = Tcs_::new_(crate::connection::SingleConnAllocCfg::default());
         let waiter = tcs.clone();
         let submitted = block_on_ready_(ctl.submit_async_(
-            MainRequest_::Bind {
+            MainLoopRequest_::Bind {
                 local_dock: dock,
                 reply: tcs,
             },
@@ -922,7 +922,7 @@ mod tests_ {
         let reply = block_on_ready_(core::future::poll_fn(|cx| waiter.poll_wait_(cx)))
             .expect("Bind 请求应完成")
             .expect("Bind 应成功");
-        let MainReply_::Dock { dock, unbind_ } = reply else {
+        let MainLoopReply_::Dock { dock, unbind_ } = reply else {
             panic!("Bind 的答复应当是 Dock");
         };
         DockBinding::new_(conn.clone(), dock, unbind_)

@@ -29,8 +29,8 @@ use mm_ptr::Shared;
 
 use crate::{
     connection::{
-        MuxChanCfg_, TrConnAllocCfg,
-        main_loop::MainRequest_,
+        MpmcChanCfg_, TrConnAllocCfg,
+        main_loop::MainLoopRequest_,
         slot_::{HintSlot_, PushErr_},
     },
     x_deps::{abs_cancel, mm_ptr},
@@ -43,24 +43,24 @@ pub(crate) const K_MAIN_REQ_CAP: usize = 64usize;
 pub(crate) const HINT_MAIN_RETIRED: u64 = 1u64 << 0usize;
 
 /// 请求通道的缓冲区类型别名（`MpmcBuf` 由 `MpmcChan` 持有）。
-type ControlBuf_<C> = MpmcBuf<MainRequest_<C>, K_MAIN_REQ_CAP>;
+type ControlBuf_<C> = MpmcBuf<MainLoopRequest_<C>, K_MAIN_REQ_CAP>;
 
 /// 请求通道的发送端类型。
 type ControlTx_<C> = mpmc_chan::Sender<
     'static,
-    MainRequest_<C>,
+    MainLoopRequest_<C>,
     K_MAIN_REQ_CAP,
     ControlBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
 >;
 
 /// 请求通道的接收端类型。
 type ControlRx_<C> = mpmc_chan::Receiver<
     'static,
-    MainRequest_<C>,
+    MainLoopRequest_<C>,
     K_MAIN_REQ_CAP,
     ControlBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
 >;
 
 /// `main_loop` 的请求等待 future（`RecvAsync` 是参数载体，`into_future` 之后才登记唤醒）。
@@ -68,9 +68,9 @@ pub(crate) type ControlRecvAsync_<'f, C> = RecvAsync<
     'static,
     'f,
     'f,
-    MainRequest_<C>,
+    MainLoopRequest_<C>,
     ControlBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
     K_MAIN_REQ_CAP,
 >;
 
@@ -118,10 +118,10 @@ where
     /// 通道的外层 `Arc` 与缓存用 `alloc` 分配；等待 chunk 在首次 park 时申请。
     pub(crate) fn new_(cfg: C) -> Self {
         let (tx_, rx_) = MpmcChan::<
-            MainRequest_<C>,
+            MainLoopRequest_<C>,
             K_MAIN_REQ_CAP,
             _,
-            MuxChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
+            MpmcChanCfg_<<C as TrConnAllocCfg>::MpmcAlloc<'static>>,
         >::new_in(ControlBuf_::<C>::new(), cfg.mpmc_alloc());
         ControlState_ {
             inner_: Shared::new(
@@ -143,9 +143,9 @@ where
     /// - [`PushErr_::Cancelled`]：等空位期间被取消；请求原样带回。
     pub(crate) async fn submit_async_<K>(
         &self,
-        request: MainRequest_<C>,
+        request: MainLoopRequest_<C>,
         cancel: K,
-    ) -> Result<(), PushErr_<MainRequest_<C>>>
+    ) -> Result<(), PushErr_<MainLoopRequest_<C>>>
     where
         K: TrCancellationToken,
     {
@@ -165,7 +165,7 @@ where
     /// 非阻塞取一个请求（`main_loop` 的批处理用）。
     ///
     /// 通道关闭后仍可 drain 已入队元素；空且关闭时返回 `None`。
-    pub(crate) fn try_pop_request_(&self) -> Option<MainRequest_<C>> {
+    pub(crate) fn try_pop_request_(&self) -> Option<MainLoopRequest_<C>> {
         match self.inner_.rx_.try_recv() {
             Result::Ok(request) => Option::Some(request),
             Result::Err(TryRecvError::Empty) | Result::Err(TryRecvError::Closed) => Option::None,
@@ -227,7 +227,7 @@ mod tests_ {
             let reply = Tcs_::new_(cfg);
             assert!(
                 futures::executor::block_on(ctl.submit_async_(
-                    MainRequest_::Bind {
+                    MainLoopRequest_::Bind {
                         local_dock: Dock::new(dock),
                         reply,
                     },
@@ -239,7 +239,7 @@ mod tests_ {
         }
         for expected in [1u32, 2u32] {
             match ctl.try_pop_request_() {
-                Option::Some(MainRequest_::Bind { local_dock, .. }) => {
+                Option::Some(MainLoopRequest_::Bind { local_dock, .. }) => {
                     assert_eq!(local_dock, Dock::new(expected));
                 }
                 _ => panic!("应当取到第 {expected} 条 Bind 请求"),
@@ -250,7 +250,7 @@ mod tests_ {
         ctl.close_requests_();
         let reply = Tcs_::new_(cfg);
         let err = futures::executor::block_on(ctl.submit_async_(
-            MainRequest_::Bind {
+            MainLoopRequest_::Bind {
                 local_dock: Dock::new(3u32),
                 reply,
             },

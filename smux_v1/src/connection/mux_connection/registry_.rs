@@ -152,7 +152,7 @@ use mpmc_chan::{MpmcBuf, MpmcChan, RecvAsync, SendError, TryRecvError, TrySendEr
 
 use crate::{
     connection::{
-        Dock, MuxChanCfg_, MuxError, TrConnAllocCfg,
+        Dock, MpmcChanCfg_, MuxError, TrConnAllocCfg,
         owner_::{
             AbortCode_, ChannelNotice, ChannelOwner_, LsnOwner_, TgOwner_,
             new_listener_owner_, new_owner_, new_telegraph_owner_,
@@ -1141,7 +1141,7 @@ type WriteAttachTx_<C> = mpmc_chan::Sender<
     WriteAttach_<C>,
     ATTACH_INBOX_CAP,
     WriteAttachBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
 >;
 
 /// 写侧 `Attach` 通道的接收端。
@@ -1150,7 +1150,7 @@ type WriteAttachRx_<C> = mpmc_chan::Receiver<
     WriteAttach_<C>,
     ATTACH_INBOX_CAP,
     WriteAttachBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
 >;
 
 /// 写循环等一条 `Attach` 的 future。
@@ -1160,7 +1160,7 @@ pub(crate) type WriteAttachRecvAsync_<'f, C> = RecvAsync<
     'f,
     WriteAttach_<C>,
     WriteAttachBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
     ATTACH_INBOX_CAP,
 >;
 
@@ -1173,7 +1173,7 @@ type ReadAttachTx_<C> = mpmc_chan::Sender<
     ReadAttach_<C>,
     ATTACH_INBOX_CAP,
     ReadAttachBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
 >;
 
 /// 读侧 `Attach` 通道的接收端。
@@ -1182,7 +1182,7 @@ type ReadAttachRx_<C> = mpmc_chan::Receiver<
     ReadAttach_<C>,
     ATTACH_INBOX_CAP,
     ReadAttachBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
 >;
 
 /// 读循环等一条 `Attach` 的 future。
@@ -1192,7 +1192,7 @@ pub(crate) type ReadAttachRecvAsync_<'f, C> = RecvAsync<
     'f,
     ReadAttach_<C>,
     ReadAttachBuf_<C>,
-    MuxChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
+    MpmcChanCfg_<<C as TrConnAllocCfg>::AttachAlloc>,
     ATTACH_INBOX_CAP,
 >;
 
@@ -1300,12 +1300,12 @@ where
             crate::connection::dock_index_::DockBPlusTree_::new_in(alloc.clone())
                 .expect("2 KiB B+ 树足以容纳到期索引表项");
         let (mux_inbox_tx_, mux_inbox_rx_) =
-            MpmcChan::<WriteAttach_<C>, ATTACH_INBOX_CAP, _, MuxChanCfg_<C::AttachAlloc>>::new_in(
+            MpmcChan::<WriteAttach_<C>, ATTACH_INBOX_CAP, _, MpmcChanCfg_<C::AttachAlloc>>::new_in(
                 WriteAttachBuf_::<C>::new(),
                 attach_alloc.clone(),
             );
         let (demux_inbox_tx_, demux_inbox_rx_) =
-            MpmcChan::<ReadAttach_<C>, ATTACH_INBOX_CAP, _, MuxChanCfg_<C::AttachAlloc>>::new_in(
+            MpmcChan::<ReadAttach_<C>, ATTACH_INBOX_CAP, _, MpmcChanCfg_<C::AttachAlloc>>::new_in(
                 ReadAttachBuf_::<C>::new(),
                 attach_alloc,
             );
