@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）
-- **状态**：**现行（R1：每循环 Scope 基座；R2：建流期 message 路径；R3：open/reject 与 tg_live）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）
+- **状态**：**现行（R1：每循环 Scope 基座；R2：建流期 message 路径；R3：open/reject 与 tg_live；R4：retired 扫描列表）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -42,18 +42,19 @@ P3.3c / P4 / P5 的清理依据。
 | `open_channel_async` / `reject_async` 的 message / reason（R3） | `[u8]` | 一次请求 | 连接级 `Scope` | 容量 `cap + 1`，读满即判超长；不再走全局 `Vec` |
 | `demux` 的 `tg_live`（R3） | `DockSet_`（2 KiB B 树） | 每轮复用 | `C::LocalTableAlloc` | 不再用全局 `BTreeSet`；随循环归还 |
 | `demux` 的 `gone` 列表（R3） | `Vec<Dock>` | 每轮复用 | `C::LocalTableAlloc` | 同上，容量跨轮复用 |
+| `reap_retired_` 的 5 个列表（R4） | `Vec<Dock>` / `Vec<(Dock, Dock)>` | 一次扫描 | `C::RegistryAlloc` | 空列表不分配；非空时用连接结构分配器，不再走全局 |
 
 ### 3.2 仍直接走 Global 的临时分配（待清）
 
 | 分配点 | 对象 | 生命周期 | 建议 |
 | --- | --- | --- | --- |
-| `reap_retired_` 的 5 个列表 | `Vec<Dock>` / `Vec<(Dock, Dock)>` | 一次扫描 | 固定内联 / 回调 / `DockSet_`（R4） |
 | 事件通道 / 邮箱 | `Box<MpmcBuf>`、`Arc<Overflow_>`、`VecDeque` | 连接 / 事件 | P5 删除；不要复活 `EventAlloc` |
 
 > R2 已清掉 `main_loop` 的 `read_msg_outgoing_` 与 `read_message_async` 的全局
 > `Vec`，并删除 `ControlFrame_.payload_`。R3 清掉 open / reject 的 message / reason
-> 与 demux 的 `BTreeSet`。非空 welcome 仍受 `accept_async` 的 `TrBuffWrite` 形状
-> 限制（P3.3c 待补）。
+> 与 demux 的 `BTreeSet`。R4 把 `reap_retired_` 的临时列表从全局 `Vec` 换成连接
+> 结构分配器（绑定 + 监听阶段全局 11 → 4，注入 33 → 40）。非空 welcome 仍受
+> `accept_async` 的 `TrBuffWrite` 形状限制（P3.3c 待补）。
 
 ### 3.3 临时对象借用长期池（待决策）
 
@@ -128,15 +129,27 @@ P3.3c / P4 / P5 的清理依据。
 5. 验收：lib **365 passed**；`inmem_mux` **21 passed**（compio / tokio / smol）；
    `smoke_compio` 5 passed；`alloc_count` 基线不变（全局 11 / 注入 33）。
 
+## 4.3 第 4 轮实施记录（retired 扫描列表）
+
+1. `reap_retired_` 的 5 个临时列表（listener / telegraph / unreserve / reject /
+   unbind）改用 `C::RegistryAlloc` 的 `Vec::new_in`；空列表不分配，非空时也不再落
+   全局堆。
+2. 返回类型改为 `Vec<(Dock, Dock), C::RegistryAlloc>`，main 侧迭代方式不变。
+3. 分配基线变化：绑定 + 监听阶段全局 **11 → 4**、注入 **33 → 40**（同一批分配换了
+   归属，字节数基本不变）；`alloc_count` 断言更新为全局 ≤8 / 注入 =40。
+4. 验收：lib **365 passed**；`inmem_mux` **21 passed**；`alloc_count` 1 passed；
+   clippy 全目标干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
 | --- | --- |
 | R2（已完成） | `main_loop` 读 outgoing 用固定 Scope 缓冲；删除 `ControlFrame_.payload_`；`read_message_async` 栈上分块；补 `OPEN` message 集成测试 |
 | R3（已完成） | open / reject 的 message / reason 用 Scope 有界读取；`tg_live` / `gone` 去 Global |
-| R4（P4 尾） | `PendingFin_` → `TX_DRAINED`；`reap_retired_` 列表去 Global；T1 让 mux 只搬数据 |
-| R5（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
-| R6（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R4（已完成） | `reap_retired_` 的 5 个列表改走连接结构分配器 |
+| R5（P4 尾） | `PendingFin_` → `TX_DRAINED`；T1 让 mux 只搬数据 |
+| R6（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
+| R7（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 

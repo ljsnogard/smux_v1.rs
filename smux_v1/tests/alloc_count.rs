@@ -501,22 +501,25 @@ where
     // **按池**向注入分配器要内存，不再每请求一次。因此注入侧的线性增长项少了一项，
     // 全局侧只钉一个量级上限。
     //
-    // # 基线为什么是 11 / 33（旧注释写的是 1 / 11，上一版是 11 / 52）
+    // # 基线为什么是 4 / 40（旧注释写的是 1 / 11，再上一版是 11 / 33）
     //
     // 请求队列从内联队列换成 `mpmc_chan`（`fd3aa1c`）之后，每次请求的 park / 唤醒
     // 会在 4 KiB 等待 chunk 里登记节点，注入分配数随之上升；旧基线（11 次）是内联
     // 队列时代的数字。`Tcs_` 迁入 Scope 后，完成源从「每请求一次 `Shared::new_in`」
-    // 变成「Scope 强池按块分配」，注入次数从 52 降到 33。逐笔归因（那 11 次全局
-    // 分配来自哪条路径）仍是待办，见 dev-notes。
+    // 变成「Scope 强池按块分配」，注入次数从 52 降到 33。
+    //
+    // R4：`reap_retired_` 的临时列表改用连接的结构分配器（不再走全局 `Vec`），
+    // 9 个 dock 的绑定 + 监听阶段全局分配从 11 降到 4、注入从 33 升到 40（同一批
+    // 分配换了归属，字节数基本不变）。全局侧因此收紧到 8；注入侧按 40 钉住。
     assert!(
-        bind_global.allocs_ <= 16usize,
-        "绑定 + 监听阶段发生了 {} 次全局分配（9 个 dock）——listener 通知可能又回到了堆上",
+        bind_global.allocs_ <= 8usize,
+        "绑定 + 监听阶段发生了 {} 次全局分配（9 个 dock）——listener 通知或 retired 列表可能又回到了堆上",
         bind_global.allocs_
     );
     assert_eq!(
-        bind_injected.allocs_, 33usize,
-        "9 个 dock（1 binding + 8 listener）实测 33 次注入分配（身份节点 + 请求通道\
-         等待节点 + Scope 池块），实际 {}",
+        bind_injected.allocs_, 40usize,
+        "9 个 dock（1 binding + 8 listener）实测 40 次注入分配（身份节点 + 请求通道\
+         等待节点 + Scope 池块 + retired 临时列表），实际 {}",
         bind_injected.allocs_
     );
 

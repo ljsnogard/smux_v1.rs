@@ -132,10 +132,7 @@
 //! 管理的值。这条区分由一个随每次绑定重置的标记承担（`DockCtx_::auto_`），它同时让
 //! 「只用手动绑定的连接」在解绑路径上零额外分配。
 
-use alloc::{
-    collections::VecDeque,
-    vec::Vec,
-};
+use alloc::collections::VecDeque;
 use core::{
     ops::Bound,
     sync::atomic::{AtomicU64, Ordering},
@@ -1982,18 +1979,24 @@ where
     ///   返回给 `main_loop`，由它发帧后再 [`release_channel_`](Self::release_channel_)；
     /// - `DockBinding`：锁外 [`unbind_dock_`](Self::unbind_dock_)。
     ///
-    /// 冷路径，O(n)；同一轮合并多个释放。返回的列表通常是空的（`Vec::new()` 不分配）。
+    /// 冷路径，O(n)；同一轮合并多个释放。返回的列表通常是空的（`Vec::new_in` 不
+    /// 分配）；非空时用连接的结构分配器，不落全局堆。
     pub(crate) async fn reap_retired_<K: TrCancellationToken>(
         &self,
         cancel: K,
-    ) -> Result<Vec<(Dock, Dock)>, ReserveErr_> {
+    ) -> Result<alloc::vec::Vec<(Dock, Dock), C::RegistryAlloc>, ReserveErr_> {
         let mut session = self.root_.inner_.acquire_session();
         let mut guard = acquire_write_(&mut session, cancel.child_token()).await?;
+        let alloc = guard.alloc_.clone();
         let inner = &mut *guard;
-        let mut retired_listeners: Vec<Dock> = Vec::new();
-        let mut retired_telegraphs: Vec<Dock> = Vec::new();
-        let mut retired_unreserve: Vec<(Dock, Dock)> = Vec::new();
-        let mut retired_reject: Vec<(Dock, Dock)> = Vec::new();
+        let mut retired_listeners: alloc::vec::Vec<Dock, C::RegistryAlloc> =
+            alloc::vec::Vec::new_in(alloc.clone());
+        let mut retired_telegraphs: alloc::vec::Vec<Dock, C::RegistryAlloc> =
+            alloc::vec::Vec::new_in(alloc.clone());
+        let mut retired_unreserve: alloc::vec::Vec<(Dock, Dock), C::RegistryAlloc> =
+            alloc::vec::Vec::new_in(alloc.clone());
+        let mut retired_reject: alloc::vec::Vec<(Dock, Dock), C::RegistryAlloc> =
+            alloc::vec::Vec::new_in(alloc.clone());
         for (key, binding) in inner.bindings_.iter() {
             match binding {
                 BindingSlot_::Listener(rec) if rec.is_retired_() => {
@@ -2021,7 +2024,8 @@ where
             inner.bindings_.remove(telegraph_key_(local_dock));
             inner.settle_pending_return_(local_dock);
         }
-        let mut unbind_docks: Vec<Dock> = Vec::new();
+        let mut unbind_docks: alloc::vec::Vec<Dock, C::RegistryAlloc> =
+            alloc::vec::Vec::new_in(alloc);
         for (dock, ctx) in inner.docks_.iter() {
             if ctx
                 .unbind_requested_
