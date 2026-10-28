@@ -159,7 +159,7 @@ use crate::{
             new_listener_owner_, new_owner_, new_telegraph_owner_,
         },
         pending_msg_::{PendingMsgApp_, PendingMsgMain_, new_pending_msg_},
-        public_channel_::ChunkReadState_,
+        public_channel_::{ChunkReadErr_, ChunkReadState_},
         scope_::new_conn_scope_,
         signal_::{ReadAttach_, SessionEvent_, SessionMailbox_, WriteAttach_},
         slot_::PushErr_,
@@ -1245,6 +1245,19 @@ where
     }
 }
 
+/// 从建流期 message ring 读 outgoing 载荷时的失败原因。
+///
+/// - `Cancelled`：等锁被取消，或 ring 在读完前缀后提前关闭；
+/// - `TooLarge`：声明长度超过调用方给的缓冲（等价于旧路径的 `FrameTooLarge`）。
+#[derive(Debug)]
+pub(crate) enum ReadOutgoingErr_ {
+    /// 等锁被取消 / ring 关闭。
+    Cancelled,
+
+    /// 消息长度超过调用方缓冲。
+    TooLarge,
+}
+
 impl<C> ChannelRegistry_<C>
 where
     C: TrConnAllocCfg + 'static,
@@ -1257,6 +1270,20 @@ where
         let mut session = self.root_.inner_.acquire_session();
         let guard = acquire_read_(&mut session, cancel).await?;
         Result::Ok(guard.table_alloc_.clone())
+    }
+
+    /// 取**每循环临时对象域**的池分配器（暂用 `RegistryAlloc`）。
+    ///
+    /// 每个循环用自己的域承载重复性临时对象；域实体仍从 crate 级 root 的实体池分配。
+    /// 这里只借出“页的来源”，不共享域锁。
+    #[allow(dead_code, reason = "R3 起由 mux/demux 的每轮临时对象接线")]
+    pub(crate) async fn loop_scope_alloc_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<C::RegistryAlloc, ReserveErr_> {
+        let mut session = self.root_.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        Result::Ok(guard.alloc_.clone())
     }
 
     /// 取**连接级临时对象域**的句柄（`Tcs_` 与循环暂存从这里分配）。
@@ -1893,19 +1920,29 @@ where
         Result::Ok(state)
     }
 
-    /// 读走 app 写在 outgoing message ring 里的载荷（**不取走** ring）。
+    /// 读走 app 写在 outgoing message ring 里的载荷（**不取走** ring），写进调用方
+    /// 给的缓冲。
     ///
     /// `msg_main_` 的读端读 outgoing、写端留给 incoming（`read_message_async` 用），
-    /// 因此这里只借 `as_mut()`，不把整对 ring 取走。
-    pub(crate) async fn read_msg_outgoing_<K: TrCancellationToken>(
+    /// 因此这里只借 `as_mut()`，不把整对 ring 取走。与旧的 `read_msg_outgoing_` 相比
+    /// 不再返回 `Vec<u8>`：`dst` 由 `main_loop` 从每循环 Scope 借出，`dst.len()` 就是
+    /// 该方向允许的最大载荷（即 `pending_msg_capacity`）。返回 `Some(len)` 表示读到
+    /// 了 `len` 字节（`0` 表示空 message）；`None` 表示该身份 / ring 已不存在。
+    ///
+    /// # Errors
+    ///
+    /// 见 [`ReadOutgoingErr_`]。
+    pub(crate) async fn read_msg_outgoing_into_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
-        cap: usize,
+        dst: &mut [u8],
         cancel: K,
-    ) -> Result<Option<Vec<u8>>, ReserveErr_> {
+    ) -> Result<Option<usize>, ReadOutgoingErr_> {
         let mut session = self.root_.inner_.acquire_session();
-        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let mut guard = acquire_write_(&mut session, cancel)
+            .await
+            .map_err(|_| ReadOutgoingErr_::Cancelled)?;
         let Option::Some(BindingSlot_::Channel(ctx)) =
             guard.bindings_.get_mut((local_dock, remote_dock)).map(|(_, slot)| slot)
         else {
@@ -1915,21 +1952,23 @@ where
             return Result::Ok(Option::None);
         };
         let mut state = ChunkReadState_::new_message_();
-        let len = match msg.read_prefix_outgoing_(&mut state, cap) {
+        let len = match msg.read_prefix_outgoing_(&mut state, dst.len()) {
             Result::Ok(Option::Some(len)) => len,
             // 没有消息 / 还没写完：按空 message 处理。
-            Result::Ok(Option::None) => return Result::Ok(Option::Some(Vec::new())),
-            Result::Err(_) => return Result::Err(ReserveErr_::Cancelled),
+            Result::Ok(Option::None) => return Result::Ok(Option::Some(0usize)),
+            Result::Err(ChunkReadErr_::TooLarge) => {
+                return Result::Err(ReadOutgoingErr_::TooLarge);
+            }
+            Result::Err(_) => return Result::Err(ReadOutgoingErr_::Cancelled),
         };
-        let mut out = alloc::vec![0u8; len];
         let mut filled = 0usize;
         while filled < len {
-            match msg.read_body_outgoing_(&mut state, &mut out[filled..]) {
+            match msg.read_body_outgoing_(&mut state, &mut dst[filled..len]) {
                 Result::Ok(n) if n > 0usize => filled += n,
-                _ => break,
+                _ => return Result::Err(ReadOutgoingErr_::Cancelled),
             }
         }
-        Result::Ok(Option::Some(out))
+        Result::Ok(Option::Some(len))
     }
 
     /// 释放所有已被 `Drop` 置 retired 位的身份（P4 的 retired 扫描）。
@@ -4294,4 +4333,55 @@ mod tests_ {
         assert_index_consistent_(&registry);
     }
     multi_art_test_!(owner_is_created_with_the_identity);
+
+    /// 测试 outgoing message 读入调用方缓冲，且超长在**读正文之前**就被拒绝。
+    /// - 手段：登记一条 channel，写入 `b"hello"`，用 64 字节缓冲读回；再写一次，
+    ///   改用 2 字节缓冲读取。
+    /// - 判断：第一次返回 `Some(5)` 且内容逐字节相等；第二次返回
+    ///   `Err(ReadOutgoingErr_::TooLarge)`，不读取正文。
+    ///
+    /// Test goal: outgoing messages are copied into the caller's buffer, and an
+    /// over-long message is refused before its body is read.
+    /// Method: reserve a channel, write `b"hello"`, read it into a 64-byte buffer;
+    /// write again and read into a 2-byte buffer.
+    /// Assertion: the first read returns `Some(5)` with equal bytes; the second returns
+    /// `Err(ReadOutgoingErr_::TooLarge)`.
+    async fn read_outgoing_into_buffer_rejects_overlong() {
+        let registry: ChannelRegistry_<SingleConnAllocCfg> =
+            ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
+        let local = Dock::new(0x31u32);
+        let remote = Dock::new(0x32u32);
+        let (_owner, mut msg) = registry
+            .reserve_channel_(
+                local,
+                remote,
+                TEST_NOW_MILLIS_,
+                64usize,
+                NonCancellableToken::new(),
+            )
+            .await
+            .expect("登记 channel 应当成功");
+
+        msg.write_outgoing_(b"hello", 64usize)
+            .expect("写 outgoing message 应当成功");
+        let mut big = [0u8; 64usize];
+        let read = registry
+            .read_msg_outgoing_into_(local, remote, &mut big, NonCancellableToken::new())
+            .await
+            .expect("读 outgoing message 应当成功")
+            .expect("应当有一条 message");
+        assert_eq!(read, 5usize);
+        assert_eq!(&big[..read], b"hello");
+
+        msg.write_outgoing_(b"hello", 64usize)
+            .expect("再次写 outgoing message 应当成功");
+        let mut small = [0u8; 2usize];
+        assert!(matches!(
+            registry
+                .read_msg_outgoing_into_(local, remote, &mut small, NonCancellableToken::new())
+                .await,
+            Result::Err(ReadOutgoingErr_::TooLarge)
+        ));
+    }
+    multi_art_test_!(read_outgoing_into_buffer_rejects_overlong);
 }

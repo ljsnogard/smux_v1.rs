@@ -345,7 +345,6 @@ where
                 *local_dock,
                 *remote_dock,
                 Option::Some((report.recv_total(), report.window())),
-                Vec::new(),
             );
             w_events.try_send_durable_event_(WriteEvent_::Control { frame_: frame })
         }

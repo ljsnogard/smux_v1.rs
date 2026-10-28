@@ -1,5 +1,3 @@
-use alloc::vec::Vec;
-
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
@@ -221,7 +219,6 @@ fn abort_pending_<C>(
             local,
             remote,
             Option::None,
-            Vec::new(),
         ),
     });
     // 响应方已经回过 `OPEN`：进入拆流宽限期，让在途帧被静默丢弃。
@@ -901,21 +898,28 @@ where
     if len == 0usize {
         return Result::Ok(0usize);
     }
-    let mut buf = alloc::vec![0u8; len];
+    // 分块搬运到 sink：不再先分配一个 `Vec<u8>` 装整条 message。message ring 本身
+    // 已经是暂存，这里只需要一个栈上小块；每块立刻写进 sink，背压由 `enqueue_frame_`
+    // 的 `write_async` 承担。
+    const K_READ_MSG_CHUNK: usize = 1024usize;
+    let mut buf = [0u8; K_READ_MSG_CHUNK];
     let mut filled = 0usize;
     while filled < len {
+        let want = core::cmp::min(buf.len(), len - filled);
         match handle
             .msg_
-            .read_body_incoming_(&mut state, &mut buf[filled..])
+            .read_body_incoming_(&mut state, &mut buf[..want])
         {
-            Result::Ok(n) if n > 0usize => filled += n,
+            Result::Ok(n) if n > 0usize => {
+                enqueue_frame_(sink, &buf[..n], cancel.child_token()).await?;
+                filled += n;
+            }
             Result::Ok(_) => {
                 let _ = poll_fn(|cx| handle.msg_.poll_incoming_readable_(cx)).await;
             }
             Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::MalformedFrame)),
         }
     }
-    enqueue_frame_(sink, &buf, cancel.child_token()).await?;
     Result::Ok(len)
 }
 
@@ -936,7 +940,6 @@ where
             local,
             remote,
             Option::None,
-            Vec::new(),
         ),
     });
     // 进拆流宽限期：对端可能已经在途的帧会被静默丢弃。

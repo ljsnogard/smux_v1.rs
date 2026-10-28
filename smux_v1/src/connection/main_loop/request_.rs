@@ -61,14 +61,14 @@ where
         reply: Tcs_<MainLoopResult_<C>>,
     },
 
-    /// 把一条已组好的控制帧写进公共 TX ring（fire-and-forget）。
+    /// 把一条**无载荷**控制帧写进公共 TX ring（fire-and-forget）。
     ///
-    /// P3.1b 的过渡：`OPEN` / `ACCEPT` / `REJECT` 的载荷仍在
-    /// `ControlFrame_::payload_`；P3.2 起改由 `Accept` / `Reject` 请求从 message ring
-    /// 读载荷。没有完成源——写失败（队列关闭 / 帧过大）只记在连接状态上。
+    /// `OPEN` / `ACCEPT` / `REJECT` 的载荷不在这里：它们由 `Accept` / `Reject` 请求
+    /// 从建流期 message ring 读进 `main_loop` 的缓冲，再由写帧函数作为独立切片传入。
+    /// 本变体只给 timer / demux 的 `PULSE`、`CLOSE`、`WINDOW_UPDATE` 等无载荷帧用。
     #[allow(dead_code, reason = "P4/P5 把 timer 的控制帧迁到公共 TX 时使用")]
     SendControl {
-        /// 待写出的控制帧。
+        /// 待写出的控制帧（只有帧头字段）。
         frame: ControlFrame_,
 
         /// 完成源：帧真正写进公共 TX ring 后完成，调用方据此保证后续帧的顺序。

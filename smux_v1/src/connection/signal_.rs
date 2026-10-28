@@ -89,10 +89,11 @@ use crate::{
 /// 数据帧不走这里：写循环直接从各子流的发送环取数据并成帧，见
 /// [`WriteEvent_::TxReady`]。
 ///
-/// `payload_` 用 `Vec<u8>`：控制帧的产生频率由协议状态机约束（建流 / 拆流各一次），
-/// 属**冷路径**；数据路径不产生任何堆分配。这是「不隐式分配」纪律的一处明确例外
-/// （分配清单见 `dev-notes/audit-heap-alloc-20261004-1122.md`）。
-#[derive(Debug, Clone)]
+/// 控制帧本身只带帧头字段；`OPEN` / `ACCEPT` / `REJECT` 的 message / welcome /
+/// reason 由 `main_loop` 从建流期 message ring 读出后，作为**独立切片**交给写帧
+/// 函数（见 `main_loop::write_control_frame_async_`），不再挂在帧结构上。这样控制
+/// 帧不再持有 `Vec<u8>`，事件通道里的控制帧也就没有载荷分配。
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ControlFrame_ {
     /// 帧种类。
     kind_: FrameKind,
@@ -109,13 +110,10 @@ pub(crate) struct ControlFrame_ {
     /// 窗口通告 `(累计已收 R, 接收窗口 W)`；只有 `OPEN` / `PULSE` /
     /// `WINDOW_UPDATE` 带。
     window_: Option<(RecvTotal, Credit)>,
-
-    /// 帧载荷字节。
-    payload_: Vec<u8>,
 }
 
 impl ControlFrame_ {
-    /// 造一条不带窗口、不带载荷的控制帧（`CLOSE` 等）。
+    /// 造一条不带窗口的控制帧（`CLOSE` 等）。
     pub(crate) fn plain_(kind: FrameKind, flags: u8, local_dock: Dock, remote_dock: Dock) -> Self {
         ControlFrame_ {
             kind_: kind,
@@ -123,18 +121,16 @@ impl ControlFrame_ {
             local_dock_: local_dock,
             remote_dock_: remote_dock,
             window_: Option::None,
-            payload_: Vec::new(),
         }
     }
 
-    /// 造一条带窗口通告与载荷的控制帧（`OPEN` / `ACCEPT` 等）。
+    /// 造一条带窗口通告的控制帧（`OPEN` / `PULSE` 等）。
     pub(crate) fn with_window_(
         kind: FrameKind,
         flags: u8,
         local_dock: Dock,
         remote_dock: Dock,
         window: Option<(RecvTotal, Credit)>,
-        payload: Vec<u8>,
     ) -> Self {
         ControlFrame_ {
             kind_: kind,
@@ -142,7 +138,6 @@ impl ControlFrame_ {
             local_dock_: local_dock,
             remote_dock_: remote_dock,
             window_: window,
-            payload_: payload,
         }
     }
 
@@ -169,11 +164,6 @@ impl ControlFrame_ {
     /// 窗口通告（若带）。
     pub(crate) fn window_(&self) -> Option<(RecvTotal, Credit)> {
         self.window_
-    }
-
-    /// 帧载荷字节。
-    pub(crate) fn payload_(&self) -> &[u8] {
-        &self.payload_
     }
 }
 
