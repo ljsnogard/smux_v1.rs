@@ -107,7 +107,7 @@
 //!
 //! [`ChannelCloseReason::ConnFailed`] 的逐子流回调就在这两个守卫里上报，判据是
 //! 「本次收尾伴随连接级失败」+ [`ChannelOwner_::claim_release_`] 的一次性 CAS；
-//! 后者与正常收尾路径（`maybe_release_`）共用同一把闸门，因此**每条子流恰好上报
+//! 后者与正常收尾路径（`main_loop::flush_releasable_`）共用同一把闸门，因此**每条子流恰好上报
 //! 一次**：正常收尾的那条报 `Fin`，被连接级失败牵连的那条报 `ConnFailed`，不会重复。
 //!
 //! [`ChannelOwner_::claim_release_`]: crate::connection::owner_::ChannelOwner_::claim_release_

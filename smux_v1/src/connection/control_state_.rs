@@ -48,6 +48,15 @@ pub(crate) const HINT_MAIN_TX_DRAINED: u64 = 1u64 << 1usize;
 /// 「应用已关闭接收方向」：`main_loop` 扫描并写 `CLOSE(RESET)`。
 pub(crate) const HINT_MAIN_RESET: u64 = 1u64 << 2usize;
 
+/// 「有子流两个方向都已在协议层收尾」：`main_loop` 扫描身份表并释放注册表身份。
+///
+/// 写循环在完成自己的本地动作（置 `LOCAL_FIN_SENT` / `LOCAL_RESET_FLUSHED`、摘写表）
+/// 之后 raise 它；释放判据由 [`ChannelState_::claim_release_`] 的一次性 CAS 给出，
+/// 因此**恰好一次**的语义不依赖本提示不重复。
+///
+/// [`ChannelState_::claim_release_`]: crate::connection::owner_::ChannelState_::claim_release_
+pub(crate) const HINT_MAIN_RELEASE: u64 = 1u64 << 3usize;
+
 /// 请求通道的缓冲区类型别名（`MpmcBuf` 由 `MpmcChan` 持有）。
 type ControlBuf_<C> = MpmcBuf<MainLoopRequest_<C>, K_MAIN_REQ_CAP>;
 

@@ -1354,6 +1354,89 @@ where
         &self.scope_
     }
 
+    /// 释放所有「两个方向都已在协议层收尾」的子流身份（`main_loop` 专用）。
+    ///
+    /// # 判据与「恰好一次」
+    ///
+    /// 判据是 [`ChannelState_::claim_release_`] 的**一次性 CAS**：它把「发送方向已收尾」
+    /// （`LOCAL_FIN_SENT` / 对端 `RESET`）与「接收方向已收尾」（应用关读 / 对端 `FIN`）
+    /// 放在同一次比较交换里，因此同一把闸门只可能成功一次——写循环重复 raise
+    /// [`HINT_MAIN_RELEASE`] 不会重复释放，也不会重复上报 `on_channel_closed`。
+    ///
+    /// 认领与「转宽限态」在**同一把写锁**内完成：若分两次取锁，认领成功之后锁失败
+    /// 会让该子流带着 `RELEASED` 位永远留在活跃表里（`claim_release_` 不再成功，
+    /// 也没有别的路径替它转宽限态）。
+    ///
+    /// # 为什么还要求 `LOCAL_RESET_FLUSHED`
+    ///
+    /// 应用关掉接收方向时，本端仍欠对端一条 `CLOSE(RESET)`；那条帧由 `main_loop`
+    /// 写进公共 TX ring，写循环在刷空后置 `LOCAL_RESET_FLUSHED`。若在这里提前释放，
+    /// 身份变成 `WaitClose` 之后 [`scan_reset_pending_`](Self::scan_reset_pending_)
+    /// 就再也看不到它，`RESET` 会永久丢失。因此「欠 `RESET`」的子流等帧上线后再释放
+    /// ——写循环那时会再 raise 一次提示。
+    ///
+    /// # 返回值
+    ///
+    /// `(本次释放的 (pair, owner) 列表, 释放后活跃子流是否归零)`。列表按 `RegistryAlloc`
+    /// 分配，只在**确实有释放**时发生（空 `Vec::new_in` 不分配）。
+    ///
+    /// [`ChannelState_::claim_release_`]: crate::connection::owner_::ChannelState_::claim_release_
+    /// [`HINT_MAIN_RELEASE`]: crate::connection::control_state_::HINT_MAIN_RELEASE
+    pub(crate) async fn release_done_channels_<K: TrCancellationToken>(
+        &self,
+        now_millis: u64,
+        cancel: K,
+    ) -> Result<
+        (
+            alloc::vec::Vec<
+                ((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>),
+                C::RegistryAlloc,
+            >,
+            bool,
+        ),
+        ReserveErr_,
+    > {
+        let mut session = self.root_.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let inner = &mut *guard;
+        inner.reap_wait_close_(now_millis);
+        let mut out = alloc::vec::Vec::new_in(inner.alloc_.clone());
+        // 第一步：只动 owner 的状态字（CAS），不改表，因此可以边遍历边收集。
+        for (pair, binding) in inner.bindings_.iter() {
+            let BindingSlot_::Channel(ctx) = binding else {
+                continue;
+            };
+            // 欠一条 `RESET` 的子流先不释放（原因见类型文档）。
+            if ctx.rec_.is_app_rx_closed_() && !ctx.rec_.is_local_reset_flushed_() {
+                continue;
+            }
+            if ctx.rec_.claim_release_() {
+                out.push((*pair, ctx.rec_.clone()));
+            }
+        }
+        // 第二步：把已认领的身份改成宽限态（墓碑）。认领与这里之间不会有人改动表
+        // ——同一把写锁内，而 `main_loop` 是唯一写者。
+        let until = now_millis.saturating_add(millis_of_(inner.opts_.max_channel_wait_close));
+        for (pair, _) in out.iter() {
+            let (local_dock, remote_dock) = *pair;
+            inner.bindings_.insert(
+                (local_dock, remote_dock),
+                BindingSlot_::WaitClose(WaitCloseCtx_),
+            );
+            inner
+                .wait_close_expiry_
+                .insert((until, local_dock, remote_dock), ());
+            inner.remote_index_.remove((remote_dock, local_dock));
+            inner.total_ = inner.total_.saturating_sub(1usize);
+            if let Option::Some((_, dock)) = inner.docks_.get_mut(local_dock) {
+                dock.chan_count_ = dock.chan_count_.saturating_sub(1usize);
+            }
+            inner.prune_dock_(local_dock);
+        }
+        let became_idle = inner.total_ == 0usize;
+        Result::Ok((out, became_idle))
+    }
+
     /// 建立注册表：分配根对象与四本索引，并为四个循环建好取消令牌。
     ///
     /// 每一项分配器都从分配器配置按用途取：结构（索引 / 根对象）用
@@ -1687,8 +1770,8 @@ where
                 local_dock,
                 remote_dock,
             } => {
-                // 返回值是「释放后活跃子流是否归零」——由**循环**在收口点关心
-                // （见 `session_::maybe_release_`），会话事件的批量落实不看它。
+                // 返回值是「释放后活跃子流是否归零」——由**控制面循环**在收口点
+                // 关心（见 `main_loop::flush_releasable_`），会话事件的批量落实不看它。
                 let _ = self
                     .unreserve_channel_(local_dock, remote_dock, cancel)
                     .await;

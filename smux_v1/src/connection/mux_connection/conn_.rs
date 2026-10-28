@@ -242,7 +242,6 @@ where
                 tx,
                 shared_.clone(),
                 w_receiver_,
-                core_.r_events_().clone(),
                 public_tx_r_,
                 core_.loop_token_(1usize),
             ),
@@ -569,7 +568,7 @@ where
 ///
 /// | 时机 | 执行者 | 依据 |
 /// | --- | --- | --- |
-/// | 最后一条活跃子流与对端双向收尾 | 复用循环（`session_::maybe_release_`） | 身份释放后活跃子流归零 |
+/// | 最后一条活跃子流与对端双向收尾 | 控制面循环（`main_loop::flush_releasable_`） | 身份释放后活跃子流归零 |
 /// | 关闭点上没有活跃子流，或关闭整体超时 | 计时循环（`timer_loop_async_`） | `TimerScan_::close_action_` |
 ///
 /// 「所有正在活动的子流排空并向对端发关闭信号」这一步同样由计时循环完成：它在
