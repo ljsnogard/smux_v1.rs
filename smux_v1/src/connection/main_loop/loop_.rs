@@ -907,7 +907,7 @@ mod tests_ {
         dock: Dock,
     ) -> DockBinding<TestMuxConfig_> {
         let cancel = NonCancellableToken::new();
-        let scope = crate::x_deps::sw_scope::Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let tcs = block_on_ready_(Tcs_::new_(&scope)).expect("测试域可用");
         let waiter = tcs.clone();
         let submitted = block_on_ready_(ctl.submit_async_(

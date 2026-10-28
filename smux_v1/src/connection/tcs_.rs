@@ -354,7 +354,7 @@ mod tests_ {
     /// Assertion: first poll is `Ready(Some(7))`; second is `Ready(None)`.
     #[test]
     fn tcs_set_then_poll_takes_value_once_() {
-        let scope = Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let tcs = new_tcs_::<u32>(&scope);
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
@@ -377,7 +377,7 @@ mod tests_ {
     /// Assertion: `Pending` first; wake count increases; `Ready(Some(9))` last.
     #[test]
     fn tcs_set_wakes_pending_waiter_() {
-        let scope = Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let tcs = new_tcs_::<u32>(&scope);
         let (waker, probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
@@ -410,7 +410,7 @@ mod tests_ {
         }
 
         let count = Arc::new(AtomicUsize::new(0usize));
-        let scope = Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let tcs = new_tcs_::<DropProbe_>(&scope);
         tcs.abandon_();
         assert!(!tcs.set_(DropProbe_ {
@@ -429,7 +429,7 @@ mod tests_ {
     /// Assertion: `Ready(Some(11))`; a second `set_` returns false.
     #[test]
     fn tcs_clone_shares_state_() {
-        let scope = Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let tcs = new_tcs_::<u32>(&scope);
         let other = tcs.clone();
         let (waker, _probe) = counting_waker_();
@@ -453,7 +453,7 @@ mod tests_ {
     /// Assertion: `is_abandoned_()` is true; a later `set_(1)` returns false.
     #[test]
     fn tcs_abandon_guard_abandons_on_drop_() {
-        let scope = Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let tcs = new_tcs_::<u32>(&scope);
         {
             let _guard = TcsAbandonGuard_::new_(&tcs);
@@ -471,7 +471,7 @@ mod tests_ {
     /// Assertion: not abandoned; `Ready(Some(13))`.
     #[test]
     fn tcs_abandon_after_set_keeps_value_() {
-        let scope = Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let tcs = new_tcs_::<u32>(&scope);
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);
@@ -486,7 +486,7 @@ mod tests_ {
     }
 
     /// 测试域关闭后完成源失效：`set_` 返回 `false`，`poll_wait_` 返回 `Ready(None)`。
-    /// - 手段：`Scope::new()` 建完成源，`close()` 域，再访问完成源。
+    /// - 手段：`new_test_scope_()` 建完成源，`close()` 域，再访问完成源。
     /// - 判断：`set_` 为假；`poll_wait_` 为 `Ready(None)`；`is_abandoned_` 为真。
     ///
     /// Test goal: a closed domain makes the source fail closed.
@@ -494,7 +494,7 @@ mod tests_ {
     /// Assertion: `set_` is false; `poll_wait_` is `Ready(None)`; `is_abandoned_` is true.
     #[test]
     fn tcs_closed_scope_reports_cancelled_() {
-        let scope = Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let tcs = new_tcs_::<u32>(&scope);
         let (waker, _probe) = counting_waker_();
         let mut cx = Context::from_waker(&waker);

@@ -1281,8 +1281,10 @@ where
         let attach_alloc = cfg.attach_alloc();
         let core_alloc = cfg.core_alloc();
         // 连接级临时对象域：池分配器取注入的结构分配器，对象因此仍落在调用方
-        // 选定的分配器上（域实体本身走 sw-scope 默认 root 的全局分配，每连接一次）。
-        let scope_ = new_conn_scope_(alloc.clone());
+        // 选定的分配器上；域实体从 crate 级 RootScope 的实体池分配（root 自身用
+        // `Global` 分配且不随连接关闭）。
+        let scope_ = new_conn_scope_(alloc.clone())
+            .expect("crate 级 RootScope 应当可用");
         let loops = [
             // 0：解复用（transport Rx → 各子流接收环）
             // 1：复用（各子流发送环 → transport Tx）

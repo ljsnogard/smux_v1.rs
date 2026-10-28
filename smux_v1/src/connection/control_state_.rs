@@ -222,7 +222,7 @@ mod tests_ {
     #[test]
     fn control_state_is_fifo_and_closes_() {
         let cfg = SingleConnAllocCfg::default();
-        let scope = crate::x_deps::sw_scope::Scope::new();
+        let scope = crate::connection::new_test_scope_();
         let ctl = ControlState_::<SingleConnAllocCfg>::new_(cfg);
         for dock in [1u32, 2u32] {
             let reply = futures::executor::block_on(Tcs_::new_(&scope)).expect("测试域可用");

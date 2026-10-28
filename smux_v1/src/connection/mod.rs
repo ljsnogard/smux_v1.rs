@@ -668,6 +668,8 @@ pub(crate) type ConnCoreAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::CoreAl
 pub(crate) type ConnPublicAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::PublicAlloc;
 pub(crate) use control_state_::{ControlState_, HINT_MAIN_RETIRED};
 pub(crate) use scope_::alloc_zeroed_bytes_async_;
+#[cfg(test)]
+pub(crate) use scope_::new_test_scope_;
 pub(crate) use main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_, main_loop_async_};
 pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
 pub(crate) use mux_connection::ReserveErr_;
