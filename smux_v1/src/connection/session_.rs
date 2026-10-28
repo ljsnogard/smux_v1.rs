@@ -135,6 +135,7 @@ use buffex::ring::ConsumerError;
 use crate::{
     connection::{
         Dock, FrameHeader, FrameKind, MuxError, TrConnAllocCfg, TrConnCfg, flags,
+        control_state_::ControlState_,
         frame_::{K_MAX_FRAME_HEADER, encode_header_},
         frame_parser_,
         mux_connection::ChannelRegistry_,
@@ -143,8 +144,8 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, EventTake_,
-            HINT_R_RELEASE, HINT_W_PEER_CLOSED, HINT_W_RELEASED, HINT_W_RX_CLOSED,
-            ReadAttach_, ReadEvent_, TrEventReceiver_,
+            HINT_R_RELEASE, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED, HINT_W_RELEASED,
+            HINT_W_RX_CLOSED, ReadAttach_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteAttach_, WriteEvent_,
         },
         telegraph::TgRecvCtx_,
@@ -194,6 +195,9 @@ where
 {
     /// 注册表（dock / 子流索引与配额、失败标志、取消令牌、计时唤醒槽）。
     reg_: ChannelRegistry_<C>,
+
+    /// 控制面共享句柄：写循环据此 raise `HINT_MAIN_*`（例如发送环已排空）。
+    control_: ControlState_<C>,
 
     /// 协商出的单帧总长上限。
     max_packet_size_: usize,
@@ -246,6 +250,7 @@ where
     fn clone(&self) -> Self {
         MuxLoopShared_ {
             reg_: self.reg_.clone(),
+            control_: self.control_.clone(),
             max_packet_size_: self.max_packet_size_,
             pending_msg_cap_: self.pending_msg_cap_,
             conn_clock_: self.conn_clock_.clone(),
@@ -263,8 +268,13 @@ where
     M: TrMetricsSink,
 {
     /// 由建连路径展开后的量构造（成员私有，构造只能走这里）。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "构造器一次接收建连时已展开的共享量"
+    )]
     pub(crate) fn new_(
         reg: ChannelRegistry_<C>,
+        control: ControlState_<C>,
         max_packet_size: usize,
         pending_msg_cap: usize,
         conn_clock: ConnClock_<R>,
@@ -274,6 +284,7 @@ where
     ) -> Self {
         MuxLoopShared_ {
             reg_: reg,
+            control_: control,
             max_packet_size_: max_packet_size,
             pending_msg_cap_: pending_msg_cap,
             conn_clock_: conn_clock,
@@ -293,6 +304,11 @@ where
     /// 注册表句柄。
     pub(crate) fn reg_(&self) -> &ChannelRegistry_<C> {
         &self.reg_
+    }
+
+    /// 控制面共享句柄（写循环据此 raise `HINT_MAIN_*`）。
+    pub(crate) fn control_(&self) -> &ControlState_<C> {
+        &self.control_
     }
 
     /// 连接级时钟。
@@ -446,10 +462,11 @@ type TgWriteTable_<C> = crate::connection::dock_index_::DockBPlusTree_<
 >;
 
 
-// 半关闭的 `FIN` 重试不再维护独立的 `PendingFin_` 集合：
-// `drain_once_` 每轮扫描本地写表时，对 `APP_TX_CLOSED && !LOCAL_FIN_SENT` 的条目
-// 直接尝试 `finalize_entry_`。发送环空 / 额度不足的条目会在下一轮自然重试，既不会
-// 饿死后面的条目，也省掉一整棵本地索引树。
+// 半关闭的 `FIN` 不再维护独立的 `PendingFin_` 集合：
+// `drain_once_` 每轮扫描本地写表时，对 `APP_TX_CLOSED && !TX_DRAINED` 的条目在
+// 发送环排空后置 `TX_DRAINED` 并叫醒 main；main 把 `CLOSE(FIN)` 写进公共 TX ring，
+// 由 `scan_fin_enqueued_` 在刷空后确认上线。既不会饿死后面的条目，也省掉一整棵
+// 本地索引树。
 
 /// 处理写循环收到的一条 `Attach`：插入本地写表，并补查那些可能早于 `Attach` 到达的
 /// 一次性事实（应用封口 / 关接收、对端 `CLOSE`）。
@@ -535,6 +552,12 @@ where
         };
         let owner = entry.owner_.clone();
         if !owner.is_app_rx_closed_() || owner.is_local_reset_flushed_() {
+            continue;
+        }
+        // FIN 已经进公共 TX ring、但还没确认上线：先等它上线，再发 RESET。
+        // 否则 RESET（写循环直接写 `ConnTx`）会越过 FIN（公共 TX ring），对端先看到
+        // RESET、后看到 FIN，接收方向就少了一次 `peer_fin` 的释放触发点。
+        if owner.is_app_tx_closed_() && !owner.is_local_fin_sent_() {
             continue;
         }
         if !owner.claim_local_reset_() {
@@ -667,6 +690,60 @@ where
     }
 }
 
+/// 确认 `main_loop` 已写进公共 TX ring 的 `CLOSE(FIN)` 真正上线。
+///
+/// 调用点保证公共 TX ring 已经刷空；此时 `FIN_ENQUEUED` 的条目可以置
+/// `LOCAL_FIN_SENT`、关发送环消费端并唤醒 `close_async` 等待者。
+async fn scan_fin_enqueued_<C, K>(
+    shared: &MuxShared_<C>,
+    table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
+    read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    C::Rt: TrTime + Clone,
+    K: TrCancellationToken,
+{
+    let mut cursor: Option<(Dock, Dock)> = Option::None;
+    loop {
+        let next = match cursor {
+            Option::None => table.keys().next().copied(),
+            Option::Some(last) => table
+                .range((Bound::Excluded(last), Bound::Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        };
+        let Option::Some(pair) = next else {
+            return Result::Ok(());
+        };
+        cursor = Option::Some(pair);
+        let Option::Some((_, entry)) = table.get(pair) else {
+            continue;
+        };
+        if !entry.owner_.is_fin_enqueued_() || entry.owner_.is_local_fin_sent_() {
+            continue;
+        }
+        let owner = entry.owner_.clone();
+        owner.set_local_fin_sent_();
+        #[cfg(feature = "test-loop-probe")]
+        crate::connection::loop_probe_::local_fin_sent_();
+        if let Option::Some((_, entry)) = table.get_mut(pair) {
+            entry.reader_.close();
+            entry.fin_sent_ = true;
+            entry.owner_.notify_tx_progress_();
+        }
+        maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
+        if table
+            .get(pair)
+            .map(|(_, entry)| entry.owner_.is_released_())
+            .unwrap_or(false)
+        {
+            table.remove(pair);
+        }
+    }
+}
+
 /// 摘掉「身份已释放」的读表项并关闭接收环写端。
 ///
 /// `buffex` 的环半部被 drop **不会**置位关闭标记：少了显式 `close()`，应用侧正 park
@@ -699,103 +776,6 @@ where
             entry.writer_.close();
         }
     }
-}
-
-/// 尝试把一条「已丢弃发送半边」的子流真正收尾：排空发送环 → 发 `CLOSE(FIN)` →
-/// 设置 `local_fin_sent_` → 从本地表移除。
-///
-/// 返回 `true` 表示**本轮有进展**（循环值得再调一次），`false` 表示遇到下面两种
-/// 合法阻塞之一；`drain_once_` 每轮重扫本地写表，因此阻塞条目下一轮会自然再试：
-///
-/// - **发送环里还有数据但额度为 0**：等对端的窗口通告；
-/// - **段一时借不出来**（环被写者占住）：等下一次 `TxReady` / 环提交。
-///
-/// 收尾成功后调用方仍需走 [`maybe_release_`]——真正释放注册表条目还要看接收方向
-/// 是否也已收尾。
-#[allow(clippy::too_many_arguments)]
-async fn finalize_entry_<C, K>(
-    tx_stage: &mut C::ConnTx,
-    shared: &MuxShared_<C>,
-    table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    scratch: &mut [u8],
-    read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
-    pair: (Dock, Dock),
-    cancel: &K,
-) -> Result<bool, MuxError>
-where
-    C: TrConnCfg,
-    C::Rt: TrTime + Clone,
-    K: TrCancellationToken,
-{
-    // 0. 表里已经没有这条子流：它已经被别的路径收掉了（对端 `RESET`、本端主动拆流、
-    //    连接收尾）。没有表项就没有可排空的环，直接返回。
-    if !table.contains_key(pair) {
-        return Result::Ok(false);
-    }
-
-    // 1. 先尽力把环里剩下的字节送出去（额度用尽时 `drain_one_` 静默返回 `false`）。
-    flush_entry_::<C, _>(tx_stage, shared, table, scratch, pair, cancel).await?;
-
-    // 2. 环里还有没有数据？`None` = 不可判定（写者正占着环），下轮再来。
-    //    `drain_once_` 每轮都会重扫本地写表，因此这里**不需要**登记待收尾集合；
-    //    阻塞的条目只是在下一轮被再次尝试，不会饿死后面的条目。
-    match has_writable_::<C>(table, pair) {
-        Option::None => {
-            #[cfg(feature = "test-loop-probe")]
-            crate::connection::loop_probe_::fin_see_unknown_();
-            return Result::Ok(false);
-        }
-        // 还有数据没发出去：等额度 / 环推进。
-        Option::Some(true) => {
-            #[cfg(feature = "test-loop-probe")]
-            crate::connection::loop_probe_::fin_see_data_();
-            return Result::Ok(false);
-        }
-        Option::Some(false) => {
-            #[cfg(feature = "test-loop-probe")]
-            crate::connection::loop_probe_::fin_see_empty_();
-        }
-    }
-
-    // 3. 环已排空：此刻才可以发 `CLOSE(FIN)`。
-    control_close_via_::<C, _>(
-        tx_stage,
-        shared,
-        shared.max_packet_size_,
-        pair.0,
-        pair.1,
-        false,
-        cancel.child_token(),
-    )
-    .await?;
-    if let Option::Some((_, entry)) = table.get_mut(pair) {
-        #[cfg(feature = "test-loop-probe")]
-        crate::connection::loop_probe_::local_fin_sent_();
-        entry.owner_.set_local_fin_sent_();
-        // 排空已完成、`FIN` 已发出：**关掉发送环的消费端**。
-        //
-        // 对既有的「应用已经丢弃发送半边」这条路径它只是顺手收尾（写端早已释放）；
-        // 对**优雅关闭**（`close_async` 替应用发起的收尾）它才是必需的——应用手里
-        // 那份 `ChannelTx` 可能还在，关掉消费端能让它的下一次写入立刻拿到「发送
-        // 方向已关闭」，而不是把字节留在一条再没有读者的环里静默丢掉。
-        // 手法与 `scan_write_released_` 的拆流收尾相同。
-        entry.reader_.close();
-        // `FIN` 已上线：应用侧的 `close_async` 等待者由此醒来并复检成功。
-        entry.owner_.notify_tx_progress_();
-        entry.fin_sent_ = true;
-    }
-    maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
-    // **不在这里无条件摘表**：本端 `FIN` 发出后，对端随后的 `CLOSE` 仍要经本表扫描
-    // 推进身份释放（`scan_peer_closed_`）。只有身份确实已释放时才摘；否则留到对端
-    // `CLOSE` / 主动拆流 / 循环退出时处理。
-    if table
-        .get(pair)
-        .map(|(_, entry)| entry.owner_.is_released_())
-        .unwrap_or(false)
-    {
-        table.remove(pair);
-    }
-    Result::Ok(true)
 }
 
 /// 复用循环 park 的就绪判据之一：**「最近通知过的那条发送环」此刻真的有段可借吗**。
@@ -2683,6 +2663,29 @@ pub(crate) async fn mux_loop_async_<C, K>(
         // 位是**唤醒**而不是事实：事实在各子流状态字里，这里按表扫一次即可补齐。
         let mut hints = shared.reg_().take_write_hint_();
         hints |= core::mem::take(&mut pending_hints);
+        // main 已把 `CLOSE(FIN)` 放进公共 TX ring；只有把它刷空之后才能确认上线。
+        // 这里不 park：若还有未刷出的 chunk / 半个前缀，下一轮或 `HINT_W_FIN_ENQUEUED`
+        // 再次到达时再确认。
+        if hints & HINT_W_FIN_ENQUEUED != 0u64 {
+            if public_tx_r.ring_state().data_size() == 0usize {
+                match race_cancel_(
+                    &cancel,
+                    scan_fin_enqueued_::<C, _>(&shared, &mut *table, &read_events, &cancel),
+                )
+                .await
+                {
+                    Option::None => return,
+                    Option::Some(Result::Ok(())) => {}
+                    Option::Some(Result::Err(err)) => {
+                        fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+                        return;
+                    }
+                }
+            } else {
+                // FIN 还在公共 TX 里：留到下一轮刷空之后再确认。
+                pending_hints |= HINT_W_FIN_ENQUEUED;
+            }
+        }
         if hints & HINT_W_RX_CLOSED != 0u64 {
             match race_cancel_(
                 &cancel,
@@ -2799,7 +2802,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &shared,
                     &mut *table,
                     &mut scratch[..],
-                    &read_events,
                     &cancel,
                 ),
             )
@@ -3454,37 +3456,6 @@ where
     Result::Ok(())
 }
 
-/// 把某条子流发送环里已提交的数据全部写出（直到取空）。
-async fn flush_entry_<C, K>(
-    tx_stage: &mut C::ConnTx,
-    shared: &MuxShared_<C>,
-    table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    scratch: &mut [u8],
-    pair: (Dock, Dock),
-    cancel: &K,
-) -> Result<(), MuxError>
-where
-    C: TrConnCfg,
-    C::Rt: TrTime + Clone,
-    K: TrCancellationToken,
-{
-    loop {
-        let progressed =
-            drain_one_::<C, _>(
-                tx_stage,
-                shared,
-                table,
-                scratch,
-                pair,
-                cancel,
-            )
-            .await?;
-        if !progressed {
-            return Result::Ok(());
-        }
-    }
-}
-
 /// 轮转一遍本地表，最多写出一段数据；返回是否有进展。
 #[allow(clippy::too_many_arguments)]
 async fn drain_once_<C, K>(
@@ -3492,7 +3463,6 @@ async fn drain_once_<C, K>(
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
     scratch: &mut [u8],
-    read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     cancel: &K,
 ) -> Result<bool, MuxError>
 where
@@ -3529,27 +3499,30 @@ where
         {
             return Result::Ok(true);
         }
-        // 发送方向已封口、但还没发 `FIN`：这一轮顺手推进一次。阻塞（环里还有数据 /
-        // 额度没回 / 段借不出来）时不登记任何集合，下一轮重扫本地表时会再试。
+        // 发送方向已封口、还没进入 FIN 流程：确认环是否已经排空。
+        // 只有「明确排空」才置 `TX_DRAINED` 并叫醒 main 组 `CLOSE(FIN)`；环里还有
+        // 数据 / 不可判定时留给下一轮。main 写进公共 TX ring 后由
+        // `scan_fin_enqueued_` 在刷空时确认上线。
         let eligible = table
             .get(pair)
             .map(|(_, entry)| {
-                entry.owner_.is_app_tx_closed_() && !entry.owner_.is_local_fin_sent_()
+                entry.owner_.is_app_tx_closed_()
+                    && !entry.owner_.is_local_fin_sent_()
+                    && !entry.owner_.is_fin_enqueued_()
+                    && !entry.owner_.is_tx_drained_()
             })
             .unwrap_or(false);
-        if eligible
-            && finalize_entry_::<C, _>(
-                tx_stage,
-                shared,
-                table,
-                scratch,
-                read_events,
-                pair,
-                cancel,
-            )
-            .await?
-        {
-            return Result::Ok(true);
+        if eligible && matches!(has_writable_::<C>(table, pair), Option::Some(false)) {
+            let first = table
+                .get(pair)
+                .map(|(_, entry)| entry.owner_.set_tx_drained_())
+                .unwrap_or(false);
+            if first {
+                shared
+                    .control_()
+                    .raise_main_hint_(crate::connection::HINT_MAIN_TX_DRAINED);
+            }
+            return Result::Ok(false);
         }
     }
 }

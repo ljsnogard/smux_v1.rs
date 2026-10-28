@@ -206,16 +206,19 @@ pub fn timer_exits_() -> (u64, u64, u64) {
 }
 
 /// 记一次「`finalize_entry_` 看到环里还有数据」。
+#[allow(dead_code, reason = "R6 起 finalize_entry_ 删除；probe 保留待下一轮清理")]
 pub(crate) fn fin_see_data_() {
     FIN_SEE_DATA.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// 记一次「`finalize_entry_` 看到环已排空」。
+#[allow(dead_code, reason = "R6 起 finalize_entry_ 删除；probe 保留待下一轮清理")]
 pub(crate) fn fin_see_empty_() {
     FIN_SEE_EMPTY.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// 记一次「`finalize_entry_` 无法判定」。
+#[allow(dead_code, reason = "R6 起 finalize_entry_ 删除；probe 保留待下一轮清理")]
 pub(crate) fn fin_see_unknown_() {
     FIN_SEE_UNKNOWN.with(|c| c.set(c.get().wrapping_add(1)));
 }

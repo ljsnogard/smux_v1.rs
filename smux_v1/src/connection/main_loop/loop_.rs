@@ -31,8 +31,8 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         session_::race_cancel_,
         session_::MuxShared_,
-        HINT_MAIN_RETIRED,
-        signal_::{ControlFrame_, HINT_W_PEER_CLOSED},
+        HINT_MAIN_RETIRED, HINT_MAIN_TX_DRAINED,
+        signal_::{ControlFrame_, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED},
     },
     flow_ctrl::{RecvTotal, WindowReport},
     x_deps::{abs_cancel, abs_smux},
@@ -203,6 +203,13 @@ where
     let hints = ctl.take_main_hint_();
     if hints & HINT_MAIN_RETIRED != 0u64 {
         reap_retired_and_release_::<C, _>(shared, public_tx_w, cancel).await;
+    }
+    if hints & HINT_MAIN_TX_DRAINED != 0u64
+        && let Result::Err(err) = flush_tx_drained_::<C, _>(shared, public_tx_w, cancel).await
+    {
+        let _ = shared.reg_().mark_failed_(&err, cancel.child_token()).await;
+        shared.reg_().cancel_loops_();
+        return false;
     }
 
     // 公共 RX：每轮最多 `K_MAIN_FRAME_BATCH` 条完整帧。
@@ -849,6 +856,42 @@ async fn reap_retired_and_release_<C, K>(
             )
             .await;
     }
+}
+
+/// 把 `TX_DRAINED` 的子流收成 `CLOSE(FIN)`，写进公共 TX ring。
+///
+/// FIN 的**上线确认**仍由复用循环完成：它在把公共 TX ring 刷空之后置
+/// `local_fin_sent_`。因此这里只置 `FIN_ENQUEUED`，不提前唤醒 `close_async`。
+async fn flush_tx_drained_<C, K>(
+    shared: &MuxShared_<C>,
+    public_tx_w: &mut BufferedTx,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let Result::Ok(drained) = shared
+        .reg_()
+        .scan_tx_drained_(cancel.child_token())
+        .await
+    else {
+        return Result::Ok(());
+    };
+    for (pair, owner) in drained {
+        write_control_frame_async_::<C, _>(
+            public_tx_w,
+            shared,
+            &ControlFrame_::plain_(FrameKind::Close, flags::K_FIN, pair.0, pair.1),
+            &[],
+            cancel,
+        )
+        .await?;
+        if owner.set_fin_enqueued_() {
+            shared.reg_().raise_write_hint_(HINT_W_FIN_ENQUEUED);
+        }
+    }
+    Result::Ok(())
 }
 
 /// 把一条控制帧写进公共 TX ring（背压时 park 等 `tx_space`）。
