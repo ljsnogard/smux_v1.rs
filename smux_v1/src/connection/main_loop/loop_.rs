@@ -31,8 +31,10 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         session_::race_cancel_,
         session_::MuxShared_,
-        HINT_MAIN_RETIRED, HINT_MAIN_TX_DRAINED,
-        signal_::{ControlFrame_, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED},
+        HINT_MAIN_RESET, HINT_MAIN_RETIRED, HINT_MAIN_TX_DRAINED,
+        signal_::{
+            ControlFrame_, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED, HINT_W_RESET_ENQUEUED,
+        },
     },
     flow_ctrl::{RecvTotal, WindowReport},
     x_deps::{abs_cancel, abs_smux},
@@ -206,6 +208,13 @@ where
     }
     if hints & HINT_MAIN_TX_DRAINED != 0u64
         && let Result::Err(err) = flush_tx_drained_::<C, _>(shared, public_tx_w, cancel).await
+    {
+        let _ = shared.reg_().mark_failed_(&err, cancel.child_token()).await;
+        shared.reg_().cancel_loops_();
+        return false;
+    }
+    if hints & HINT_MAIN_RESET != 0u64
+        && let Result::Err(err) = flush_reset_::<C, _>(shared, public_tx_w, cancel).await
     {
         let _ = shared.reg_().mark_failed_(&err, cancel.child_token()).await;
         shared.reg_().cancel_loops_();
@@ -889,6 +898,43 @@ where
         .await?;
         if owner.set_fin_enqueued_() {
             shared.reg_().raise_write_hint_(HINT_W_FIN_ENQUEUED);
+        }
+    }
+    Result::Ok(())
+}
+
+/// 把「应用已关闭接收方向」的子流收成 `CLOSE(RESET)`，写进公共 TX ring。
+///
+/// 与 FIN 相同：上线确认由复用循环在公共 TX 刷空后完成；这里只置
+/// `RESET_ENQUEUED`，不提前唤醒 `ChannelRx::close_async`。若本端发送方向也已封口，
+/// 注册表扫描会等到 `LOCAL_FIN_SENT` 之后才返回该子流，保证 RESET 不越过 FIN。
+async fn flush_reset_<C, K>(
+    shared: &MuxShared_<C>,
+    public_tx_w: &mut BufferedTx,
+    cancel: &K,
+) -> Result<(), MuxError>
+where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    let Result::Ok(pending) = shared
+        .reg_()
+        .scan_reset_pending_(cancel.child_token())
+        .await
+    else {
+        return Result::Ok(());
+    };
+    for (pair, owner) in pending {
+        write_control_frame_async_::<C, _>(
+            public_tx_w,
+            shared,
+            &ControlFrame_::plain_(FrameKind::Close, flags::K_RESET, pair.0, pair.1),
+            &[],
+            cancel,
+        )
+        .await?;
+        if owner.set_reset_enqueued_() {
+            shared.reg_().raise_write_hint_(HINT_W_RESET_ENQUEUED);
         }
     }
     Result::Ok(())

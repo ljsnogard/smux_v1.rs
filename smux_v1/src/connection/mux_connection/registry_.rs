@@ -1314,6 +1314,41 @@ where
         Result::Ok(out)
     }
 
+    /// 扫描「应用已关闭接收方向、等待 main 组 `CLOSE(RESET)`」的子流。
+    ///
+    /// 若本端发送方向也已封口，RESET 必须排在 FIN 之后：只有 `LOCAL_FIN_SENT` 之后
+    /// 才把该子流返回，避免 RESET 越过 FIN 导致对端少一次释放触发点。
+    pub(crate) async fn scan_reset_pending_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<
+        alloc::vec::Vec<
+            ((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>),
+            C::RegistryAlloc,
+        >,
+        ReserveErr_,
+    > {
+        let mut session = self.root_.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        let mut out = alloc::vec::Vec::new_in(guard.alloc_.clone());
+        for (pair, binding) in guard.bindings_.iter() {
+            let BindingSlot_::Channel(ctx) = binding else {
+                continue;
+            };
+            if !ctx.rec_.is_app_rx_closed_()
+                || ctx.rec_.is_reset_enqueued_()
+                || ctx.rec_.is_local_reset_flushed_()
+            {
+                continue;
+            }
+            if ctx.rec_.is_app_tx_closed_() && !ctx.rec_.is_local_fin_sent_() {
+                continue;
+            }
+            out.push((*pair, ctx.rec_.clone()));
+        }
+        Result::Ok(out)
+    }
+
     /// 取**连接级临时对象域**的句柄（`Tcs_` 与循环暂存从这里分配）。
     pub(crate) fn scope_(&self) -> &Scope {
         &self.scope_

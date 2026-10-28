@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN / `TX_DRAINED`）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -177,6 +177,28 @@ P3.3c / P4 / P5 的清理依据。
 8. **T1 仍未完全完成**：mux 不再发 FIN，但仍负责 `CLOSE(RESET)`（`flush_rx_closed_`）
    与 `maybe_release_` 本地表动作；把 RESET 也迁到 main 需要另一次收尾状态机迁移。
 
+## 4.6 第 7 轮实施记录（main 发 RESET）
+
+1. `ChannelState_` 增加 `RESET_ENQUEUED`；新增 `HINT_MAIN_RESET` 与
+   `HINT_W_RESET_ENQUEUED`。
+2. `ChannelRx::seal_rx_` 不再 raise 写循环提示，改为 raise `HINT_MAIN_RESET`；
+   `handle_write_attach_` 补查 `APP_RX_CLOSED` 时同样 raise main。
+3. `scan_reset_pending_` 从注册表扫描 `APP_RX_CLOSED && !LOCAL_RESET_FLUSHED &&
+   !RESET_ENQUEUED`；若本端发送方向已封口，则等到 `LOCAL_FIN_SENT` 之后才返回，
+   保证 RESET 排在 FIN 之后。
+4. main `flush_reset_` 把 `CLOSE(RESET)` 写进公共 TX ring 并置 `RESET_ENQUEUED`；
+   mux 在公共 TX 刷空后 `scan_reset_enqueued_` 置 `LOCAL_RESET_FLUSHED`、唤醒
+   `ChannelRx::close_async` 并尝试释放身份。
+5. `scan_fin_enqueued_` 在 FIN 上线后 raise `HINT_MAIN_RESET`，唤醒此前被 FIN
+   顺序挡住的 RESET 扫描。
+6. 删除 `flush_rx_closed_`、`HINT_W_RX_CLOSED`、`control_close_via_`；mux 不再直接
+   写 FIN / RESET。
+7. 验收：lib **365**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；clippy / doc / format
+   干净。
+8. **T1 剩余**：mux 仍通过 `maybe_release_` 做本地表释放，并仍处理 timer 的
+   `WriteEvent_::Control`（PULSE 等）；这两块留 R8。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -186,9 +208,10 @@ P3.3c / P4 / P5 的清理依据。
 | R4（已完成） | `reap_retired_` 的 5 个列表改走连接结构分配器 |
 | R5（已完成） | 删除 `PendingFin_`；FIN 重试先折进 `drain_once_` 的表扫描 |
 | R6（已完成） | `TX_DRAINED` / `FIN_ENQUEUED`；main 发 `CLOSE(FIN)`；mux 在公共 TX 刷空后确认上线 |
-| R7（P4 尾） | 把 `CLOSE(RESET)` 与 `maybe_release_` 也迁出 mux，完成 T1 |
-| R8（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
-| R9（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R7（已完成） | 把 `CLOSE(RESET)` 迁到 main；删除 `flush_rx_closed_` / `HINT_W_RX_CLOSED` / `control_close_via_` |
+| R8（T1 尾） | 把 `maybe_release_` 本地表释放与 timer 控制帧也迁出 mux，完成 T1 |
+| R9（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
+| R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 

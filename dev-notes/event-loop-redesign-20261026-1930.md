@@ -1978,6 +1978,21 @@ connection/
      cross_thread 1 / `alloc_count` 1；clippy / doc / format 干净。
   6. **T1 剩余**：mux 仍发 `CLOSE(RESET)` 并做 `maybe_release_` 本地表动作。
 
+- 20261029-0620：**R7：main 发 RESET**。
+  1. `ChannelState_` 增加 `RESET_ENQUEUED`；新增 `HINT_MAIN_RESET` /
+     `HINT_W_RESET_ENQUEUED`。
+  2. `ChannelRx::seal_rx_` raise `HINT_MAIN_RESET`；`scan_reset_pending_` 扫注册表，
+     若本端发送方向已封口则等 `LOCAL_FIN_SENT` 之后才返回。
+  3. main `flush_reset_` 把 `CLOSE(RESET)` 写进公共 TX ring；mux 在公共 TX 刷空后
+     `scan_reset_enqueued_` 置 `LOCAL_RESET_FLUSHED`、唤醒 `ChannelRx::close_async`。
+  4. `scan_fin_enqueued_` 在 FIN 上线后 raise `HINT_MAIN_RESET`，释放被 FIN 顺序挡住
+     的 RESET。
+  5. 删除 `flush_rx_closed_` / `HINT_W_RX_CLOSED` / `control_close_via_`。
+  6. 验收：lib 365 / inmem 21 / keepalive 5 / smoke 5 / cross_thread 1 /
+     `alloc_count` 1；clippy / doc / format 干净。
+  7. **T1 剩余**：mux 仍通过 `maybe_release_` 做本地表释放，并仍处理 timer 的
+     `WriteEvent_::Control`。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2144,7 +2159,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 部分完成（R6：`TX_DRAINED` + main 发 FIN 已接；mux 仍发 `CLOSE(RESET)` 并做 `maybe_release_`，T1 剩余） |
+| T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 部分完成（R6：FIN；R7：RESET；mux 仍通过 `maybe_release_` 做本地表释放、仍处理 timer 的 `WriteEvent_::Control`，T1 剩余） |
 | T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P3.3b 完成：`OPEN/ACCEPT/REJECT/CLOSE` 全部写公共 RX，直接状态推进已删 |
 | T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；P2–P3 完成控制帧组帧与建流裁决；关闭推进 / tick 待 P5 |
 | T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | 待做 |

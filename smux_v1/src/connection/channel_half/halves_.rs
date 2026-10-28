@@ -58,7 +58,7 @@ use crate::{
         owner_::ChannelOwner_,
         session_::race_cancel_,
         signal_::{
-            HINT_W_RX_CLOSED, HINT_W_TX_CLOSED, ReadEvent_, TrEventSender_, WriteEvent_,
+            HINT_W_TX_CLOSED, ReadEvent_, TrEventSender_, WriteEvent_,
         },
     },
     flow_ctrl::Credit,
@@ -691,11 +691,11 @@ where
     fn seal_rx_(&mut self) {
         self.ring_.close();
         if self.owner_.set_app_rx_closed_() {
-            // 同 `seal_tx_`：位是事实，提示只负责唤醒。
+            // 位是事实；main 扫描到 `APP_RX_CLOSED` 后组 `CLOSE(RESET)`。
             self.conn_
                 .core_()
-                .reg_()
-                .raise_write_hint_(HINT_W_RX_CLOSED);
+                .control_()
+                .raise_main_hint_(crate::connection::HINT_MAIN_RESET);
         }
     }
 

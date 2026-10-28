@@ -45,6 +45,9 @@ pub(crate) const HINT_MAIN_RETIRED: u64 = 1u64 << 0usize;
 /// 「某条子流的发送环已排空」：`main_loop` 扫描并写 `CLOSE(FIN)`。
 pub(crate) const HINT_MAIN_TX_DRAINED: u64 = 1u64 << 1usize;
 
+/// 「应用已关闭接收方向」：`main_loop` 扫描并写 `CLOSE(RESET)`。
+pub(crate) const HINT_MAIN_RESET: u64 = 1u64 << 2usize;
+
 /// 请求通道的缓冲区类型别名（`MpmcBuf` 由 `MpmcChan` 持有）。
 type ControlBuf_<C> = MpmcBuf<MainLoopRequest_<C>, K_MAIN_REQ_CAP>;
 
