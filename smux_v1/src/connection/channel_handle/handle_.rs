@@ -24,7 +24,7 @@ use crate::{
         pending_msg_::PendingMsgApp_,
         public_channel_::ChunkReadState_,
         session_::enqueue_frame_,
-        util_::read_available_into_vec_,
+        util_::read_available_into_slice_,
     },
     flow_ctrl::{
         Credit, FlowCtrlError, TrFlowCtrlPolicy,
@@ -827,16 +827,24 @@ where
 
     // 取消只能截断「理由载荷」，不能不让拒绝发生：先记下取消，照常裁决。
     let cancelled = cancel.is_cancelled();
-    let payload = read_available_into_vec_(
-        reason,
-        conn.core_().opts_().basic_opts.max_packet_size,
-        cancel.child_token(),
+    let cap = conn.core_().config_().pending_msg_capacity();
+    let payload_retain = crate::connection::alloc_zeroed_bytes_async_(
+        conn.core_().reg_().scope_(),
+        cap.saturating_add(1usize),
     )
-    .await;
-    let written = payload.len();
+    .await
+    .map_err(|_| HandleError::Mux(MuxError::Closed))?;
+    let mut payload = payload_retain
+        .try_owning()
+        .expect("刚分配的 reason 缓冲应当可独占");
+    let written = read_available_into_slice_(reason, &mut payload[..], cancel.child_token()).await;
+    if written > cap {
+        handle.settled_ = true;
+        return Result::Err(HandleError::Mux(MuxError::FrameTooLarge));
+    }
     if handle
         .msg_
-        .write_outgoing_(&payload, conn.core_().config_().pending_msg_capacity())
+        .write_outgoing_(&payload[..written], cap)
         .is_err()
     {
         handle.settled_ = true;

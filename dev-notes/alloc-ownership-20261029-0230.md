@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2，从 `feat/sw-scope` 开出）
-- **状态**：**现行（R1：每循环 Scope 基座；R2：建流期 message 路径去 Global/T23）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）
+- **状态**：**现行（R1：每循环 Scope 基座；R2：建流期 message 路径；R3：open/reject 与 tg_live）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -29,7 +29,7 @@ P3.3c / P4 / P5 的清理依据。
 
 ## 3. 逐点归属表
 
-### 3.1 已经迁入 Scope
+### 3.1 已迁出 Global 的临时分配（Scope / 注入池 / 栈）
 
 | 分配点 | 对象 | 生命周期 | 当前归属 | 备注 |
 | --- | --- | --- | --- | --- |
@@ -39,20 +39,21 @@ P3.3c / P4 / P5 的清理依据。
 | `demux_loop` 的控制帧载荷暂存 | `[u8]` | 循环 | 连接级 `Scope`（暂留） | 一次性分配；没有锁竞争收益 |
 | `main_loop` 的建流期 message 缓冲（R2） | `[u8]` | 连接（按请求复用） | 连接级 `Scope` | 一次分配、每请求复用；`read_msg_outgoing_into_` 写入切片 |
 | `read_message_async` 的搬运块（R2） | `[u8; 1024]` | 一次读取 | 栈 | 分块直接写 sink，不再分配整条 `Vec` |
+| `open_channel_async` / `reject_async` 的 message / reason（R3） | `[u8]` | 一次请求 | 连接级 `Scope` | 容量 `cap + 1`，读满即判超长；不再走全局 `Vec` |
+| `demux` 的 `tg_live`（R3） | `DockSet_`（2 KiB B 树） | 每轮复用 | `C::LocalTableAlloc` | 不再用全局 `BTreeSet`；随循环归还 |
+| `demux` 的 `gone` 列表（R3） | `Vec<Dock>` | 每轮复用 | `C::LocalTableAlloc` | 同上，容量跨轮复用 |
 
 ### 3.2 仍直接走 Global 的临时分配（待清）
 
 | 分配点 | 对象 | 生命周期 | 建议 |
 | --- | --- | --- | --- |
-| `open_channel_async` / `reject_async` 的 `read_available_into_vec_` | `Vec<u8>` | 一次请求 | 有界读取 / 连接 Scope / 流式写 ring |
-| `reap_retired_` 的 5 个列表 | `Vec<Dock>` / `Vec<(Dock, Dock)>` | 一次扫描 | 固定内联 / 回调 / `DockSet_` |
-| `demux` 的 `tg_live` | `BTreeSet<Dock>` | 每轮复用 | `DockSet_<C::LocalTableAlloc>` 或 demux Scope |
+| `reap_retired_` 的 5 个列表 | `Vec<Dock>` / `Vec<(Dock, Dock)>` | 一次扫描 | 固定内联 / 回调 / `DockSet_`（R4） |
 | 事件通道 / 邮箱 | `Box<MpmcBuf>`、`Arc<Overflow_>`、`VecDeque` | 连接 / 事件 | P5 删除；不要复活 `EventAlloc` |
-| `util_` 的握手读取 | `Vec<u8>` | 握手 | 一次性冷路径，可保留为例外 |
 
 > R2 已清掉 `main_loop` 的 `read_msg_outgoing_` 与 `read_message_async` 的全局
-> `Vec`，并删除 `ControlFrame_.payload_`。非空 welcome 仍受 `accept_async` 的
-> `TrBuffWrite` 形状限制（P3.3c 待补）。
+> `Vec`，并删除 `ControlFrame_.payload_`。R3 清掉 open / reject 的 message / reason
+> 与 demux 的 `BTreeSet`。非空 welcome 仍受 `accept_async` 的 `TrBuffWrite` 形状
+> 限制（P3.3c 待补）。
 
 ### 3.3 临时对象借用长期池（待决策）
 
@@ -114,14 +115,28 @@ P3.3c / P4 / P5 的清理依据。
 7. 已知未做：`accept_async` 的 welcome 仍是空载荷（其参数是 `TrBuffWrite`，无法读出
    本地 welcome 源；需要 API 形状决策），留 P3.3c。
 
+## 4.2 第 3 轮实施记录（open / reject / tg_live）
+
+1. `util_::read_available_into_vec_` 换成 `read_available_into_slice_`：调用方给
+   `&mut [u8]`，函数只负责填满并返回长度，不再自己分配。
+2. `open_channel_async` / `reject_async` 从连接级 Scope 分配 `cap + 1` 字节缓冲；
+   读到 `cap + 1` 即判超长（`FrameTooLarge`），避免先读完整条再拒绝。
+3. `demux` 的 `tg_live` 从全局 `BTreeSet<Dock>` 换成
+   `DockSet_<C::LocalTableAlloc, Dock>`；`gone` 列表从全局 `Vec` 换成
+   `Vec<Dock, C::LocalTableAlloc>`，两者都跨轮复用、随循环归还。
+4. `session_` 删除 `BTreeSet` 导入。
+5. 验收：lib **365 passed**；`inmem_mux` **21 passed**（compio / tokio / smol）；
+   `smoke_compio` 5 passed；`alloc_count` 基线不变（全局 11 / 注入 33）。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
 | --- | --- |
 | R2（已完成） | `main_loop` 读 outgoing 用固定 Scope 缓冲；删除 `ControlFrame_.payload_`；`read_message_async` 栈上分块；补 `OPEN` message 集成测试 |
-| R3（P3.3c 尾 + P4 尾） | open / reject 的有界读取；`PendingFin_` → `TX_DRAINED`；`reap_retired_` 列表与 `tg_live` 去 Global；T1 让 mux 只搬数据 |
-| R4（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
-| R5（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R3（已完成） | open / reject 的 message / reason 用 Scope 有界读取；`tg_live` / `gone` 去 Global |
+| R4（P4 尾） | `PendingFin_` → `TX_DRAINED`；`reap_retired_` 列表去 Global；T1 让 mux 只搬数据 |
+| R5（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
+| R6（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 
