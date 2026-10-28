@@ -144,7 +144,7 @@ use crate::{
         signal_::{
             ControlFrame_, EventReceiver_, EventSender_, EventTake_,
             HINT_R_RELEASE, HINT_W_PEER_CLOSED, HINT_W_RELEASED, HINT_W_RX_CLOSED,
-            HINT_W_TX_CLOSED, ReadAttach_, ReadEvent_, TrEventReceiver_,
+            ReadAttach_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteAttach_, WriteEvent_,
         },
         telegraph::TgRecvCtx_,
@@ -446,37 +446,23 @@ type TgWriteTable_<C> = crate::connection::dock_index_::DockBPlusTree_<
 >;
 
 
-/// 「发送方向已收尾、但**数据还没排空**（或额度还没回来），因此还没发 `FIN`」的
-/// 子流集合（复用循环本地持有）。
-///
-/// 存在的唯一理由是**半关闭的协议义务**：`drop(tx)` 只表示「不再写」，应用此前
-/// 写进发送环的字节**仍然是承诺要送达的**，`FIN` 必须等它们全部上线之后才能发。
-/// 而发送额度可能在中途用尽（`SendWindow::available() == 0`），此时循环不能 park
-/// 在这一条子流上（那会挡住别的子流的事件），只能把它记在这里、等额度回补充或
-/// 环被读空时再继续。见 [`finalize_entry_`]。
-/// 分配器参数与两个本地表同源（调用方注入）：它的节点在**首次进入**该集合时分配，
-/// 用全局分配器会让「丢半边 + 额度为 0」这条收尾路径隐式落到全局堆上
-/// （`dev-notes/audit-heap-alloc-20261004-1122.md` N1）。
-type PendingFin_<C> =
-    crate::connection::dock_index_::DockSet_<<C as TrConnAllocCfg>::LocalTableAlloc, (Dock, Dock)>;
+// 半关闭的 `FIN` 重试不再维护独立的 `PendingFin_` 集合：
+// `drain_once_` 每轮扫描本地写表时，对 `APP_TX_CLOSED && !LOCAL_FIN_SENT` 的条目
+// 直接尝试 `finalize_entry_`。发送环空 / 额度不足的条目会在下一轮自然重试，既不会
+// 饿死后面的条目，也省掉一整棵本地索引树。
 
 /// 处理写循环收到的一条 `Attach`：插入本地写表，并补查那些可能早于 `Attach` 到达的
 /// 一次性事实（应用封口 / 关接收、对端 `CLOSE`）。
 fn handle_write_attach_<C>(
     attach: WriteAttach_<crate::connection::ConnAllocCfg_<C>>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    pending_fin: &mut PendingFin_<crate::connection::ConnAllocCfg_<C>>,
     shared: &MuxShared_<C>,
 ) where
     C: TrConnCfg,
 {
     let (pair, owner, reader_) = attach.into_parts_();
-    let tx_closed = owner.is_app_tx_closed_();
     let rx_closed = owner.is_app_rx_closed_();
     let peer_closed = owner.is_peer_fin_() || owner.is_peer_reset_();
-    if tx_closed {
-        pending_fin.insert(pair, ());
-    }
     table.insert(
         pair,
         WriteEntry_ {
@@ -512,26 +498,6 @@ where
             writer_,
         },
     );
-}
-
-/// 把「应用已丢弃发送半边」的条目登记进待收尾集合。
-///
-/// 收尾事实（`APP_TX_CLOSED`）在状态字里，提示位只负责把写循环叫醒；这里按表扫描一次，
-/// 把尚未发 `FIN` 的条目交给主循环 2.5 步的 [`finalize_entry_`] 推进。幂等：同一对反复
-/// 插入同一个键没有副作用（`BTreeSet`）。
-fn scan_tx_closed_<C>(table: &WriteTable_<C>, pending_fin: &mut PendingFin_<C>)
-where
-    C: TrConnAllocCfg + 'static,
-{
-    for (pair, entry) in table.iter() {
-        if entry.owner_.is_app_tx_closed_()
-            && !entry.owner_.is_local_fin_sent_()
-            && pending_fin.insert(*pair, ()).is_none()
-        {
-            #[cfg(feature = "test-loop-probe")]
-            crate::connection::loop_probe_::tx_closed_handled_();
-        }
-    }
 }
 
 /// 对每条「应用已丢弃接收半边」的子流补一次 `CLOSE(RESET)`。
@@ -602,7 +568,6 @@ where
 async fn scan_peer_closed_<C, K>(
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    pending_fin: &mut PendingFin_<crate::connection::ConnAllocCfg_<C>>,
     read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     cancel: &K,
 ) -> Result<(), MuxError>
@@ -630,7 +595,6 @@ where
         let owner = entry.owner_.clone();
         if owner.is_peer_reset_() {
             table.remove(pair);
-            pending_fin.remove(pair);
             maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
             continue;
         }
@@ -667,7 +631,6 @@ where
 async fn scan_write_released_<C, K>(
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    pending_fin: &mut PendingFin_<crate::connection::ConnAllocCfg_<C>>,
     read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     cancel: &K,
 ) -> Result<(), MuxError>
@@ -700,7 +663,6 @@ where
             entry.owner_.notify_both_progress_();
         }
         table.remove(pair);
-        pending_fin.remove(pair);
         maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
     }
 }
@@ -743,7 +705,7 @@ where
 /// 设置 `local_fin_sent_` → 从本地表移除。
 ///
 /// 返回 `true` 表示**本轮有进展**（循环值得再调一次），`false` 表示遇到下面两种
-/// 合法阻塞之一、已把它留在 [`PendingFin_`] 里等条件变化：
+/// 合法阻塞之一；`drain_once_` 每轮重扫本地写表，因此阻塞条目下一轮会自然再试：
 ///
 /// - **发送环里还有数据但额度为 0**：等对端的窗口通告；
 /// - **段一时借不出来**（环被写者占住）：等下一次 `TxReady` / 环提交。
@@ -756,7 +718,6 @@ async fn finalize_entry_<C, K>(
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
     scratch: &mut [u8],
-    pending_fin: &mut PendingFin_<crate::connection::ConnAllocCfg_<C>>,
     read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     pair: (Dock, Dock),
     cancel: &K,
@@ -767,11 +728,8 @@ where
     K: TrCancellationToken,
 {
     // 0. 表里已经没有这条子流：它已经被别的路径收掉了（对端 `RESET`、本端主动拆流、
-    //    连接收尾）。此时**不能**把它登记进「欠一条 `FIN`」的集合——没有表项就永远
-    //    排不了空、也永远发不出 `FIN`，那会留下一个每轮扫描都要探测一次的僵尸条目。
-    //    应用在收到对端 `RESET` 之后再丢弃（或显式封口）发送半边正是这条路径。
+    //    连接收尾）。没有表项就没有可排空的环，直接返回。
     if !table.contains_key(pair) {
-        pending_fin.remove(pair);
         return Result::Ok(false);
     }
 
@@ -779,27 +737,18 @@ where
     flush_entry_::<C, _>(tx_stage, shared, table, scratch, pair, cancel).await?;
 
     // 2. 环里还有没有数据？`None` = 不可判定（写者正占着环），下轮再来。
-    //
-    //    **不可判定与「还有数据」一样要登记进待收尾集合**：调用方（事件处理）拿到
-    //    `false` 就返回了，若这里不登记，「下轮再来」根本没有触发者——那条子流的
-    //    `FIN` 会一直欠着，它也会长期留在本地表里。登记是安全方向：主循环每轮只做
-    //    一次非阻塞的探测，推送不动就下一轮再试。
-    //
-    //    注意 `has_writable_` 的 `None` **不**包含「表里没有这条子流」那一档：上面
-    //    第 0 步已经把它挡在外面，因此这里的 `None` 一定是「环给不出结论」（它内部
-    //    用 `table.get_mut` 的 `?` 表达前者，这个前提必须在调用点保证）。
+    //    `drain_once_` 每轮都会重扫本地写表，因此这里**不需要**登记待收尾集合；
+    //    阻塞的条目只是在下一轮被再次尝试，不会饿死后面的条目。
     match has_writable_::<C>(table, pair) {
         Option::None => {
             #[cfg(feature = "test-loop-probe")]
             crate::connection::loop_probe_::fin_see_unknown_();
-            pending_fin.insert(pair, ());
             return Result::Ok(false);
         }
-        // 还有数据没发出去：留在待收尾集合里等额度 / 环推进。
+        // 还有数据没发出去：等额度 / 环推进。
         Option::Some(true) => {
             #[cfg(feature = "test-loop-probe")]
             crate::connection::loop_probe_::fin_see_data_();
-            pending_fin.insert(pair, ());
             return Result::Ok(false);
         }
         Option::Some(false) => {
@@ -835,7 +784,6 @@ where
         entry.owner_.notify_tx_progress_();
         entry.fin_sent_ = true;
     }
-    pending_fin.remove(pair);
     maybe_release_::<C, _>(shared, read_events, table, pair, cancel.child_token()).await?;
     // **不在这里无条件摘表**：本端 `FIN` 发出后，对端随后的 `CLOSE` 仍要经本表扫描
     // 推进身份释放（`scan_peer_closed_`）。只有身份确实已释放时才摘；否则留到对端
@@ -2677,12 +2625,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
     // 公共 TX 的 chunked 读进度。
     let mut public_read = ChunkReadState_::new_();
-    // 「发送方向已丢弃、但发送环还没排空（或额度没回来）」的子流：它们还欠对端一条
-    // `CLOSE(FIN)`，由下面第 2.5 步在有进展时继续收尾（见 `finalize_entry_`）。
-    let mut pending_fin: PendingFin_<crate::connection::ConnAllocCfg_<C>> = crate::connection::dock_index_::DockSet_::new_in(lock_or_exit_!(
-        shared.reg_.local_table_alloc_(cancel.child_token())
-    ))
-    .expect("2 KiB B 树足以容纳一个 (Dock, Dock)");
     // park 期间被合并提示唤醒时，把掩码带到这里、在下一轮顶部统一处理。
     let mut pending_hints = 0u64;
     // 环段字节的搬出暂存：`clone_items_from_buff` / `move_items_to_buff` 需要一个
@@ -2711,7 +2653,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
 
         // 0.05 `Attach` inbox：环半部从这里进入本地写表（不再走事件通道）。
         while let Option::Some(attach) = shared.reg_().take_write_attach_() {
-            handle_write_attach_::<C>(attach, &mut *table, &mut pending_fin, &shared);
+            handle_write_attach_::<C>(attach, &mut *table, &shared);
         }
 
         // 3. 公共子流优先：先把 TX ring 里的 chunk 搬进传输，再发用户数据。
@@ -2741,9 +2683,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
         // 位是**唤醒**而不是事实：事实在各子流状态字里，这里按表扫一次即可补齐。
         let mut hints = shared.reg_().take_write_hint_();
         hints |= core::mem::take(&mut pending_hints);
-        if hints & HINT_W_TX_CLOSED != 0u64 {
-            scan_tx_closed_(&table, &mut pending_fin);
-        }
         if hints & HINT_W_RX_CLOSED != 0u64 {
             match race_cancel_(
                 &cancel,
@@ -2771,7 +2710,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 scan_peer_closed_::<C, _>(
                     &shared,
                     &mut *table,
-                    &mut pending_fin,
                     &read_events,
                     &cancel,
                 ),
@@ -2792,7 +2730,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 scan_write_released_::<C, _>(
                     &shared,
                     &mut *table,
-                    &mut pending_fin,
                     &read_events,
                     &cancel,
                 ),
@@ -2862,6 +2799,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &shared,
                     &mut *table,
                     &mut scratch[..],
+                    &read_events,
                     &cancel,
                 ),
             )
@@ -2893,60 +2831,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
             {
                 Option::None => return,
                 Option::Some(Result::Ok(_)) => {}
-                Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-                    return;
-                }
-            }
-        }
-
-        // 2.5. 额度回补或环被读空之后，把「欠着 FIN」的子流继续收尾。
-        //
-        //    收尾要等两个条件同时成立：发送环已排空、且能写出 `CLOSE` 帧。`drain_once_`
-        //    刚刚尽力把数据发出去了，因此这里**每条都试一次**、且**不跨 `await` 持有对
-        //    集合的借用**（收尾本身会改写集合）。用游标推进而不是每轮只取最小的一条：
-        //    被阻塞的条目（额度没回 / 环被写者占住）**不能挡住后面的条目**——否则一条
-        //    永远等不到额度的子流会把其它只差一条 `FIN` 的子流饿死，那些子流因此长期
-        //    留在本地表里（`last_ready` 还指着它们），正是「环已关闭却被当成可读」那条
-        //    空转路径的持久化来源（真机取证见
-        //    `smux_v1_sock_demo/dev-notes/intermittent-stall-20261007-0200.md`）。
-        //    收尾成功（返回 `true`，该条目已被摘掉）就从最小的一条重扫：其间可能又有
-        //    新条目加入、或者原先阻塞的条件已经不存在。
-        let mut fin_cursor: Option<(Dock, Dock)> = Option::None;
-        loop {
-            let next = match fin_cursor {
-                Option::None => pending_fin.iter().next().map(|(key, _)| *key),
-                Option::Some(last) => pending_fin
-                    .range((Bound::Excluded(last), Bound::Unbounded))
-                    .next()
-                    .map(|(key, _)| *key),
-            };
-            let Option::Some(pair) = next else {
-                break;
-            };
-            fin_cursor = Option::Some(pair);
-            match race_cancel_(
-                &cancel,
-                finalize_entry_::<C, _>(
-                    &mut tx_stage,
-                    &shared,
-                    &mut *table,
-                    &mut scratch[..],
-                    &mut pending_fin,
-                    &read_events,
-                    pair,
-                    &cancel,
-                ),
-            )
-            .await
-            {
-                Option::None => return,
-                Option::Some(Result::Ok(true)) => {
-                    // 这一条已经收尾并摘掉：从最小的一条重扫。
-                    fin_cursor = Option::None;
-                }
-                // 这一条暂时推不动：跳过它去试下一条（可能还有别的能收尾）。
-                Option::Some(Result::Ok(false)) => {}
                 Option::Some(Result::Err(err)) => {
                     fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                     return;
@@ -3068,7 +2952,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
             continue;
         }
         if let Option::Some(attach) = taken_attach {
-            handle_write_attach_::<C>(attach, &mut *table, &mut pending_fin, &shared);
+            handle_write_attach_::<C>(attach, &mut *table, &shared);
             continue;
         }
         if let Option::Some(event) = taken {
@@ -3608,6 +3492,7 @@ async fn drain_once_<C, K>(
     shared: &MuxShared_<C>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
     scratch: &mut [u8],
+    read_events: &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     cancel: &K,
 ) -> Result<bool, MuxError>
 where
@@ -3641,6 +3526,28 @@ where
             cancel,
         )
         .await?
+        {
+            return Result::Ok(true);
+        }
+        // 发送方向已封口、但还没发 `FIN`：这一轮顺手推进一次。阻塞（环里还有数据 /
+        // 额度没回 / 段借不出来）时不登记任何集合，下一轮重扫本地表时会再试。
+        let eligible = table
+            .get(pair)
+            .map(|(_, entry)| {
+                entry.owner_.is_app_tx_closed_() && !entry.owner_.is_local_fin_sent_()
+            })
+            .unwrap_or(false);
+        if eligible
+            && finalize_entry_::<C, _>(
+                tx_stage,
+                shared,
+                table,
+                scratch,
+                read_events,
+                pair,
+                cancel,
+            )
+            .await?
         {
             return Result::Ok(true);
         }

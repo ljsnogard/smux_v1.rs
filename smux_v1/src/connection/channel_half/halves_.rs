@@ -318,8 +318,7 @@ where
     ///
     /// [`BufferedTx`] 的 `close` 本身幂等；协议侧那一次「排空 + 发 `FIN`」的**投递**
     /// 用 `ChannelState_::set_app_tx_closed_` 的首次置位去重。少了这层去重，第二条
-    /// 收尾提示会在写循环的表项已被摘掉之后重新登记一个「欠一条 `FIN`」的僵尸条目
-    /// （`pending_fin` 里永远查不到表项的那一条）。
+    /// 收尾提示会让写循环对已经收尾 / 摘表的条目再做一轮 `FIN` 探测。
     fn seal_tx_(&mut self) {
         self.ring_.close();
         if self.owner_.set_app_tx_closed_() {

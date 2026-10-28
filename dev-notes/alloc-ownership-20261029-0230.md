@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）
-- **状态**：**现行（R1：每循环 Scope 基座；R2：建流期 message 路径；R3：open/reject 与 tg_live；R4：retired 扫描列表）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -140,6 +140,21 @@ P3.3c / P4 / P5 的清理依据。
 4. 验收：lib **365 passed**；`inmem_mux` **21 passed**；`alloc_count` 1 passed；
    clippy 全目标干净。
 
+## 4.4 第 5 轮实施记录（删除 `PendingFin_`）
+
+1. 删除 `PendingFin_`（`LocalTableAlloc` 上的 B 树）及其全部参数 / 扫描函数
+   `scan_tx_closed_`：半关闭的 `FIN` 重试不再维护独立集合。
+2. `drain_once_` 每轮扫本地写表时，对
+   `APP_TX_CLOSED && !LOCAL_FIN_SENT` 的条目直接调用 `finalize_entry_`；环里还有数据 /
+   额度不足 / 段借不出来时返回 `false`，下一轮自然重试，不会饿死后面的条目。
+3. 删除对应的 `tx_closed_handled_` loop-probe 计数；`finalize_entry_` / `scan_peer_closed_`
+   / `scan_write_released_` 去掉 `pending_fin` 参数。
+4. 验收：lib **365 passed**；`inmem_mux` **21 passed**；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1（建流阶段全局 1→0，
+   拆流阶段注入 6→4，绑定 + 监听基线不变）。
+5. **未做**：`FIN` 仍由复用循环直接写 `ConnTx`，`TX_DRAINED` 位与「main 发 FIN / T1」
+   尚未迁移；公开 `close_async` 的「FIN 已上线」语义仍依赖现有直接写路径。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -147,9 +162,10 @@ P3.3c / P4 / P5 的清理依据。
 | R2（已完成） | `main_loop` 读 outgoing 用固定 Scope 缓冲；删除 `ControlFrame_.payload_`；`read_message_async` 栈上分块；补 `OPEN` message 集成测试 |
 | R3（已完成） | open / reject 的 message / reason 用 Scope 有界读取；`tg_live` / `gone` 去 Global |
 | R4（已完成） | `reap_retired_` 的 5 个列表改走连接结构分配器 |
-| R5（P4 尾） | `PendingFin_` → `TX_DRAINED`；T1 让 mux 只搬数据 |
-| R6（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
-| R7（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R5（已完成） | 删除 `PendingFin_`；`FIN` 重试折进 `drain_once_` 的每轮表扫描 |
+| R6（P4 尾） | `TX_DRAINED` 位；main 发 `FIN`；T1 让 mux 只搬数据（需解决 public TX 的 FIN 完成语义） |
+| R7（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
+| R8（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 

@@ -81,7 +81,7 @@ where
     /// `Attach` 交接（`WriteAttach_` / `ReadAttach_`）的分配器。
     type AttachAlloc: AllocatorClone + Send + Sync + 'static;
 
-    /// 数据面本地表（`WriteTable_` / `ReadTable_` / `PendingFin_` / telegraph 表）的分配器。
+    /// 数据面本地表（`WriteTable_` / `ReadTable_` / telegraph 表）的分配器。
     type LocalTableAlloc: AllocatorClone + Send + Sync + 'static;
 
     /// 连接核心 / 共享量 / 取消令牌的分配器。

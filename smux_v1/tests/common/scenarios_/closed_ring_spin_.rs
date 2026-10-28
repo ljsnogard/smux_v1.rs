@@ -167,7 +167,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
         .await
         .expect("A 侧绑定 Q 应当成功");
 
-    // 先按 P、Q 的顺序发起：B 侧的入向队列因此也是 P 在前（`pending_fin` 的键序同理）。
+    // 先按 P、Q 的顺序发起：B 侧的入向队列因此也是 P 在前（完成登记的键序同理）。
     let mut empty: &[u8] = &[];
     let mut handle_p = binding_p
         .open_channel_async(listener_dock, &mut empty)
