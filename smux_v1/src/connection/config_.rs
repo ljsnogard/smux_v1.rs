@@ -54,14 +54,16 @@ pub trait TrMuxAllocConfig {
 ///
 /// 每一项对应一类结构，而不是「一个全局分配器」：
 ///
-/// - [`Self::RegistryAlloc`]：注册表、索引树、事件通道等连接内部结构；
+/// - [`Self::RegistryAlloc`]：注册表、索引树、`ControlStateInner_` 等连接内部结构；
 /// - [`Self::ChanOwnerAlloc`]：身份节点（`ChannelOwner_` / `DockBinding_` 等）；
 /// - [`Self::MpmcAlloc`]：会话内 `mpmc_chan` 通道（外层 `Arc` + 等待 chunk）。
 ///
-/// **临时对象不走这里**：请求完成源（`Tcs_`）与循环暂存（`Owned<[u8]>`）已改由
-/// 连接级 `sw_scope::Scope` 分配，见 `connection::scope_` 与
-/// `dev-notes/sw-scope-20261028-2130.md`。剩下的项都服务于要求 `Allocator` /
-/// `AllocatorClone` 的第三方结构，或连接级 `Shared`。
+/// **临时对象原则上不走这里**：请求完成源（`Tcs_`）走连接级 `sw_scope::Scope`；
+/// 循环暂存目前仍借用连接级 Scope，后续按需迁入各自的每循环 `Scope`，见
+/// `connection::scope_` 与 `dev-notes/alloc-ownership-20261029-0230.md`。剩下的项
+/// 大多服务于要求 `Allocator` / `AllocatorClone` 的第三方结构，或连接级 `Shared`；
+/// 已知例外是建流期 message ring，它仍借用 `RegistryAlloc`（第三方 ring 要求
+/// `Allocator`），是否补 `MsgAlloc` 见该文档的待拍板项。
 ///
 /// 本 trait **不要求 `'static`**；只有 [`Self::MpmcAlloc`] 的 GAT 在 `'a` 上带
 /// 生命周期约束——通道把分配器类型嵌进 `MpmcChan<'static, …>`，需要
