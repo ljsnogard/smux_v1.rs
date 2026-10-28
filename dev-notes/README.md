@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | `event-loop-redesign-20261026-1930.md` | **设计稿（已评审，P0–P3 完成，P4 位化完成、`PendingFin_` 待做，P5 请求/Attach 通道已换 `mpmc_chan`，分配器配置改 `TrConnAllocCfg` GAT、连接内复合结构已全部改为 `C` 参数（`EventAlloc` 未接））** | 三业务循环 + 计时服务 + 公共报文子流（ring + chunked）+ 建流期 message ring + arena 索引（bplus_tree_cmp）+ 请求通道 + TCS |
 | `sw-scope-20261028-2130.md` | **现行（保守方案 + crate 级 `RootScope` 已实施）** | sw-scope 原理、`TrConnAllocCfg` 逐项可行性判定；`TcsAlloc` / `ScratchAlloc` 迁入连接级 Scope，删除 `EventAlloc`；crate 级 `RootScope` 显式发布 |
-| `alloc-ownership-20261029-0230.md` | **现行（R1：每循环 Scope 基座；R2：建流期 message；R3：open/reject + tg_live）** | 按对象真实生命周期重分 Global / 专用池 / Scope；每循环 `LoopScope_` 基座落地（一次性 scratch 暂留连接级）；R2 清 main message 与 `ControlFrame_.payload_`；R3 清 open/reject 与 demux 的全局临时分配；后续 P4/P5 的清理表 |
+| `alloc-ownership-20261029-0230.md` | **现行（R1：每循环 Scope 基座；R2：建流期 message；R3：open/reject + tg_live；R4：retired 列表）** | 按对象真实生命周期重分 Global / 专用池 / Scope；每循环 `LoopScope_` 基座落地（一次性 scratch 暂留连接级）；R2 清 main message 与 `ControlFrame_.payload_`；R3 清 open/reject 与 demux；R4 清 retired 扫描列表；后续 P4/P5 的清理表 |
 | `connection-delivery-20261026-1845.md` | **现行** | 从 socket 收到什么帧、交给哪些对象、当前用什么队列/槽交付；含重复路径与待决问题 |
 | `event-backpressure-20261026-0514.md` | **现行** | 拆流/释放通知位化、`Attach` 迁入内联 inbox、容量 256、锁与锁外状态收敛的实施记录 |
 | `no-stage-20261015-1955.md` | 历史 | 去掉连接级 stage 环与两个贴传输的泵 |
