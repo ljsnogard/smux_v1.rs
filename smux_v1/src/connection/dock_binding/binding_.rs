@@ -17,7 +17,7 @@ use crate::{
         ChannelHandle, Dock, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError,
         PushErr_, ReserveErr_, TcsAbandonGuard_, Tcs_, TrConnCfg,
         channel_listener::ChannelListener,
-        util_::read_available_into_vec_,
+        util_::read_available_into_slice_,
     },
     x_deps::{abs_buff, abs_cancel, abs_smux, gen_mcf2},
 };
@@ -323,19 +323,25 @@ where
         }
     };
 
-    // 2. 把开场消息搬进句柄（`OPEN` 要等 `accept_async` 才发）。
-    let payload = read_available_into_vec_(
-        message,
-        conn.core_().opts_().basic_opts.max_packet_size,
-        cancel.child_token(),
+    // 2. 把开场消息搬进句柄（`OPEN` 要等 `accept_async` 才发）。缓冲来自连接级
+    // Scope，容量是 `cap + 1`：读到 `cap + 1` 字节就说明超长，在写 ring 之前拒绝。
+    let cap = conn.core_().config_().pending_msg_capacity();
+    let payload_retain = crate::connection::alloc_zeroed_bytes_async_(
+        conn.core_().reg_().scope_(),
+        cap.saturating_add(1usize),
     )
-    .await;
+    .await
+    .map_err(|_| BindingError::Closed)?;
+    let mut payload = payload_retain
+        .try_owning()
+        .expect("刚分配的 message 缓冲应当可独占");
+    let filled = read_available_into_slice_(message, &mut payload[..], cancel.child_token()).await;
+    if filled > cap {
+        return Result::Err(BindingError::Mux(MuxError::FrameTooLarge));
+    }
 
     // 同时写进建流期 message ring：P3.1b 起由 `main_loop` 从这里读走组 `OPEN`。
-    if msg_
-        .write_outgoing_(&payload, conn.core_().config_().pending_msg_capacity())
-        .is_err()
-    {
+    if msg_.write_outgoing_(&payload[..filled], cap).is_err() {
         return Result::Err(BindingError::Mux(MuxError::FrameTooLarge));
     }
     Result::Ok(ChannelHandle::new_initiator_(

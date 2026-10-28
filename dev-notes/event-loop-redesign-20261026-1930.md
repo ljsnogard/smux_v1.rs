@@ -2164,7 +2164,7 @@ value，key 与树结构保持不变。
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 仍待 P4 剩余（需先有 `TX_DRAINED` + main 发 FIN） |
-| T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` 已删（R2，改独立切片）；`util_` 待 P5 |
+| T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` 已删（R2，改独立切片）；`util_` 已改有界切片（R3） |
 | T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
 
 ### G. 测试与验收

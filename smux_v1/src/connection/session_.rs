@@ -122,7 +122,6 @@ use core::{
     ptr::NonNull,
     task::{Context, Poll},
 };
-use alloc::collections::BTreeSet;
 
 use abs_buff::{
     Demand, TrBuffRead, TrBuffTryFlush, TrBuffTryWrite, TrBuffWrite,
@@ -1367,8 +1366,12 @@ pub(crate) async fn demux_loop_async_<C, K>(
             .expect("2 KiB B+ 树足以容纳一个 telegraph 端点"),
         _use_shared_: core::marker::PhantomData,
     };
-    // 自查用的临时集合：复用同一个（每轮先 `clear`）。
-    let mut tg_live: BTreeSet<Dock> = BTreeSet::new();
+    // 自查用的临时集合：复用同一个（每轮先 `clear`）。用本地表分配器的 2 KiB B 树，
+    // 不再落到全局 `BTreeSet`；它随循环退出一并归还。
+    let mut tg_live = crate::connection::dock_index_::DockSet_::new_in(alloc.clone())
+        .expect("2 KiB B 树足以容纳存活的 telegraph dock");
+    // 「已消失」的 dock 列表：复用同一个 `Vec`，分配器同样取本地表分配器。
+    let mut gone = alloc::vec::Vec::new_in(alloc);
     let mut events: DemuxEventsGuard_<'_, C> = DemuxEventsGuard_ {
         events,
         shared: &shared,
@@ -1434,19 +1437,21 @@ pub(crate) async fn demux_loop_async_<C, K>(
         if shared
             .reg_
             .for_each_live_telegraph_(|local_dock| {
-                tg_live.insert(local_dock);
+                tg_live.insert(local_dock, ());
             })
         {
-            let gone: alloc::vec::Vec<Dock> = tg_table
-                .keys()
-                .copied()
-                .filter(|local_dock| !tg_live.contains(local_dock))
-                .collect();
-            for local_dock in gone {
+            gone.clear();
+            for local_dock in tg_table.keys() {
+                if !tg_live.contains_key(local_dock) {
+                    gone.push(*local_dock);
+                }
+            }
+            for local_dock in gone.iter().copied() {
                 if let Option::Some(mut entry) = tg_table.remove(local_dock) {
                     entry.close_();
                 }
             }
+            gone.clear();
             tg_live.clear();
         }
         // 1. 先把挂起的 `Attach` / `Release` / `RxConsumed` 成批排空。
