@@ -1283,6 +1283,37 @@ where
         Result::Ok(guard.alloc_.clone())
     }
 
+    /// 扫描「发送环已排空、等待 main 组 `CLOSE(FIN)`」的子流。
+    ///
+    /// 返回 `(pair, owner)` 列表；owner 用来在帧写进公共 TX ring 之后置
+    /// `FIN_ENQUEUED`。列表用连接结构分配器，冷路径且通常很短。
+    pub(crate) async fn scan_tx_drained_<K: TrCancellationToken>(
+        &self,
+        cancel: K,
+    ) -> Result<
+        alloc::vec::Vec<
+            ((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>),
+            C::RegistryAlloc,
+        >,
+        ReserveErr_,
+    > {
+        let mut session = self.root_.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        let mut out = alloc::vec::Vec::new_in(guard.alloc_.clone());
+        for (pair, binding) in guard.bindings_.iter() {
+            let BindingSlot_::Channel(ctx) = binding else {
+                continue;
+            };
+            if ctx.rec_.is_tx_drained_()
+                && !ctx.rec_.is_fin_enqueued_()
+                && !ctx.rec_.is_local_fin_sent_()
+            {
+                out.push((*pair, ctx.rec_.clone()));
+            }
+        }
+        Result::Ok(out)
+    }
+
     /// 取**连接级临时对象域**的句柄（`Tcs_` 与循环暂存从这里分配）。
     pub(crate) fn scope_(&self) -> &Scope {
         &self.scope_

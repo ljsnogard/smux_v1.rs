@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN / `TX_DRAINED`）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -155,6 +155,28 @@ P3.3c / P4 / P5 的清理依据。
 5. **未做**：`FIN` 仍由复用循环直接写 `ConnTx`，`TX_DRAINED` 位与「main 发 FIN / T1」
    尚未迁移；公开 `close_async` 的「FIN 已上线」语义仍依赖现有直接写路径。
 
+## 4.5 第 6 轮实施记录（main 发 FIN / `TX_DRAINED`）
+
+1. `ChannelState_` 增加 `TX_DRAINED`（bit 19）与 `FIN_ENQUEUED`（bit 20）。
+2. `drain_once_` 不再直接发 FIN：发送环明确排空后置 `TX_DRAINED` 并 raise
+   `HINT_MAIN_TX_DRAINED`；`finalize_entry_` / `flush_entry_` 删除。
+3. main 新增 `flush_tx_drained_`：扫描 `TX_DRAINED` 子流，把 `CLOSE(FIN)` 写进公共
+   TX ring，置 `FIN_ENQUEUED` 并 raise `HINT_W_FIN_ENQUEUED`。
+4. mux 在公共 TX ring 刷空后调用 `scan_fin_enqueued_`：置 `LOCAL_FIN_SENT`、关发送环
+   消费端、唤醒 `close_async` 等待者，并走 `maybe_release_`。若 ring 未空则把
+   `HINT_W_FIN_ENQUEUED` 留给下一轮。
+5. `MuxLoopShared_` 增加 `ControlState_` 句柄（写循环可 raise `HINT_MAIN_*`），构造器
+   与 `Clone` 同步。
+6. 修正 RESET 越序：`flush_rx_closed_` 在 `APP_TX_CLOSED && !LOCAL_FIN_SENT` 时先不发
+   RESET，等 FIN 确认上线后再发；否则对端先看到 RESET、后看到 FIN，接收方向会少一次
+   `peer_fin` 释放触发点（`mux_graceful_close_dual_` 曾因此超时）。
+7. 验收：lib **365**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1（绑定 + 监听基线不变；
+   拆流阶段注入 4→14、全局仍 0，新增来自 FIN 扫描 / 公共 TX 路径，后续可再收）；
+   clippy / doc / format 干净。
+8. **T1 仍未完全完成**：mux 不再发 FIN，但仍负责 `CLOSE(RESET)`（`flush_rx_closed_`）
+   与 `maybe_release_` 本地表动作；把 RESET 也迁到 main 需要另一次收尾状态机迁移。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -162,10 +184,11 @@ P3.3c / P4 / P5 的清理依据。
 | R2（已完成） | `main_loop` 读 outgoing 用固定 Scope 缓冲；删除 `ControlFrame_.payload_`；`read_message_async` 栈上分块；补 `OPEN` message 集成测试 |
 | R3（已完成） | open / reject 的 message / reason 用 Scope 有界读取；`tg_live` / `gone` 去 Global |
 | R4（已完成） | `reap_retired_` 的 5 个列表改走连接结构分配器 |
-| R5（已完成） | 删除 `PendingFin_`；`FIN` 重试折进 `drain_once_` 的每轮表扫描 |
-| R6（P4 尾） | `TX_DRAINED` 位；main 发 `FIN`；T1 让 mux 只搬数据（需解决 public TX 的 FIN 完成语义） |
-| R7（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
-| R8（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R5（已完成） | 删除 `PendingFin_`；FIN 重试先折进 `drain_once_` 的表扫描 |
+| R6（已完成） | `TX_DRAINED` / `FIN_ENQUEUED`；main 发 `CLOSE(FIN)`；mux 在公共 TX 刷空后确认上线 |
+| R7（P4 尾） | 把 `CLOSE(RESET)` 与 `maybe_release_` 也迁出 mux，完成 T1 |
+| R8（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩；全局分配基线重定 |
+| R9（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 

@@ -96,6 +96,12 @@ const APP_RX_CLOSED: usize = 1usize << 1usize;
 /// 本端已发出 `CLOSE(FIN)`：不再发送数据（**且发送环已排空**，`FIN` 只在排空后发）。
 const LOCAL_FIN_SENT: usize = 1usize << 2usize;
 
+/// 复用循环判定「发送环已排空、可以发 `CLOSE(FIN)`」，等待 `main_loop` 组帧。
+const TX_DRAINED: usize = 1usize << 19usize;
+
+/// `main_loop` 已把 `CLOSE(FIN)` 写进公共 TX ring，等待复用循环在刷出后确认上线。
+const FIN_ENQUEUED: usize = 1usize << 20usize;
+
 /// 本端已发出 `CLOSE(RESET)`：不再接收数据。
 const LOCAL_RESET_SENT: usize = 1usize << 3usize;
 
@@ -786,6 +792,36 @@ impl ChannelState_ {
     /// `main_loop` 的 retired 扫描据此区分「这条身份还在、但应用已放弃」。
     pub(crate) fn is_handle_retired_(&self) -> bool {
         has_flag_(self.flags_.value(), HANDLE_RETIRED)
+    }
+
+    /// 记录「复用循环已判定发送环排空」；返回是否首次置位。
+    pub(crate) fn set_tx_drained_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| !has_flag_(value, TX_DRAINED),
+                |value| value | TX_DRAINED,
+            )
+            .is_succ()
+    }
+
+    /// 发送环是否已排空、等待 `main_loop` 发 `CLOSE(FIN)`。
+    pub(crate) fn is_tx_drained_(&self) -> bool {
+        has_flag_(self.flags_.value(), TX_DRAINED)
+    }
+
+    /// 记录「`main_loop` 已把 `CLOSE(FIN)` 写进公共 TX ring」；返回是否首次置位。
+    pub(crate) fn set_fin_enqueued_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| !has_flag_(value, FIN_ENQUEUED),
+                |value| value | FIN_ENQUEUED,
+            )
+            .is_succ()
+    }
+
+    /// `main_loop` 是否已把 `CLOSE(FIN)` 写进公共 TX ring。
+    pub(crate) fn is_fin_enqueued_(&self) -> bool {
+        has_flag_(self.flags_.value(), FIN_ENQUEUED)
     }
 
     /// 记录「本端已发出 `CLOSE(FIN)`」（调用方保证发送环已排空）。

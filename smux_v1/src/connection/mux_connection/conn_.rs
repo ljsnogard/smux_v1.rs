@@ -389,6 +389,7 @@ where
 
         let shared = MuxShared_::<C>::new_(
             reg.clone(),
+            control.clone(),
             max_packet_size,
             pending_msg_cap,
             conn_clock.clone(),

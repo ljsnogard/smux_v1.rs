@@ -405,6 +405,9 @@ pub(crate) const HINT_W_PEER_CLOSED: u64 = 1u64 << 2usize;
 /// 一次性 `WriteEvent_::LocalAbort`：一条子流至多释放一次，扫描是幂等的。
 pub(crate) const HINT_W_RELEASED: u64 = 1u64 << 3usize;
 
+/// 「`main_loop` 已把 `CLOSE(FIN)` 写进公共 TX ring」：写循环在刷出后确认上线。
+pub(crate) const HINT_W_FIN_ENQUEUED: u64 = 1u64 << 4usize;
+
 /// 「身份已释放」：读循环据此摘掉接收表项并关闭接收环写端。
 pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;
 
