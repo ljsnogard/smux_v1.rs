@@ -124,7 +124,7 @@ where
     control_: ControlState_<crate::connection::ConnAllocCfg_<C>>,
 
     /// 写事件发送端（控制帧、建流注册、水位与拆流通知）。
-    w_events_: EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
+    w_events_: EventSender_<WriteEvent_>,
 
     /// 读事件发送端（接收环注册与释放）。
 
@@ -153,7 +153,7 @@ where
         reg: ChannelRegistry_<crate::connection::ConnAllocCfg_<C>>,
         control: ControlState_<crate::connection::ConnAllocCfg_<C>>,
         epoch: <C::Rt as TrClock>::Instant,
-        w_events: EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
+        w_events: EventSender_<WriteEvent_>,
         loops: [CancelToken_<crate::connection::ConnCoreAlloc_<C>>; 4],
     ) -> Self {
         MuxCore {
@@ -189,7 +189,7 @@ where
     }
 
     /// 写事件发送端。
-    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>> {
+    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_> {
         &self.w_events_
     }
 

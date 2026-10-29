@@ -173,109 +173,161 @@ impl ControlFrame_ {
 /// 它不再走事件通道，而是经**内联 inbox**（每连接一条，容量固定）交给写循环：
 /// 环半部是 move 语义的一次性资源，放在共享槽里比塞进通用事件枚举更直接，也不受
 /// 「子流变多 ⇒ 队列被打满」的影响。
-pub(crate) struct WriteAttach_<C>
+pub(crate) enum WriteAttach_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
-    /// 本端 / 对端 dock。
-    pair_: (Dock, Dock),
+    /// 一条 channel 子流的发送环读端。
+    Channel {
+        /// 本端 / 对端 dock。
+        pair_: (Dock, Dock),
 
-    /// 该子流的共享状态。
-    owner_: ChannelOwner_<C::ChanOwnerAlloc>,
+        /// 该子流的共享状态。
+        owner_: ChannelOwner_<C::ChanOwnerAlloc>,
 
-    /// 会话侧发送环读端（应用写、写循环读）。
-    reader_: BufferedRx,
+        /// 会话侧发送环读端（应用写、写循环读）。
+        reader_: BufferedRx,
+    },
+
+    /// 一条 telegraph 端点的发送环读端（键只有 `local_dock`）。
+    Telegraph {
+        /// 本端 dock。
+        local_dock_: Dock,
+
+        /// 该端点的身份节点句柄（循环由它取「已提交报文长度」队列）。
+        owner_: TgOwner_<C::ChanOwnerAlloc>,
+
+        /// 会话侧发送环读端（应用写、本循环读）。
+        reader_: BufferedRx,
+    },
 }
 
 impl<C> WriteAttach_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
-    /// 造一条写侧 `Attach`。
+    /// 造一条 channel 的写侧 `Attach`。
     pub(crate) fn new_(
         pair: (Dock, Dock),
         owner_: ChannelOwner_<C::ChanOwnerAlloc>,
         reader_: BufferedRx,
     ) -> Self {
-        WriteAttach_ {
+        WriteAttach_::Channel {
             pair_: pair,
             owner_,
             reader_,
         }
     }
 
-    /// 拆成 `(dock 对, 身份节点, 发送环读端)`。
+    /// 造一条 telegraph 的写侧 `Attach`。
+    pub(crate) fn new_tg_(
+        local_dock_: Dock,
+        owner_: TgOwner_<C::ChanOwnerAlloc>,
+        reader_: BufferedRx,
+    ) -> Self {
+        WriteAttach_::Telegraph {
+            local_dock_,
+            owner_,
+            reader_,
+        }
+    }
+
+    /// 拆成 `(dock 对, 身份节点, 发送环读端)`；telegraph 变体返回 `None`。
+    #[allow(clippy::type_complexity, reason = "返回元组即调用方要的三件套")]
     pub(crate) fn into_parts_(
         self,
-    ) -> ((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>, BufferedRx) {
-        (self.pair_, self.owner_, self.reader_)
+    ) -> Option<((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>, BufferedRx)> {
+        match self {
+            WriteAttach_::Channel {
+                pair_,
+                owner_,
+                reader_,
+            } => Option::Some((pair_, owner_, reader_)),
+            WriteAttach_::Telegraph { .. } => Option::None,
+        }
     }
+
 }
 
 /// 读循环的 `Attach` 负载：`(dock 对, 身份节点, 接收环写端)`。
-pub(crate) struct ReadAttach_<C>
+pub(crate) enum ReadAttach_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
-    /// 本端 / 对端 dock。
-    pair_: (Dock, Dock),
+    /// 一条 channel 子流的接收环写端。
+    Channel {
+        /// 本端 / 对端 dock。
+        pair_: (Dock, Dock),
 
-    /// 该子流的共享状态。
-    owner_: ChannelOwner_<C::ChanOwnerAlloc>,
+        /// 该子流的共享状态。
+        owner_: ChannelOwner_<C::ChanOwnerAlloc>,
 
-    /// 会话侧接收环写端（读循环写、应用读）。
-    writer_: BufferedTx,
+        /// 会话侧接收环写端（读循环写、应用读）。
+        writer_: BufferedTx,
+    },
+
+    /// 一条 telegraph 端点的接收环写端（键只有 `local_dock`）。
+    Telegraph {
+        /// 本端 dock。
+        local_dock_: Dock,
+
+        /// 该端点的身份节点句柄（接收方向的报文边界记在它内联的队列里）。
+        owner_: TgOwner_<C::ChanOwnerAlloc>,
+
+        /// 会话侧接收环写端（读循环写、本循环读）。
+        writer_: BufferedTx,
+    },
 }
 
 impl<C> ReadAttach_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
-    /// 造一条读侧 `Attach`。
+    /// 造一条 channel 的读侧 `Attach`。
     pub(crate) fn new_(
         pair: (Dock, Dock),
         owner_: ChannelOwner_<C::ChanOwnerAlloc>,
         writer_: BufferedTx,
     ) -> Self {
-        ReadAttach_ {
+        ReadAttach_::Channel {
             pair_: pair,
             owner_,
             writer_,
         }
     }
 
-    /// 拆成 `(dock 对, 身份节点, 接收环写端)`。
+    /// 造一条 telegraph 的读侧 `Attach`。
+    pub(crate) fn new_tg_(
+        local_dock_: Dock,
+        owner_: TgOwner_<C::ChanOwnerAlloc>,
+        writer_: BufferedTx,
+    ) -> Self {
+        ReadAttach_::Telegraph {
+            local_dock_,
+            owner_,
+            writer_,
+        }
+    }
+
+    /// 拆成 `(dock 对, 身份节点, 接收环写端)`；telegraph 变体返回 `None`。
+    #[allow(clippy::type_complexity, reason = "返回元组即调用方要的三件套")]
     pub(crate) fn into_parts_(
         self,
-    ) -> ((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>, BufferedTx) {
-        (self.pair_, self.owner_, self.writer_)
+    ) -> Option<((Dock, Dock), ChannelOwner_<C::ChanOwnerAlloc>, BufferedTx)> {
+        match self {
+            ReadAttach_::Channel {
+                pair_,
+                owner_,
+                writer_,
+            } => Option::Some((pair_, owner_, writer_)),
+            ReadAttach_::Telegraph { .. } => Option::None,
+        }
     }
+
 }
 
 /// 送到**写循环**的事件。
-pub(crate) enum WriteEvent_<C>
-where
-    C: TrConnAllocCfg + 'static,
-{
-    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-    // telegraph（数据报）：与 channel 走**同一套**「环半部上线」模式
-    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-    /// 一条 telegraph 的**发送环读端**上线：复用循环把它存进本地表，此后按
-    /// `local_dock` 索引。
-    ///
-    /// 与 channel 的 `Attach` 同形（telegraph 的环半部仍走事件通道），但键只有
-    /// `local_dock`——telegraph **独占**
-    /// 该 dock，没有 `remote_dock` 这一维（对端地址是协议里的**地址**而非**身份**，
-    /// 见 `crate::connection` 模块文档 §4）。
-    TgAttach {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 该端点的身份节点句柄（循环由它取「已提交报文长度」队列）。
-        owner: TgOwner_<C::ChanOwnerAlloc>,
-        /// 会话侧发送环读端（应用写、本循环读）。
-        reader_: BufferedRx,
-    },
-
+pub(crate) enum WriteEvent_ {
     /// 某条 telegraph 的**发送环有已提交数据**（应用侧提交后置位）。
     ///
     /// 只带 `local_dock`：「目的地址 + 长度」按 FIFO 记在身份节点的发送队列里
@@ -285,33 +337,6 @@ where
         local_dock: Dock,
     },
 }
-
-/// 送给**读循环**的事件。
-pub(crate) enum ReadEvent_<C>
-where
-    C: TrConnAllocCfg + 'static,
-{
-    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-    // telegraph（数据报）
-    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-    /// 一条 telegraph 的**接收环写端**上线：解复用循环把它存进本地表，此后按
-    /// `local_dock` 索引。
-    ///
-    /// 除环半部外还要带**身份句柄**：接收方向的「报文边界」记在身份节点内联的接收长度
-    /// 队列里（`TgRec_::in_`），解复用循环每收下一条报文都要往那里入队并唤醒应用侧。
-    TgAttach {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 该端点的身份节点句柄（循环由它取「已收报文长度」队列）。
-        owner: TgOwner_<C::ChanOwnerAlloc>,
-        /// 会话侧接收环写端（本循环写、应用读）。
-        writer_: BufferedTx,
-    },
-}
-
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// 通道
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 合并提示的位定义
@@ -480,6 +505,7 @@ impl<E> Overflow_<E> {
     }
 
     /// 追加一条不可重建事件。
+    #[allow(dead_code, reason = "只服务 `try_send_durable_event_`，R17 一并移除")]
     fn push_durable_(&self, event: E) {
         self.with_durable_(|queue| queue.push_back(event));
         self.durable_len_.fetch_add(1usize, Ordering::Release);
@@ -544,6 +570,10 @@ impl<E: Send + 'static> EventSender_<E> {
     /// FIFO（只在环满时增长）。
     ///
     /// 返回 `false` 表示消费者已全部消失（连接收尾）。
+    ///
+    /// R16 之后没有调用者（`TgAttach` 改走 attach inbox、其余通知全部位化）；
+    /// 整条事件通道在 R17 删除时一并移除。
+    #[allow(dead_code, reason = "R17 删事件通道时移除")]
     pub(crate) fn try_send_durable_event_(&self, event: E) -> bool {
         match self.tx_.try_send(event) {
             Result::Ok(()) => true,

@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -391,6 +391,27 @@ P3.3c / P4 / P5 的清理依据。
    `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
    import 格式干净。
 
+## 4.15 第 16 轮实施记录（`TgAttach` 走 attach inbox，删除读事件通道）
+
+1. `WriteAttach_` / `ReadAttach_` 由 struct 改为**枚举**：`Channel` 变体沿用原字段，
+   新增 `Telegraph` 变体（键只有 `local_dock`）。channel 与 telegraph 因此共用同一条
+   attach inbox——不需要再加两对通道与八个类型别名。
+2. `MuxLoopShared` 的 `OpenTelegraph` 处理改投 inbox（满时用
+   `push_*_attach_async_` 背压等待），不再投 `TgAttach` 事件。
+3. 删除 `WriteEvent_::TgAttach` / `ReadEvent_::TgAttach`；`ReadEvent_` 变空后**整条
+   读事件通道删除**：`DemuxEventsGuard_`、`drain_read_events_`、`handle_read_event_`、
+   `park_read_wake_` 的 `events` 参数与 `ReadWake_::Event` / `Rescan` 变体、
+   `CoreBundle_::r_receiver_`、`MuxShared_` 的 `r_events_` 全部移除。
+4. `WriteEvent_` 去掉 `C` 泛型（只剩 `TgReady { local_dock }`）。
+5. **保留 `MuxLoopShared_::w_events_` 作为纯保活句柄**：核心析构只发起优雅关闭，循环
+   要继续把已提交字节发完；少了这份生产端克隆，事件通道在核心析构时即关闭，写循环
+   会在 `EventTake_::Closed` 处立刻退出——`mux_drop_flush_dual_` 实测复现（删掉后
+   稳定失败，恢复后通过）。R17 删整条通道时这条保活语义要由「核心析构 → raise
+   `HINT_MAIN_TIMER` → main tick → cancel」接替。
+6. 验收：lib **367**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
+   import 格式干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -409,6 +430,7 @@ P3.3c / P4 / P5 的清理依据。
 | R13（已完成） | `TxReady` 位化（`HINT_W_TX_READY`）；`demux` 不再持写事件生产端 |
 | R14（未落地） | `Tg*` 位化尝试后回退：写循环在 `enqueue_frame_` 背压时无法被合并提示唤醒（见 §4.13） |
 | R15（已完成） | `TgTxClosed` 位化（`TgRec_::tx_closed_` + `scan_tg_tx_closed_`）；`TgReady` 仍走事件通道 |
+| R16（已完成） | `TgAttach` 走 attach inbox（`WriteAttach_`/`ReadAttach_` 改枚举）；删除整条读事件通道 |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：

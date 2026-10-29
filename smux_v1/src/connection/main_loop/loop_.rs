@@ -522,23 +522,39 @@ where
                     return;
                 }
             };
-            // `TgAttach` 携带环半部、不可位化：两条事件都由 main 投递（channel 的
-            // `Attach` 早已走 inbox）。投递失败 = 循环已退出，撤销身份。
-            let attached = shared
-                .w_events_()
-                .try_send_durable_event_(crate::connection::signal_::WriteEvent_::TgAttach {
+            // 两个环半部经 **Attach inbox** 交给两个循环（与 channel 的 `Attach` 同一条
+            // 通道，`TgAttach` 事件因此彻底删除）。inbox 满时按背压等空位——环半部是
+            // 一次性资源，不能丢。
+            let write_ok = match shared.reg_().try_push_write_attach_(
+                crate::connection::signal_::WriteAttach_::new_tg_(
                     local_dock,
-                    owner: owner.clone(),
+                    owner.clone(),
                     reader_,
-                })
-                && shared
-                    .r_events_()
-                    .try_send_durable_event_(crate::connection::signal_::ReadEvent_::TgAttach {
+                ),
+            ) {
+                Result::Ok(()) => true,
+                Result::Err(item) => shared
+                    .reg_()
+                    .push_write_attach_async_(item, cancel.child_token())
+                    .await
+                    .is_ok(),
+            };
+            let read_ok = write_ok
+                && match shared.reg_().try_push_read_attach_(
+                    crate::connection::signal_::ReadAttach_::new_tg_(
                         local_dock,
-                        owner: owner.clone(),
+                        owner.clone(),
                         writer_,
-                    });
-            if !attached && !cfg!(test) {
+                    ),
+                ) {
+                    Result::Ok(()) => true,
+                    Result::Err(item) => shared
+                        .reg_()
+                        .push_read_attach_async_(item, cancel.child_token())
+                        .await
+                        .is_ok(),
+                };
+            if !read_ok {
                 // 循环已不在：撤销刚登记的身份，再如实答复 Closed。
                 let _ = shared
                     .reg_()

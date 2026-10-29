@@ -20,7 +20,7 @@ use crate::{
         public_channel_::{PublicChannel_, PublicChunkIo_},
         ring_::new_buffered_channel,
         session_::{MuxShared_, demux_loop_async_, mux_loop_async_, race_cancel_},
-        signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
+        signal_::{EventReceiver_, WriteEvent_, event_channel_},
         timer_::timer_loop_async_,
     },
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
@@ -218,7 +218,6 @@ where
             public_rx_w_,
             public_rx_r_,
             w_receiver_,
-            r_receiver_,
         } = bundle;
 
         // 解复用：**直接读传输的读半边**（没有读泵，也没有连接读环）。
@@ -227,7 +226,6 @@ where
             demux_loop_async_::<C, _>(
                 rx,
                 shared_.clone(),
-                r_receiver_,
                 public_rx_w_,
                 core_.loop_token_(0usize),
             ),
@@ -332,8 +330,7 @@ where
     public_tx_r_: BufferedRx,
     public_rx_w_: BufferedTx,
     public_rx_r_: BufferedRx,
-    w_receiver_: EventReceiver_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
-    r_receiver_: EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
+    w_receiver_: EventReceiver_<WriteEvent_>,
 }
 
 impl<C> CoreBundle_<C>
@@ -369,7 +366,6 @@ where
                 .expect("公共 RX ring：容量由 max_packet_size 决定，失败等同分配失败");
         let public = PublicChannel_::new_(config.alloc_cfg());
         let (w_events, w_receiver) = event_channel_();
-        let (r_events, r_receiver) = event_channel_();
 
         // 指标接收方在**建连这一刻**从配置克隆一份：循环不持有核心，拿不到
         // `MuxCore`，只能像运行时值那样自持一份（见 `core_` 模块文档「队列保活」）。
@@ -390,7 +386,6 @@ where
             public,
             metrics.clone(),
             w_events.clone(),
-            r_events.clone(),
         );
         // 核心自持一份三个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
         // （那会阻塞，而 `Drop` 可能在任意线程上发生）。
@@ -422,7 +417,6 @@ where
             public_rx_w_,
             public_rx_r_,
             w_receiver_: w_receiver,
-            r_receiver_: r_receiver,
         }
     }
 }

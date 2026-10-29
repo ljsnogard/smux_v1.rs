@@ -561,7 +561,9 @@ where
         Result::Ok(()) => Option::None,
         Result::Err(attach) => {
             if reg.is_write_inbox_closed_() {
-                let (_, _, mut reader_) = attach.into_parts_();
+                let Some((_, _, mut reader_)) = attach.into_parts_() else {
+                    return Result::Err(HandleError::Mux(MuxError::Closed));
+                };
                 reader_.close();
                 return Result::Err(HandleError::Mux(attach_closed_reason_(&owner, conn)));
             }
@@ -581,7 +583,9 @@ where
         Result::Ok(()) => Option::None,
         Result::Err(attach) => {
             if reg.is_read_inbox_closed_() {
-                let (_, _, mut writer_) = attach.into_parts_();
+                let Some((_, _, mut writer_)) = attach.into_parts_() else {
+                    return Result::Err(HandleError::Mux(MuxError::Closed));
+                };
                 writer_.close();
                 return Result::Err(HandleError::Mux(attach_closed_reason_(&owner, conn)));
             }
@@ -646,12 +650,16 @@ where
         {
             Result::Ok(()) => {}
             Result::Err(PushErr_::Closed(attach)) => {
-                let (_, _, mut reader_) = attach.into_parts_();
+                let Some((_, _, mut reader_)) = attach.into_parts_() else {
+                    return Result::Err(HandleError::Mux(MuxError::Closed));
+                };
                 reader_.close();
                 return Result::Err(HandleError::Mux(MuxError::Closed));
             }
             Result::Err(PushErr_::Cancelled(attach)) => {
-                let (_, _, mut reader_) = attach.into_parts_();
+                let Some((_, _, mut reader_)) = attach.into_parts_() else {
+                    return Result::Err(HandleError::Mux(MuxError::Closed));
+                };
                 reader_.close();
                 return Result::Err(HandleError::Cancelled);
             }
@@ -664,12 +672,16 @@ where
         {
             Result::Ok(()) => {}
             Result::Err(PushErr_::Closed(attach)) => {
-                let (_, _, mut writer_) = attach.into_parts_();
+                let Some((_, _, mut writer_)) = attach.into_parts_() else {
+                    return Result::Err(HandleError::Mux(MuxError::Closed));
+                };
                 writer_.close();
                 return Result::Err(HandleError::Mux(MuxError::Closed));
             }
             Result::Err(PushErr_::Cancelled(attach)) => {
-                let (_, _, mut writer_) = attach.into_parts_();
+                let Some((_, _, mut writer_)) = attach.into_parts_() else {
+                    return Result::Err(HandleError::Mux(MuxError::Closed));
+                };
                 writer_.close();
                 return Result::Err(HandleError::Cancelled);
             }
