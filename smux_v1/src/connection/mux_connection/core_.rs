@@ -56,7 +56,6 @@ use crate::{
         signal_::{EventSender_, ReadEvent_, WriteEvent_},
         sync_::CancelToken_,
     },
-    handshake::opts::HandshakeOpts,
     metrics::{ConnCloseReason, TrMetricsSink},
     x_deps::abs_cancel,
 };
@@ -114,7 +113,6 @@ where
     config_: C,
 
     /// 握手协商结果（连接级配额）。
-    opts_: HandshakeOpts,
 
     /// **建连时刻**：一切「连接内毫秒」的零点。
     ///
@@ -155,7 +153,6 @@ where
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_(
         config: C,
-        opts: HandshakeOpts,
         reg: ChannelRegistry_<crate::connection::ConnAllocCfg_<C>>,
         control: ControlState_<crate::connection::ConnAllocCfg_<C>>,
         epoch: <C::Rt as TrClock>::Instant,
@@ -165,7 +162,6 @@ where
     ) -> Self {
         MuxCore {
             config_: config,
-            opts_: opts,
             epoch_: epoch,
             reg_: reg,
             control_: control,
@@ -182,11 +178,6 @@ where
     /// 控制面共享状态（API 面提交请求用）。
     pub(crate) fn control_(&self) -> &ControlState_<crate::connection::ConnAllocCfg_<C>> {
         &self.control_
-    }
-
-    /// 握手协商结果（连接级配额）。
-    pub(crate) fn opts_(&self) -> &HandshakeOpts {
-        &self.opts_
     }
 
     /// 「现在」的连接内毫秒（自建连 epoch 起算、向下取整、饱和）。
@@ -238,17 +229,6 @@ where
     /// [`ChannelRegistry_::enter_waiting_close_`]）。
     pub(crate) fn is_closing_(&self) -> bool {
         self.reg_.is_closing_()
-    }
-
-    /// **进入「等待关闭」**（幂等、不取锁、不分配），返回是否首次进入。
-    ///
-    /// 它替代了上一版「在写锁里把活跃子流收进一个 `Vec`」的做法：排空请求改由
-    /// **计时循环**在扫描时逐条认领（见 [`ChannelRegistry_::timer_scan_`]），因此
-    /// 进入关闭这一步只是**一次 CAS**。
-    ///
-    /// 调用方在首次进入之后应当 [`MuxCore::notify_timer_`] 唤醒推进引擎。
-    pub(crate) fn enter_waiting_close_(&self) -> bool {
-        self.reg_.enter_waiting_close_(self.now_millis_())
     }
 
     /// 唤醒**控制面**立刻做一轮定时决策。

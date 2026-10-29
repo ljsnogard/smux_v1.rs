@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -272,6 +272,33 @@ P3.3c / P4 / P5 的清理依据。
    `RxConsumed` 仍排队）、`TakeInbound` / `Close` / `OpenTelegraph` 请求化、telegraph
    仍由 API 线程写身份表。
 
+## 4.9 第 10 轮实施记录（`Close` 请求化 + 删 `ctl_.rs`）
+
+1. **`Close` 走请求 + TCS**：`MainLoopRequest_::Close { reply }` 与
+   `MainLoopReply_::Closed(bool)`；`MainTickState_` 增加 `close_reply_`（跨轮保存
+   等待者）。`main_loop` 在 `tick_` 的连接级关闭动作里**先 `set_` 答复、再
+   `cancel_loops_()`**（Q8）：活跃子流归零 ⇒ `Closed(true)`；整体超时 ⇒ `Closed(false)`。
+   连接级失败在 `main_step_` 开头直接答 `Closed(false)` 并取消。
+2. **`close_async` 改请求 + 完成源**：删掉 `wait_for_finalize_`（它等的是取消令牌，
+   分不清「收敛」与「被取消」）；调用方只等一个 TCS 结果，取消时放弃结果并补一次强制
+   收尾。连带删除 `MuxCore::opts_` / `MuxCore::enter_waiting_close_` /
+   `ChannelRegistry_::is_forced_close_`（都已无使用者）。
+3. **补一处实测缺陷**：`flush_releasable_` 在「最后一条子流释放 ⇒ 活跃归零」时直接
+   `cancel_loops_`，**没有完成 `Close` 的 TCS** → `mux_graceful_close_dual_` 挂起。
+   现在它先 `set_` `Closed(true)` 再取消。
+4. 删除 `ctl_.rs`（未编译的死文件）与 `MainLoopRequest_::SendControl`（R9 起控制帧全由
+   main 自组，无生产者）。
+5. **T8 位化尝试后回退**（记录，不落地）：把 `WriteEvent_::TxReady` /
+   `ReadEvent_::RxConsumed` 改成 `HINT_W_TX_READY` / `HINT_R_RX_CONSUMED` 合并提示、
+   并删掉两个事件变体后，`mux_closed_ring_spin_dual_`（`Q` 的环在窗口回补后不再被排空）、
+   `mux_drop_flush_dual_`、`flow_ctrl_socket_compio_` 三个用例失败；回退到事件通道。
+   结论：**下轮位化前先把「窗口回补 → mux 重试」这条因果钉成单测**（当前它同时依赖
+   `RxConsumed` 事件与 `TxReady` 事件两条通道，位化时任何一条的唤醒语义变化都会让
+   `Q` 永久卡在 0 额度）。
+6. 验收：lib **367**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
+   import 格式干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -284,6 +311,7 @@ P3.3c / P4 / P5 的清理依据。
 | R7（已完成） | 把 `CLOSE(RESET)` 迁到 main；删除 `flush_rx_closed_` / `HINT_W_RX_CLOSED` / `control_close_via_` |
 | R8（已完成） | 身份释放（`claim_release_` / `release_channel_` / 关闭上报 / 连接收尾）迁到 `main_loop::flush_releasable_`；mux 只置位 + raise `HINT_MAIN_RELEASE` |
 | R9（已完成） | timer 收缩为纯计时；`PULSE` / 空闲拆流 `FIN`+`RESET` / 建流超时 `REJECT` / `WINDOW_UPDATE` 全部由 main 写公共 TX；删会话邮箱；`mux` 不再写身份表、不再处理控制帧 |
+| R10（已完成） | `Close` 请求 + TCS（Q8：先答 TCS 再取消）；删 `wait_for_finalize_` / `ctl_.rs` / `SendControl`；T8 位化尝试后回退 |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：

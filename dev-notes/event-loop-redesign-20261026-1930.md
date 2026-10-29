@@ -2041,6 +2041,24 @@ connection/
      T8 只剩两条事件通道本身（`TxReady` / `TgReady` / `RxConsumed` 仍排队）；
      T10 仍缺 `TakeInbound` / `Close` / `OpenTelegraph`。
 
+- 20261029-2100：**R10：`Close` 请求化（T10/Q8）+ 删 `ctl_.rs`**。
+  1. `MainLoopRequest_::Close { reply }` + `MainLoopReply_::Closed(bool)`；
+     `MainTickState_::close_reply_` 跨轮保存等待者。main 在 `tick_` 的连接级关闭动作里
+     **先 `set_` 答复、再 `cancel_loops_()`**：活跃归零 ⇒ `Closed(true)`，整体超时 ⇒
+     `Closed(false)`；连接级失败在 `main_step_` 开头直接答 `false`。
+  2. `close_async` 改为「提交请求 + 等 TCS」，删除 `wait_for_finalize_`（它等取消令牌，
+     分不清「收敛」与「被取消」）。连带删除 `MuxCore::opts_` /
+     `MuxCore::enter_waiting_close_` / `is_forced_close_`。
+  3. `flush_releasable_` 在「最后一条子流释放」时补 `set_ Closed(true)` 再取消——少了
+     这一步 `mux_graceful_close_dual_` 会挂起（实测）。
+  4. 删除 `ctl_.rs`（未编译死文件）与 `MainLoopRequest_::SendControl`。
+  5. **T8 位化尝试后回退**：`TxReady` / `RxConsumed` 改 `HINT_W_TX_READY` /
+     `HINT_R_RX_CONSUMED` 后，`mux_closed_ring_spin_dual_` / `mux_drop_flush_dual_` /
+     `flow_ctrl_socket_compio_` 失败（窗口回补后发送环不再被排空），回退到事件通道。
+     R11 位化前必须先把「窗口回补 → mux 重试」钉成单测。
+  6. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2219,14 +2237,14 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | P0 原语完成（`PublicChunkIo_`，未接线） |
 | T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | 完成（P3.1b：`OPEN`/`ACCEPT`/`REJECT`/`CLOSE` 全走公共子流；timer 的 `PULSE`/`CLOSE` 待 P4/P5） |
-| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：`SessionMailbox_` / `SessionEvent_` / `Overflow_` 已删（R9）；`WriteEvent_` / `ReadEvent_` 仍承载 `TxReady` / `TgReady` / `RxConsumed` |
+| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：邮箱已删（R9）；`WriteEvent_` / `ReadEvent_` 仍承载 `TxReady` / `TgReady` / `RxConsumed`（R10 的位化尝试回退，见修订记录） |
 
 ### C. 请求 / TCS
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | P0 完成 |
-| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 除 `TakeInbound`/`Close`/`OpenTelegraph` 外完成；`SendControl` 已删（R9 控制帧全由 main 自组）。队列是 `mpmc_chan`，等待者用 Arena slab |
+| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 除 `TakeInbound`/`OpenTelegraph` 外完成（`Close` 见 R10）；`SendControl` 已删。队列是 `mpmc_chan`，等待者用 Arena slab |
 | T11 | `MainReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | 待做 |
 
 ### D. 建流期 message ring
@@ -2255,7 +2273,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 已删（R5）；`TX_DRAINED` + main FIN 已接（R6） |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` 已删（R2，改独立切片）；`util_` 已改有界切片（R3） |
-| T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 部分：`session_` 已无控制帧构造 / 无邮箱 drain；`signal_` 的 `SessionEvent_`/`SessionMailbox_`/`MailboxOverflow_`/`Control` 已删（R9）；`ctl_.rs` 仍是未编译的死文件 |
+| T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 部分：`session_` 已无控制帧构造 / 无邮箱 drain；`signal_` 的 `SessionEvent_`/`SessionMailbox_`/`MailboxOverflow_`/`Control` 已删（R9）；`ctl_.rs` 已删（R10）；剩余事件通道待 T8 |
 
 ### G. 测试与验收
 

@@ -16,7 +16,6 @@ use crate::connection::{
     mux_connection::ReserveErr_,
     owner_::{ChannelOwner_, LsnOwner_},
     pending_msg_::PendingMsgApp_,
-    signal_::ControlFrame_,
     tcs_::Tcs_,
 };
 
@@ -58,20 +57,6 @@ where
         reserve: usize,
 
         /// 完成源。
-        reply: Tcs_<MainLoopResult_<C>>,
-    },
-
-    /// 把一条**无载荷**控制帧写进公共 TX ring（fire-and-forget）。
-    ///
-    /// `OPEN` / `ACCEPT` / `REJECT` 的载荷不在这里：它们由 `Accept` / `Reject` 请求
-    /// 从建流期 message ring 读进 `main_loop` 的缓冲，再由写帧函数作为独立切片传入。
-    /// 本变体只给 timer / demux 的 `PULSE`、`CLOSE`、`WINDOW_UPDATE` 等无载荷帧用。
-    #[allow(dead_code, reason = "P4/P5 把 timer 的控制帧迁到公共 TX 时使用")]
-    SendControl {
-        /// 待写出的控制帧（只有帧头字段）。
-        frame: ControlFrame_,
-
-        /// 完成源：帧真正写进公共 TX ring 后完成，调用方据此保证后续帧的顺序。
         reply: Tcs_<MainLoopResult_<C>>,
     },
 
@@ -125,6 +110,16 @@ where
         /// 完成源。
         reply: Tcs_<MainLoopResult_<C>>,
     },
+
+    /// 优雅关闭：进入「等待关闭」并交由 `main_loop` 推进，答复里给出「是否与对端收敛」。
+    ///
+    /// 收尾的**判定与执行**都在 main（`tick_` 的连接级关闭动作）：活跃子流归零 ⇒
+    /// `Closed(true)`；整体超时 ⇒ `Closed(false)`。答复**先于** `cancel_loops_()`
+    /// 完成，调用方拿到的是「收尾结果」而不是「被取消」。
+    Close {
+        /// 完成源。
+        reply: Tcs_<MainLoopResult_<C>>,
+    },
 }
 
 impl<C> MainLoopRequest_<C>
@@ -137,9 +132,9 @@ where
             MainLoopRequest_::Bind { reply, .. }
             | MainLoopRequest_::Listen { reply, .. }
             | MainLoopRequest_::ReserveChannel { reply, .. }
-            | MainLoopRequest_::SendControl { reply, .. }
             | MainLoopRequest_::Accept { reply, .. }
-            | MainLoopRequest_::Reject { reply, .. } => Option::Some(reply),
+            | MainLoopRequest_::Reject { reply, .. }
+            | MainLoopRequest_::Close { reply } => Option::Some(reply),
         }
     }
 
@@ -178,9 +173,11 @@ where
     /// 新建的 listener 身份节点。
     Listener(LsnOwner_<C::ChanOwnerAlloc>),
 
-    /// 仅表示「已受理」（P3.2 的 `Accept` / `Reject` 请求使用）。
-    #[allow(dead_code, reason = "P3.2 起由 Accept / Reject 使用")]
+    /// 仅表示「已受理」（`Accept` / `Reject` 请求使用）。
     Unit,
+
+    /// 优雅关闭的答复：`true` = 与对端双向收敛；`false` = 整体超时 / 连接失败。
+    Closed(bool),
 }
 
 /// `main_loop` 的统一错误。
