@@ -193,19 +193,19 @@ impl RecvInner {
         }
     }
 
-    /// 应用消费之后的核对：重算累计已消费量、必要时记账，再「该报就报」。
+    /// 应用消费之后的核对：重算累计已消费量、必要时记账，**但不产出快照**。
     ///
-    /// 返回「是否推进了消费记账」（调用方据此刷新活跃时间）与可选的通告快照。
-    fn recheck_(&mut self, buffered: Credit) -> (bool, Option<WindowReport>) {
-        // 权威的累计已消费量。`R` 可能已经把「尚未写进环」的字节记在账上（`on_data`
-        // 先于入环），因此这里用饱和减法兜住那个瞬间。
+    /// 返回 `(是否推进了消费记账, 是否该通告)`。供收缩后的 `demux_loop` 用：记账
+    /// （它才知道环内积压）必须由读循环做，而「产出 + 组帧」归 `main_loop`。判定
+    /// 保持消费式，因此这里绝不能顺手 `take`。
+    fn recheck_due_(&mut self, buffered: Credit) -> (bool, bool) {
         let consumed = self.received_.saturating_sub(buffered as u64);
         let delta = consumed.saturating_sub(self.consumed_);
         let advanced = delta > 0u64;
         if advanced {
             self.on_consumed_(Credit::try_from(delta).unwrap_or(Credit::MAX));
         }
-        (advanced, self.take_report_())
+        (advanced, self.should_report_())
     }
 }
 
@@ -373,12 +373,14 @@ impl RecvWindow {
         self.with_inner_(|inner| inner.take_report_())
     }
 
-    /// 应用消费之后由**持有接收环写端**的解复用循环核对水位并择机补发通告。
-    ///
-    /// 返回「是否推进了消费记账」（调用方据此刷新活跃时间）与可选的通告快照；
-    /// 全程在**同一个临界区**里完成。
-    pub(crate) fn recheck_(&self, buffered: Credit) -> (bool, Option<WindowReport>) {
-        self.with_inner_(|inner| inner.recheck_(buffered))
+    /// 记账但不产出快照：返回 `(是否推进了消费记账, 是否该通告)`。
+    pub(crate) fn recheck_due_(&self, buffered: Credit) -> (bool, bool) {
+        self.with_inner_(|inner| inner.recheck_due_(buffered))
+    }
+
+    /// 当前是否该通告（**只读判定**，不推进「已通告」快照）。
+    pub(crate) fn should_report_now_(&self) -> bool {
+        self.with_inner_(|inner| inner.should_report_())
     }
 
     /// 生成一份通告快照并把它记为「已通告」（此后越权判定以它为准、变动量清零）。

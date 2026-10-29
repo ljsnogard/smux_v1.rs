@@ -1574,7 +1574,7 @@ connection/
 
 | 文档 | 状态 |
 | --- | --- |
-| `event-loop-redesign-20261026-1930.md`（本文） | **设计稿（已评审）；P0–P3.3a 已实施，P3.3b 进行中** |
+| `event-loop-redesign-20261026-1930.md`（本文） | **设计稿（已评审）；P0–P3 完成，P4 完成（拆流/释放/关闭位化），P5 部分（timer 收缩 + 邮箱已删；事件通道待删）** |
 | `connection-delivery-20261026-1845.md` | 现行：现状矩阵；本文定稿后应把 §3 标为“历史基线” |
 | `event-backpressure-20261026-0514.md` | 现行：位化与内联队列的实施记录；本文的 P4/P5 会取代其阶段 3/4 |
 | `no-vec-audit-20261024-0008.md` | 历史：原则仍有效；本文 §10/§11 是其落地清单 |
@@ -2021,6 +2021,26 @@ connection/
      `drain_session_events_`（`SessionMailbox_` 投递不带唤醒）。两者都留 R9/P5
      （timer 收缩 T4 + 事件通道清理 T8/T24）。
 
+- 20261029-0900：**R9：timer 收缩 + 控制帧全走公共 TX（T1/T4 完成）**。
+  1. `timer_loop` 只等 `TimerSignal_` 的期限、到期 raise `HINT_MAIN_TIMER`；`timer_scan_`
+     的决策整段迁入 `main_loop::tick_`（`Pulse` / `Abort` / `RejectEstablish` /
+     `Finalize` / 连接级关闭动作）。`TimerSignal_` 进 `ControlState_`。
+  2. 所有控制帧改由 main 写公共 TX ring：`PULSE`、空闲拆流的 `CLOSE(FIN)`+`CLOSE(RESET)`、
+     建流超时 `REJECT`、`WINDOW_UPDATE`、未裁决放弃的 `REJECT`。不可重建的帧在公共 TX
+     满时留在 `MainTickState_` 定容队列，下一轮补写（main 不被背压卡住）。
+  3. 窗口通告：`demux_loop` 只记账 + 判定 + raise `HINT_MAIN_WINDOW_DIRTY`；main 先确认
+     空间再取快照（栈上定长缓冲，零分配），空间不足时不取（快照留在窗口里）。
+  4. 未裁决放弃位化：新增 `LOCAL_OPEN_SENT`；`abort_pending_` / `reject_after_open_` 只置
+     `HANDLE_RETIRED` + raise，`reap_retired_` 按「对端是否知道」决定撤销或回 `REJECT`。
+  5. 删除 `WriteEvent_::Control` / `write_control_blocking_`；删除 `SessionEvent_` /
+     `SessionMailbox_` / `MailboxOverflow_` / `post_session_event_` / `drain_session_events_`；
+     `MuxCore::notify_timer_` 改为 raise `HINT_MAIN_TIMER`。
+  6. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1（稳态注入恢复 0）/ doc 12；clippy 干净。
+  7. **T1 完成**（mux 不再写身份表、不再处理控制帧）；**T4 完成**（timer 只计时）。
+     T8 只剩两条事件通道本身（`TxReady` / `TgReady` / `RxConsumed` 仍排队）；
+     T10 仍缺 `TakeInbound` / `Close` / `OpenTelegraph`。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2187,10 +2207,10 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | 接近完成（R6：FIN；R7：RESET；R8：身份释放迁 `main_loop::flush_releasable_`。剩余：mux 仍处理 timer 的 `WriteEvent_::Control`，留 R9/T4） |
+| T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | **完成**（R6 FIN / R7 RESET / R8 身份释放 / R9 控制帧全走 main） |
 | T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P3.3b 完成：`OPEN/ACCEPT/REJECT/CLOSE` 全部写公共 RX，直接状态推进已删 |
 | T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；P2–P3 完成控制帧组帧与建流裁决；关闭推进 / tick 待 P5 |
-| T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | 待做 |
+| T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | **完成**（R9：`TimerSignal_` 进 `ControlState_`，决策迁 `main_loop::tick_`） |
 | T5 | 删除 `ctl_`；循环数 / 取消令牌覆盖 4 个 | P1 | 完成（`loops_[3]` = main） |
 
 ### B. 传输与公共子流
@@ -2199,14 +2219,14 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | P0 原语完成（`PublicChunkIo_`，未接线） |
 | T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | 完成（P3.1b：`OPEN`/`ACCEPT`/`REJECT`/`CLOSE` 全走公共子流；timer 的 `PULSE`/`CLOSE` 待 P4/P5） |
-| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 待做 |
+| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：`SessionMailbox_` / `SessionEvent_` / `Overflow_` 已删（R9）；`WriteEvent_` / `ReadEvent_` 仍承载 `TxReady` / `TgReady` / `RxConsumed` |
 
 ### C. 请求 / TCS
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | P0 完成 |
-| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 除 `TakeInbound`/`Close`/`OpenTelegraph` 外完成（`Accept`/`Reject` 见 P3.2）；队列已换 `mpmc_chan`（P5，等待者用 Arena slab，不再需要 `WakerSlots_`） |
+| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 除 `TakeInbound`/`Close`/`OpenTelegraph` 外完成；`SendControl` 已删（R9 控制帧全由 main 自组）。队列是 `mpmc_chan`，等待者用 Arena slab |
 | T11 | `MainReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | 待做 |
 
 ### D. 建流期 message ring
@@ -2235,7 +2255,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 已删（R5）；`TX_DRAINED` + main FIN 已接（R6） |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` 已删（R2，改独立切片）；`util_` 已改有界切片（R3） |
-| T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 待做 |
+| T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 部分：`session_` 已无控制帧构造 / 无邮箱 drain；`signal_` 的 `SessionEvent_`/`SessionMailbox_`/`MailboxOverflow_`/`Control` 已删（R9）；`ctl_.rs` 仍是未编译的死文件 |
 
 ### G. 测试与验收
 

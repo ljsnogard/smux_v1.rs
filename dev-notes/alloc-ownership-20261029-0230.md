@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -237,6 +237,41 @@ P3.3c / P4 / P5 的清理依据。
     `keepalive_compio` 5；`smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；
     doc 12；clippy 干净。
 
+## 4.8 第 9 轮实施记录（timer 收缩 + 控制帧全走公共 TX）
+
+1. **`timer_loop` 收缩为纯计时**：只读 [`TimerSignal_`]、`delay`、到期
+   `raise_main_hint_(HINT_MAIN_TIMER)`；不再 `timer_scan_`、不再组帧、不再发协议动作。
+   `TimerSignal_` 从 `timer_.rs` 的 dead code 挪进 `ControlState_`（main / timer 各持一句柄）。
+2. **定时决策迁 `main_loop::tick_`**：`TimerAction_`（`Pulse` / `Abort` /
+   `RejectEstablish` / `Finalize`）与连接级关闭动作都由 main 执行；产生的控制帧进
+   **公共 TX ring**（FIFO：`CLOSE(FIN)` 必在 `CLOSE(RESET)` 之前）。公共 TX 满时
+   不可重建的帧留在 `MainTickState_` 的定容队列里，下一轮补写（不 park、不丢）。
+3. **窗口通告回程归 main**：`demux_loop` 只做 `recheck_due_`（记账 + 判定）并 raise
+   `HINT_MAIN_WINDOW_DIRTY`；`main_loop` 先确认公共 TX 有空间，再用**栈上定长缓冲**
+   调 `take_window_reports_` 取快照并组 `WINDOW_UPDATE`（零分配；空间不足不取，快照
+   留在窗口里）。
+4. **未裁决放弃改 retired 位**：`ChannelState_` 新增 `LOCAL_OPEN_SENT`；
+   `abort_pending_` / `reject_after_open_` 只置 `HANDLE_RETIRED` + raise
+   `HINT_MAIN_RETIRED`，由 `reap_retired_` 按「对端是否知道这条子流」决定撤销预留还是
+   回 `REJECT` + 宽限。`accept_prepare_` 的 ring 建失败不再先投 `ReleaseChannel`
+   （否则身份变 `WaitClose`，`REJECT` 永远发不出去——`mux_ring_rejected_dual_` 实测撞到）。
+5. **删除 `WriteEvent_::Control` / `write_control_blocking_`**：控制帧不再经事件通道、
+   不再由复用循环直写 `ConnTx`。
+6. **删除会话释放邮箱**：`SessionEvent_` / `SessionMailbox_` / `MailboxOverflow_` /
+   `post_session_event_` / `drain_session_events_` 全部删除。`MuxCore::notify_timer_`
+   改为 raise `HINT_MAIN_TIMER`（timer 不再被唤醒重算）。至此 `mux_loop` / `demux_loop`
+   都不再调用任何身份表写入口，`mux_loop` 也不再处理控制帧。
+7. 顺带清理死代码：`RegistryShared_::poll_timer_`、`poll_timer_wake_`、
+   `ChannelState_::recv_recheck_`、`RecvWindow::recheck_`、`timer_exit_*` probe；
+   `TimerSignal_::clear_` 收敛为 `#[cfg(test)]`。
+8. 验收：lib **367**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1（稳态搬运注入恢复 **0**，
+   窗口通告改用栈上定长缓冲后不再每批分配）；doc 12；clippy / import 格式干净。
+9. **T1 完全完成**：`mux_loop` 只做「数据成帧 + 公共 chunk 搬运 + 本地表动作 + 置位」。
+   **T4 完成**（timer 只计时）。剩余（R10）：事件通道本身（`TxReady` / `TgReady` /
+   `RxConsumed` 仍排队）、`TakeInbound` / `Close` / `OpenTelegraph` 请求化、telegraph
+   仍由 API 线程写身份表。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -248,7 +283,7 @@ P3.3c / P4 / P5 的清理依据。
 | R6（已完成） | `TX_DRAINED` / `FIN_ENQUEUED`；main 发 `CLOSE(FIN)`；mux 在公共 TX 刷空后确认上线 |
 | R7（已完成） | 把 `CLOSE(RESET)` 迁到 main；删除 `flush_rx_closed_` / `HINT_W_RX_CLOSED` / `control_close_via_` |
 | R8（已完成） | 身份释放（`claim_release_` / `release_channel_` / 关闭上报 / 连接收尾）迁到 `main_loop::flush_releasable_`；mux 只置位 + raise `HINT_MAIN_RELEASE` |
-| R9（P5） | 删除事件通道 / 邮箱 / `signal_.rs` 大部分；timer 收缩（`PULSE` / 空闲拆流的 `FIN`/`RESET` / 建流超时 `REJECT` 改由 main 组帧）；全局分配基线重定 |
+| R9（已完成） | timer 收缩为纯计时；`PULSE` / 空闲拆流 `FIN`+`RESET` / 建流超时 `REJECT` / `WINDOW_UPDATE` 全部由 main 写公共 TX；删会话邮箱；`mux` 不再写身份表、不再处理控制帧 |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：

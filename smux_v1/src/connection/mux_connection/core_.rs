@@ -231,24 +231,6 @@ impl<C> MuxCore<C>
 where
     C: TrConnCfg,
 {
-    /// 投递一条会话释放消息（**同步、不取锁**；`Drop` 与错误清理路径用）。
-    pub(crate) fn post_session_event_(
-        &self,
-        event: crate::connection::signal_::SessionEvent_,
-    ) -> bool {
-        self.reg_.post_session_event_(event)
-    }
-
-    /// 落实积压的会话释放消息（`Drop` 只投消息，见 `signal_::SessionEvent_`）。
-    pub(crate) async fn drain_session_events_<K: TrCancellationToken>(
-        &self,
-        cancel: K,
-    ) -> Result<(), ReserveErr_> {
-        self.reg_
-            .drain_session_events_(self.now_millis_(), cancel)
-            .await
-    }
-
     /// 连接是否已经进入**优雅关闭**（锁外原子读，热路径可用）。
     ///
     /// 语义有两条：**不再接受任何新身份**；已登记的子流由连接自己推进「排空 + 发
@@ -269,9 +251,14 @@ where
         self.reg_.enter_waiting_close_(self.now_millis_())
     }
 
-    /// 唤醒计时循环：它在等待关闭时是推进排空与收口的那台引擎。
+    /// 唤醒**控制面**立刻做一轮定时决策。
+    ///
+    /// R9 起 `timer_loop` 只做计时（只等 `TimerSignal_` 的期限），定时决策的唯一
+    /// 执行者是 `main_loop::tick_`。因此「进入等待关闭 / 关闭请求」需要的是让 main
+    /// 立刻 tick 一次，而不是唤醒 timer 重算——直接 raise `HINT_MAIN_TIMER`。
     pub(crate) fn notify_timer_(&self) {
-        self.reg_.notify_timer_()
+        self.control_
+            .raise_main_hint_(crate::connection::HINT_MAIN_TIMER);
     }
 
     /// 登记 telegraph 身份，并交出它的**身份节点句柄**。
@@ -372,7 +359,9 @@ where
         if self.reg_.enter_waiting_close_(now_millis) {
             #[cfg(feature = "test-loop-probe")]
             crate::connection::loop_probe_::note_core_entered_close_();
-            self.reg_.notify_timer_();
+            // 走本核心的统一入口（raise `HINT_MAIN_TIMER`），而不是 registry 的
+            // `notify_timer_`——R9 起 timer 只做计时，不再扫描注册表。
+            self.notify_timer_();
         }
 
         // 关闭连接级临时对象域：拒绝后续放入，并尝试清盘本域对象。`try_flush_` 用

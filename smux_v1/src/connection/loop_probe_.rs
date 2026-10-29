@@ -186,15 +186,7 @@ pub(crate) fn timer_exit_cancel_() {
     TIMER_EXIT_CANCEL.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
-/// 记「计时循环因扫描失败退出」。
-pub(crate) fn timer_exit_scan_err_() {
-    TIMER_EXIT_SCAN_ERR.with(|c| c.set(c.get().wrapping_add(1)));
-}
 
-/// 记「计时循环因投递失败退出」。
-pub(crate) fn timer_exit_send_fail_() {
-    TIMER_EXIT_SEND_FAIL.with(|c| c.set(c.get().wrapping_add(1)));
-}
 
 /// 读三条计时循环退出计数 `(取消, 扫描失败, 投递失败)`。
 pub fn timer_exits_() -> (u64, u64, u64) {

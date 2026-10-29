@@ -19,10 +19,10 @@ use abs_smux::dock::TrDock;
 
 use crate::{
     connection::{
-        FrameHeader, FrameKind, MuxError, ReadOutgoingErr_, ReserveErr_, TrConnCfg,
+        Dock, FrameHeader, FrameKind, MuxError, ReadOutgoingErr_, ReserveErr_, TrConnCfg,
         control_state_::ControlState_,
         flags,
-        frame_::encode_header_,
+        frame_::{K_MAX_FRAME_HEADER, encode_header_},
         frame_parser_::decode_header_sync_,
         main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_},
         TrConnAllocCfg,
@@ -31,11 +31,14 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         session_::race_cancel_,
         session_::MuxShared_,
-        HINT_MAIN_RELEASE, HINT_MAIN_RESET, HINT_MAIN_RETIRED, HINT_MAIN_TX_DRAINED,
+        HINT_MAIN_RELEASE, HINT_MAIN_RESET, HINT_MAIN_RETIRED, HINT_MAIN_TIMER,
+        HINT_MAIN_TX_DRAINED, HINT_MAIN_WINDOW_DIRTY,
+        mux_connection::{K_CLOSE_NONE, K_CLOSE_TIMEOUT},
         signal_::{
             ControlFrame_, HINT_R_RELEASE, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED,
-            HINT_W_RELEASED, HINT_W_RESET_ENQUEUED,
+            HINT_W_RELEASED, HINT_W_RESET_ENQUEUED, HINT_W_TX_CLOSED,
         },
+        timer_::{K_TIMER_ACTION_BATCH, TimerAction_},
     },
     flow_ctrl::{RecvTotal, WindowReport},
     metrics::{ChannelCloseReason, TrMetricsSink},
@@ -49,6 +52,76 @@ pub(crate) const K_MAIN_REQ_BATCH: usize = 16usize;
 
 /// 每轮最多处理多少条公共 RX 控制帧。
 pub(crate) const K_MAIN_FRAME_BATCH: usize = 32usize;
+
+/// 每轮最多处理多少条接收窗口通告（栈上定长缓冲，零分配）。
+pub(crate) const K_WINDOW_REPORT_BATCH: usize = 32usize;
+
+/// 每轮 tick 最多缓存多少条待写控制帧。
+///
+/// `Abort` 每个动作产 2 条（`CLOSE(FIN)` + `CLOSE(RESET)`），其余动作至多 1 条，
+/// 因此取动作批次的 2 倍；不会溢出。
+pub(crate) const K_TICK_FRAME_BATCH: usize = 2usize * K_TIMER_ACTION_BATCH;
+
+/// `main_loop` 的 tick 跨轮状态：**已认领但还没写进公共 TX 的控制帧**。
+///
+/// # 为什么需要它
+///
+/// `timer_scan_` 的认领是**一次性**的（`claim_abort_` 等原子位）：动作一旦认领，
+/// 下一轮扫描不会再返回同一条子流。而不可重建的帧（`CLOSE(FIN)` / `CLOSE(RESET)` /
+/// `REJECT`）不能丢，因此它们在公共 TX 满时留在本结构里，下一轮先补写。
+///
+/// 定容、零分配；`ControlFrame_` 是纯帧头（`Copy`），不持载荷。
+pub(crate) struct MainTickState_ {
+    /// 待写帧的 FIFO（`None` = 空位）。
+    frames_: [Option<ControlFrame_>; K_TICK_FRAME_BATCH],
+
+    /// 有效前缀长度。
+    len_: usize,
+}
+
+impl MainTickState_ {
+    /// 空状态。
+    pub(crate) fn new_() -> Self {
+        MainTickState_ {
+            frames_: [Option::None; K_TICK_FRAME_BATCH],
+            len_: 0usize,
+        }
+    }
+
+    /// 追加一条待写帧（调用方保证不溢出）。
+    fn push_(&mut self, frame: ControlFrame_) {
+        debug_assert!(
+            self.len_ < K_TICK_FRAME_BATCH,
+            "tick 帧队列溢出：动作批次与帧批次必须满足 2:1"
+        );
+        if self.len_ < K_TICK_FRAME_BATCH {
+            self.frames_[self.len_] = Option::Some(frame);
+            self.len_ += 1usize;
+        }
+    }
+
+    /// 队头帧（不移除）。
+    fn first_(&self) -> Option<ControlFrame_> {
+        self.frames_.first().copied().flatten()
+    }
+
+    /// 移除队头帧（左移一格；批次很小，O(n) 可接受）。
+    fn pop_front_(&mut self) {
+        if self.len_ == 0usize {
+            return;
+        }
+        for idx in 1usize..self.len_ {
+            self.frames_[idx - 1usize] = self.frames_[idx];
+        }
+        self.len_ -= 1usize;
+        self.frames_[self.len_] = Option::None;
+    }
+
+    /// 是否还有待写帧。
+    pub(crate) fn has_pending_(&self) -> bool {
+        self.len_ > 0usize
+    }
+}
 
 /// `main_loop` 的 park 点被唤醒的原因。
 enum MainWake_<C>
@@ -120,6 +193,18 @@ pub(crate) async fn main_loop_async_<C, K>(
         .try_owning()
         .expect("刚分配的 message 缓冲应当可独占");
     let mut public_read = MainPublicRead_::new_();
+    let mut tick = MainTickState_::new_();
+
+    // 先发布一次初始期限：`timer_loop` 据此睡到「第一个 `PULSE` 到期」而不是
+    // 傻等 `channel_timeout`。此后每轮 `tick_` 结束都会重新发布。
+    {
+        let now = shared.conn_clock_().now_millis_();
+        let pulse = shared.channel_timeout_millis_() / 2u64;
+        shared
+            .control_()
+            .timer_signal_()
+            .publish_(now.saturating_add(pulse));
+    }
 
     loop {
         if cancel.is_cancelled() {
@@ -134,6 +219,7 @@ pub(crate) async fn main_loop_async_<C, K>(
             &mut rx_scratch[..],
             &mut msg_buf[..msg_cap],
             &mut public_read,
+            &mut tick,
             &cancel,
         )
         .await
@@ -186,25 +272,23 @@ pub(crate) async fn main_step_<C, K>(
     rx_scratch: &mut [u8],
     msg_buf: &mut [u8],
     public_read: &mut MainPublicRead_,
+    tick: &mut MainTickState_,
     cancel: &K,
 ) -> bool
 where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    // 过渡：显式失败路径（`abort_pending_`）仍投 `SessionEvent_`；`Drop` 已改为
-    // retired 位（P4），剩余的投递点在 P5 清理。
-    if shared
-        .reg_()
-        .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token())
-        .await
-        .is_err()
-    {
-        return false;
-    }
-
-    // 合并提示：目前只有 retired 位（P4 起逐步接入 window-dirty 等）。
+    // 合并提示：定时到期 → retired（身份释放）→ 窗口通告 → FIN/RESET → 身份释放。
+    //
+    // tick 放在最前：它的「连接级关闭动作」可能直接结束连接，后续工作已无意义。
     let hints = ctl.take_main_hint_();
+    if hints & HINT_MAIN_TIMER != 0u64 {
+        tick_::<C, _>(shared, public_tx_w, tick, cancel).await;
+    }
+    if hints & HINT_MAIN_WINDOW_DIRTY != 0u64 {
+        flush_window_dirty_::<C, _>(shared, public_tx_w, cancel).await;
+    }
     if hints & HINT_MAIN_RETIRED != 0u64 {
         reap_retired_and_release_::<C, _>(shared, public_tx_w, cancel).await;
     }
@@ -288,17 +372,6 @@ where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
-    // 过渡：显式失败路径仍投 `SessionEvent_`。登记之前先把它落实，保证「丢弃后
-    // 立刻重绑 / 重听 / 重新登记同一条 dock 对」与旧 API 的语义一致。
-    if shared
-        .reg_()
-        .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token())
-        .await
-        .is_err()
-    {
-        request.fail_(MainLoopErr_::Mux(MuxError::Cancelled));
-        return;
-    }
     // 同一轮合并的 retired 释放先落实：保证「丢弃后立刻重听」看到的是已释放。
     reap_retired_and_release_::<C, _>(shared, public_tx_w, cancel).await;
     match request {
@@ -488,6 +561,11 @@ where
             };
             match result {
                 Result::Ok(()) => {
+                    if role_ == EstablishRole_::Initiator {
+                        // 发起方的 `OPEN` 已经进公共 TX：此后若应用放弃，对端已经知道
+                        // 这条子流，必须回 `REJECT`（`reap_retired_` 据此判据）。
+                        owner.set_local_open_sent_();
+                    }
                     if role_ == EstablishRole_::Responder {
                         owner.set_establish_settled_();
                     }
@@ -1016,6 +1094,363 @@ where
     }
 }
 
+/// 执行一轮定时决策（原 `timer_loop` 的「扫描 + 认领 + 投递」整段搬到这里）。
+///
+/// # 为什么在 main
+///
+/// `timer_scan_` 的判定与认领都是**身份表写操作**（认领 `PULSE` 职责、拆流、建流
+/// 超时、优雅关闭 finalize、`WaitClose` 回收），而身份表的唯一写者是 `main_loop`
+/// （设计稿 §6.4 / I3）。`timer_loop` 收缩成纯计时后，这里成为唯一的定时决策者。
+///
+/// # 组帧与背压
+///
+/// 所有帧都进**公共 TX ring**（FIFO）：`Abort` 的 `CLOSE(FIN)` 一定排在
+/// `CLOSE(RESET)` 之前，与 R6/R7 建立的「RESET 不越过 FIN」顺序一致。公共 TX 满时
+/// 帧留在 [`MainTickState_`] 里（不可重建的帧不能丢），下一轮先补写。
+async fn tick_<C, K>(
+    shared: &MuxShared_<C>,
+    public_tx_w: &mut BufferedTx,
+    tick: &mut MainTickState_,
+    cancel: &K,
+) where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    // 先把上一轮没写出去的帧尽力补发；仍写不进就本轮不再产生新动作（避免队列
+    // 继续增长——虽然定容，但认领是不可逆的，攒太多会占满缓冲区）。
+    flush_tick_frames_::<C>(shared, public_tx_w, tick);
+    if tick.has_pending_() {
+        return;
+    }
+
+    let now = shared.conn_clock_().now_millis_();
+    let timeout_millis = shared.channel_timeout_millis_();
+    let pulse_millis = timeout_millis / 2u64;
+    let mut actions = [TimerAction_::Idle; K_TIMER_ACTION_BATCH];
+    let Result::Ok(scan) = shared
+        .reg_()
+        .timer_scan_(
+            now,
+            pulse_millis,
+            timeout_millis,
+            &mut actions,
+            cancel.child_token(),
+        )
+        .await
+    else {
+        return;
+    };
+
+    // 连接级关闭动作优先：等待关闭已经不需要再排空（活跃子流归零），或关闭整体
+    // 超时——两种情形都到此为止，本轮认领的逐子流动作已无意义。
+    if scan.close_action_() != K_CLOSE_NONE {
+        if scan.close_action_() == K_CLOSE_TIMEOUT {
+            shared.reg_().mark_forced_close_();
+        }
+        shared.reg_().cancel_loops_();
+        return;
+    }
+
+    for action in &actions[..scan.actions_()] {
+        deliver_timer_action_::<C, _>(shared, action, tick, cancel).await;
+    }
+
+    // 发布下一次期限；批次满则立刻再来一轮（`now` 会被 `max(1)` 兜成 1 ms 后）。
+    let next = if scan.is_full_() {
+        now
+    } else {
+        scan.next_millis_().min(now.saturating_add(timeout_millis))
+    };
+    shared.control_().timer_signal_().publish_(next);
+
+    flush_tick_frames_::<C>(shared, public_tx_w, tick);
+}
+
+/// 落实一条定时动作：状态 / 身份副作用立即做，控制帧进 [`MainTickState_`]。
+///
+/// 副作用与组帧严格按「先状态、后帧」的顺序：即使帧因背压留到下一轮，状态也已经
+/// 是终局，`scan_write_released_` / `scan_fin_enqueued_` 之类的位扫描不会漏。
+async fn deliver_timer_action_<C, K>(
+    shared: &MuxShared_<C>,
+    action: &TimerAction_,
+    tick: &mut MainTickState_,
+    cancel: &K,
+) where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    match action {
+        TimerAction_::Idle => {}
+
+        TimerAction_::Finalize {
+            local_dock,
+            remote_dock,
+        } => {
+            // 复用「应用丢弃发送半边」路径：置 `APP_TX_CLOSED`，写循环在发送环排空后
+            // 置 `TX_DRAINED`，再由本循环组 `CLOSE(FIN)`。
+            let owner = shared
+                .reg_()
+                .channel_owner_(*local_dock, *remote_dock, cancel.child_token())
+                .await;
+            if let Result::Ok(Option::Some(owner)) = owner {
+                let _ = owner.set_app_tx_closed_();
+                shared.reg_().raise_write_hint_(HINT_W_TX_CLOSED);
+            }
+        }
+
+        TimerAction_::Pulse {
+            local_dock,
+            remote_dock,
+            report,
+        } => {
+            // `PULSE` 与 `WINDOW_UPDATE` 共用「携带窗口通告」的形状：保活的同时把本端
+            // 接收窗口重同步一次（协议 §7.1）。可重建（下一 tick 会再到期），但这里
+            // 仍然入队而不是丢弃：入队才保证与同批的 CLOSE 保持 FIFO。
+            tick.push_(ControlFrame_::with_window_(
+                FrameKind::Pulse,
+                if report.is_reset() {
+                    flags::K_TOTAL_RESET
+                } else {
+                    0u8
+                },
+                *local_dock,
+                *remote_dock,
+                Option::Some((report.recv_total(), report.window())),
+            ));
+        }
+
+        TimerAction_::Abort {
+            local_dock,
+            remote_dock,
+        } => {
+            let (local, remote) = (*local_dock, *remote_dock);
+            // 1. 先取状态句柄：身份一转宽限态就再也取不到了。
+            let owner = match shared
+                .reg_()
+                .channel_owner_(local, remote, cancel.child_token())
+                .await
+            {
+                Result::Ok(owner) => owner,
+                Result::Err(_) => return,
+            };
+            // 2. **先**落宽限态：此后到达的在途帧一律静默丢弃。必须早于本地表动作，
+            //    否则读循环可能把在途数据帧判成「未知子流」而终止整条连接。
+            let _ = shared
+                .reg_()
+                .release_channel_(
+                    local,
+                    remote,
+                    shared.conn_clock_().now_millis_(),
+                    cancel.child_token(),
+                )
+                .await;
+            // 3. 两个方向都记成「协议收尾」：发送环里剩下的字节被主动放弃，接收方向
+            //    也不再收。`mark_released_` 让两侧循环摘本地表（绕过 `claim_release_`
+            //    的两方向判据——空闲超时本就没有「应用收尾」）。
+            if let Option::Some(owner) = owner {
+                owner.set_local_fin_sent_();
+                let _ = owner.claim_local_reset_();
+                owner.mark_released_();
+                owner.notify_both_progress_();
+                let now_millis = shared.conn_clock_().now_millis_();
+                shared.metrics_().on_channel_closed(
+                    local,
+                    remote,
+                    ChannelCloseReason::IdleTimeout,
+                    now_millis.saturating_sub(owner.created_millis_()),
+                );
+            }
+            // 4. 尽力告诉对端两个方向都收尾：`FIN` 关掉对端的接收方向、`RESET` 关掉
+            //    对端的发送方向，一条帧只能表达一个方向，因此发两条（FIFO 保证顺序）。
+            tick.push_(ControlFrame_::plain_(
+                FrameKind::Close,
+                flags::K_FIN,
+                local,
+                remote,
+            ));
+            tick.push_(ControlFrame_::plain_(
+                FrameKind::Close,
+                flags::K_RESET,
+                local,
+                remote,
+            ));
+            // 5. 本地两个循环各自摘表（事实位 `RELEASED`，提示只负责唤醒）。
+            shared.reg_().raise_write_hint_(HINT_W_RELEASED);
+            shared.reg_().raise_read_hint_(HINT_R_RELEASE);
+        }
+
+        TimerAction_::RejectEstablish {
+            local_dock,
+            remote_dock,
+        } => {
+            let (local, remote) = (*local_dock, *remote_dock);
+            let owner = match shared
+                .reg_()
+                .channel_owner_(local, remote, cancel.child_token())
+                .await
+            {
+                Result::Ok(owner) => owner,
+                Result::Err(_) => return,
+            };
+            // 对端此刻一定在等裁决，必须明确回 `REJECT` 把它放走。
+            tick.push_(ControlFrame_::plain_(
+                FrameKind::Reject,
+                0u8,
+                local,
+                remote,
+            ));
+            let _ = shared
+                .reg_()
+                .release_channel_(
+                    local,
+                    remote,
+                    shared.conn_clock_().now_millis_(),
+                    cancel.child_token(),
+                )
+                .await;
+            if let Option::Some(owner) = owner {
+                owner.set_establish_settled_();
+                owner.notify_establish_();
+                let now_millis = shared.conn_clock_().now_millis_();
+                shared.metrics_().on_channel_closed(
+                    local,
+                    remote,
+                    ChannelCloseReason::EstablishTimeout,
+                    now_millis.saturating_sub(owner.created_millis_()),
+                );
+            }
+        }
+    }
+}
+
+/// 把 [`MainTickState_`] 里已组好的控制帧**非阻塞**写进公共 TX ring。
+///
+/// 写不进（ring 当前空闲不足 `2 + len`）就停在这里，剩余的留到下一轮——不能 park，
+/// 否则 `main_loop` 会被一个控制帧的背压卡住（§15.1 风险 3）。
+fn flush_tick_frames_<C>(
+    shared: &MuxShared_<C>,
+    public_tx_w: &mut BufferedTx,
+    tick: &mut MainTickState_,
+) where
+    C: TrConnCfg,
+{
+    while let Option::Some(frame) = tick.first_() {
+        match try_write_control_frame_::<C>(public_tx_w, shared, &frame) {
+            Result::Ok(true) => tick.pop_front_(),
+            // ring 满：保留队头，下一轮再试。
+            Result::Ok(false) => break,
+            // 帧本身非法（超长）：丢弃队头，避免永久卡住整条队列。帧头是内部的
+            // 定长编码，走到这里说明协商上限与帧头不一致。
+            Result::Err(_) => tick.pop_front_(),
+        }
+    }
+}
+
+/// 尝试把一条无载荷控制帧写进公共 TX ring；`Ok(false)` 表示当前空间不足。
+///
+/// 与 [`write_control_frame_async_`] 的区别只有一处：**不 park**。定时决策产生的帧
+/// 不能把 `main_loop` 卡在背压上。
+fn try_write_control_frame_<C>(
+    public_tx_w: &mut BufferedTx,
+    shared: &MuxShared_<C>,
+    frame: &ControlFrame_,
+) -> Result<bool, MuxError>
+where
+    C: TrConnCfg,
+{
+    let header = FrameHeader::new_(
+        frame.kind_(),
+        frame.flags_(),
+        frame.local_dock_(),
+        frame.remote_dock_(),
+        0usize,
+        frame.window_(),
+    );
+    let (head, head_len) = encode_header_(&header).map_err(|_| MuxError::MalformedFrame)?;
+    match PublicChunkIo_::try_write_chunk_(
+        public_tx_w,
+        &head[..head_len],
+        &[],
+        shared.max_packet_size_(),
+    ) {
+        Result::Ok(()) => {
+            shared.public_().notify_tx_ready_();
+            Result::Ok(true)
+        }
+        Result::Err(ChunkWriteErr_::WouldBlock) => Result::Ok(false),
+        Result::Err(_) => Result::Err(MuxError::FrameTooLarge),
+    }
+}
+
+/// 把「接收窗口快照待通告」的子流收成 `WINDOW_UPDATE`，写进公共 TX ring。
+///
+/// # 判定为什么由 main 做
+///
+/// `should_report` 的判定是**消费式**的（取了就记为已通告），因此必须与「帧真的写
+/// 进 ring」在同一个成功路径上：先确认公共 TX 还有空间，**再**取快照。空间不足时
+/// 一个都不取——快照留在窗口里，下一轮 `HINT_MAIN_WINDOW_DIRTY` 再来。
+///
+/// 空间预算按最坏帧长（`2 + K_MAX_FRAME_HEADER`）估算，因此本轮取出的每一条都一定
+/// 写得进；不会出现「取了快照却写不进去」而丢通告。
+async fn flush_window_dirty_<C, K>(
+    shared: &MuxShared_<C>,
+    public_tx_w: &mut BufferedTx,
+    cancel: &K,
+) where
+    C: TrConnCfg,
+    K: TrCancellationToken,
+{
+    // 每条通告最坏占用（chunk 前缀 + 帧头上界）；WINDOW_UPDATE 无载荷。
+    let per_frame = 2usize.saturating_add(K_MAX_FRAME_HEADER);
+    let free = public_tx_w
+        .producer_state()
+        .map(|(free, _closed)| free)
+        .unwrap_or(0usize);
+    let budget = free / per_frame.max(1usize);
+    if budget == 0usize {
+        // 没有空间：保留快照（不取），重新挂起提示，等 mux 搬走后再来。
+        shared.control_().raise_main_hint_(HINT_MAIN_WINDOW_DIRTY);
+        return;
+    }
+    // 定长缓冲（栈上，零分配）：窗口通告是低频事件，一轮最多处理
+    // `K_WINDOW_REPORT_BATCH` 条；超出部分留到下一轮（快照没有被取走，仍在窗口里）。
+    let mut reports: [Option<((Dock, Dock), WindowReport)>; K_WINDOW_REPORT_BATCH] =
+        [Option::None; K_WINDOW_REPORT_BATCH];
+    let Result::Ok(count) = shared
+        .reg_()
+        .take_window_reports_(budget, &mut reports, cancel.child_token())
+        .await
+    else {
+        return;
+    };
+    if count == budget.min(K_WINDOW_REPORT_BATCH) && count == K_WINDOW_REPORT_BATCH {
+        // 本轮可能有剩余快照：挂起提示，下一轮继续。
+        shared.control_().raise_main_hint_(HINT_MAIN_WINDOW_DIRTY);
+    }
+    for (pair, report) in reports[..count].iter().flatten() {
+        let frame = ControlFrame_::with_window_(
+            FrameKind::WindowUpdate,
+            if report.is_reset() {
+                flags::K_TOTAL_RESET
+            } else {
+                0u8
+            },
+            pair.0,
+            pair.1,
+            Option::Some((report.recv_total(), report.window())),
+        );
+        match try_write_control_frame_::<C>(public_tx_w, shared, &frame) {
+            Result::Ok(true) => {}
+            // 预算已按最坏帧长算过，正常不会到这里；保守起见停下来，剩余快照
+            // 由下一轮提示重试。
+            Result::Ok(false) | Result::Err(_) => {
+                shared.control_().raise_main_hint_(HINT_MAIN_WINDOW_DIRTY);
+                break;
+            }
+        }
+    }
+}
+
 /// 把一条控制帧写进公共 TX ring（背压时 park 等 `tx_space`）。
 ///
 /// 帧头由 `FrameHeader` + `encode_header_` 重新编码；`payload` 是 `OPEN` / `ACCEPT` /
@@ -1071,7 +1506,9 @@ mod tests_ {
     use abs_mm::CoreAlloc;
     use mm_ptr::Owned;
 
-    use super::{main_step_, park_main_, try_read_public_frame_, MainPublicRead_, MainWake_};
+    use super::{
+        main_step_, park_main_, try_read_public_frame_, MainPublicRead_, MainTickState_, MainWake_,
+    };
     use crate::{
         connection::{
             main_loop::{MainLoopReply_, MainLoopRequest_},
@@ -1129,6 +1566,7 @@ mod tests_ {
         assert!(submitted.is_ok(), "Bind 请求应能入队");
         // 本辅助只驱动 Bind，不读 message；给 `main_step_` 一个足够的栈上缓冲。
         let mut msg_buf = [0u8; 512usize];
+        let mut tick = MainTickState_::new_();
         assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
             shared,
             ctl,
@@ -1137,6 +1575,7 @@ mod tests_ {
             scratch,
             &mut msg_buf,
             public_read,
+            &mut tick,
             &cancel
         )));
         let reply = block_on_ready_(core::future::poll_fn(|cx| waiter.poll_wait_(cx)))
@@ -1276,6 +1715,7 @@ mod tests_ {
 
         // 本用例驱动的是 retired → REJECT，不需要读 message ring；给一个栈上缓冲。
         let mut msg_buf = [0u8; 512usize];
+        let mut tick = MainTickState_::new_();
         assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
             &shared,
             &ctl,
@@ -1284,6 +1724,7 @@ mod tests_ {
             &mut scratch,
             &mut msg_buf,
             &mut rx_public_read,
+            &mut tick,
             &cancel,
         )));
         assert!(
@@ -1343,6 +1784,7 @@ mod tests_ {
         let mut scratch = [0u8; 256usize];
         let mut msg_buf = [0u8; 512usize];
         let mut public_read = MainPublicRead_::new_();
+        let mut tick = MainTickState_::new_();
         let cancel = NonCancellableToken::new();
         let local = Dock::new(7u32);
         let remote = Dock::new(9u32);
@@ -1369,6 +1811,7 @@ mod tests_ {
             &mut scratch,
             &mut msg_buf,
             &mut public_read,
+            &mut tick,
             &cancel,
         )));
         assert!(owner.is_released_(), "main 应当释放已完成收尾的身份");
@@ -1420,6 +1863,7 @@ mod tests_ {
         let mut scratch = [0u8; 256usize];
         let mut msg_buf = [0u8; 512usize];
         let mut public_read = MainPublicRead_::new_();
+        let mut tick = MainTickState_::new_();
         let cancel = NonCancellableToken::new();
         let local = Dock::new(11u32);
         let remote = Dock::new(13u32);
@@ -1444,6 +1888,7 @@ mod tests_ {
             &mut scratch,
             &mut msg_buf,
             &mut public_read,
+            &mut tick,
             &cancel,
         )));
         assert!(
@@ -1472,6 +1917,7 @@ mod tests_ {
             &mut scratch,
             &mut msg_buf,
             &mut public_read,
+            &mut tick,
             &cancel,
         )));
         assert!(owner.is_released_(), "RESET 上线后应当释放身份");

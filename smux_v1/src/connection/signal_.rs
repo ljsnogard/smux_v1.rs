@@ -10,8 +10,9 @@
 //! - **`Attach` 不走这两条通道**：会话侧环半部经内联 inbox（[`WriteAttach_`] /
 //!   [`ReadAttach_`]）交给对应循环——每连接一条、容量固定，不受「子流变多 ⇒ 事件
 //!   队列被打满」的影响；
-//! - [`WriteEvent_`] → **写循环**：待写出的控制帧（[`WriteEvent_::Control`]）、
-//!   「某条子流发送环有数据」（[`WriteEvent_::TxReady`]）；拆流已位化（见下节）；
+//! - [`WriteEvent_`] → **写循环**：「某条子流发送环有数据」
+//!   （[`WriteEvent_::TxReady`]）与 telegraph 的半部 / 就绪信号；拆流已位化，
+//!   控制帧已全部改由 `main_loop` 写公共 TX ring（R9 起本通道**不再承载控制帧**）；
 //! - [`ReadEvent_`] → **读循环**：「应用取走了数据，去看看接收水位」
 //!   （[`ReadEvent_::RxConsumed`]）。
 //!
@@ -256,12 +257,6 @@ pub(crate) enum WriteEvent_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
-    /// 一条待写出的控制帧。
-    Control {
-        /// 待写出的帧。
-        frame_: ControlFrame_,
-    },
-
     /// 某条子流的发送环有数据（应用侧写路径置位，见 dev-notes Q4 的契约）。
     TxReady {
         /// 本端 dock。
@@ -347,36 +342,6 @@ where
     },
 }
 
-/// **会话释放消息**：会话句柄的 `Drop` 只投递它，不碰注册表。
-///
-/// # 为什么 `Drop` 不能自己改注册表
-///
-/// 改注册表要取锁；而锁在跨线程争用时是**阻塞等待**
-/// （见 `sync_::acquire_write_`）。`Drop` 只允许
-/// 「不阻塞、不做事」——它投一条消息，由核心执行者（两个循环、或任意下一次 API
-/// 操作）在**异步上下文**里落实：改身份表、按协议进入 `WAIT_CLOSE`，必要时向对端
-/// 通告。
-///
-/// `ChannelTx::drop` / `ChannelRx::drop` 早就是这个形状（只投 [`WriteEvent_`] /
-/// [`ReadEvent_`]）；本枚举把剩下的四处会话身份释放拉回同一条纪律。
-pub(crate) enum SessionEvent_ {
-    /// 发起方句柄未裁决就丢弃：**撤销**尚未露面的子流登记（不留宽限期）。
-    UnreserveChannel {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-    },
-
-    /// 已露过面的子流收尾（响应方未裁决就丢弃）：进入拆流宽限期 `WAIT_CLOSE`。
-    ReleaseChannel {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-    },
-}
-
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 通道
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -427,10 +392,6 @@ pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;
 /// 字节，256 容量约 16 KiB/通道（两条共 32 KiB/连接），比原先的 1024 省 96 KiB。
 #[cfg_attr(feature = "chan-flume", allow(dead_code))]
 pub(crate) const EVENT_CHAN_CAP: usize = 256;
-
-/// 会话释放邮箱的容量（同样只是快速路径；满时走自旋锁溢出暂存）。
-#[cfg_attr(feature = "chan-flume", allow(dead_code))]
-pub(crate) const MAILBOX_CHAN_CAP: usize = 256;
 
 #[cfg(feature = "chan-flume")]
 type EventTx_<E> = Sender<E>;
@@ -738,144 +699,6 @@ impl<E: Send + 'static> TrEventReceiver_<E> for EventReceiver_<E> {
             }
         })
         .await
-    }
-}
-
-/// **会话释放邮箱**：`Drop` 投递、核心执行者 drain。
-///
-/// # 与 `WriteEvent_` / `ReadEvent_` 通道的区别
-///
-/// 那两条通道是**单消费者**（各自的循环独占）；本邮箱**允许多个消费者**：
-/// 两个循环与任意 API 面都可以 drain，每条消息只会被其中一个取到。这是「丢弃
-/// binding 后立刻重绑」能否确定成立的关键——重绑的那次 `bind_async` 自己就能
-/// 把积压的释放消息落实掉，而不必等某个特定任务被调度。
-///
-/// # 定容与兜底
-///
-/// 正常路径走 [`MAILBOX_CHAN_CAP`] 的定容通道；消息数天然有上界（每个会话句柄
-/// 至多一条）。`Drop` 里不能 `await`，因此环满时把消息推进一个**自旋锁保护的
-/// 溢出暂存**（`VecDeque`）。这条兜底路径只在极端并发 `Drop` 时才会走到；它保证
-/// 释放消息不丢，代价是溢出期间有界之外的一次堆增长。
-pub(crate) struct SessionMailbox_ {
-    /// 生产端；可克隆。
-    tx_: MailboxTx_,
-
-    /// 消费端；**可克隆**（多消费者）。
-    rx_: MailboxRx_,
-
-    /// 满时溢出暂存（多消费者共享）。
-    overflow_: Arc<MailboxOverflow_>,
-}
-
-#[cfg(feature = "chan-flume")]
-type MailboxTx_ = Sender<SessionEvent_>;
-#[cfg(feature = "chan-flume")]
-type MailboxRx_ = Receiver<SessionEvent_>;
-#[cfg(not(feature = "chan-flume"))]
-type MailboxTx_ = mpmc_chan::Sender<
-    'static,
-    SessionEvent_,
-    MAILBOX_CHAN_CAP,
-    Box<MpmcBuf<SessionEvent_, MAILBOX_CHAN_CAP>>,
->;
-#[cfg(not(feature = "chan-flume"))]
-type MailboxRx_ = mpmc_chan::Receiver<
-    'static,
-    SessionEvent_,
-    MAILBOX_CHAN_CAP,
-    Box<MpmcBuf<SessionEvent_, MAILBOX_CHAN_CAP>>,
->;
-
-/// 邮箱满时的溢出暂存。
-///
-/// 用自旋锁而不是 `std::sync::Mutex`：`post_` 可能在 `Drop` 里、任意线程上调用，
-/// 临界区只有一次 `push_back` / `pop_front`，自旋比唤醒系统锁更符合本模块
-/// 「不阻塞、不隐式分配」的纪律（溢出时的那次增长是明确例外）。
-struct MailboxOverflow_ {
-    /// 溢出消息（FIFO）。
-    queue_: SpinningMutexOwned<VecDeque<SessionEvent_>>,
-}
-
-impl MailboxOverflow_ {
-    /// 空溢出队列。
-    fn new_() -> Self {
-        MailboxOverflow_ {
-            queue_: SpinningMutexOwned::new_owned(VecDeque::new()),
-        }
-    }
-
-    /// 在锁下访问队列。
-    fn with_<R>(&self, f: impl FnOnce(&mut VecDeque<SessionEvent_>) -> R) -> R {
-        let mut session = self.queue_.lock_session();
-        // 不可取消的自旋锁不会以取消告终（与 `NotifySlot_::with_waker_` 同款）。
-        let mut guard = session
-            .lock()
-            .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
-        f(&mut guard)
-    }
-
-    /// 追加一条溢出消息。
-    fn push_(&self, event: SessionEvent_) {
-        self.with_(|queue| queue.push_back(event));
-    }
-
-    /// 取一条溢出消息。
-    fn pop_(&self) -> Option<SessionEvent_> {
-        self.with_(|queue| queue.pop_front())
-    }
-}
-
-impl Clone for SessionMailbox_ {
-    fn clone(&self) -> Self {
-        SessionMailbox_ {
-            tx_: self.tx_.clone(),
-            rx_: self.rx_.clone(),
-            overflow_: Arc::clone(&self.overflow_),
-        }
-    }
-}
-
-impl SessionMailbox_ {
-    /// 建一个空邮箱。
-    pub(crate) fn new_() -> Self {
-        let overflow_ = Arc::new(MailboxOverflow_::new_());
-        #[cfg(feature = "chan-flume")]
-        let (tx_, rx_) = flume::unbounded();
-        #[cfg(not(feature = "chan-flume"))]
-        let (tx_, rx_) = MpmcChan::new(Box::new(MpmcBuf::<SessionEvent_, MAILBOX_CHAN_CAP>::new()));
-        SessionMailbox_ {
-            tx_,
-            rx_,
-            overflow_,
-        }
-    }
-
-    /// 非阻塞投递（`Drop` 用；不取注册表锁、不 `await`）。
-    ///
-    /// 返回 `false` 表示消费者已全部消失（注册表自己始终持一份消费者，因此只有
-    /// 连接彻底收尾时才会发生）；调用方按「没送出去」处理即可。
-    pub(crate) fn post_(&self, event: SessionEvent_) -> bool {
-        match self.tx_.try_send(event) {
-            Result::Ok(()) => true,
-            // 定容环满：推进溢出暂存，仍然算送达。
-            Result::Err(TrySendError::Full(event)) => {
-                self.overflow_.push_(event);
-                true
-            }
-            Result::Err(_) => false,
-        }
-    }
-
-    /// 非阻塞取一条；没有积压时返回 `None`。
-    ///
-    /// 先取定容环，再取溢出暂存。多个消费者并发时每条消息只会被取到一次。
-    pub(crate) fn try_take_(&self) -> Option<SessionEvent_> {
-        match self.rx_.try_recv() {
-            Result::Ok(event) => return Option::Some(event),
-            Result::Err(TryRecvError::Empty) => {}
-            Result::Err(_) => {}
-        }
-        self.overflow_.pop_()
     }
 }
 
