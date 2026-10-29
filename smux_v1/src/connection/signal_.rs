@@ -257,14 +257,6 @@ pub(crate) enum WriteEvent_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
-    /// 某条子流的发送环有数据（应用侧写路径置位，见 dev-notes Q4 的契约）。
-    TxReady {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-    },
-
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
     // telegraph（数据报）：与 channel 走**同一套**「环半部上线」模式
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -351,6 +343,12 @@ pub(crate) const HINT_W_PEER_CLOSED: u64 = 1u64 << 2usize;
 /// 事实是 `ChannelState_` 的 `RELEASED` 位；本位只负责把写循环叫醒。替换了原先的
 /// 一次性 `WriteEvent_::LocalAbort`：一条子流至多释放一次，扫描是幂等的。
 pub(crate) const HINT_W_RELEASED: u64 = 1u64 << 3usize;
+
+/// 「某条子流的发送环刚有数据入队」：写循环据此回顶部做全表排空。
+///
+/// 可重建的高频提示：事实是 owner 的 `TX_QUEUED` 去重位（`mark_tx_queued_` 的
+/// 第一次置位才 raise）。重复或丢失都不会漏数据——写循环每轮本来就是全表扫描。
+pub(crate) const HINT_W_TX_READY: u64 = 1u64 << 6usize;
 
 /// 「`main_loop` 已把 `CLOSE(FIN)` 写进公共 TX ring」：写循环在刷出后确认上线。
 pub(crate) const HINT_W_FIN_ENQUEUED: u64 = 1u64 << 4usize;

@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -342,6 +342,22 @@ P3.3c / P4 / P5 的清理依据。
    `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
    import 格式干净。
 
+## 4.12 第 13 轮实施记录（`TxReady` 位化）
+
+1. `WriteEvent_::TxReady` 删除，改 `HINT_W_TX_READY`：`ChannelTx` 的写入路径在
+   `mark_tx_queued_` 第一次成功时 raise 合并提示（去重位保证「不重复唤醒」，位本身
+   保证「不丢」）；`demux_loop` 收到 `WINDOW_UPDATE` / `PULSE` 时也 raise 它（窗口回补
+   必须能叫醒写循环重试）。
+2. `demux_loop` 去掉 `events_tx` 参数（TxReady 是它最后一个写事件使用者）；写循环
+   的 `handle_write_event_` 只剩 telegraph 三项。
+3. **保留 `last_ready` 判据**（`last_ready` 现在恒为 `None`，该分支不再触发）：
+   R11 曾把它连同 park 的环等待一起删掉并在 `mux_drop_flush_dual_` 上失败；本轮
+   只删事件、不动 park 结构，全部用例通过。等 telegraph 位化、`WriteEvent_` 整体删除
+   时再一并清掉这段死判据。
+4. 验收：lib **367**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
+   import 格式干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -357,6 +373,7 @@ P3.3c / P4 / P5 的清理依据。
 | R10（已完成） | `Close` 请求 + TCS（Q8：先答 TCS 再取消）；删 `wait_for_finalize_` / `ctl_.rs` / `SendControl`；T8 位化尝试后回退 |
 | R11（已完成） | `RxConsumed` 位化（`HINT_R_RX_CONSUMED`）；修 demux park 丢位；`TxReady` 位化尝试后回退 |
 | R12（已完成） | `TakeInbound` / `OpenTelegraph` 请求化；`income_async` / `open_telegraph_async` 不再直接写身份表 |
+| R13（已完成） | `TxReady` 位化（`HINT_W_TX_READY`）；`demux` 不再持写事件生产端 |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
