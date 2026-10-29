@@ -51,7 +51,6 @@ use crate::{
         control_state_::ControlState_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
         scope_::close_conn_scope_,
-        signal_::{EventSender_, WriteEvent_},
         sync_::CancelToken_,
     },
     metrics::{ConnCloseReason, TrMetricsSink},
@@ -124,7 +123,6 @@ where
     control_: ControlState_<crate::connection::ConnAllocCfg_<C>>,
 
     /// 写事件发送端（控制帧、建流注册、水位与拆流通知）。
-    w_events_: EventSender_<WriteEvent_>,
 
     /// 读事件发送端（接收环注册与释放）。
 
@@ -153,7 +151,6 @@ where
         reg: ChannelRegistry_<crate::connection::ConnAllocCfg_<C>>,
         control: ControlState_<crate::connection::ConnAllocCfg_<C>>,
         epoch: <C::Rt as TrClock>::Instant,
-        w_events: EventSender_<WriteEvent_>,
         loops: [CancelToken_<crate::connection::ConnCoreAlloc_<C>>; 4],
     ) -> Self {
         MuxCore {
@@ -161,7 +158,6 @@ where
             epoch_: epoch,
             reg_: reg,
             control_: control,
-            w_events_: w_events,
             loops_: loops}
     }
 
@@ -186,11 +182,6 @@ where
     /// dock / 子流身份索引与失败标志。
     pub(crate) fn reg_(&self) -> &ChannelRegistry_<crate::connection::ConnAllocCfg_<C>> {
         &self.reg_
-    }
-
-    /// 写事件发送端。
-    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_> {
-        &self.w_events_
     }
 
     /// 第 `idx` 个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时）。

@@ -143,11 +143,10 @@ use crate::{
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChannel_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx},
         signal_::{
-            EventReceiver_, EventTake_,
             HINT_R_RELEASE, HINT_R_RX_CONSUMED, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED,
             HINT_W_RELEASED, HINT_W_TG_TX_CLOSED, HINT_W_TX_READY,
-            HINT_W_RESET_ENQUEUED, ReadAttach_, TrEventReceiver_,
-            WriteAttach_, WriteEvent_,
+            HINT_W_RESET_ENQUEUED, ReadAttach_,
+            WriteAttach_,
         },
         telegraph::TgRecvCtx_,
     },
@@ -201,15 +200,6 @@ where
     control_: ControlState_<C>,
 
 
-    /// 写侧事件通道的**保活**句柄。
-    ///
-    /// 它不参与任何通知（channel 的通知全部位化、telegraph 的 `TgAttach` 走 attach
-    /// inbox），但**必须保留一份生产端**：核心析构（`MuxCore::Drop`）只发起优雅关闭，
-    /// 循环要继续把已提交字节发完；若这里没有克隆，核心一析构事件通道就关闭，写循环
-    /// 会在 `EventTake_::Closed` 处立刻退出，未发完的载荷随之丢失
-    /// （`mux_drop_flush_dual_` 就是钉这一点的用例）。
-    w_events_: crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_>,
-
     /// 协商出的单帧总长上限。
     max_packet_size_: usize,
 
@@ -262,7 +252,6 @@ where
         MuxLoopShared_ {
             reg_: self.reg_.clone(),
             control_: self.control_.clone(),
-            w_events_: self.w_events_.clone(),
             max_packet_size_: self.max_packet_size_,
             pending_msg_cap_: self.pending_msg_cap_,
             conn_clock_: self.conn_clock_.clone(),
@@ -293,12 +282,10 @@ where
         channel_timeout_millis: u64,
         public: PublicChannel_<C>,
         metrics: M,
-        w_events: crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_>,
     ) -> Self {
         MuxLoopShared_ {
             reg_: reg,
             control_: control,
-            w_events_: w_events,
             max_packet_size_: max_packet_size,
             pending_msg_cap_: pending_msg_cap,
             conn_clock_: conn_clock,
@@ -323,14 +310,6 @@ where
     /// 控制面共享句柄（写循环据此 raise `HINT_MAIN_*`）。
     pub(crate) fn control_(&self) -> &ControlState_<C> {
         &self.control_
-    }
-
-    /// 写侧事件通道的保活句柄（不直接使用；见字段文档）。
-    #[allow(dead_code, reason = "只用于保活，不参与通知")]
-    pub(crate) fn w_events_(
-        &self,
-    ) -> &crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_> {
-        &self.w_events_
     }
 
     /// 连接级时钟。
@@ -483,13 +462,17 @@ type TgWriteTable_<C> = crate::connection::dock_index_::DockBPlusTree_<
 
 /// 处理写循环收到的一条 `Attach`：插入本地写表，并补查那些可能早于 `Attach` 到达的
 /// 一次性事实（应用封口 / 关接收、对端 `CLOSE`）。
-fn handle_write_attach_<C>(
+async fn handle_write_attach_<C, K>(
     attach: WriteAttach_<crate::connection::ConnAllocCfg_<C>>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
     tg_table: &mut TgWriteTable_<crate::connection::ConnAllocCfg_<C>>,
+    tx_stage: &mut C::ConnTx,
     shared: &MuxShared_<C>,
+    cancel: &K,
 ) where
     C: TrConnCfg,
+    C::Rt: TrTime + Clone,
+    K: TrCancellationToken,
 {
     match attach {
         WriteAttach_::Channel {
@@ -530,6 +513,16 @@ fn handle_write_attach_<C>(
                     reader_,
                 },
             );
+        }
+        // 「某条 telegraph 有已提交报文」：当场排空该端点（与事件通道时的语义一致）。
+        WriteAttach_::TgReady { local_dock_ } => {
+            if let Option::Some(entry) = tg_table.get_mut(local_dock_).map(|(_, v)| v) {
+                let _ = race_cancel_(
+                    cancel,
+                    flush_tg_endpoint_::<C, _>(tx_stage, entry, local_dock_, shared, cancel),
+                )
+                .await;
+            }
         }
     }
 }
@@ -2110,6 +2103,8 @@ where
             match attach {
                 WriteAttach_::Channel { mut reader_, .. }
                 | WriteAttach_::Telegraph { mut reader_, .. } => reader_.close(),
+                // 零 payload 的信号：没有环半部要关。
+                WriteAttach_::TgReady { .. } => {}
             }
         }
         self.shared.reg_.close_write_inbox_();
@@ -2160,50 +2155,6 @@ where
         for entry in self.table.values_mut() {
             entry.close_();
         }
-    }
-}
-
-/// 复用循环**写事件队列**的收尾守卫（规则与理由见 [`MuxLocalGuard_`]）。
-struct MuxEventsGuard_<'a, C>
-where
-    C: TrConnCfg,
-{
-    /// 尚未处理的事件（里面可能还压着没进表的 `Attach` 半部）。
-    events: EventReceiver_<WriteEvent_>,
-
-    /// 连接共享面（上报关闭与读时钟用）。
-    shared: &'a MuxShared_<C>,
-}
-
-impl<C> core::ops::Deref for MuxEventsGuard_<'_, C>
-where
-    C: TrConnCfg,
-{
-    type Target = EventReceiver_<WriteEvent_>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.events
-    }
-}
-
-impl<C> core::ops::DerefMut for MuxEventsGuard_<'_, C>
-where
-    C: TrConnCfg,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.events
-    }
-}
-
-impl<C> Drop for MuxEventsGuard_<'_, C>
-where
-    C: TrConnCfg,
-{
-    fn drop(&mut self) {
-        // 事件通道里只剩 `TgReady`（可重建提示）：退出时直接丢弃即可——环半部全部
-        // 走 `Attach` inbox，已由 [`MuxLocalGuard_`] 负责关闭。
-        let _ = self.shared;
-        while let EventTake_::Event(_) | EventTake_::Rescan = self.events.try_take_event_() {}
     }
 }
 
@@ -2317,7 +2268,6 @@ where
 pub(crate) async fn mux_loop_async_<C, K>(
     tx_stage: C::ConnTx,
     shared: MuxShared_<C>,
-    events: EventReceiver_<WriteEvent_>,
     mut public_tx_r: BufferedRx,
     cancel: K,
 ) where
@@ -2369,10 +2319,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
             shared.reg_.local_table_alloc_(cancel.child_token())
         ))
         .expect("2 KiB B+ 树足以容纳一个 telegraph 端点");
-    let mut events: MuxEventsGuard_<'_, C> = MuxEventsGuard_ {
-        events,
-        shared: &shared,
-    };
     let mut last_ready: Option<(Dock, Dock)> = Option::None;
     // 公共 TX 的 chunked 读进度。
     let mut public_read = ChunkReadState_::new_();
@@ -2398,7 +2344,15 @@ pub(crate) async fn mux_loop_async_<C, K>(
 
         // 0.05 `Attach` inbox：环半部从这里进入本地写表（不再走事件通道）。
         while let Option::Some(attach) = shared.reg_().take_write_attach_() {
-            handle_write_attach_::<C>(attach, &mut *table, &mut tg_table, &shared);
+            handle_write_attach_::<C, _>(
+                attach,
+                &mut *table,
+                &mut tg_table,
+                &mut tx_stage,
+                &shared,
+                &cancel,
+            )
+            .await;
         }
 
         // 3. 公共子流优先：先把 TX ring 里的 chunk 搬进传输，再发用户数据。
@@ -2457,50 +2411,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
             scan_tg_tx_closed_::<C>(&mut tg_table);
         }
 
-        // 1. 先把**已经到达**的事件成批处理掉（非阻塞），**但批有上限**。
-        //
-        // 这一步的顺序很关键：下面第 2 步会 park 在「最近通知过的那条发送环」上；
-        // 若不在 park 之前排空事件队列，其它子流的 `Attach` / `Control`（例如它们
-        // 的 `OPEN`）就会排在一条正在 park 的循环后面，形成死锁。单线程运行时下
-        // 「检查队列」与「登记 park」之间没有 `await`，因此不存在竞态。
-        //
-        // **上限不可省。** 事件是持续到来的（每条子流每次写入都会投 `TxReady`），
-        // 若「每处理一条事件就 `continue` 回顶部」，那么只要事件队列始终非空，第 2 步
-        // 的排空**永远轮不到**——发送方一帧也发不出去。这不是理论风险：真实 socket 的
-        // 流控验收用例正是卡在这里（对端已经把窗口抬到 384，事件也不断到达，而本循环
-        // 一直在顶部打转、从没进过排空段）。因此每轮只处理有上限的一批，然后必定走一次
-        // 排空。
-        const K_EVENT_BATCH: usize = 32usize;
-        for _ in 0..K_EVENT_BATCH {
-            let event = match events.try_take_event_() {
-                EventTake_::Event(event) => event,
-                // 有可重建事件（`TxReady` / `TgReady`）被丢弃：直接进入本轮的排空段。
-                // 写循环的排空本来就是**全表**扫描（`drain_once_` 与 2.7 段），因此
-                // 不需要额外的状态位全扫——这一轮必定会把可写的数据取走。
-                EventTake_::Rescan => break,
-                EventTake_::Empty | EventTake_::Closed => break,
-            };
-            match race_cancel_(
-                &cancel,
-                handle_write_event_::<C, _>(
-                        event,
-                    &mut tx_stage,
-                    &mut tg_table,
-                    &shared,
-                    &cancel,
-                ),
-            )
-            .await
-            {
-                Option::None => return,
-                Option::Some(Result::Ok(())) => {}
-                Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-                    return;
-                }
-            }
-        }
-
         // 2. 尽量把各子流的数据发出去（一次一段），直到没有可发的。
         loop {
             match race_cancel_(
@@ -2555,19 +2465,16 @@ pub(crate) async fn mux_loop_async_<C, K>(
         //    「别的子流刚入队的事件」一直排在一个睡着的循环后面（多子流下就是死锁）；
         //    不轮询传输写半边则「腾出空间」这条唤醒会丢（下游排空方把字节搬走之后没有
         //    任何人通知复用循环，若这里不同时 park 在它上面，drain 就再也不会被触发）。
-        let mut taken: Option<WriteEvent_> = Option::None;
-        // `Attach` 通道的接收 future：与事件通道一样跨 poll 持有。
+        // `Attach` 通道的接收 future：跨 poll 持有。
         let mut attach_fut = core::pin::pin!(core::future::IntoFuture::into_future(
             shared.reg_().recv_write_attach_async_()
         ));
-        let mut need_rescan = false;
         let mut ring_ready = false;
         let mut hint_ready = false;
         let mut public_ready = false;
         let mut taken_attach: Option<WriteAttach_<crate::connection::ConnAllocCfg_<C>>> = Option::None;
         let alive = {
             let cancel_fut = cancel.child_token().cancellation();
-            let mut event_fut = core::pin::pin!(events.take_event_async_());
             let mut cancel_fut = core::pin::pin!(cancel_fut);
             // 仅当上一轮是**因为写环没空间**停下时，才把写环的就绪作为唤醒条件。
             // 写环有空间就说明可以重试 `drain_once_`（这一步不消费借出的段）。
@@ -2576,24 +2483,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                 // 取消令牌优先：连接已收尾，直接退出。
                 if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
                     return Poll::Ready(false);
-                }
-                match core::future::Future::poll(event_fut.as_mut(), cx) {
-                    Poll::Ready(EventTake_::Event(event)) => {
-                        taken = Option::Some(event);
-                        return Poll::Ready(true);
-                    }
-                    // 有可重建事件被丢弃：醒来做全扫（状态位都在各子流上）。
-                    Poll::Ready(EventTake_::Rescan) => {
-                        need_rescan = true;
-                        return Poll::Ready(true);
-                    }
-                    // 所有生产者都没了：连接正在收尾，退出。
-                    Poll::Ready(EventTake_::Closed) => {
-                        return Poll::Ready(false);
-                    }
-                    // `take_event_async_` 不会返回 `Empty`；保守地当作「稍后再试」。
-                    Poll::Ready(EventTake_::Empty) => {}
-                    Poll::Pending => {}
                 }
                 // 子流发送环有新数据：回到顶部由 `drain_once_` 正式取走。
                 //
@@ -2656,35 +2545,16 @@ pub(crate) async fn mux_loop_async_<C, K>(
         if !alive {
             return;
         }
-        if need_rescan {
-            // 有可重建事件（`TxReady` / `TgReady`）被丢弃：回顶部，本轮排空段本来
-            // 就是全表扫描，足以把可写数据取走。
-            continue;
-        }
         if let Option::Some(attach) = taken_attach {
-            handle_write_attach_::<C>(attach, &mut *table, &mut tg_table, &shared);
-            continue;
-        }
-        if let Option::Some(event) = taken {
-            match race_cancel_(
+            handle_write_attach_::<C, _>(
+                attach,
+                &mut *table,
+                &mut tg_table,
+                &mut tx_stage,
+                &shared,
                 &cancel,
-                handle_write_event_::<C, _>(
-                        event,
-                    &mut tx_stage,
-                    &mut tg_table,
-                    &shared,
-                    &cancel,
-                ),
             )
-            .await
-            {
-                Option::None => return,
-                Option::Some(Result::Ok(())) => {}
-                Option::Some(Result::Err(err)) => {
-                    fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-                    return;
-                }
-            }
+            .await;
             continue;
         }
         if ring_ready {
@@ -2703,39 +2573,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
         last_ready = Option::None;
         continue;
     }
-}
-
-/// 处理一条写事件；返回 `Err` 表示连接级失败（调用方负责 `mark_failed_` 并退出）。
-///
-/// 只做**事件自身**的动作（写控制帧、置 `last_ready`、telegraph 收支）：本地表的
-/// 扫描收尾已改为提示位驱动（`HINT_W_*`），因此这里不再借用写表。
-async fn handle_write_event_<C, K>(
-    event: WriteEvent_,
-    tx_stage: &mut C::ConnTx,
-    tg_table: &mut TgWriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    shared: &MuxShared_<C>,
-    cancel: &K,
-) -> Result<(), MuxError>
-where
-    C: TrConnCfg,
-    C::Rt: TrTime + Clone,
-    K: TrCancellationToken,
-{
-    match event {
-        WriteEvent_::TgReady { local_dock } => {
-            // 只对**已在本地表**里的端点动手：`TgAttach` 可能还在 inbox 里（同一轮的
-            // 事件顺序由应用侧保证不了），真正的排空在主循环第 2.7 步兜底。
-            let Some(entry) = tg_table.get_mut(local_dock).map(|(_, value)| value) else {
-                return Result::Ok(());
-            };
-            let _ = race_cancel_(
-                cancel,
-                flush_tg_endpoint_::<C, _>(tx_stage, entry, local_dock, shared, cancel),
-            )
-            .await;
-        }
-    }
-    Result::Ok(())
 }
 
 /// 摘掉「应用已丢弃发送半边」的 telegraph 表项（位化后的 `TgTxClosed`）。

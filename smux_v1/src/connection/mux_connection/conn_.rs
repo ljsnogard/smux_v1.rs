@@ -20,7 +20,7 @@ use crate::{
         public_channel_::{PublicChannel_, PublicChunkIo_},
         ring_::new_buffered_channel,
         session_::{MuxShared_, demux_loop_async_, mux_loop_async_, race_cancel_},
-        signal_::{EventReceiver_, WriteEvent_, event_channel_},
+
         timer_::timer_loop_async_,
     },
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
@@ -217,7 +217,6 @@ where
             public_tx_r_,
             public_rx_w_,
             public_rx_r_,
-            w_receiver_,
         } = bundle;
 
         // 解复用：**直接读传输的读半边**（没有读泵，也没有连接读环）。
@@ -238,7 +237,6 @@ where
             mux_loop_async_::<C, _>(
                 tx,
                 shared_.clone(),
-                w_receiver_,
                 public_tx_r_,
                 core_.loop_token_(1usize),
             ),
@@ -330,7 +328,6 @@ where
     public_tx_r_: BufferedRx,
     public_rx_w_: BufferedTx,
     public_rx_r_: BufferedRx,
-    w_receiver_: EventReceiver_<WriteEvent_>,
 }
 
 impl<C> CoreBundle_<C>
@@ -365,7 +362,6 @@ where
             new_buffered_channel(Owned::new_uninit_slice(public_cap, public_alloc.clone()))
                 .expect("公共 RX ring：容量由 max_packet_size 决定，失败等同分配失败");
         let public = PublicChannel_::new_(config.alloc_cfg());
-        let (w_events, w_receiver) = event_channel_();
 
         // 指标接收方在**建连这一刻**从配置克隆一份：循环不持有核心，拿不到
         // `MuxCore`，只能像运行时值那样自持一份（见 `core_` 模块文档「队列保活」）。
@@ -385,7 +381,6 @@ where
             channel_timeout_millis,
             public,
             metrics.clone(),
-            w_events.clone(),
         );
         // 核心自持一份三个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
         // （那会阻塞，而 `Drop` 可能在任意线程上发生）。
@@ -402,7 +397,6 @@ where
                 reg,
                 control.clone(),
                 conn_clock.epoch_(),
-                w_events,
                 loops,
             ),
             core_alloc,
@@ -416,7 +410,6 @@ where
             public_tx_r_,
             public_rx_w_,
             public_rx_r_,
-            w_receiver_: w_receiver,
         }
     }
 }

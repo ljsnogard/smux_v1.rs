@@ -1574,7 +1574,7 @@ connection/
 
 | 文档 | 状态 |
 | --- | --- |
-| `event-loop-redesign-20261026-1930.md`（本文） | **设计稿（已评审）；P0–P3 完成，P4 完成（拆流/释放/关闭位化），P5 部分（timer 收缩 + 邮箱已删；事件通道待删）** |
+| `event-loop-redesign-20261026-1930.md`（本文） | **设计稿（已评审）；P0–P5 完成（R17：事件通道与邮箱全部删除、timer 只计时、mux 只搬数据）** |
 | `connection-delivery-20261026-1845.md` | 现行：现状矩阵；本文定稿后应把 §3 标为“历史基线” |
 | `event-backpressure-20261026-0514.md` | 现行：位化与内联队列的实施记录；本文的 P4/P5 会取代其阶段 3/4 |
 | `no-vec-audit-20261024-0008.md` | 历史：原则仍有效；本文 §10/§11 是其落地清单 |
@@ -2129,6 +2129,22 @@ connection/
   4. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
      cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
 
+- 20261030-0430：**R17：事件通道整体删除（T8 完成）**。
+  1. `TgReady` 改走 attach inbox 的**零 payload 信号**：`Sender::send_async` 只 try_push
+     一条标记（满时丢弃，可重建），写循环收到后当场排空该端点。**不能用合并提示**：
+     R14/R15 两次尝试都让 `mux_telegraph_inmem_dual_` 挂起——合并位只保证醒一次，
+     队列语义才保证「写环刚才满、现在有空」时还能再被叫醒。
+  2. 删除 `WriteEvent_` / `ReadEvent_` 与整条事件通道（`EventSender_` /
+     `EventReceiver_` / `Overflow_` / `EventTake_` / `TrEventReceiver_` /
+     `event_channel_` / `EVENT_CHAN_CAP` / `EventTx_` / `EventRx_`）、
+     `MuxEventsGuard_`、`mux_loop` 的 `events` 参数、`MuxShared_`/`MuxCore` 的
+     `w_events_`、`CoreBundle_::w_receiver_`。
+  3. 保活语义改由「`MuxCore::Drop` → raise `HINT_MAIN_TIMER` → main tick →
+     `cancel_loops_`」承担（R16 记录的隐性保障）。
+  4. 删 13 个只测事件通道的单测（lib 367 → 354）与四个通道 probe。
+  5. 验收：lib 354 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2307,7 +2323,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | P0 原语完成（`PublicChunkIo_`，未接线） |
 | T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | 完成（P3.1b：`OPEN`/`ACCEPT`/`REJECT`/`CLOSE` 全走公共子流；timer 的 `PULSE`/`CLOSE` 待 P4/P5） |
-| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：邮箱已删（R9）；`RxConsumed` / `TxReady` / `TgTxClosed` 已位化（R11/R13/R15）；`TgAttach` 改走 inbox、`ReadEvent_` 已删（R16）；`WriteEvent_` 只剩 `TgReady` |
+| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | **完成**（R9 邮箱、R11/R13/R15 位化、R16 `TgAttach` inbox、R17 `TgReady` inbox + 整条通道删除） |
 
 ### C. 请求 / TCS
 
