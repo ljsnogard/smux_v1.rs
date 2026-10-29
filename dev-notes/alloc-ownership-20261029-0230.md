@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -299,6 +299,28 @@ P3.3c / P4 / P5 的清理依据。
    `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
    import 格式干净。
 
+## 4.10 第 11 轮实施记录（`RxConsumed` 位化 + park 丢位修复）
+
+1. **`ReadEvent_::RxConsumed` 位化**：`ChannelRx::notify_consumed_` 去重位成功后只
+   raise `HINT_R_RX_CONSUMED`；`demux_loop` 在顶部按全表调用 `rescan_read_`
+   （清位 → 读积压 → `recv_recheck_due_` → raise `HINT_MAIN_WINDOW_DIRTY`）。
+   `handle_read_event_` 因此只剩 `TgAttach`（签名收窄为 `(event, tg_table)`）。
+2. **修复一处真实的丢唤醒缺陷**：`demux_loop` 的 park 里 `ReadWake_::Hint(bits)` 只处理
+   `HINT_R_RELEASE`，而 `poll_read_hint_` 是「**取出并返回**」语义——park 取走却不处理
+   的位直接丢失。位化 `RxConsumed` 后这等于「应用读了数据、水位永不重算、对端收不到
+   `WINDOW_UPDATE`、发送方额度永远不回来」，`mux_closed_ring_spin_dual_` 与
+   `flow_ctrl_socket_compio_` 立刻暴露。现在未处理的位**回放到顶部**，新增提示位不会
+   再踩这个坑。
+3. **`TxReady` 位化尝试后回退**（记录，不落地）：把 `WriteEvent_::TxReady` 也改成
+   `HINT_W_TX_READY`、并删掉 `last_ready` / `last_ready_has_segment_`（park 不再等
+   具体环）之后，`mux_drop_flush_dual_` 失败：应用写满 14 KiB 后**立即** drop，
+   `raise_write_hint_` 之后 mux 没有下一轮（它停在某个等待源上，write hint 打不断）。
+   回退到事件通道。结论：**下一轮位化前先查清 mux 在 ConnTx 背压 / 公共 chunk park
+   时的唤醒源**（write hint 只覆盖「park 等提示」这一种形态）。
+4. 验收：lib **367**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
+   import 格式干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -312,6 +334,7 @@ P3.3c / P4 / P5 的清理依据。
 | R8（已完成） | 身份释放（`claim_release_` / `release_channel_` / 关闭上报 / 连接收尾）迁到 `main_loop::flush_releasable_`；mux 只置位 + raise `HINT_MAIN_RELEASE` |
 | R9（已完成） | timer 收缩为纯计时；`PULSE` / 空闲拆流 `FIN`+`RESET` / 建流超时 `REJECT` / `WINDOW_UPDATE` 全部由 main 写公共 TX；删会话邮箱；`mux` 不再写身份表、不再处理控制帧 |
 | R10（已完成） | `Close` 请求 + TCS（Q8：先答 TCS 再取消）；删 `wait_for_finalize_` / `ctl_.rs` / `SendControl`；T8 位化尝试后回退 |
+| R11（已完成） | `RxConsumed` 位化（`HINT_R_RX_CONSUMED`）；修 demux park 丢位；`TxReady` 位化尝试后回退 |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：

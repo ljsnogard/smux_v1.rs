@@ -144,7 +144,8 @@ use crate::{
         ring_::{BufferedRx, BufferedTx},
         signal_::{
             EventReceiver_, EventSender_, EventTake_,
-            HINT_R_RELEASE, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED, HINT_W_RELEASED,
+            HINT_R_RELEASE, HINT_R_RX_CONSUMED, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED,
+            HINT_W_RELEASED,
             HINT_W_RESET_ENQUEUED, ReadAttach_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteAttach_, WriteEvent_,
         },
@@ -1240,9 +1241,8 @@ where
                 EventTake_::Rescan | EventTake_::Empty | EventTake_::Closed => break,
             };
             // 通道 `Attach` 已经改走 inbox；事件里只剩 telegraph 的环半部需要显式关闭。
-            if let ReadEvent_::TgAttach { mut writer_, .. } = event {
-                writer_.close();
-            }
+            let ReadEvent_::TgAttach { mut writer_, .. } = event;
+            writer_.close();
         }
     }
 }
@@ -1310,6 +1310,19 @@ pub(crate) async fn demux_loop_async_<C, K>(
         let read_hints = shared.reg_().take_read_hint_();
         if read_hints & HINT_R_RELEASE != 0u64 {
             scan_released_::<C>(&mut *table);
+        }
+        // 应用刚消费过数据：按全表重算接收水位（`RxConsumed` 位化之后）。
+        // `rescan_read_` 的「先清位、再读积压」顺序保证不丢。
+        if read_hints & HINT_R_RX_CONSUMED != 0u64
+            && let Result::Err(err) = rescan_read_::<C>(
+                &shared,
+                &mut *table,
+                shared.conn_clock_().now_millis_(),
+            )
+            .await
+        {
+            fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
+            return;
         }
         // 0.06 `Attach` inbox：接收环写端从这里进入本地读表。
         //
@@ -1411,15 +1424,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 // `Attach` / `RxConsumed` 静默吞掉），因此必须在这里就地处理，不能只
                 // 回顶部等 `drain_read_events_` 再取一次。
                 ReadWake_::Event(event) => {
-                    if let Result::Err(err) = handle_read_event_::<C>(
-                        &shared,
-                        event,
-                        &mut table.table,
-                        &mut *tg_table,
-                        table.shared.conn_clock_().now_millis_(),
-                    )
-                    .await
-                    {
+                    if let Result::Err(err) = handle_read_event_::<C>(event, &mut *tg_table) {
                         fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
                         return;
                     }
@@ -1442,9 +1447,19 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     handle_read_attach_::<C>(attach, &mut table.table);
                 }
                 // 合并提示（身份释放）：按 `RELEASED` 位摘读表并关接收环写端。
+                // 合并提示：`RELEASED` 就地摘表；**其余位回放到顶部**统一处理。
+                //
+                // 回放不可省：`poll_read_hint_` 是「取出并返回」语义，park 取走却没处理
+                // 的位就等于丢掉——`HINT_R_RX_CONSUMED` 正是这样丢的（应用读了数据、
+                // 水位永不重算，对端收不到 `WINDOW_UPDATE`，发送方额度永远不回来）。
                 ReadWake_::Hint(bits) => {
-                    if bits & HINT_R_RELEASE != 0u64 {
+                    let mut rest = bits;
+                    if rest & HINT_R_RELEASE != 0u64 {
+                        rest &= !HINT_R_RELEASE;
                         scan_released_::<C>(&mut table.table);
+                    }
+                    if rest != 0u64 {
+                        shared.reg_().raise_read_hint_(rest);
                     }
                 }
                 ReadWake_::Cancelled => return,
@@ -1826,14 +1841,7 @@ where
     for _ in 0..K_EVENT_BATCH {
         match events.try_take_event_() {
             EventTake_::Event(event) => {
-                handle_read_event_::<C>(
-                    shared,
-                    event,
-                    table,
-                    tg_table,
-                    now_millis,
-                )
-                    .await?;
+                handle_read_event_::<C>(event, tg_table)?;
             }
             // 有可重建事件被丢弃：按各子流的状态位全扫一次，然后让主循环继续。
             EventTake_::Rescan => {
@@ -1900,37 +1908,14 @@ where
 /// park 拿到手又丢掉就等于把这条 `Attach` 静默吞掉（本仓库的
 /// `mux_min_stage_inmem` 用例正是这么挂死的：附加事件被 park 吃掉，随后到达的数据帧
 /// 在本地表里找不到表项，读循环掉进「未知子流」分支并卡在注册表锁上）。
-async fn handle_read_event_<C>(
-    shared: &MuxShared_<C>,
+fn handle_read_event_<C>(
     event: ReadEvent_<crate::connection::ConnAllocCfg_<C>>,
-    table: &mut ReadTable_<crate::connection::ConnAllocCfg_<C>>,
     tg_table: &mut TgReadTable_<crate::connection::ConnAllocCfg_<C>>,
-    now_millis: u64,
 ) -> Result<(), MuxError>
 where
     C: TrConnCfg,
 {
     match event {
-        ReadEvent_::RxConsumed {
-            local_dock,
-            remote_dock,
-        } => {
-            let pair = (local_dock, remote_dock);
-            let Some((_, entry)) = table.get_mut(pair) else {
-                // 表里没有这条子流：附加事件还没到（或已被 Release 摘掉），
-                // 本次通知已无对象，直接丢弃。
-                return Result::Ok(());
-            };
-            // **先清位、再读环内积压**：顺序不可反，否则「清位与读积压之间」发生的
-            // 那次消费会既没有置位、也没有被这次核对看到（见
-            // `ChannelState_::clear_rx_consumed_`）。
-            entry.owner_.clear_rx_consumed_();
-            let owner = entry.owner_.clone();
-            // 环内**实际积压**（已提交、应用还没取走）。本循环是接收环唯一的写入
-            // 方，因此这次采样与上面的 `received_` 是同一时刻的一致快照。
-            let buffered = entry.writer_.ring_state().data_size();
-            recheck_recv_level_::<C>(shared, &owner, buffered, now_millis);
-        }
         // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
         // telegraph（数据报）
         // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----

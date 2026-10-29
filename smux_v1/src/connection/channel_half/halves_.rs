@@ -58,7 +58,7 @@ use crate::{
         owner_::ChannelOwner_,
         session_::race_cancel_,
         signal_::{
-            HINT_W_TX_CLOSED, ReadEvent_, TrEventSender_, WriteEvent_,
+            HINT_W_TX_CLOSED, TrEventSender_, WriteEvent_,
         },
     },
     flow_ctrl::Credit,
@@ -603,17 +603,13 @@ where
             crate::connection::loop_probe_::event_rx_consumed_dedup_();
             return;
         }
-        let sent = self
-            .conn_
+        // 位化：只 raise 合并提示，读循环按全表重算水位（清位顺序保证不丢）。
+        self.conn_
             .core_()
-            .r_events_()
-            .try_send_event_(ReadEvent_::RxConsumed {
-                local_dock: self.local_dock_,
-                remote_dock: self.remote_dock_});
+            .reg_()
+            .raise_read_hint_(crate::connection::signal_::HINT_R_RX_CONSUMED);
         #[cfg(feature = "test-loop-probe")]
-        crate::connection::loop_probe_::event_rx_consumed_result_(sent);
-        #[cfg(not(feature = "test-loop-probe"))]
-        let _ = sent;
+        crate::connection::loop_probe_::event_rx_consumed_result_(true);
     }
 
     /// 从接收环读满 `out`。

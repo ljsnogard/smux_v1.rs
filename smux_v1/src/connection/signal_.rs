@@ -13,8 +13,8 @@
 //! - [`WriteEvent_`] → **写循环**：「某条子流发送环有数据」
 //!   （[`WriteEvent_::TxReady`]）与 telegraph 的半部 / 就绪信号；拆流已位化，
 //!   控制帧已全部改由 `main_loop` 写公共 TX ring（R9 起本通道**不再承载控制帧**）；
-//! - [`ReadEvent_`] → **读循环**：「应用取走了数据，去看看接收水位」
-//!   （[`ReadEvent_::RxConsumed`]）。
+//! - [`ReadEvent_`] → **读循环**：只剩 telegraph 的接收半部；「应用取走了数据」
+//!   已改为 `HINT_R_RX_CONSUMED` 合并提示（R11）。
 //!
 //! # 两条水位通知的方向**刻意不同**
 //!
@@ -308,22 +308,6 @@ pub(crate) enum ReadEvent_<C>
 where
     C: TrConnAllocCfg + 'static,
 {
-    /// 应用从接收环取走了数据：**接收窗口的账面水位可能变了**。
-    ///
-    /// 这是**裸通知**，刻意不带增量。增量必须由**持有接收环写端**的解复用循环按
-    /// 「自己记账的累计已收 − 环内实际积压」重算：应用侧只能采样 `data_size` 的差值，
-    /// 而一次并发写入就会把同一区间里的读出完全掩盖，额度被永久漏记、两端互等
-    /// （因果链见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
-    ///
-    /// 投递按子流去重（`ChannelState_::mark_rx_consumed_`）：每条子流至多一条待处理
-    /// 通知。
-    RxConsumed {
-        /// 本端 dock。
-        local_dock: Dock,
-        /// 对端 dock。
-        remote_dock: Dock,
-    },
-
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
     // telegraph（数据报）
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -373,6 +357,12 @@ pub(crate) const HINT_W_FIN_ENQUEUED: u64 = 1u64 << 4usize;
 
 /// 「main 已把 `CLOSE(RESET)` 写进公共 TX ring」：写循环在刷出后确认上线。
 pub(crate) const HINT_W_RESET_ENQUEUED: u64 = 1u64 << 5usize;
+
+/// 「应用刚消费了接收数据」：读循环据此按全表重算接收水位。
+///
+/// 可重建的高频提示：事实是 owner 的 `RX_CONSUMED` 去重位；读循环的清位顺序
+/// （**先清位、再读环内积压**）保证不丢。
+pub(crate) const HINT_R_RX_CONSUMED: u64 = 1u64 << 1usize;
 
 /// 「身份已释放」：读循环据此摘掉接收表项并关闭接收环写端。
 pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;
