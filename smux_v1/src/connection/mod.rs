@@ -647,6 +647,14 @@ pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
+pub use ring_::{
+    BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff_, MuxChanBuffOwnedBy, RingBuildErr,
+    new_buffered_channel,
+};
+pub use telegraph::{DemandErr, Receiver, RecvDatagram, Sender, Telegraph, TelegraphError};
+pub use types_::Dock;
+
+
 pub(crate) use chan_cfg_::MpmcChanCfg_;
 
 /// 连接配置对应的分配器配置类型。
@@ -677,11 +685,3 @@ pub(crate) use main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoo
 pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
 pub(crate) use mux_connection::{ReadOutgoingErr_, ReserveErr_};
 pub(crate) use slot_::PushErr_;
-pub use ring_::{
-    BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff_, MuxChanBuffOwnedBy, RingBuildErr,
-    new_buffered_channel,
-};
-
-pub use telegraph::{DemandErr, Receiver, RecvDatagram, Sender, Telegraph, TelegraphError};
-
-pub use types_::Dock;
