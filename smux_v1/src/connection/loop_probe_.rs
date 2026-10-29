@@ -347,25 +347,9 @@ pub(crate) fn event_rx_consumed_result_(sent: bool) {
     }
 }
 
-/// 记一次「可重建事件因环满被丢弃」。
-pub(crate) fn event_full_recoverable_() {
-    EVENT_FULL_RECOVERABLE.fetch_add(1, Ordering::Relaxed);
-}
 
-/// 记一次「不可重建事件进入兜底暂存」。
-pub(crate) fn event_durable_stashed_() {
-    EVENT_DURABLE_STASHED.fetch_add(1, Ordering::Relaxed);
-}
 
-/// 记一次「不可重建事件投递时消费者已消失」。
-pub(crate) fn event_durable_closed_() {
-    EVENT_DURABLE_CLOSED.fetch_add(1, Ordering::Relaxed);
-}
 
-/// 记一次「消费者看到 `Rescan`」。
-pub(crate) fn event_rescan_() {
-    EVENT_RESCAN.fetch_add(1, Ordering::Relaxed);
-}
 
 /// 读事件通道诊断快照。
 pub fn event_probe_snapshot_() -> EventProbeSnapshot {

@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -412,6 +412,27 @@ P3.3c / P4 / P5 的清理依据。
    `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
    import 格式干净。
 
+## 4.16 第 17 轮实施记录（事件通道整体删除）
+
+1. `TgReady` 改走 **attach inbox 的零 payload 信号**（`WriteAttach_::TgReady`）：
+   `Sender::send_async` 只 `try_push` 一条标记，inbox 满时丢弃（可重建，写循环每轮
+   都会扫所有端点）；`handle_write_attach_` 收到标记后当场排空该端点。
+   **为什么不用合并提示**：R14/R15 两次把它改成 `HINT_W_TG_READY` 都让
+   `mux_telegraph_inmem_dual_` 挂起——合并位只保证「醒一次」，而队列语义保证「写环
+   刚才满、随后有空」时还能被再叫醒一次。这是本轮唯一改变结论的地方。
+2. 删除 `WriteEvent_` / `ReadEvent_` 两个枚举与**整条事件通道**：
+   `EventSender_` / `EventReceiver_` / `Overflow_` / `EventTake_` /
+   `TrEventReceiver_` / `event_channel_` / `EVENT_CHAN_CAP` / `EventTx_` / `EventRx_`，
+   以及 `MuxEventsGuard_`、`mux_loop` 的 `events` 参数、`MuxShared_::w_events_`、
+   `MuxCore::w_events_`、`CoreBundle_::w_receiver_`。
+3. **保活语义转移**：R16 发现 `MuxShared_::w_events_` 是「核心析构后循环仍继续排空」
+   的隐性保障；通道删除后改由「`MuxCore::Drop` → raise `HINT_MAIN_TIMER` → main tick
+   → `cancel_loops_`」接替，`mux_drop_flush_dual_` 通过。
+4. 删除 13 个只测事件通道的单测（lib 367 → **354**）与四个通道相关 probe。
+5. 验收：lib **354**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
+   import 格式干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -431,6 +452,7 @@ P3.3c / P4 / P5 的清理依据。
 | R14（未落地） | `Tg*` 位化尝试后回退：写循环在 `enqueue_frame_` 背压时无法被合并提示唤醒（见 §4.13） |
 | R15（已完成） | `TgTxClosed` 位化（`TgRec_::tx_closed_` + `scan_tg_tx_closed_`）；`TgReady` 仍走事件通道 |
 | R16（已完成） | `TgAttach` 走 attach inbox（`WriteAttach_`/`ReadAttach_` 改枚举）；删除整条读事件通道 |
+| R17（已完成） | `TgReady` 走 inbox 信号；删除 `WriteEvent_`/`ReadEvent_` 与整条事件通道；T8 完成 |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：

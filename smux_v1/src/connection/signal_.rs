@@ -1,84 +1,38 @@
-//! 连接的**事件通道**：中心循环与 API 面之间的唯一异步消息通路。
+//! 连接内部的**一次性资源交接**与**合并提示位**（R17 起不再有事件通道）。
 //!
-//! 本模块在「演员核心 + 智能指针」架构下**保留**：需求怎么投递不是设计纪律，而
-//! 水位这类高频提示走一次性通道恰好合适（见 [`crate::connection`] 模块文档 §2.3）。
-//! 通道实现在 [`EVENT_CHAN_CAP`] 处**定容**（默认后端 `mpmc_chan`）；旧的 `flume`
-//! 无界实现保留在 `chan-flume` feature 下用于 A/B 对比。
-//! 本模块在早先的「上行窗口通知」（见 `connection-20260919-1631.md` §11.4）基础
-//! 上扩展成两条**带类型负载**的事件通道：
+//! # 这个模块现在装什么
 //!
-//! - **`Attach` 不走这两条通道**：会话侧环半部经内联 inbox（[`WriteAttach_`] /
-//!   [`ReadAttach_`]）交给对应循环——每连接一条、容量固定，不受「子流变多 ⇒ 事件
-//!   队列被打满」的影响；
-//! - [`WriteEvent_`] → **写循环**：「某条子流发送环有数据」
-//!   （[`WriteEvent_::TxReady`]）与 telegraph 的半部 / 就绪信号；拆流已位化，
-//!   控制帧已全部改由 `main_loop` 写公共 TX ring（R9 起本通道**不再承载控制帧**）；
-//! - [`ReadEvent_`] → **读循环**：只剩 telegraph 的接收半部；「应用取走了数据」
-//!   已改为 `HINT_R_RX_CONSUMED` 合并提示（R11）。
+//! | 内容 | 说明 |
+//! | --- | --- |
+//! | [`WriteAttach_`] / [`ReadAttach_`] | 环半部（发送环读端 / 接收环写端）经内联 inbox 交给两个数据循环；channel 与 telegraph 共用同一条 inbox |
+//! | `HINT_W_*` / `HINT_R_*` | 合并提示位：可重建的「可能变了」只置位 + 唤醒，事实在各 owner 的状态字里 |
+//! | [`ControlFrame_`] | main 组帧用的纯帧头（载荷由独立切片携带） |
 //!
-//! # 两条水位通知的方向**刻意不同**
+//! # 两条事件通道已删除（R17）
 //!
-//! - 「发送环有数据」投给**写循环**：只有它持有发送环读端，能立刻去搬。
-//! - 「应用消费了」投给**读循环**：只有它持有接收环**写端**，能在同一任务里读到
-//!   「环内实际积压」，从而算出**精确**的累计已消费量。应用侧采样差值会被并发写入
-//!   掩盖，因此那条路早已废弃（见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
+//! `WriteEvent_` / `ReadEvent_` 曾承载四类通知，逐轮迁走：
 //!
-//! # 定容 + 全扫兜底（`feat/mpmc-chan` 试验）
+//! - `TxClosed` / `RxClosed` / `PeerClosed` / `Release` / `LocalAbort`：**位化**（状态字 + `HINT_*`）；
+//! - `Control`（`PULSE` / `CLOSE` / `REJECT`）：改由 `main_loop` 组帧写公共 TX ring（R9）；
+//! - `RxConsumed`：`HINT_R_RX_CONSUMED` + `demux` 全表重算（R11）；
+//! - `TxReady`：`HINT_W_TX_READY`（R13）；
+//! - `TgTxClosed`：`HINT_W_TG_TX_CLOSED` + 扫本地 tg 表（R15）；
+//! - `TgAttach`：改走 attach inbox（R16）；
+//! - `TgReady`：改走 attach inbox 的零 payload 信号（R17）——**用队列而不是合并位**，
+//!   因为「写环刚才满、现在有空」时必须保证写循环还能被再叫醒一次。
 //!
-//! `mpmc_chan` 没有无界模式，因此按「事件能否由状态位重建」分两类投递：
-//!
-//! 1. **可重建的高频提示**（`TxReady` / `TgReady` / `RxConsumed`）：环满时直接丢弃，
-//!    只置一个「需要全扫」标志并唤醒消费者。写循环的排空本来就是全表扫描，读循环的
-//!    `rescan_read_` 则按 `RX_CONSUMED` 位 + 环内积压重算窗口。这些事件的信息量只是
-//!    「可能变了」，状态位才是事实来源。
-//! 2. **不可重建的一次性通知**（`Attach` / `Control` / `TgAttach` / `TgTxClosed`）：环满时
-//!    推进 [`Overflow_::durable_`] 暂存（自旋锁 FIFO），消费者下次取事件时先取它。
-//!    它们携带环半部句柄或控制帧，丢了就真的无法可靠恢复。
-//!
-//! 这样正常路径只走定容环与一次原子读；全扫只在环满的极端情况下发生。`chan-flume`
-//! 后端是无界通道，两条兜底路径都不会被触发（保留它是为了同一提交内 A/B 对比）。
-//!
-//! # 拆流通知已位化（2026-10-27）
-//!
-//! `TxClosed` / `RxClosed` / `PeerClosed` / `Release` 已不再走事件通道：收尾事实在
-//! `owner_::ChannelState_` 的状态字（`APP_*` / `PEER_*` / `RELEASED`），生产者只
-//! `raise_` 一个合并提示（`HINT_W_*` / `HINT_R_*`），对应循环醒来后按表扫描并推进
-//! `finalize` / `RESET` / 摘表。这样共享队列里少了每子流四条消息，也不再需要在「满」
-//! 时暂存它们。
-//!
-//! `LocalAbort` 也已位化：计时循环的拆流动作把 `RELEASED` 位写在 owner 上，只
-//! `raise_` 一个 `HINT_W_RELEASED`；写循环扫本地表，对已释放条目关发送环、
-//! 摘表并尝试释放身份（原事件分支的动作）。
-//!
-//! # 为什么不是一条通道
+//! # 两条 inbox 的方向**刻意不同**
 //!
 //! 会话侧的两个环半部必须分别交给**不同**的循环：发送环的读端进写循环，接收环的
-//! 写端进读循环。若只用一条通道，两个循环会互相取走对方的 `Attach` 事件。因此按
-//! 消费者拆成两条。
-
-#[cfg(not(feature = "chan-flume"))]
-use alloc::boxed::Box;
-use alloc::{collections::VecDeque, sync::Arc};
-use core::{
-    future::Future,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    task::{Context, Poll},
-};
-
-#[cfg(feature = "chan-flume")]
-use flume::{Receiver, Sender, TryRecvError, TrySendError};
-#[cfg(not(feature = "chan-flume"))]
-use mpmc_chan::{MpmcBuf, MpmcChan, TryRecvError, TrySendError};
+//! 写端进读循环。若只用一条通道，两个循环会互相取走对方的 `Attach`。
 
 use crate::{
     connection::{
         Dock, FrameKind, TrConnAllocCfg,
         owner_::{ChannelOwner_, TgOwner_},
         ring_::{BufferedRx, BufferedTx},
-        sync_::NotifySlot_,
     },
     flow_ctrl::{Credit, RecvTotal},
-    x_deps::{abs_sync::may_break::TrMayBreak, atomic_sync::mutex::preemptive::SpinningMutexOwned},
 };
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -189,6 +143,16 @@ where
         reader_: BufferedRx,
     },
 
+    /// 「某条 telegraph 有已提交报文」的信号（零 payload）。
+    ///
+    /// 它是**可重建**的轻量信号：丢了也不要紧——写循环每轮都会把所有端点过一遍；
+    /// 用 inbox 而不用合并提示，是因为「一次提交一条信号」的队列语义能保证「写环
+    /// 刚才满、现在有空」时写循环**一定会再被叫醒**（合并提示只保证一次唤醒）。
+    TgReady {
+        /// 本端 dock。
+        local_dock_: Dock,
+    },
+
     /// 一条 telegraph 端点的发送环读端（键只有 `local_dock`）。
     Telegraph {
         /// 本端 dock。
@@ -219,6 +183,11 @@ where
         }
     }
 
+    /// 造一条「telegraph 有已提交报文」的信号。
+    pub(crate) fn new_tg_ready_(local_dock_: Dock) -> Self {
+        WriteAttach_::TgReady { local_dock_ }
+    }
+
     /// 造一条 telegraph 的写侧 `Attach`。
     pub(crate) fn new_tg_(
         local_dock_: Dock,
@@ -243,7 +212,8 @@ where
                 owner_,
                 reader_,
             } => Option::Some((pair_, owner_, reader_)),
-            WriteAttach_::Telegraph { .. } => Option::None,
+            WriteAttach_::Telegraph { .. }
+            | WriteAttach_::TgReady { .. } => Option::None,
         }
     }
 
@@ -326,18 +296,6 @@ where
 
 }
 
-/// 送到**写循环**的事件。
-pub(crate) enum WriteEvent_ {
-    /// 某条 telegraph 的**发送环有已提交数据**（应用侧提交后置位）。
-    ///
-    /// 只带 `local_dock`：「目的地址 + 长度」按 FIFO 记在身份节点的发送队列里
-    /// （目的地址是**逐次发送**的实参，不是端点的固有属性），本事件只负责把循环叫醒。
-    TgReady {
-        /// 本端 dock。
-        local_dock: Dock,
-    },
-}
-
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 合并提示的位定义
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -383,558 +341,3 @@ pub(crate) const HINT_R_RX_CONSUMED: u64 = 1u64 << 1usize;
 
 /// 「身份已释放」：读循环据此摘掉接收表项并关闭接收环写端。
 pub(crate) const HINT_R_RELEASE: u64 = 1u64 << 0usize;
-
-/// 定容事件通道的容量（`mpmc_chan` 要求 2 的幂且 `>= 2`）。
-///
-/// 事件通道承载两类东西：
-///
-/// - **不可重建的一次性通知**（`Attach` / `Control` / `TgAttach`）：
-///   生产者走 [`EventSender_::try_send_durable_event_`]，满时进入兜底暂存，**绝不丢**；
-/// - **可重建的高频提示**（`TxReady` / `TgReady` / `RxConsumed`）：走
-///   [`TrEventSender_::try_send_event_`]，满时丢弃并置「需要全扫」标志，由消费者按
-///   状态位 / 全表排空重建。
-///
-/// `Attach` 移出到内联 inbox、拆流与释放位化之后，这条通道只剩控制帧与高频提示；256 在
-/// 256 条并发子流的跨线程用例与三后端 smoke（真实 socket）上均通过。事件枚举 64
-/// 字节，256 容量约 16 KiB/通道（两条共 32 KiB/连接），比原先的 1024 省 96 KiB。
-#[cfg_attr(feature = "chan-flume", allow(dead_code))]
-pub(crate) const EVENT_CHAN_CAP: usize = 256;
-
-#[cfg(feature = "chan-flume")]
-type EventTx_<E> = Sender<E>;
-#[cfg(feature = "chan-flume")]
-type EventRx_<E> = Receiver<E>;
-#[cfg(not(feature = "chan-flume"))]
-type EventTx_<E> = mpmc_chan::Sender<'static, E, EVENT_CHAN_CAP, Box<MpmcBuf<E, EVENT_CHAN_CAP>>>;
-#[cfg(not(feature = "chan-flume"))]
-type EventRx_<E> = mpmc_chan::Receiver<'static, E, EVENT_CHAN_CAP, Box<MpmcBuf<E, EVENT_CHAN_CAP>>>;
-
-/// 一次「取事件」的完整结论。
-///
-/// `Rescan` 是定容通道的**兜底入口**：某条可重建的高频提示（`TxReady` /
-/// `TgReady` / `RxConsumed`）因为环满被丢弃时，生产者置位溢出标志并唤醒消费者。
-/// 写循环看到它直接进入本轮全表排空；读循环调用 `rescan_read_` 按 `RX_CONSUMED`
-/// 位重算窗口。它不等于「通道有数据」，也不等于「通道关闭」。
-pub(crate) enum EventTake_<E> {
-    /// 取到一条事件。
-    Event(E),
-    /// 有可重建事件被丢弃；请全扫。
-    Rescan,
-    /// 当前没有事件（方向锁短暂占用也归这里，调用方应按「稍后再试」处理）。
-    Empty,
-    /// 通道已关闭且无积压。
-    Closed,
-}
-
-/// 定容通道的满时兜底。
-///
-/// 两条路：
-///
-/// - **可重建事件**（水位提示）：环满时丢弃并置 [`Self::flag_`]，消费者看到
-///   `Rescan` 后按各子流状态位全扫重建；
-/// - **不可重建事件**（`Attach` / `Control` / `TgAttach`）：环满时推进
-///   [`Self::durable_`] 暂存，消费者下次取事件时先取它，**绝不丢**。
-///
-/// 暂存用自旋锁保护：投递可能发生在 `Drop` 里、任意线程上，临界区只有一次
-/// `push_back` / `pop_front`。它只在环满时增长，正常路径不触碰。
-///
-/// 只有 `mpmc_chan` 后端会走到这里；`chan-flume` 是无界通道，标志与暂存永远为空。
-struct Overflow_<E> {
-    /// 「有可重建事件被丢弃，需要全扫」。
-    flag_: AtomicBool,
-
-    /// 唤醒消费者的单等待者槽（用 `NotifySlot_` 的持久位，避免丢唤醒）。
-    wake_: NotifySlot_,
-
-    /// 不可重建事件的满时暂存（FIFO）。
-    durable_: SpinningMutexOwned<VecDeque<E>>,
-
-    /// 暂存队列的近似长度：正常路径（为 0）据此**不取锁**。
-    ///
-    /// 多生产者在锁内 push 之后自增、单消费者 pop 之后自减；短暂偏差只会让消费者
-    /// 多取一次锁或晚一轮看到事件，而后者由 `mark_` 的唤醒兜住。
-    durable_len_: AtomicUsize,
-}
-
-impl<E> Overflow_<E> {
-    /// 空兜底。
-    fn new_() -> Self {
-        Overflow_ {
-            flag_: AtomicBool::new(false),
-            wake_: NotifySlot_::new_(),
-            durable_: SpinningMutexOwned::new_owned(VecDeque::new()),
-            durable_len_: AtomicUsize::new(0usize),
-        }
-    }
-
-    /// 报告「有可重建事件被丢弃 / 有暂存事件到达」：置位并唤醒消费者。
-    /// 幂等、不阻塞。
-    fn mark_(&self) {
-        self.flag_.store(true, Ordering::Release);
-        self.wake_.notify_();
-    }
-
-    /// 取得并清除标志；返回此前是否置位。
-    fn take_(&self) -> bool {
-        let taken = self.flag_.swap(false, Ordering::AcqRel);
-        #[cfg(feature = "test-loop-probe")]
-        if taken {
-            crate::connection::loop_probe_::event_rescan_();
-        }
-        taken
-    }
-
-    /// 等待标志置位；已置位时立刻就绪并顺手消费通知槽的持久位。
-    fn poll_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.take_() {
-            // 清掉通知槽的持久位，避免下一轮因残留 pending 空转。
-            let _ = self.wake_.poll_wait_(cx);
-            return Poll::Ready(());
-        }
-        self.wake_.poll_wait_(cx)
-    }
-
-    /// 在锁下访问暂存队列。
-    fn with_durable_<R>(&self, f: impl FnOnce(&mut VecDeque<E>) -> R) -> R {
-        let mut session = self.durable_.lock_session();
-        // 不可取消的自旋锁不会以取消告终（与 `NotifySlot_::with_waker_` 同款）。
-        let mut guard = session
-            .lock()
-            .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
-        f(&mut guard)
-    }
-
-    /// 追加一条不可重建事件。
-    #[allow(dead_code, reason = "只服务 `try_send_durable_event_`，R17 一并移除")]
-    fn push_durable_(&self, event: E) {
-        self.with_durable_(|queue| queue.push_back(event));
-        self.durable_len_.fetch_add(1usize, Ordering::Release);
-    }
-
-    /// 取一条不可重建事件。
-    ///
-    /// 队列为空时只做一次原子读，**不取自旋锁**——这是事件循环的取事件快路径上
-    /// 最频繁的分支。
-    fn pop_durable_(&self) -> Option<E> {
-        if self.durable_len_.load(Ordering::Acquire) == 0usize {
-            return Option::None;
-        }
-        let popped = self.with_durable_(|queue| queue.pop_front());
-        if popped.is_some() {
-            self.durable_len_.fetch_sub(1usize, Ordering::Release);
-        }
-        popped
-    }
-}
-
-/// 事件的生产端；可克隆，因此任意多处持有。
-pub(crate) trait TrEventSender_<E> {
-    /// 非阻塞投递一条**可重建**事件。返回 `false` 表示消费者已消失（连接正在收尾）
-    /// 或环满（此时已置位全扫标志）。
-    fn try_send_event_(&self, event: E) -> bool;
-}
-
-/// 事件的消费端；对应循环独占。
-pub(crate) trait TrEventReceiver_<E> {
-    /// 非阻塞取一条。
-    fn try_take_event_(&mut self) -> EventTake_<E>;
-
-    /// 异步取一条：没有积压时 park，直到有事件到达、需要全扫、或生产端全部消失。
-    ///
-    /// 调用方应当把它放在取消令牌的 `select` 里，连接关闭时才不会永远 park。
-    fn take_event_async_(&mut self) -> impl Future<Output = EventTake_<E>> + '_;
-}
-
-/// 生产端（两种后端都可克隆 ⇒ 多生产者）。
-pub(crate) struct EventSender_<E: 'static> {
-    tx_: EventTx_<E>,
-
-    /// 满时兜底（与消费端共享）。
-    overflow_: Arc<Overflow_<E>>,
-}
-
-impl<E> Clone for EventSender_<E> {
-    fn clone(&self) -> Self {
-        EventSender_ {
-            tx_: self.tx_.clone(),
-            overflow_: Arc::clone(&self.overflow_),
-        }
-    }
-}
-
-impl<E: Send + 'static> EventSender_<E> {
-    /// 投递一条**不可重建**事件（`Attach` / `Control` / `TgAttach`）。
-    ///
-    /// 与 [`TrEventSender_::try_send_event_`] 的区别：环满时把事件推进兜底暂存，
-    /// **不丢弃**。它是同步入口，因此可以在 `Drop` 里调用；暂存本身是自旋锁保护的
-    /// FIFO（只在环满时增长）。
-    ///
-    /// 返回 `false` 表示消费者已全部消失（连接收尾）。
-    ///
-    /// R16 之后没有调用者（`TgAttach` 改走 attach inbox、其余通知全部位化）；
-    /// 整条事件通道在 R17 删除时一并移除。
-    #[allow(dead_code, reason = "R17 删事件通道时移除")]
-    pub(crate) fn try_send_durable_event_(&self, event: E) -> bool {
-        match self.tx_.try_send(event) {
-            Result::Ok(()) => true,
-            Result::Err(TrySendError::Full(event)) => {
-                self.overflow_.push_durable_(event);
-                self.overflow_.mark_();
-                #[cfg(feature = "test-loop-probe")]
-                crate::connection::loop_probe_::event_durable_stashed_();
-                true
-            }
-            Result::Err(_) => {
-                #[cfg(feature = "test-loop-probe")]
-                crate::connection::loop_probe_::event_durable_closed_();
-                false
-            }
-        }
-    }
-}
-
-/// 消费端（单消费者；`Receiver` 不在本类型上提供克隆）。
-pub(crate) struct EventReceiver_<E: 'static> {
-    rx_: EventRx_<E>,
-
-    /// 满时兜底（与生产端共享）。
-    overflow_: Arc<Overflow_<E>>,
-}
-
-/// 建一对事件通道。
-///
-/// - 默认 `mpmc_chan`：定容 [`EVENT_CHAN_CAP`]，满时按上述协议兜底；
-/// - `chan-flume`：保持旧的**无界**实现，仅用于 A/B 对比。
-pub(crate) fn event_channel_<E>() -> (EventSender_<E>, EventReceiver_<E>)
-where
-    E: Send + 'static,
-{
-    let overflow_ = Arc::new(Overflow_::<E>::new_());
-    #[cfg(feature = "chan-flume")]
-    let (tx_, rx_) = flume::unbounded();
-    #[cfg(not(feature = "chan-flume"))]
-    let (tx_, rx_) = MpmcChan::new(Box::new(MpmcBuf::<E, EVENT_CHAN_CAP>::new()));
-    (
-        EventSender_ {
-            tx_,
-            overflow_: Arc::clone(&overflow_),
-        },
-        EventReceiver_ { rx_, overflow_ },
-    )
-}
-
-impl<E: Send + 'static> TrEventSender_<E> for EventSender_<E> {
-    fn try_send_event_(&self, event: E) -> bool {
-        match self.tx_.try_send(event) {
-            Result::Ok(()) => true,
-            // 环满（或生产者方向锁被慢写者占用）：丢弃并置全扫标志。
-            Result::Err(TrySendError::Full(_)) => {
-                self.overflow_.mark_();
-                #[cfg(feature = "test-loop-probe")]
-                crate::connection::loop_probe_::event_full_recoverable_();
-                false
-            }
-            // 消费者已消失（连接正在收尾）：按「没送出去」处理。
-            Result::Err(_) => false,
-        }
-    }
-}
-
-impl<E: Send + 'static> TrEventReceiver_<E> for EventReceiver_<E> {
-    fn try_take_event_(&mut self) -> EventTake_<E> {
-        // 先取不可重建事件的满时暂存：它们不能被当成 `Rescan` 丢掉。
-        if let Option::Some(event) = self.overflow_.pop_durable_() {
-            return EventTake_::Event(event);
-        }
-        match self.rx_.try_recv() {
-            Result::Ok(event) => EventTake_::Event(event),
-            Result::Err(TryRecvError::Empty) => {
-                if self.overflow_.take_() {
-                    EventTake_::Rescan
-                } else {
-                    EventTake_::Empty
-                }
-            }
-            Result::Err(_) => EventTake_::Closed,
-        }
-    }
-
-    async fn take_event_async_(&mut self) -> EventTake_<E> {
-        let rx = &self.rx_;
-        let overflow = Arc::clone(&self.overflow_);
-        // 快路径：暂存 → 环 → 全扫标志。
-        if let Option::Some(event) = overflow.pop_durable_() {
-            return EventTake_::Event(event);
-        }
-        match rx.try_recv() {
-            Result::Ok(event) => return EventTake_::Event(event),
-            Result::Err(TryRecvError::Empty) => {}
-            Result::Err(_) => return EventTake_::Closed,
-        }
-        if overflow.take_() {
-            return if let Option::Some(event) = overflow.pop_durable_() {
-                EventTake_::Event(event)
-            } else {
-                EventTake_::Rescan
-            };
-        }
-        // 同时等「通道有事件」与「需要全扫 / 暂存到达」：只等其一都会丢掉另一种唤醒。
-        //
-        // `mpmc_chan` 的 `RecvAsync` 是参数载体（实现 `IntoFuture`），不是 `Future`
-        // 本身；这里先转成 future 再 `pin`，以便跨 poll 持有它的唤醒登记。
-        let recv_fut = core::future::IntoFuture::into_future(rx.recv_async());
-        let mut recv_fut = core::pin::pin!(recv_fut);
-        core::future::poll_fn(|cx| {
-            if let Option::Some(event) = overflow.pop_durable_() {
-                return Poll::Ready(EventTake_::Event(event));
-            }
-            if overflow.take_() {
-                return if let Option::Some(event) = overflow.pop_durable_() {
-                    Poll::Ready(EventTake_::Event(event))
-                } else {
-                    Poll::Ready(EventTake_::Rescan)
-                };
-            }
-            match core::future::Future::poll(recv_fut.as_mut(), cx) {
-                Poll::Ready(Result::Ok(event)) => Poll::Ready(EventTake_::Event(event)),
-                Poll::Ready(Result::Err(_)) => Poll::Ready(EventTake_::Closed),
-                Poll::Pending => match overflow.poll_(cx) {
-                    Poll::Ready(()) => {
-                        if let Option::Some(event) = overflow.pop_durable_() {
-                            Poll::Ready(EventTake_::Event(event))
-                        } else {
-                            Poll::Ready(EventTake_::Rescan)
-                        }
-                    }
-                    Poll::Pending => Poll::Pending,
-                },
-            }
-        })
-        .await
-    }
-}
-
-#[cfg(test)]
-mod tests_ {
-    use core::{
-        pin::pin,
-        task::{Context, Poll, Waker},
-    };
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        task::Wake,
-    };
-
-    use super::*;
-
-    /// 测试用的事件负载：一个带序号的整数。
-    type TestEvent = u32;
-
-    /// 计数唤醒器：统计 `wake` 次数，用来断言「确实被唤醒」而不只是断言状态。
-    struct CountingWake_ {
-        count_: AtomicUsize,
-    }
-
-    impl Wake for CountingWake_ {
-        fn wake(self: Arc<Self>) {
-            self.count_.fetch_add(1usize, Ordering::SeqCst);
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.count_.fetch_add(1usize, Ordering::SeqCst);
-        }
-    }
-
-    /// 造一个带计数的 `Waker`。
-    fn counting_waker_() -> (Waker, Arc<CountingWake_>) {
-        let probe = Arc::new(CountingWake_ {
-            count_: AtomicUsize::new(0),
-        });
-        (Waker::from(probe.clone()), probe)
-    }
-
-    /// 测试事件通道按 FIFO 交付，且容量内投递不丢。
-    /// - 手段：连投 64 条（小于容量 256），然后逐条取出。
-    /// - 判断：取出的顺序与投递顺序逐一相等，且最后再取为空。
-    ///
-    /// Test goal: verify FIFO delivery and no loss within capacity.
-    /// Method: send 64 events (below capacity 256), then take them one by one.
-    /// Assertion: taken events equal the send order; the next take is empty.
-    #[test]
-    fn event_band_is_fifo_and_within_capacity() {
-        let (sender, mut receiver) = event_channel_::<TestEvent>();
-        for i in 0..64u32 {
-            assert!(sender.try_send_event_(i), "容量内投递不应当失败");
-        }
-        for i in 0..64u32 {
-            assert!(matches!(
-                receiver.try_take_event_(),
-                EventTake_::Event(value) if value == i
-            ));
-        }
-        assert!(matches!(receiver.try_take_event_(), EventTake_::Empty));
-    }
-
-    /// 测试可重建事件在环满时被丢弃，并在队列取空后报告一次「需要全扫」。
-    /// - 手段：把容量 256 填满，再投一条可重建事件（应失败），然后取空全部。
-    /// - 判断：多出的那条投递返回 `false`；取空后紧接着是 `Rescan`，再之后为空。
-    ///
-    /// Test goal: verify recoverable events are dropped when full and a single
-    /// `Rescan` is reported once the ring is drained.
-    /// Method: fill capacity 256, send one more recoverable event (must fail),
-    /// then drain everything.
-    /// Assertion: the extra send is `false`; after the drain comes `Rescan`,
-    /// then empty.
-    #[cfg(not(feature = "chan-flume"))]
-    #[test]
-    fn event_full_drops_recoverable_and_flags_rescan() {
-        let (sender, mut receiver) = event_channel_::<TestEvent>();
-        for i in 0..EVENT_CHAN_CAP {
-            assert!(sender.try_send_event_(i as u32), "容量内投递不应当失败");
-        }
-        assert!(
-            !sender.try_send_event_(u32::MAX),
-            "环满时多出的可重建事件应当被丢弃"
-        );
-        for i in 0..EVENT_CHAN_CAP {
-            assert!(matches!(
-                receiver.try_take_event_(),
-                EventTake_::Event(value) if value == i as u32
-            ));
-        }
-        assert!(matches!(receiver.try_take_event_(), EventTake_::Rescan));
-        assert!(matches!(receiver.try_take_event_(), EventTake_::Empty));
-    }
-
-    /// 测试不可重建事件在环满时进入暂存而不是被丢弃。
-    /// - 手段：把容量 256 填满，再投一条 durable 事件（应成功），然后取空全部。
-    /// - 判断：durable 事件先被取出（暂存优先），随后是 0..256，最后是 `Rescan`。
-    ///
-    /// Test goal: verify non-reconstructible events are stashed, not dropped,
-    /// when the ring is full.
-    /// Method: fill capacity 256, send one durable event (must succeed), then
-    /// drain everything.
-    /// Assertion: the durable event comes first (stash has priority), then
-    /// 0..256, and finally `Rescan`.
-    #[cfg(not(feature = "chan-flume"))]
-    #[test]
-    fn event_full_stashes_durable_event() {
-        let (sender, mut receiver) = event_channel_::<TestEvent>();
-        for i in 0..EVENT_CHAN_CAP {
-            assert!(sender.try_send_event_(i as u32), "容量内投递不应当失败");
-        }
-        assert!(
-            sender.try_send_durable_event_(999u32),
-            "环满时不可重建事件必须进入暂存而不是丢弃"
-        );
-        assert!(matches!(
-            receiver.try_take_event_(),
-            EventTake_::Event(999u32)
-        ));
-        for i in 0..EVENT_CHAN_CAP {
-            assert!(matches!(
-                receiver.try_take_event_(),
-                EventTake_::Event(value) if value == i as u32
-            ));
-        }
-        assert!(matches!(receiver.try_take_event_(), EventTake_::Rescan));
-        assert!(matches!(receiver.try_take_event_(), EventTake_::Empty));
-    }
-
-    /// 测试空通道上异步取出会 park，并在投递时被唤醒。
-    /// - 手段：先把 `take_event_async_` 的 future 建好并 poll 一次（此时应
-    ///   `Pending`、唤醒计数为 0），再投递，最后再 poll。
-    /// - 判断：第一次 `Pending`；投递后唤醒计数增加；再次 poll 返回
-    ///   `Ready(Event(..))`。
-    ///
-    /// Test goal: verify an async take parks on an empty channel and wakes on send.
-    /// Method: build the `take_event_async_` future and poll once (expect Pending,
-    /// wake count 0), send, then poll again.
-    /// Assertion: first poll is Pending; wake count increases after send; the
-    /// second poll is `Ready(Event(..))`.
-    async fn event_async_take_parks_until_send() {
-        let (sender, mut receiver) = event_channel_::<TestEvent>();
-        let (waker, probe) = counting_waker_();
-        let mut context = Context::from_waker(&waker);
-
-        let mut wait = pin!(receiver.take_event_async_());
-        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
-        assert_eq!(probe.count_.load(Ordering::SeqCst), 0usize);
-
-        assert!(sender.try_send_event_(7u32));
-        assert!(
-            probe.count_.load(Ordering::SeqCst) >= 1usize,
-            "投递应当唤醒正在 park 的消费者"
-        );
-        assert!(matches!(
-            wait.as_mut().poll(&mut context),
-            Poll::Ready(EventTake_::Event(7u32))
-        ));
-    }
-    multi_art_test_!(event_async_take_parks_until_send);
-
-    /// 测试已有积压时异步取出立刻就绪，不产生多余唤醒。
-    /// - 手段：先投一条，再建 future 并 poll。
-    /// - 判断：首次 poll 即 `Ready(Event(..))`，唤醒计数保持 0。
-    ///
-    /// Test goal: verify an async take is immediately ready when a backlog exists.
-    /// Method: send one event first, then build and poll the future.
-    /// Assertion: the first poll is `Ready(Event(..))`; wake count stays 0.
-    async fn event_async_take_is_immediate_with_backlog() {
-        let (sender, mut receiver) = event_channel_::<TestEvent>();
-        assert!(sender.try_send_event_(9u32));
-
-        let (waker, probe) = counting_waker_();
-        let mut context = Context::from_waker(&waker);
-        let mut wait = pin!(receiver.take_event_async_());
-        assert!(matches!(
-            wait.as_mut().poll(&mut context),
-            Poll::Ready(EventTake_::Event(9u32))
-        ));
-        assert_eq!(probe.count_.load(Ordering::SeqCst), 0usize);
-    }
-    multi_art_test_!(event_async_take_is_immediate_with_backlog);
-
-    /// 测试生产端可以克隆成多个（多生产者），任一克隆投递都能被同一个消费者取到。
-    /// - 手段：把 sender 克隆成两份，各投一条。
-    /// - 判断：两条都能按投递顺序取到。
-    ///
-    /// Test goal: verify multiple producers share one consumer.
-    /// Method: clone the sender once and send one event through each clone.
-    /// Assertion: both events are taken in send order.
-    #[test]
-    fn event_band_supports_multiple_producers() {
-        let (sender, mut receiver) = event_channel_::<TestEvent>();
-        let second = sender.clone();
-        assert!(sender.try_send_event_(1u32));
-        assert!(second.try_send_event_(2u32));
-        assert!(matches!(
-            receiver.try_take_event_(),
-            EventTake_::Event(1u32)
-        ));
-        assert!(matches!(
-            receiver.try_take_event_(),
-            EventTake_::Event(2u32)
-        ));
-    }
-
-    /// 测试所有生产端消失后，异步取出返回关闭而不是永久 park。
-    /// - 手段：建通道后立刻丢弃生产端，再 await 取出。
-    /// - 判断：返回 `Closed`——这正是连接收尾时循环能退出的前提。
-    ///
-    /// Test goal: verify an async take returns closed after all senders drop.
-    /// Method: drop the sender immediately after building the channel, then await.
-    /// Assertion: `Closed` is returned, which is what lets the loops exit.
-    async fn event_async_take_ends_when_senders_drop() {
-        let (sender, mut receiver) = event_channel_::<TestEvent>();
-        drop(sender);
-        assert!(matches!(
-            receiver.take_event_async_().await,
-            EventTake_::Closed
-        ));
-    }
-    multi_art_test_!(event_async_take_ends_when_senders_drop);
-}
