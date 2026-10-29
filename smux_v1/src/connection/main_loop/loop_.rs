@@ -24,7 +24,9 @@ use crate::{
         flags,
         frame_::{K_MAX_FRAME_HEADER, encode_header_},
         frame_parser_::decode_header_sync_,
-        main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_},
+        main_loop::{
+            EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MainLoopResult_,
+        },
         TrConnAllocCfg,
         owner_::EstablishOutcome_,
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChunkIo_},
@@ -34,6 +36,7 @@ use crate::{
         HINT_MAIN_RELEASE, HINT_MAIN_RESET, HINT_MAIN_RETIRED, HINT_MAIN_TIMER,
         HINT_MAIN_TX_DRAINED, HINT_MAIN_WINDOW_DIRTY,
         mux_connection::{K_CLOSE_NONE, K_CLOSE_TIMEOUT},
+        tcs_::Tcs_,
         signal_::{
             ControlFrame_, HINT_R_RELEASE, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED,
             HINT_W_RELEASED, HINT_W_RESET_ENQUEUED, HINT_W_TX_CLOSED,
@@ -71,21 +74,47 @@ pub(crate) const K_TICK_FRAME_BATCH: usize = 2usize * K_TIMER_ACTION_BATCH;
 /// `REJECT`）不能丢，因此它们在公共 TX 满时留在本结构里，下一轮先补写。
 ///
 /// 定容、零分配；`ControlFrame_` 是纯帧头（`Copy`），不持载荷。
-pub(crate) struct MainTickState_ {
+pub(crate) struct MainTickState_<A>
+where
+    A: TrConnAllocCfg + 'static,
+{
     /// 待写帧的 FIFO（`None` = 空位）。
     frames_: [Option<ControlFrame_>; K_TICK_FRAME_BATCH],
 
     /// 有效前缀长度。
     len_: usize,
+
+    /// 正在等答复的 `Close` 请求（同一时刻至多一个：`close_async` 的语义是幂等的）。
+    ///
+    /// 收尾发生时**先** `set_` 它、**再** `cancel_loops_()`，调用方拿到的是「收尾
+    /// 结果」而不是「被取消」（设计稿 §6.3 / Q8）。
+    close_reply_: Option<Tcs_<MainLoopResult_<A>>>,
 }
 
-impl MainTickState_ {
+impl<A> MainTickState_<A>
+where
+    A: TrConnAllocCfg + 'static,
+{
     /// 空状态。
     pub(crate) fn new_() -> Self {
         MainTickState_ {
             frames_: [Option::None; K_TICK_FRAME_BATCH],
             len_: 0usize,
+            close_reply_: Option::None,
         }
+    }
+
+    /// 记下等待答复的 `Close` 请求；已有等待者时覆盖（旧的那条由 `set_` 的
+    /// abandoned 语义自然丢弃——调用方已经放弃它）。
+    fn set_close_reply_(&mut self, reply: Tcs_<MainLoopResult_<A>>) {
+        if let Option::Some(old) = self.close_reply_.replace(reply) {
+            let _ = old.set_(Result::Ok(MainLoopReply_::Closed(false)));
+        }
+    }
+
+    /// 取走等待答复的 `Close` 请求。
+    fn take_close_reply_(&mut self) -> Option<Tcs_<MainLoopResult_<A>>> {
+        self.close_reply_.take()
     }
 
     /// 追加一条待写帧（调用方保证不溢出）。
@@ -122,6 +151,9 @@ impl MainTickState_ {
         self.len_ > 0usize
     }
 }
+
+/// `MainTickState_` 在连接级泛型 `C` 下的别名（状态里的完成源要 `C` 的分配器配置）。
+pub(crate) type MainTickStateOf_<C> = MainTickState_<crate::connection::ConnAllocCfg_<C>>;
 
 /// `main_loop` 的 park 点被唤醒的原因。
 enum MainWake_<C>
@@ -193,7 +225,7 @@ pub(crate) async fn main_loop_async_<C, K>(
         .try_owning()
         .expect("刚分配的 message 缓冲应当可独占");
     let mut public_read = MainPublicRead_::new_();
-    let mut tick = MainTickState_::new_();
+    let mut tick = MainTickStateOf_::<C>::new_();
 
     // 先发布一次初始期限：`timer_loop` 据此睡到「第一个 `PULSE` 到期」而不是
     // 傻等 `channel_timeout`。此后每轮 `tick_` 结束都会重新发布。
@@ -233,6 +265,7 @@ pub(crate) async fn main_loop_async_<C, K>(
                 handle_request_::<C, _>(
                     &shared,
                     &mut public_tx_w,
+                    &mut tick,
                     request,
                     &mut msg_buf[..msg_cap],
                     &cancel,
@@ -272,13 +305,23 @@ pub(crate) async fn main_step_<C, K>(
     rx_scratch: &mut [u8],
     msg_buf: &mut [u8],
     public_read: &mut MainPublicRead_,
-    tick: &mut MainTickState_,
+    tick: &mut MainTickStateOf_<C>,
     cancel: &K,
 ) -> bool
 where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
+    // 连接级失败优先：已登记的 `Close` 等待者要拿到 `Closed(false)`，而不是永远
+    // 等一个不会再来的收尾信号。
+    if shared.reg_().fail_kind_().is_some() {
+        if let Option::Some(reply) = tick.take_close_reply_() {
+            let _ = reply.set_(Result::Ok(MainLoopReply_::Closed(false)));
+        }
+        shared.reg_().cancel_loops_();
+        return false;
+    }
+
     // 合并提示：定时到期 → retired（身份释放）→ 窗口通告 → FIN/RESET → 身份释放。
     //
     // tick 放在最前：它的「连接级关闭动作」可能直接结束连接，后续工作已无意义。
@@ -310,7 +353,7 @@ where
     // 释放扫描看到的是最新状态。判据由 `claim_release_` 的一次性 CAS 给出，因此写
     // 循环重复 raise 本提示不会重复释放。
     if hints & HINT_MAIN_RELEASE != 0u64 {
-        flush_releasable_::<C, _>(shared, cancel).await;
+        flush_releasable_::<C, _>(shared, tick, cancel).await;
     }
 
     // 公共 RX：每轮最多 `K_MAIN_FRAME_BATCH` 条完整帧。
@@ -342,7 +385,7 @@ where
         let Some(request) = ctl.try_pop_request_() else {
             break;
         };
-        handle_request_::<C, _>(shared, public_tx_w, request, msg_buf, cancel).await;
+        handle_request_::<C, _>(shared, public_tx_w, tick, request, msg_buf, cancel).await;
     }
     true
 }
@@ -364,6 +407,7 @@ where
 async fn handle_request_<C, K>(
     shared: &MuxShared_<C>,
     public_tx_w: &mut BufferedTx,
+    tick: &mut MainTickStateOf_<C>,
     request: MainLoopRequest_<crate::connection::ConnAllocCfg_<C>>,
     msg_buf: &mut [u8],
     cancel: &K,
@@ -375,15 +419,8 @@ where
     // 同一轮合并的 retired 释放先落实：保证「丢弃后立刻重听」看到的是已释放。
     reap_retired_and_release_::<C, _>(shared, public_tx_w, cancel).await;
     match request {
-        MainLoopRequest_::SendControl { frame, reply } => {
-            match write_control_frame_async_::<C, _>(public_tx_w, shared, &frame, &[], cancel).await {
-                Result::Ok(()) => {
-                    let _ = reply.set_(Result::Ok(MainLoopReply_::Unit));
-                }
-                Result::Err(err) => {
-                    let _ = reply.set_(Result::Err(MainLoopErr_::Mux(err)));
-                }
-            }
+        MainLoopRequest_::Close { reply } => {
+            handle_close_request_::<C>(shared, tick, reply).await;
         }
         MainLoopRequest_::Bind { local_dock, reply } => {
             if reply.is_abandoned_() {
@@ -647,6 +684,43 @@ where
             }
         }
     }
+}
+
+/// 处理一条 `Close` 请求：进入「等待关闭」，把完成源留给 `tick_`。
+///
+/// 收尾的判定与执行都在 `tick_`（连接级关闭动作）：活跃子流归零 ⇒ `Closed(true)`；
+/// 整体超时 ⇒ `Closed(false)`。这里只负责「进入状态 + 立刻催一轮 tick」。
+async fn handle_close_request_<C>(
+    shared: &MuxShared_<C>,
+    tick: &mut MainTickStateOf_<C>,
+    reply: Tcs_<MainLoopResult_<crate::connection::ConnAllocCfg_<C>>>,
+) where
+    C: TrConnCfg,
+{
+    if reply.is_abandoned_() {
+        // 调用方已经放弃：协议动作仍要推进（进入等待关闭），但不保留完成源。
+        shared
+            .reg_()
+            .enter_waiting_close_(shared.conn_clock_().now_millis_());
+        shared
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_TIMER);
+        return;
+    }
+    // 连接已经失败：没有「优雅」可言，直接如实答复 false。
+    if shared.reg_().fail_kind_().is_some() {
+        let _ = reply.set_(Result::Ok(MainLoopReply_::Closed(false)));
+        shared.reg_().cancel_loops_();
+        return;
+    }
+    shared
+        .reg_()
+        .enter_waiting_close_(shared.conn_clock_().now_millis_());
+    tick.set_close_reply_(reply);
+    // 立刻来一轮 tick：关闭点上本来就没有活跃子流时，不必等下一个期限。
+    shared
+        .control_()
+        .raise_main_hint_(crate::connection::HINT_MAIN_TIMER);
 }
 
 /// park 到「有请求 / 有提示 / 取消」之一。
@@ -1047,8 +1121,11 @@ where
 ///
 /// [`ChannelRegistry_::release_done_channels_`]:
 ///     crate::connection::ChannelRegistry_::release_done_channels_
-async fn flush_releasable_<C, K>(shared: &MuxShared_<C>, cancel: &K)
-where
+async fn flush_releasable_<C, K>(
+    shared: &MuxShared_<C>,
+    tick: &mut MainTickStateOf_<C>,
+    cancel: &K,
+) where
     C: TrConnCfg,
     K: TrCancellationToken,
 {
@@ -1087,6 +1164,11 @@ where
     // 「可以收尾」——两边谁先看到谁做。放在这里而不是全交给计时循环，是因为延迟
     // 敏感：计时循环可能正睡在一个较远的期限上。
     if did_release && became_idle && shared.reg_().is_closing_() {
+        // **先完成 `Close` 的 TCS，再取消循环**（Q8）：连接是与对端双向收敛的，
+        // 调用方应当拿到 `Closed(true)` 而不是「被取消」。
+        if let Option::Some(reply) = tick.take_close_reply_() {
+            let _ = reply.set_(Result::Ok(MainLoopReply_::Closed(true)));
+        }
         // 本版没有写泵：复用循环成帧时直接写进传输，因此收尾就是「几个循环一起
         // 取消」——连接内部没有任何还压着字节的环要排空（见
         // `ChannelRegistry_::cancel_loops_` 的文档）。
@@ -1110,7 +1192,7 @@ where
 async fn tick_<C, K>(
     shared: &MuxShared_<C>,
     public_tx_w: &mut BufferedTx,
-    tick: &mut MainTickState_,
+    tick: &mut MainTickStateOf_<C>,
     cancel: &K,
 ) where
     C: TrConnCfg,
@@ -1144,8 +1226,14 @@ async fn tick_<C, K>(
     // 连接级关闭动作优先：等待关闭已经不需要再排空（活跃子流归零），或关闭整体
     // 超时——两种情形都到此为止，本轮认领的逐子流动作已无意义。
     if scan.close_action_() != K_CLOSE_NONE {
-        if scan.close_action_() == K_CLOSE_TIMEOUT {
+        let timed_out = scan.close_action_() == K_CLOSE_TIMEOUT;
+        if timed_out {
             shared.reg_().mark_forced_close_();
+        }
+        // **先完成 `Close` 的 TCS，再取消循环**（Q8）：调用方拿到的是「收尾结果」，
+        // 而不是「被取消」。`Closed(true)` = 与对端双向收敛；`false` = 整体超时。
+        if let Option::Some(reply) = tick.take_close_reply_() {
+            let _ = reply.set_(Result::Ok(MainLoopReply_::Closed(!timed_out)));
         }
         shared.reg_().cancel_loops_();
         return;
@@ -1173,7 +1261,7 @@ async fn tick_<C, K>(
 async fn deliver_timer_action_<C, K>(
     shared: &MuxShared_<C>,
     action: &TimerAction_,
-    tick: &mut MainTickState_,
+    tick: &mut MainTickStateOf_<C>,
     cancel: &K,
 ) where
     C: TrConnCfg,
@@ -1330,7 +1418,7 @@ async fn deliver_timer_action_<C, K>(
 fn flush_tick_frames_<C>(
     shared: &MuxShared_<C>,
     public_tx_w: &mut BufferedTx,
-    tick: &mut MainTickState_,
+    tick: &mut MainTickStateOf_<C>,
 ) where
     C: TrConnCfg,
 {
@@ -1507,7 +1595,7 @@ mod tests_ {
     use mm_ptr::Owned;
 
     use super::{
-        main_step_, park_main_, try_read_public_frame_, MainPublicRead_, MainTickState_, MainWake_,
+        main_step_, park_main_, try_read_public_frame_, MainPublicRead_, MainTickStateOf_, MainWake_,
     };
     use crate::{
         connection::{
@@ -1566,7 +1654,7 @@ mod tests_ {
         assert!(submitted.is_ok(), "Bind 请求应能入队");
         // 本辅助只驱动 Bind，不读 message；给 `main_step_` 一个足够的栈上缓冲。
         let mut msg_buf = [0u8; 512usize];
-        let mut tick = MainTickState_::new_();
+        let mut tick = MainTickStateOf_::<TestMuxConfig_>::new_();
         assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
             shared,
             ctl,
@@ -1715,7 +1803,7 @@ mod tests_ {
 
         // 本用例驱动的是 retired → REJECT，不需要读 message ring；给一个栈上缓冲。
         let mut msg_buf = [0u8; 512usize];
-        let mut tick = MainTickState_::new_();
+        let mut tick = MainTickStateOf_::<TestMuxConfig_>::new_();
         assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
             &shared,
             &ctl,
@@ -1784,7 +1872,7 @@ mod tests_ {
         let mut scratch = [0u8; 256usize];
         let mut msg_buf = [0u8; 512usize];
         let mut public_read = MainPublicRead_::new_();
-        let mut tick = MainTickState_::new_();
+        let mut tick = MainTickStateOf_::<TestMuxConfig_>::new_();
         let cancel = NonCancellableToken::new();
         let local = Dock::new(7u32);
         let remote = Dock::new(9u32);
@@ -1863,7 +1951,7 @@ mod tests_ {
         let mut scratch = [0u8; 256usize];
         let mut msg_buf = [0u8; 512usize];
         let mut public_read = MainPublicRead_::new_();
-        let mut tick = MainTickState_::new_();
+        let mut tick = MainTickStateOf_::<TestMuxConfig_>::new_();
         let cancel = NonCancellableToken::new();
         let local = Dock::new(11u32);
         let remote = Dock::new(13u32);

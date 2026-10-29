@@ -950,10 +950,6 @@ impl RegistryShared_ {
         )
     }
 
-    /// 本次关闭是否由整体超时强制收尾。
-    fn is_forced_close_(&self) -> bool {
-        self.state_() == K_STATE_FORCED_CLOSE
-    }
 
     /// 尝试从 `Normal` 迁移到 `WaitingClose`；首次成功时记下关闭起点。
     fn enter_waiting_close_(&self, now_millis: u64) -> bool {
@@ -1698,11 +1694,6 @@ where
     /// `enter_waiting_close_` 的 CAS 相争（后者只从 `K_STATE_NORMAL` 迁移）。
     pub(crate) fn mark_forced_close_(&self) {
         self.root_.shared_.mark_forced_close_();
-    }
-
-    /// 本次关闭是否由**整体超时**强制收尾（见 [`K_STATE_FORCED_CLOSE`]）。
-    pub(crate) fn is_forced_close_(&self) -> bool {
-        self.root_.shared_.is_forced_close_()
     }
 
     /// **进入「等待关闭」**（幂等、不取锁、不阻塞），返回本次是否**首次**进入。

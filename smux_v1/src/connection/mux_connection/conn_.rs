@@ -1,6 +1,6 @@
-use core::{future::poll_fn, task::Poll};
+use core::future::poll_fn;
 
-use abs_art::{TrClock, TrDelay, TrJoinHandle, TrLocalScope};
+use abs_art::{TrJoinHandle, TrLocalScope};
 use abs_art_facade::ScopeHost;
 use abs_cancel::TrCancellationToken;
 use abs_smux::{
@@ -403,7 +403,6 @@ where
         let core = Shared::new(
             MuxCore::new_(
                 config,
-                opts,
                 reg,
                 control.clone(),
                 conn_clock.epoch_(),
@@ -549,140 +548,78 @@ where
 
 /// [`TrConnection::close_async`] 的 step 函数：**优雅关闭**。
 ///
-/// # 状态驱动，而不是「收集 + 遍历」
+/// # 形状：一次请求 + 完成源
 ///
 /// 本函数只做三件事：
 ///
-/// 1. **进入「等待关闭」**（[`MuxCore::enter_waiting_close_`]）：一次 CAS，不取锁、
-///    **不分配**（上一版要在这里把活跃子流收进一个 `Vec`），随后唤醒计时循环；
-/// 2. **等收尾发生**：判据是三个循环的取消令牌被触发——那是「连接确实收口了」的
-///    唯一信号，由**循环自己**在合适的时刻执行（见下）；
-/// 3. **超时或取消就强制收尾**（幂等）。
+/// 1. 把 `Close` 请求连同完成源交给 `main_loop`（身份表唯一写者）；
+/// 2. 等答复（可取消）；
+/// 3. 答复为「未收敛」时补一次强制收尾（幂等）。
 ///
-/// 谁在什么时候执行收尾：
-///
-/// | 时机 | 执行者 | 依据 |
-/// | --- | --- | --- |
-/// | 最后一条活跃子流与对端双向收尾 | 控制面循环（`main_loop::flush_releasable_`） | 身份释放后活跃子流归零 |
-/// | 关闭点上没有活跃子流，或关闭整体超时 | 计时循环（`timer_loop_async_`） | `TimerScan_::close_action_` |
-///
-/// 「所有正在活动的子流排空并向对端发关闭信号」这一步同样由计时循环完成：它在
-/// 等待关闭状态下为每条已裁决子流认领一次 `Finalize` 动作（复用循环据此**在发送环
-/// 排空之后**补 `CLOSE(FIN)`），为每条尚未裁决的子流直接回 `REJECT`。整条路径一次
-/// 堆分配都没有。
+/// **收尾判定与执行都在 main**：`main_loop::tick_` 的连接级关闭动作在「活跃子流
+/// 归零」时答 `Closed(true)`、整体超时答 `Closed(false)`，并且**先完成答复、再
+/// `cancel_loops_()`**（设计稿 §6.3 / Q8）。调用方因此拿到的是「收尾结果」，而不是
+/// 「被取消」——旧实现等的是取消令牌本身，分不清这两者。
 ///
 /// # 超时与取消
 ///
-/// 等待上限取协商项 `max_channel_timeout`；计时循环在**同一时刻**也用它作关闭整体
-/// 的超时兜底（`drop` 路径没有调用方，只有它兜得住）。调用方的取消令牌打断时同样
-/// 强制收尾并返回 `false`——本函数不得假定调用者一定会等到最后。
-///
-/// 两个期限**数值相同、起算点不同**（计时循环从进入等待关闭那一刻起算，比本函数算
-/// 自己的期限更早），因此谁先到是时序问题，不能当作判据。收尾由计时循环强制促成时，
-/// 它会把 [`K_STATE_FORCED_CLOSE`](super::registry_::K_STATE_FORCED_CLOSE) 记在连接
-/// 状态里；本函数据此把「超时收尾」与「与对端收敛」分开。
+/// 等待上限取协商项 `max_channel_timeout`，但**期限的判定在 main 的 `tick_`**：
+/// 计时循环按 `TimerSignal_` 醒来、raise `HINT_MAIN_TIMER`，main 比较「进入等待关闭
+/// 起算」的时长。调用方的取消令牌打断等待时本函数返回 `false` 并强制收尾——
+/// 本函数不得假定调用者一定会等到最后。
 ///
 /// # 返回值
 ///
-/// `true` = 收尾发生在**收敛之后**（最后一条子流已与对端双向收尾）；`false` = 超时
-/// （包括「计时循环先于本函数自己的期限判定超时」这一情形）、被取消、或连接此前
-/// 已经失败。
+/// `true` = 收尾发生在**收敛之后**（最后一条子流已与对端双向收尾）；`false` = 超时、
+/// 被取消、或连接此前已经失败。
 #[gen_may_cancel_future(MuxConnClose, pub, new(pub(crate)))]
-async fn mux_conn_close_async_<'f, C, K>(
-    conn: &'f mut MuxConnection<C>,
-    cancel: K,
-) -> bool
+async fn mux_conn_close_async_<'f, C, K>(conn: &'f mut MuxConnection<C>, cancel: K) -> bool
 where
     C: TrConnCfg + 'f,
     K: TrCancellationToken,
 {
     let core = conn.core_();
 
-    // 连接已经失败（传输错误 / 对端关闭）：没有「优雅」可言——已提交的字节此刻
-    // 是否送达不由本端决定。直接收尾，并如实报 `false`。
+    // 连接已经失败：没有「优雅」可言，直接收尾并如实报 `false`。
     if core.reg_().fail_kind_().is_some() {
         core.reg_().cancel_loops_();
         return false;
     }
 
-    // 第 1 步：进入「等待关闭」。只有首次进入才唤醒推进引擎（已经关闭中的连接，
-    // 引擎早就在转了）。
-    if core.enter_waiting_close_() {
-        core.notify_timer_();
+    let tcs = match Tcs_::new_(core.reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return false,
+    };
+    let waiter = tcs.clone();
+    // 调用方取消 / 丢弃 future 时放弃结果；main 在答复前检查 `is_abandoned_`。
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
+    if core
+        .control_()
+        .submit_async_(
+            MainLoopRequest_::Close { reply: tcs },
+            cancel.child_token(),
+        )
+        .await
+        .is_err()
+    {
+        // 请求队列已关闭 = 连接正在收尾：没有答复可等。
+        core.reg_().cancel_loops_();
+        return false;
     }
 
-    // 第 2 步：等收尾（令牌触发）、超时或取消。
-    let rt = core.config_().runtime();
-    let deadline = rt.now() + core.opts_().basic_opts.max_channel_timeout;
-    let closed = wait_for_finalize_(core, &rt, deadline, &cancel).await;
-
-    // 第 3 步：超时 / 取消 / 失败 ⇒ 强制收尾（幂等；收敛路径上循环已经做过）。
+    let reply = race_cancel_(
+        &cancel,
+        core::future::poll_fn(|cx| waiter.poll_wait_(cx)),
+    )
+    .await;
+    let closed = match reply {
+        Option::Some(Option::Some(Result::Ok(MainLoopReply_::Closed(closed)))) => closed,
+        // 取消 / 放弃 / 连接收尾：按未收敛处理。
+        _ => false,
+    };
     if !closed {
+        // 取消 / 超时 / 失败：强制收尾（幂等；收敛路径上 main 已经做过）。
         core.reg_().cancel_loops_();
     }
     closed
-}
-
-/// 优雅关闭的**等待步**：等「收尾已经发生」（取消令牌被触发）、`deadline` 到期或
-/// 调用方取消，三者任一先到就返回。
-///
-/// # 判据为什么是取消令牌
-///
-/// 上一版等的是「每条子流都收到对端 `FIN`」，因此必须在调用方手里攥着每条子流的
-/// 状态句柄（那正是 `Vec` 的来源）。本版把「最后一条子流」的判定下沉到**循环**里
-/// ——它们本来就在身份释放路径上（`total_` 归零）与扫描路径上（活跃子流归零）——
-/// 于是调用方只需等一个连接级的信号：令牌有没有被触发。
-///
-/// 令牌触发可能来自收尾，也可能来自连接级失败（失败也会取消循环），因此醒来之后
-/// 还要看一次 [`ChannelRegistry_::fail_kind_`]：非空 ⇒ 不是「优雅完成」，报 `false`。
-async fn wait_for_finalize_<C, K>(
-    core: &MuxCore<C>,
-    rt: &C::Rt,
-    deadline: <C::Rt as TrClock>::Instant,
-    cancel: &K,
-) -> bool
-where
-    C: TrConnCfg,
-    K: TrCancellationToken,
-{
-    // 两个句柄：一个用来**问**（`is_cancelled`），一个用来**等**（`cancellation()`
-    // 按值消费令牌）。克隆是零分配的共享句柄。
-    let probe = core.loop_token_(0usize);
-    let mut finalized = core::pin::pin!(probe.clone().cancellation());
-    loop {
-        // 复检：收尾可能就发生在进入本函数之前（或上一次醒来时）。
-        //
-        // 令牌触发只说明「连接确实收口了」，**不**说明是哪种收口：与对端收敛、计时
-        // 循环的整体超时兜底、连接级失败，三者都会取消它。因此判据要把后两者排除
-        // 掉——失败看 `fail_kind_`，超时看计时循环留下的**显式**标志
-        // （`is_forced_close_`，见 `K_STATE_FORCED_CLOSE` 的文档）。
-        if probe.is_cancelled() {
-            return core.reg_().fail_kind_().is_none() && !core.reg_().is_forced_close_();
-        }
-        // 连接级失败：收尾是失败牵连的结果，不是「优雅完成」。
-        if core.reg_().fail_kind_().is_some() {
-            return false;
-        }
-        let now = rt.now();
-        if now >= deadline {
-            return false;
-        }
-        let remaining = deadline - now;
-        let mut sleeping = core::pin::pin!(rt.delay(remaining));
-        let woke = race_cancel_(
-            cancel,
-            core::future::poll_fn(|cx| {
-                // 收尾信号：令牌一旦触发就永久保持，因此这里只需等一次。
-                if core::future::Future::poll(finalized.as_mut(), cx).is_ready() {
-                    return Poll::Ready(());
-                }
-                core::future::Future::poll(sleeping.as_mut(), cx)
-            }),
-        )
-        .await;
-        if woke.is_none() {
-            // 调用方取消：强制收尾。
-            return false;
-        }
-    }
 }
