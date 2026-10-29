@@ -2059,6 +2059,20 @@ connection/
   6. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
      cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
 
+- 20261029-2240：**R11：`RxConsumed` 位化 + park 丢位修复**。
+  1. `ReadEvent_::RxConsumed` 删除，改 `HINT_R_RX_CONSUMED`；`ChannelRx` 去重位成功后
+     只 raise，`demux_loop` 顶部按全表 `rescan_read_`。`handle_read_event_` 只剩
+     `TgAttach`（`ReadEvent_` 现在只有它一个变体）。
+  2. 修复 demux park 的**丢位**缺陷：`ReadWake_::Hint(bits)` 原先只处理
+     `HINT_R_RELEASE`，其余位在 `poll_read_hint_`（取出语义）里被取走即丢。现在未处理
+     的位回放到顶部统一处理。
+  3. `TxReady` 位化尝试后回退：删 `last_ready` / `last_ready_has_segment_` 并改
+     `HINT_W_TX_READY` 后，`mux_drop_flush_dual_` 失败（写满后立即 drop，raise 之后
+     mux 没有下一轮——它停在 write hint 打不断的等待源上）。回退，R12 先查清 mux 在
+     ConnTx 背压 / 公共 chunk park 时的唤醒源。
+  4. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2237,7 +2251,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | P0 原语完成（`PublicChunkIo_`，未接线） |
 | T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | 完成（P3.1b：`OPEN`/`ACCEPT`/`REJECT`/`CLOSE` 全走公共子流；timer 的 `PULSE`/`CLOSE` 待 P4/P5） |
-| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：邮箱已删（R9）；`WriteEvent_` / `ReadEvent_` 仍承载 `TxReady` / `TgReady` / `RxConsumed`（R10 的位化尝试回退，见修订记录） |
+| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：邮箱已删（R9）、`RxConsumed` 已位化（R11）；`WriteEvent_` 仍承载 `TxReady` / `Tg*`，`ReadEvent_` 只剩 `TgAttach`（`TxReady` 位化在 R11 尝试后回退） |
 
 ### C. 请求 / TCS
 
