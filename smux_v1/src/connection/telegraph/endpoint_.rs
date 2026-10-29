@@ -325,11 +325,7 @@ where
     // 1. 纯本地：建两条环（结果在 `open_telegraph_async` 里已经算出）。
     let ((tx_w, tx_r), (rx_w, rx_r)) = rings.map_err(map_telegraph_err_)?;
 
-    // 2. 先落实积压的释放消息，再认领身份（与 `listen_async` 同一纪律）。
-    conn.core_()
-        .drain_session_events_(cancel.child_token())
-        .await
-        .map_err(map_reserve_err_)?;
+    // 2. 认领身份（身份表写者是 `main_loop`；telegraph 的登记仍是过渡路径，留 R10）。
     let rec = conn
         .core_()
         .reserve_telegraph_(local, cancel.child_token())

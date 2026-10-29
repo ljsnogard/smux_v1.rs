@@ -143,7 +143,7 @@ use crate::{
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChannel_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx},
         signal_::{
-            ControlFrame_, EventReceiver_, EventSender_, EventTake_,
+            EventReceiver_, EventSender_, EventTake_,
             HINT_R_RELEASE, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED, HINT_W_RELEASED,
             HINT_W_RESET_ENQUEUED, ReadAttach_, ReadEvent_, TrEventReceiver_,
             TrEventSender_, WriteAttach_, WriteEvent_,
@@ -1306,13 +1306,6 @@ pub(crate) async fn demux_loop_async_<C, K>(
         }
         #[cfg(feature = "test-loop-probe")]
         crate::connection::loop_probe_::demux_tick_();
-        // 0. 先落实**会话释放**消息：`Drop` 只投消息、不碰身份表，因此处理「未知
-        // 子流」之前必须先让「刚被丢弃的句柄」的释放生效——否则在途帧会被误判成
-        // 协议违例，而不是宽限期（`WAIT_CLOSE`）内的静默丢弃。
-        lock_or_exit_!(shared
-            .reg_
-            .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token()));
-
         // 0.05 合并提示：身份释放只置位 + 唤醒，读循环按 `RELEASED` 位摘表。
         let read_hints = shared.reg_().take_read_hint_();
         if read_hints & HINT_R_RELEASE != 0u64 {
@@ -1329,11 +1322,10 @@ pub(crate) async fn demux_loop_async_<C, K>(
             attached_new = true;
         }
         if attached_new
-            && let Result::Err(err) = rescan_read_::<C, _>(
+            && let Result::Err(err) = rescan_read_::<C>(
+                &shared,
                 &mut *table,
-                &events_tx,
                 shared.conn_clock_().now_millis_(),
-                &cancel,
             )
             .await
         {
@@ -1369,13 +1361,12 @@ pub(crate) async fn demux_loop_async_<C, K>(
         }
         // 1. 先把挂起的 `Attach` / `Release` / `RxConsumed` 成批排空。
         if let Result::Err(err) =
-            drain_read_events_::<C, _>(
+            drain_read_events_::<C>(
+                &shared,
                 &mut *events,
                 &mut table.table,
                 &mut *tg_table,
                 table.shared.conn_clock_().now_millis_(),
-                &events_tx,
-                &cancel,
             )
             .await
         {
@@ -1420,13 +1411,12 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 // `Attach` / `RxConsumed` 静默吞掉），因此必须在这里就地处理，不能只
                 // 回顶部等 `drain_read_events_` 再取一次。
                 ReadWake_::Event(event) => {
-                    if let Result::Err(err) = handle_read_event_::<C, _>(
+                    if let Result::Err(err) = handle_read_event_::<C>(
+                        &shared,
                         event,
                         &mut table.table,
                         &mut *tg_table,
                         table.shared.conn_clock_().now_millis_(),
-                        &events_tx,
-                        &cancel,
                     )
                     .await
                     {
@@ -1436,11 +1426,10 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 }
                 // 有可重建事件被丢弃：全扫读表（水位提示在状态位里）。
                 ReadWake_::Rescan => {
-                    if let Result::Err(err) = rescan_read_::<C, _>(
+                    if let Result::Err(err) = rescan_read_::<C>(
+                        &shared,
                         &mut table.table,
-                        &events_tx,
                         table.shared.conn_clock_().now_millis_(),
-                        &cancel,
                     )
                     .await
                     {
@@ -1604,11 +1593,14 @@ pub(crate) async fn demux_loop_async_<C, K>(
                 // 仍是旧值**（上面的 `on_data` 不推进它），对端会一直按「还有一整个窗口」
                 // 行动。判据全在 `RecvWindow::should_report_with_` 里（窗口归零落在
                 // **临界区**，临界区每变必报）。
-                let imminent = entry.owner_.recv_take_report_();
-                if let Option::Some(report) = imminent {
-                    let _ = events_tx.try_send_durable_event_(WriteEvent_::Control {
-                        frame_: window_update_frame_(pair, report),
-                    });
+                //
+                // R9 起本循环**只判定、不取快照、不组帧**：`should_report` 是消费式
+                // 的，取走就必须保证帧写得出去，而写环归 `main_loop`。这里只 raise
+                // 合并提示，main 在确认公共 TX 有空间后再取快照并组 `WINDOW_UPDATE`。
+                if entry.owner_.window_report_due_() {
+                    shared
+                        .control_()
+                        .raise_main_hint_(crate::connection::HINT_MAIN_WINDOW_DIRTY);
                 }
                 let wrote = race_cancel_(
                     &cancel,
@@ -1820,28 +1812,32 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
 ///
 /// `RxConsumed` 的处理是纯原子读改写（不取锁），但通告要经事件通道投给写循环，
 /// 因此本函数仍是 `async`。
-async fn drain_read_events_<C, K>(
+async fn drain_read_events_<C>(
+    shared: &MuxShared_<C>,
     events: &mut EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     table: &mut ReadTable_<crate::connection::ConnAllocCfg_<C>>,
     tg_table: &mut TgReadTable_<crate::connection::ConnAllocCfg_<C>>,
     now_millis: u64,
-    events_tx: &EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
-    cancel: &K,
 ) -> Result<(), MuxError>
 where
     C: TrConnCfg,
-    K: TrCancellationToken,
 {
     const K_EVENT_BATCH: usize = 32usize;
     for _ in 0..K_EVENT_BATCH {
         match events.try_take_event_() {
             EventTake_::Event(event) => {
-                handle_read_event_::<C, _>(event, table, tg_table, now_millis, events_tx, cancel)
+                handle_read_event_::<C>(
+                    shared,
+                    event,
+                    table,
+                    tg_table,
+                    now_millis,
+                )
                     .await?;
             }
             // 有可重建事件被丢弃：按各子流的状态位全扫一次，然后让主循环继续。
             EventTake_::Rescan => {
-                rescan_read_::<C, _>(table, events_tx, now_millis, cancel).await?;
+                rescan_read_::<C>(shared, table, now_millis).await?;
                 break;
             }
             EventTake_::Empty | EventTake_::Closed => break,
@@ -1858,15 +1854,13 @@ where
 /// `Attach` 携带环半部句柄，生产者走 [`EventSender_::try_send_durable_event_`]，
 /// 不会丢；身份释放（`Release`）已经改为 `RELEASED` 位 + `HINT_R_RELEASE` 合并提示，
 /// 由 [`scan_released_`] 按位摘表，不再经过事件通道。
-async fn rescan_read_<C, K>(
+async fn rescan_read_<C>(
+    shared: &MuxShared_<C>,
     table: &mut ReadTable_<crate::connection::ConnAllocCfg_<C>>,
-    events_tx: &EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
     now_millis: u64,
-    cancel: &K,
 ) -> Result<(), MuxError>
 where
     C: TrConnCfg,
-    K: TrCancellationToken,
 {
     let mut cursor: Option<(Dock, Dock)> = Option::None;
     loop {
@@ -1893,15 +1887,7 @@ where
         };
 
         if owner.clear_rx_consumed_() {
-            recheck_recv_level_::<C, _>(
-                &owner,
-                buffered,
-                now_millis,
-                events_tx,
-                pair,
-                cancel,
-            )
-            .await?;
+            recheck_recv_level_::<C>(shared, &owner, buffered, now_millis);
         }
     }
 }
@@ -1914,17 +1900,15 @@ where
 /// park 拿到手又丢掉就等于把这条 `Attach` 静默吞掉（本仓库的
 /// `mux_min_stage_inmem` 用例正是这么挂死的：附加事件被 park 吃掉，随后到达的数据帧
 /// 在本地表里找不到表项，读循环掉进「未知子流」分支并卡在注册表锁上）。
-async fn handle_read_event_<C, K>(
+async fn handle_read_event_<C>(
+    shared: &MuxShared_<C>,
     event: ReadEvent_<crate::connection::ConnAllocCfg_<C>>,
     table: &mut ReadTable_<crate::connection::ConnAllocCfg_<C>>,
     tg_table: &mut TgReadTable_<crate::connection::ConnAllocCfg_<C>>,
     now_millis: u64,
-    events_tx: &EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
-    cancel: &K,
 ) -> Result<(), MuxError>
 where
     C: TrConnCfg,
-    K: TrCancellationToken,
 {
     match event {
         ReadEvent_::RxConsumed {
@@ -1945,8 +1929,7 @@ where
             // 环内**实际积压**（已提交、应用还没取走）。本循环是接收环唯一的写入
             // 方，因此这次采样与上面的 `received_` 是同一时刻的一致快照。
             let buffered = entry.writer_.ring_state().data_size();
-            recheck_recv_level_::<C, _>(&owner, buffered, now_millis, events_tx, pair, cancel)
-                .await?;
+            recheck_recv_level_::<C>(shared, &owner, buffered, now_millis);
         }
         // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
         // telegraph（数据报）
@@ -1972,44 +1955,24 @@ where
 /// 的；而应用侧只能采样 `data_size` 求差，一次并发写入就会把同一区间的读出掩盖
 /// （因果与实测终局见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
 ///
-/// 通告仍走 [`WriteEvent_::Control`] 这条车道交给复用循环写出——本循环不持有连接
-/// 写环。
-async fn recheck_recv_level_<C, K>(
+/// R9 起本循环**不组帧**：只做记账 + 判定并 raise `HINT_MAIN_WINDOW_DIRTY`，
+/// `WINDOW_UPDATE` 由 `main_loop` 在确认公共 TX 有空间后取快照并写出。
+fn recheck_recv_level_<C>(
+    shared: &MuxShared_<C>,
     owner: &ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
     buffered: usize,
     now_millis: u64,
-    events_tx: &EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
-    pair: (Dock, Dock),
-    cancel: &K,
-) -> Result<(), MuxError>
-where
+) where
     C: TrConnCfg,
-    K: TrCancellationToken,
 {
-    let _ = cancel;
+    // 记账与判定在本循环做（它才知道环内积压），**取快照 / 组帧 / 写出归 main**：
+    // `should_report` 是消费式的，取走就必须保证帧写得出去。
     let buffered = Credit::try_from(buffered).unwrap_or(Credit::MAX);
-    let report = owner.recv_recheck_(buffered, now_millis);
-    if let Option::Some(report) = report {
-        let _ = events_tx.try_send_durable_event_(WriteEvent_::Control {
-            frame_: window_update_frame_(pair, report),
-        });
+    if owner.recv_recheck_due_(buffered, now_millis) {
+        shared
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_WINDOW_DIRTY);
     }
-    Result::Ok(())
-}
-
-/// 造一条携带窗口通告的 `WINDOW_UPDATE` 控制帧（读循环的两条通告路径共用）。
-fn window_update_frame_(pair: (Dock, Dock), report: WindowReport) -> ControlFrame_ {
-    ControlFrame_::with_window_(
-        FrameKind::WindowUpdate,
-        if report.is_reset() {
-            flags::K_TOTAL_RESET
-        } else {
-            0u8
-        },
-        pair.0,
-        pair.1,
-        Option::Some((report.recv_total(), report.window())),
-    )
 }
 
 /// 解复用循环在「传输此刻没字节」时的等待结果。
@@ -2610,12 +2573,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
             return;
         }
 
-        // 0. 先落实**会话释放**消息（`Drop` 只投消息、不碰身份表）。写循环也做这
-        // 件事，是为了让释放不必等某次 API 操作：两个内侧循环任一被调度即可推进。
-        lock_or_exit_!(shared
-            .reg_
-            .drain_session_events_(shared.conn_clock_().now_millis_(), cancel.child_token()));
-
         // 0.05 `Attach` inbox：环半部从这里进入本地写表（不再走事件通道）。
         while let Option::Some(attach) = shared.reg_().take_write_attach_() {
             handle_write_attach_::<C>(attach, &mut *table, &shared);
@@ -2941,17 +2898,6 @@ where
     K: TrCancellationToken,
 {
     match event {
-        WriteEvent_::Control { frame_ } => {
-            // 控制帧也必须整帧进入写环；装不下时先 park 在写环上，再重试同一帧。
-            write_control_blocking_::<C, _>(
-                tx_stage,
-                shared,
-                shared.max_packet_size_,
-                &frame_,
-                cancel,
-            )
-                .await?;
-        }
         WriteEvent_::TxReady {
             local_dock,
             remote_dock,
@@ -3244,51 +3190,6 @@ where
 // `main_loop`：`connection::main_loop::flush_releasable_`。写循环只做本地表动作、
 // 置位，并 raise `HINT_MAIN_RELEASE`。这样 `claim_release_` 与「最后一条活跃子流
 // 收尾」都落在身份表唯一写者手里，复用循环不再取注册表写锁。
-
-/// 把控制帧写进传输写半边（分块；空间不足时 park 等下游排空方腾出空间）。
-async fn write_control_blocking_<C, K>(
-    tx_stage: &mut C::ConnTx,
-    shared: &MuxShared_<C>,
-    max_packet_size: usize,
-    frame: &ControlFrame_,
-    cancel: &K,
-) -> Result<(), MuxError>
-where
-    C: TrConnCfg,
-    K: TrCancellationToken,
-{
-    // 这条路径只写**无载荷**控制帧（CLOSE / WINDOW_UPDATE 等）；`OPEN` / `ACCEPT` /
-    // `REJECT` 的载荷由 `main_loop` 直接交给公共 TX，不经过事件通道。
-    let payload: &[u8] = &[];
-    let header = FrameHeader::new_(
-        frame.kind_(),
-        frame.flags_(),
-        frame.local_dock_(),
-        frame.remote_dock_(),
-        payload.len(),
-        frame.window_(),
-    );
-    // 帧头进栈上定长缓冲；帧总长上限的判定与「拼成整帧」时同义。
-    let (head, head_len) = encode_header_(&header)?;
-    if head_len + payload.len() > max_packet_size {
-        return Result::Err(MuxError::FrameTooLarge);
-    }
-    enqueue_frame_parts_::<_, _>(tx_stage, &head[..head_len], payload, cancel.child_token()).await?;
-    // 上报「写出一个帧」：控制帧在这里才真正**整帧**进了写环（`enqueue_frame_parts_`
-    // 把头与载荷分两次入环，因此计数点必须在它之后）。
-    shared.metrics_().on_frame(
-        FrameDir::Send,
-        frame.local_dock_(),
-        frame.remote_dock_(),
-        frame.kind_(),
-        u32::try_from(head_len + payload.len()).unwrap_or(u32::MAX),
-    );
-    shared.metrics_().on_transport_bytes(
-        FrameDir::Send,
-        u64::try_from(head_len + payload.len()).unwrap_or(u64::MAX),
-    );
-    Result::Ok(())
-}
 
 /// 轮转一遍本地表，最多写出一段数据；返回是否有进展。
 #[allow(clippy::too_many_arguments)]

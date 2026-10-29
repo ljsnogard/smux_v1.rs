@@ -14,12 +14,12 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        Dock, EstablishRole_, FrameKind, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError,
+        Dock, EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError,
         TcsAbandonGuard_, Tcs_, TrConnAllocCfg, TrConnCfg,
         channel_half::{ChannelRx, ChannelTx},
         owner_::{ChannelOwner_, EstablishOutcome_, wait_establish_},
         ring_::{RingBuildErr, new_buffered_channel},
-        signal_::{ControlFrame_, ReadAttach_, SessionEvent_, WriteAttach_, WriteEvent_},
+        signal_::{ReadAttach_, WriteAttach_},
         slot_::PushErr_,
         pending_msg_::PendingMsgApp_,
         public_channel_::ChunkReadState_,
@@ -194,38 +194,16 @@ where
 /// **不取注册表锁**：身份表改动一律投成 [`SessionEvent_`]，由核心执行者 drain 后
 /// 落实。协议帧（响应方的 `REJECT`）本来就是投事件，保持原样。
 fn abort_pending_<C>(
-    conn: &MuxConnection<C>,
-    local: Dock,
-    remote: Dock,
-    is_initiator: bool,
+    ctl: &crate::connection::ControlState_<crate::connection::ConnAllocCfg_<C>>,
+    owner: &ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
 ) where
     C: TrConnCfg,
 {
-    let core = conn.core_();
-    let reg = core.reg_();
-    if is_initiator {
-        // 发起方还没发过 `OPEN`：对端不知道这条子流存在，撤销要**立刻**归还身份与
-        // 配额（不留宽限期）。
-        let _ = reg.post_session_event_(SessionEvent_::UnreserveChannel {
-            local_dock: local,
-            remote_dock: remote,
-        });
-        return;
-    }
-    let _ = core.w_events_().try_send_durable_event_(WriteEvent_::Control {
-        frame_: ControlFrame_::with_window_(
-            FrameKind::Reject,
-            0u8,
-            local,
-            remote,
-            Option::None,
-        ),
-    });
-    // 响应方已经回过 `OPEN`：进入拆流宽限期，让在途帧被静默丢弃。
-    let _ = reg.post_session_event_(SessionEvent_::ReleaseChannel {
-        local_dock: local,
-        remote_dock: remote,
-    });
+    // R9：**不投队列、不投控制帧**。只置「未裁决放弃」位 + raise 合并提示，由
+    // `main_loop` 的 retired 扫描按「对端是否知道这条子流」决定撤销预留还是回
+    // `REJECT` + 拆流宽限（设计稿 §6.7）。
+    owner.set_handle_retired_();
+    ctl.raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
 }
 
 impl<C> ChannelHandle<C>
@@ -335,11 +313,9 @@ where
         let accept_result = self.accept_prepare_::<B, P>(prepare);
         if accept_result.is_err() {
             self.settled_ = true;
-            abort_pending_(
-                &self.conn_,
-                self.local_dock_,
-                self.remote_dock_,
-                self.is_initiator_,
+            abort_pending_::<C>(
+                self.conn_.core_().control_(),
+                &self.accepted_owner_,
             );
         }
         MuxAcceptAsync::new(self, welcome, accept_result)
@@ -407,7 +383,7 @@ where
             attach_channel_async_(&conn, pending_w, pending_r, cancel.child_token()).await
     {
         handle.settled_ = true;
-        abort_pending_(&conn, local, remote, handle.is_initiator_);
+        abort_pending_::<C>(conn.core_().control_(), &handle.accepted_owner_);
         return Result::Err(err);
     }
     let owner = handle.accepted_owner_.clone();
@@ -421,7 +397,7 @@ where
         return Result::Err(HandleError::Mux(MuxError::IdleTimeout));
     }
     if cancel.is_cancelled() {
-        abort_pending_(&conn, local, remote, handle.is_initiator_);
+        abort_pending_::<C>(conn.core_().control_(), &handle.accepted_owner_);
         handle.settled_ = true;
         return Result::Err(HandleError::Cancelled);
     }
@@ -448,7 +424,7 @@ where
     .await
     {
         handle.settled_ = true;
-        abort_pending_(&conn, local, remote, handle.is_initiator_);
+        abort_pending_::<C>(conn.core_().control_(), &handle.accepted_owner_);
         return Result::Err(err);
     }
 
@@ -457,7 +433,7 @@ where
         {
             Result::Ok(outcome) => outcome,
             Result::Err(MuxError::Cancelled) => {
-                reject_after_open_(&conn, local, remote);
+                reject_after_open_::<C>(conn.core_().control_(), &owner);
                 handle.settled_ = true;
                 return Result::Err(HandleError::Cancelled);
             }
@@ -549,10 +525,10 @@ where
     let (tx_w, tx_r) = match new_buffered_channel(tx_buff) {
         Result::Ok(pair) => pair,
         Result::Err(err) => {
-            let _ = core.post_session_event_(SessionEvent_::ReleaseChannel {
-                local_dock: local,
-                remote_dock: remote,
-            });
+            // 收尾交给 `abort_pending_` 的 retired 位路径（R9）：它会按「对端是否
+            // 已经知道这条子流」决定回 `REJECT` 还是撤销预留。这里**不能**先投
+            // `ReleaseChannel`——身份一旦转成 `WaitClose`，retired 扫描就再也看不到它，
+            // 对端会永远收不到 `REJECT`。
             return Result::Err(match err {
                 RingBuildErr::Capacity(_) => HandleError::RingRejected,
                 RingBuildErr::Alloc => HandleError::AllocationFailed,
@@ -562,10 +538,10 @@ where
     let (rx_w, rx_r) = match new_buffered_channel(rx_buff) {
         Result::Ok(pair) => pair,
         Result::Err(err) => {
-            let _ = core.post_session_event_(SessionEvent_::ReleaseChannel {
-                local_dock: local,
-                remote_dock: remote,
-            });
+            // 收尾交给 `abort_pending_` 的 retired 位路径（R9）：它会按「对端是否
+            // 已经知道这条子流」决定回 `REJECT` 还是撤销预留。这里**不能**先投
+            // `ReleaseChannel`——身份一旦转成 `WaitClose`，retired 扫描就再也看不到它，
+            // 对端会永远收不到 `REJECT`。
             return Result::Err(match err {
                 RingBuildErr::Capacity(_) => HandleError::RingRejected,
                 RingBuildErr::Alloc => HandleError::AllocationFailed,
@@ -936,25 +912,14 @@ where
 /// 与 [`abort_pending_`] 只差一处前提：那个函数假设发起方**还没发过** `OPEN`（因此只需
 /// 撤销本地预留、不必回帧）；走到这里的发起方已经发过 `OPEN`，对端可能已经回过 `OPEN`
 /// 甚至已经 `accept` 完成——不回帧就会让对端永久悬在 `wait_establish_` 上。
-fn reject_after_open_<C>(conn: &MuxConnection<C>, local: Dock, remote: Dock)
-where
+fn reject_after_open_<C>(
+    ctl: &crate::connection::ControlState_<crate::connection::ConnAllocCfg_<C>>,
+    owner: &ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
+) where
     C: TrConnCfg,
 {
-    let core = conn.core_();
-    let _ = core.w_events_().try_send_durable_event_(WriteEvent_::Control {
-        frame_: ControlFrame_::with_window_(
-            FrameKind::Reject,
-            0u8,
-            local,
-            remote,
-            Option::None,
-        ),
-    });
-    // 进拆流宽限期：对端可能已经在途的帧会被静默丢弃。
-    let _ = core
-        .reg_()
-        .post_session_event_(SessionEvent_::ReleaseChannel {
-            local_dock: local,
-            remote_dock: remote,
-        });
+    // 发起方已经发出 `OPEN`（`LOCAL_OPEN_SENT` 由 main 在 `Accept` 成功时置位），
+    // 因此 retired 扫描会走「回 `REJECT` + 拆流宽限」那条路径。
+    owner.set_handle_retired_();
+    ctl.raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
 }

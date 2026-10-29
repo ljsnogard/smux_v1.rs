@@ -266,12 +266,7 @@ where
 
         let timer_fut = keep_queue_alive_(
             scope.clone(),
-            timer_loop_async_::<C, _>(
-                shared_,
-                core_.w_events_().clone(),
-                core_.r_events_().clone(),
-                core_.loop_token_(2usize),
-            ),
+            timer_loop_async_::<C, _>(shared_, core_.loop_token_(2usize)),
         );
         scope.spawn_local(timer_fut).detach();
 

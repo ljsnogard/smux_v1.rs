@@ -32,6 +32,7 @@ use crate::{
         MpmcChanCfg_, TrConnAllocCfg,
         main_loop::MainLoopRequest_,
         slot_::{HintSlot_, PushErr_},
+        timer_::TimerSignal_,
     },
     x_deps::{abs_cancel, mm_ptr},
 };
@@ -47,6 +48,19 @@ pub(crate) const HINT_MAIN_TX_DRAINED: u64 = 1u64 << 1usize;
 
 /// 「应用已关闭接收方向」：`main_loop` 扫描并写 `CLOSE(RESET)`。
 pub(crate) const HINT_MAIN_RESET: u64 = 1u64 << 2usize;
+
+/// 「定时器到期」：`main_loop` 执行一轮 `tick_`（`timer_scan_` 决策 + 组帧）。
+///
+/// 由收缩后的 `timer_loop` 在 `delay` 到期时 raise；`main_loop` 处理完一轮后通过
+/// [`TimerSignal_::publish_`] 发布下一次期限。
+pub(crate) const HINT_MAIN_TIMER: u64 = 1u64 << 4usize;
+
+/// 「有子流的接收窗口快照待通告」：`main_loop` 扫描并组 `WINDOW_UPDATE`。
+///
+/// `demux_loop` 只负责「记账 + 置位」（它知道环内积压），**不组帧**；通告的判定
+/// （`should_report`）与组帧都归 main——判定是消费式的，所以 main 在**确认公共 TX
+/// 有空间之后**才取快照，拿不到空间就不取（快照保留在窗口里，下一轮再试）。
+pub(crate) const HINT_MAIN_WINDOW_DIRTY: u64 = 1u64 << 5usize;
 
 /// 「有子流两个方向都已在协议层收尾」：`main_loop` 扫描身份表并释放注册表身份。
 ///
@@ -122,6 +136,12 @@ where
 
     /// `main_loop` 的合并提示位（`HINT_MAIN_*`）。
     main_hint_: HintSlot_,
+
+    /// `main_loop` ↔ `timer_loop` 的最小耦合面：下一次期限 + 一个唤醒槽。
+    ///
+    /// 它是纯计时的（`AtomicU64` + `NotifySlot_`）：`main_loop::tick_` 结束时发布
+    /// 期限，`timer_loop` 只按它 `delay` 并在到期时 raise [`HINT_MAIN_TIMER`]。
+    timer_signal_: TimerSignal_,
 }
 
 impl<C> ControlState_<C>
@@ -144,6 +164,7 @@ where
                     tx_,
                     rx_,
                     main_hint_: HintSlot_::new_(),
+                    timer_signal_: TimerSignal_::new_(),
                 },
                 cfg.registry_alloc(),
             ),
@@ -216,6 +237,14 @@ where
     /// `main_loop` 的 park 点：有提示时返回掩码。
     pub(crate) fn poll_main_hint_(&self, cx: &mut Context<'_>) -> Poll<u64> {
         self.inner_.main_hint_.poll_wait_(cx)
+    }
+
+    /// main ↔ timer 的计时信号（见 [`TimerSignal_`]）。
+    ///
+    /// `main_loop` 与 `timer_loop` 各持一份 `ControlState_` 句柄，因此两侧看到的是
+    /// 同一个信号——不需要再往 `MuxShared_` 里加字段。
+    pub(crate) fn timer_signal_(&self) -> &TimerSignal_ {
+        &self.inner_.timer_signal_
     }
 }
 

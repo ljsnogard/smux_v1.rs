@@ -158,7 +158,7 @@ use crate::{
         pending_msg_::{PendingMsgApp_, PendingMsgMain_, new_pending_msg_},
         public_channel_::{ChunkReadErr_, ChunkReadState_},
         scope_::new_conn_scope_,
-        signal_::{ReadAttach_, SessionEvent_, SessionMailbox_, WriteAttach_},
+        signal_::{ReadAttach_, WriteAttach_},
         slot_::PushErr_,
         sync_::{CancelToken_, LockCancelled_, acquire_read_, acquire_write_},
         timer_::TimerAction_,
@@ -1021,18 +1021,6 @@ impl RegistryShared_ {
         wake_slot_(&self.timer_waker_);
     }
 
-    /// 等计时循环的下一次唤醒；已有持久位时立刻返回。
-    fn poll_timer_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.flags_.fetch_and(!TIMER_WAKE_BIT, Ordering::AcqRel) & TIMER_WAKE_BIT != 0u64 {
-            return Poll::Ready(());
-        }
-        register_waker_(&self.timer_waker_, cx);
-        if self.flags_.fetch_and(!TIMER_WAKE_BIT, Ordering::AcqRel) & TIMER_WAKE_BIT != 0u64 {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
 
     /// 置写循环提示位并唤醒。
     fn raise_write_hint_(&self, bits: u64) {
@@ -1218,11 +1206,6 @@ where
     /// 频率高于注册表写锁，放进来只会把两把锁串在一起。
     scope_: Scope,
 
-    /// 会话释放邮箱：`Drop` 投递、核心执行者 drain（**不入锁**）。
-    ///
-    /// 它内部已经是共享句柄（`mpmc_chan` 的 `Sender` / `Receiver` + 溢出 `Arc`），
-    /// 因此**不需要**再套一层 `Shared`。
-    mailbox_: SessionMailbox_,
 }
 
 impl<C> Clone for ChannelRegistry_<C>
@@ -1237,7 +1220,6 @@ where
             // 域句柄按值克隆：只增加句柄计数，不复制域内的对象。
             scope_: self.scope_.clone(),
             // 邮箱按值克隆：生产端共享同一条队列，消费端因此有**多个** drain 者。
-            mailbox_: self.mailbox_.clone(),
         }
     }
 }
@@ -1437,6 +1419,43 @@ where
         Result::Ok((out, became_idle))
     }
 
+    /// 取走最多 `budget` 条「待通告」的接收窗口快照（`main_loop` 专用）。
+    ///
+    /// `demux_loop` 只负责记账与 raise `HINT_MAIN_WINDOW_DIRTY`；判定
+    /// （`should_report`）是**消费式**的（取了就记为已通告），因此由 `main_loop`
+    /// 在**确认公共 TX 有空间之后**调用本方法。空间不足时一个都不取——快照留在窗口
+    /// 里，下一轮提示再来。
+    ///
+    /// 结果写进调用方给的**定长缓冲**（`main_loop` 的栈上数组）：本方法不分配，
+    /// 也不在锁内唤醒任何人——`notify_tx_ready_` 由调用方在锁外做。
+    pub(crate) async fn take_window_reports_<K: TrCancellationToken, const N: usize>(
+        &self,
+        budget: usize,
+        out: &mut [Option<((Dock, Dock), WindowReport)>; N],
+        cancel: K,
+    ) -> Result<usize, ReserveErr_> {
+        let mut session = self.root_.inner_.acquire_session();
+        let guard = acquire_read_(&mut session, cancel).await?;
+        if budget == 0usize || N == 0usize {
+            return Result::Ok(0usize);
+        }
+        let limit = budget.min(N);
+        let mut count = 0usize;
+        for (pair, binding) in guard.bindings_.iter() {
+            if count >= limit {
+                break;
+            }
+            let BindingSlot_::Channel(ctx) = binding else {
+                continue;
+            };
+            if let Option::Some(report) = ctx.rec_.recv_take_report_() {
+                out[count] = Option::Some((*pair, report));
+                count += 1usize;
+            }
+        }
+        Result::Ok(count)
+    }
+
     /// 建立注册表：分配根对象与四本索引，并为四个循环建好取消令牌。
     ///
     /// 每一项分配器都从分配器配置按用途取：结构（索引 / 根对象）用
@@ -1515,7 +1534,6 @@ where
             ),
             loops_: loops,
             scope_,
-            mailbox_: SessionMailbox_::new_(),
         }
     }
 
@@ -1528,11 +1546,6 @@ where
     /// （见 `keepalive…` §6.3）。因此登记路径一律「先出作用域、再 call」。
     pub(crate) fn notify_timer_(&self) {
         self.root_.shared_.raise_timer_();
-    }
-
-    /// 计时循环的等待点：有唤醒提示时立刻就绪，否则登记 waker 后 `Pending`。
-    pub(crate) fn poll_timer_wake_(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.root_.shared_.poll_timer_(cx)
     }
 
     /// 提醒写循环「某些子流的收尾事实变了」；位定义见 `signal_::HINT_W_*`。
@@ -1724,69 +1737,6 @@ where
     /// 计时循环用它算关闭的整体超时（见 [`ChannelRegistry_::state_`]）。
     pub(crate) fn close_since_millis_(&self) -> u64 {
         self.root_.shared_.close_since_millis_()
-    }
-
-    /// 投递一条**会话释放消息**（会话句柄的 `Drop` 调用）。
-    ///
-    /// **不取锁、不阻塞**：消息由 [`ChannelRegistry_::drain_session_events_`] 落实。
-    /// 返回值表示邮箱是否仍在（连接收尾时为 `false`，按「没送出去」处理）。
-    pub(crate) fn post_session_event_(&self, event: SessionEvent_) -> bool {
-        self.mailbox_.post_(event)
-    }
-
-    /// 取出并落实**全部**积压的会话释放消息。
-    ///
-    /// 这是「核心内部调度」的入口：两个循环每轮调用它；会创建 / 认领身份的 API
-    /// 操作（`bind` / `listen` / `open_telegraph` / `open_channel` / `accept` /
-    /// `reject`）在动身份表之前也调用它，于是「丢弃句柄后立刻复用同一身份」不需要
-    /// 等某个特定任务被调度。
-    ///
-    /// # Panics
-    ///
-    /// **调用方不得正持有本注册表的锁**：落实每条消息都要再取一次锁。
-    ///
-    /// `now_millis` 是连接内毫秒，供落实 `ReleaseChannel`（进入拆流宽限期）时打点。
-    pub(crate) async fn drain_session_events_<K: TrCancellationToken>(
-        &self,
-        now_millis: u64,
-        cancel: K,
-    ) -> Result<(), ReserveErr_> {
-        while let Option::Some(event) = self.mailbox_.try_take_() {
-            self.apply_session_event_(event, now_millis, cancel.child_token())
-                .await?;
-        }
-        Result::Ok(())
-    }
-
-    /// 落实一条释放消息（内部方法：只由 drain 调用，**不自行 drain**）。
-    async fn apply_session_event_<K: TrCancellationToken>(
-        &self,
-        event: SessionEvent_,
-        now_millis: u64,
-        cancel: K,
-    ) -> Result<(), ReserveErr_> {
-        match event {
-            SessionEvent_::UnreserveChannel {
-                local_dock,
-                remote_dock,
-            } => {
-                // 返回值是「释放后活跃子流是否归零」——由**控制面循环**在收口点
-                // 关心（见 `main_loop::flush_releasable_`），会话事件的批量落实不看它。
-                let _ = self
-                    .unreserve_channel_(local_dock, remote_dock, cancel)
-                    .await;
-                Result::Ok(())
-            }
-            SessionEvent_::ReleaseChannel {
-                local_dock,
-                remote_dock,
-            } => {
-                let _ = self
-                    .release_channel_(local_dock, remote_dock, now_millis, cancel)
-                    .await;
-                Result::Ok(())
-            }
-        }
     }
 
     /// 协商出的「整条连接最多同时在册子流数」。
@@ -2155,11 +2105,17 @@ where
                     retired_telegraphs.push(key.0);
                 }
                 BindingSlot_::Channel(ctx) if ctx.rec_.is_handle_retired_() => {
-                    // 发起方还没发过 `OPEN`：撤销即可。响应方要先回 `REJECT`。
-                    if matches!(ctx.inbound_, Inbound_::None) {
-                        retired_unreserve.push(*key);
-                    } else {
+                    // 判据是**对端是否知道这条子流**：
+                    // - 响应方（`inbound_ != None`）已经收到对端 `OPEN`，必须回 `REJECT`；
+                    // - 发起方只有在本端**发出过 `OPEN`** 之后才需要回帧，否则撤销即可
+                    //   （`LOCAL_OPEN_SENT`，R9 起取代 `abort_pending_` / `reject_after_open_`
+                    //   在 Drop 路径上直接投控制帧的做法）。
+                    let peer_knows = !matches!(ctx.inbound_, Inbound_::None)
+                        || ctx.rec_.is_local_open_sent_();
+                    if peer_knows {
                         retired_reject.push(*key);
+                    } else {
+                        retired_unreserve.push(*key);
                     }
                 }
                 _ => {}

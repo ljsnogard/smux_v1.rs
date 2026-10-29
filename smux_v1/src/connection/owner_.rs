@@ -155,6 +155,13 @@ const ESTABLISH_SETTLED: usize = 1usize << 13usize;
 /// [`TrChannelRx::close_async`](abs_smux::chan::TrChannelRx::close_async) 的完成判据。
 const LOCAL_RESET_FLUSHED: usize = 1usize << 15usize;
 
+/// 本端已经发出过 `OPEN`（发起方在 `accept` 时发；响应方由 `inbound_` 区分）。
+///
+/// 它决定「未裁决就放弃」时该走哪条收尾：**没发过 `OPEN`** 只需撤销本地预留
+/// （对端不知道这条子流）；**已发出 `OPEN`** 必须回 `REJECT`，否则对端会永远悬在
+/// `wait_establish_` 上。
+const LOCAL_OPEN_SENT: usize = 1usize << 22usize;
+
 /// 应用已丢弃**尚未裁决**的 [`ChannelHandle`](super::ChannelHandle)（P4 的 Drop 位化）。
 ///
 /// 只由 `ChannelHandle::Drop` 置位，不取锁；`main_loop` 在 `HINT_MAIN_RETIRED`
@@ -797,6 +804,18 @@ impl ChannelState_ {
         has_flag_(self.flags_.value(), HANDLE_RETIRED)
     }
 
+    /// 记录「本端已经发出过 `OPEN`」（决定未裁决放弃时是否必须回 `REJECT`）。
+    pub(crate) fn set_local_open_sent_(&self) {
+        let _ = self
+            .flags_
+            .try_spin_compare_exchange_weak(|_| true, |value| value | LOCAL_OPEN_SENT);
+    }
+
+    /// 本端是否已经发出过 `OPEN`。
+    pub(crate) fn is_local_open_sent_(&self) -> bool {
+        has_flag_(self.flags_.value(), LOCAL_OPEN_SENT)
+    }
+
     /// 记录「复用循环已判定发送环排空」；返回是否首次置位。
     pub(crate) fn set_tx_drained_(&self) -> bool {
         self.flags_
@@ -1050,21 +1069,21 @@ impl ChannelState_ {
         self.flow_.recv_window().take_report_()
     }
 
-    /// 应用消费之后由**持有接收环写端**的解复用循环核对水位并择机补发通告。
+    /// 应用消费之后的核对：**只记账 + 判定**，不产出快照、不推进「已通告」。
     ///
-    /// `buffered` 是环内**实际积压**（已提交、应用还没取走）。本循环是接收环唯一的
-    /// 写入方，因此「已记账的累计已收 − 环内积压」就是**精确**的累计已消费量；应用侧
-    /// 采样差值会被并发写入掩盖（因果见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
-    ///
-    /// 记账与判定在同一段窗口临界区里完成；只有真的推进了消费记账才刷新**存活时钟**
-    /// （这是本端应用在消费，不构成「对端还在」以外的任何保活义务，因此不推进保活
-    /// 职责时钟）。
-    pub(crate) fn recv_recheck_(&self, buffered: Credit, now_millis: u64) -> Option<WindowReport> {
-        let (advanced, report) = self.flow_.recv_window().recheck_(buffered);
+    /// 返回「是否该通告」；产出与组帧由 `main_loop` 在确认公共 TX 有空间后做
+    /// （`should_report` 是消费式的，所以这里绝不能顺手 `take`，否则背压时会丢通告）。
+    pub(crate) fn recv_recheck_due_(&self, buffered: Credit, now_millis: u64) -> bool {
+        let (advanced, due) = self.flow_.recv_window().recheck_due_(buffered);
         if advanced {
             self.touch_(now_millis);
         }
-        report
+        due
+    }
+
+    /// 当前是否该通告（只读判定，不推进快照）。
+    pub(crate) fn window_report_due_(&self) -> bool {
+        self.flow_.recv_window().should_report_now_()
     }
 
     /// 收到对端的窗口通告。
