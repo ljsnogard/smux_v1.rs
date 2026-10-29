@@ -2118,6 +2118,17 @@ connection/
   3. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
      cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
 
+- 20261030-0330：**R16：`TgAttach` 走 attach inbox，读事件通道删除**。
+  1. `WriteAttach_` / `ReadAttach_` 改枚举（`Channel` / `Telegraph` 两变体），channel
+     与 telegraph 共用同一条 attach inbox。
+  2. `OpenTelegraph` 改投 inbox（满时背压），`TgAttach` 事件删除；`ReadEvent_` 变空后
+     **整条读事件通道移除**（`DemuxEventsGuard_` / `drain_read_events_` /
+     `handle_read_event_` / `park_read_wake_` 的 events 参数 / `ReadWake_::Event|Rescan`）。
+  3. `WriteEvent_` 去泛型，只剩 `TgReady`；`MuxLoopShared_::w_events_` 降级为**纯保活**
+     句柄（删掉会让 `mux_drop_flush_dual_` 稳定失败，原因见 alloc-ownership §4.15）。
+  4. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2296,7 +2307,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | P0 原语完成（`PublicChunkIo_`，未接线） |
 | T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | 完成（P3.1b：`OPEN`/`ACCEPT`/`REJECT`/`CLOSE` 全走公共子流；timer 的 `PULSE`/`CLOSE` 待 P4/P5） |
-| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：邮箱已删（R9）；`RxConsumed` / `TxReady` / `TgTxClosed` 已位化（R11/R13/R15）；`WriteEvent_` 仍承载 `TgAttach` / `TgReady`，`ReadEvent_` 只剩 `TgAttach` |
+| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：邮箱已删（R9）；`RxConsumed` / `TxReady` / `TgTxClosed` 已位化（R11/R13/R15）；`TgAttach` 改走 inbox、`ReadEvent_` 已删（R16）；`WriteEvent_` 只剩 `TgReady` |
 
 ### C. 请求 / TCS
 

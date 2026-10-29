@@ -146,7 +146,7 @@ use crate::{
             EventReceiver_, EventTake_,
             HINT_R_RELEASE, HINT_R_RX_CONSUMED, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED,
             HINT_W_RELEASED, HINT_W_TG_TX_CLOSED, HINT_W_TX_READY,
-            HINT_W_RESET_ENQUEUED, ReadAttach_, ReadEvent_, TrEventReceiver_,
+            HINT_W_RESET_ENQUEUED, ReadAttach_, TrEventReceiver_,
             WriteAttach_, WriteEvent_,
         },
         telegraph::TgRecvCtx_,
@@ -200,11 +200,15 @@ where
     /// 控制面共享句柄：写循环据此 raise `HINT_MAIN_*`（例如发送环已排空）。
     control_: ControlState_<C>,
 
-    /// 两条事件通道的**生产端**：`main_loop` 组完 telegraph 的建流动作后要投
-    /// `TgAttach`（带环半部、不可位化）。channel 的通知已全部位化，这两份克隆只服务
-    /// telegraph，R13 给它建 attach inbox 后即可删除。
-    w_events_: crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_<C>>,
-    r_events_: crate::connection::signal_::EventSender_<crate::connection::signal_::ReadEvent_<C>>,
+
+    /// 写侧事件通道的**保活**句柄。
+    ///
+    /// 它不参与任何通知（channel 的通知全部位化、telegraph 的 `TgAttach` 走 attach
+    /// inbox），但**必须保留一份生产端**：核心析构（`MuxCore::Drop`）只发起优雅关闭，
+    /// 循环要继续把已提交字节发完；若这里没有克隆，核心一析构事件通道就关闭，写循环
+    /// 会在 `EventTake_::Closed` 处立刻退出，未发完的载荷随之丢失
+    /// （`mux_drop_flush_dual_` 就是钉这一点的用例）。
+    w_events_: crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_>,
 
     /// 协商出的单帧总长上限。
     max_packet_size_: usize,
@@ -259,7 +263,6 @@ where
             reg_: self.reg_.clone(),
             control_: self.control_.clone(),
             w_events_: self.w_events_.clone(),
-            r_events_: self.r_events_.clone(),
             max_packet_size_: self.max_packet_size_,
             pending_msg_cap_: self.pending_msg_cap_,
             conn_clock_: self.conn_clock_.clone(),
@@ -290,14 +293,12 @@ where
         channel_timeout_millis: u64,
         public: PublicChannel_<C>,
         metrics: M,
-        w_events: crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_<C>>,
-        r_events: crate::connection::signal_::EventSender_<crate::connection::signal_::ReadEvent_<C>>,
+        w_events: crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_>,
     ) -> Self {
         MuxLoopShared_ {
             reg_: reg,
             control_: control,
             w_events_: w_events,
-            r_events_: r_events,
             max_packet_size_: max_packet_size,
             pending_msg_cap_: pending_msg_cap,
             conn_clock_: conn_clock,
@@ -324,18 +325,12 @@ where
         &self.control_
     }
 
-    /// 写侧事件通道的生产端（telegraph 的 attach 投递用；R13 后删除）。
+    /// 写侧事件通道的保活句柄（不直接使用；见字段文档）。
+    #[allow(dead_code, reason = "只用于保活，不参与通知")]
     pub(crate) fn w_events_(
         &self,
-    ) -> &crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_<C>> {
+    ) -> &crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_> {
         &self.w_events_
-    }
-
-    /// 读侧事件通道的生产端（telegraph 的 attach 投递用；R13 后删除）。
-    pub(crate) fn r_events_(
-        &self,
-    ) -> &crate::connection::signal_::EventSender_<crate::connection::signal_::ReadEvent_<C>> {
-        &self.r_events_
     }
 
     /// 连接级时钟。
@@ -491,50 +486,90 @@ type TgWriteTable_<C> = crate::connection::dock_index_::DockBPlusTree_<
 fn handle_write_attach_<C>(
     attach: WriteAttach_<crate::connection::ConnAllocCfg_<C>>,
     table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
+    tg_table: &mut TgWriteTable_<crate::connection::ConnAllocCfg_<C>>,
     shared: &MuxShared_<C>,
 ) where
     C: TrConnCfg,
 {
-    let (pair, owner, reader_) = attach.into_parts_();
-    let rx_closed = owner.is_app_rx_closed_();
-    let peer_closed = owner.is_peer_fin_() || owner.is_peer_reset_();
-    table.insert(
-        pair,
-        WriteEntry_ {
-            owner_: owner,
+    match attach {
+        WriteAttach_::Channel {
+            pair_,
+            owner_,
             reader_,
-            peer_fin_handled_: false,
-            fin_sent_: false,
-        },
-    );
-    if rx_closed {
-        shared
-            .control_()
-            .raise_main_hint_(crate::connection::HINT_MAIN_RESET);
-    }
-    if peer_closed {
-        shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
+        } => {
+            let rx_closed = owner_.is_app_rx_closed_();
+            let peer_closed = owner_.is_peer_fin_() || owner_.is_peer_reset_();
+            table.insert(
+                pair_,
+                WriteEntry_ {
+                    owner_,
+                    reader_,
+                    peer_fin_handled_: false,
+                    fin_sent_: false,
+                },
+            );
+            if rx_closed {
+                shared
+                    .control_()
+                    .raise_main_hint_(crate::connection::HINT_MAIN_RESET);
+            }
+            if peer_closed {
+                shared.reg_().raise_write_hint_(HINT_W_PEER_CLOSED);
+            }
+        }
+        // telegraph 的 `Attach`：键只有 `local_dock`，进另一张本地表。
+        WriteAttach_::Telegraph {
+            local_dock_,
+            owner_,
+            reader_,
+        } => {
+            tg_table.insert(
+                local_dock_,
+                TgWriteEntry_ {
+                    owner_,
+                    reader_,
+                },
+            );
+        }
     }
 }
 
 /// 处理读循环收到的一条 `Attach`：插入本地读表；身份已经释放时直接关掉写端。
-fn handle_read_attach_<C>(attach: ReadAttach_<crate::connection::ConnAllocCfg_<C>>, table: &mut ReadTable_<crate::connection::ConnAllocCfg_<C>>)
-where
+fn handle_read_attach_<C>(
+    attach: ReadAttach_<crate::connection::ConnAllocCfg_<C>>,
+    table: &mut ReadTable_<crate::connection::ConnAllocCfg_<C>>,
+    tg_table: &mut TgReadTable_<crate::connection::ConnAllocCfg_<C>>,
+) where
     C: TrConnCfg,
 {
-    let (pair, owner, writer_) = attach.into_parts_();
-    if owner.is_released_() {
-        let mut writer_ = writer_;
-        writer_.close();
-        return;
-    }
-    table.insert(
-        pair,
-        ReadEntry_ {
-            owner_: owner,
+    match attach {
+        ReadAttach_::Channel {
+            pair_,
+            owner_,
             writer_,
-        },
-    );
+        } => {
+            if owner_.is_released_() {
+                let mut writer_ = writer_;
+                writer_.close();
+                return;
+            }
+            table.insert(
+                pair_,
+                ReadEntry_ {
+                    owner_,
+                    writer_,
+                },
+            );
+        }
+        // telegraph 的 `Attach`：键只有 `local_dock`，进另一张本地表。
+        ReadAttach_::Telegraph {
+            local_dock_,
+            owner_,
+            writer_,
+        } => {
+            tg_table.insert(local_dock_, TgRecvCtx_::new_(local_dock_, owner_, writer_));
+        }
+    }
 }
 
 /// 推进「对端已发来 `CLOSE`」的拆流记账。
@@ -1214,71 +1249,19 @@ where
         }
         // `Attach` inbox 里还没取走的环半部：显式关闭，别让应用侧永久 park。
         while let Option::Some(attach) = self.shared.reg_.take_read_attach_() {
-            let (_, _, mut writer_) = attach.into_parts_();
-            writer_.close();
+            match attach {
+                ReadAttach_::Channel { mut writer_, .. }
+                | ReadAttach_::Telegraph { mut writer_, .. } => writer_.close(),
+            }
         }
         self.shared.reg_.close_read_inbox_();
     }
 }
 
-/// 解复用循环**读事件队列**的收尾守卫（规则与理由见 [`MuxLocalGuard_`]）。
-struct DemuxEventsGuard_<'a, C>
-where
-    C: TrConnCfg,
-{
-    /// 尚未处理的事件（里面可能还压着没进表的 `Attach` 半部）。
-    events: EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
-
-    /// 连接共享面（上报关闭与读时钟用）。
-    shared: &'a MuxShared_<C>,
-}
-
-impl<C> core::ops::Deref for DemuxEventsGuard_<'_, C>
-where
-    C: TrConnCfg,
-{
-    type Target = EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.events
-    }
-}
-
-impl<C> core::ops::DerefMut for DemuxEventsGuard_<'_, C>
-where
-    C: TrConnCfg,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.events
-    }
-}
-
-impl<C> Drop for DemuxEventsGuard_<'_, C>
-where
-    C: TrConnCfg,
-{
-    fn drop(&mut self) {
-        // 共享面保留给后续 telegraph 失败上报；本轮 `TgAttach` 只需关闭环半部。
-        let _ = self.shared;
-        loop {
-            let event = match self.events.try_take_event_() {
-                EventTake_::Event(event) => event,
-                // Drop 阶段不再做全扫：其余半部由循环退出时的守卫统一关闭。
-                EventTake_::Rescan | EventTake_::Empty | EventTake_::Closed => break,
-            };
-            // 通道 `Attach` 已经改走 inbox；事件里只剩 telegraph 的环半部需要显式关闭。
-            let ReadEvent_::TgAttach { mut writer_, .. } = event;
-            writer_.close();
-        }
-    }
-}
-
-
 /// 解复用循环：从传输读半边解析帧、投递载荷、推进建流状态机。
 pub(crate) async fn demux_loop_async_<C, K>(
     mut rx_stage: C::ConnRx,
     shared: MuxShared_<C>,
-    events: EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     mut public_rx_w: BufferedTx,
     cancel: K,
 ) where
@@ -1310,10 +1293,6 @@ pub(crate) async fn demux_loop_async_<C, K>(
         .expect("2 KiB B 树足以容纳存活的 telegraph dock");
     // 「已消失」的 dock 列表：复用同一个 `Vec`，分配器同样取本地表分配器。
     let mut gone = alloc::vec::Vec::new_in(alloc);
-    let mut events: DemuxEventsGuard_<'_, C> = DemuxEventsGuard_ {
-        events,
-        shared: &shared,
-    };
 
     // 控制帧的暂存：只用于「帧头解析完成、载荷已经整块在环上」之后的取载荷。
     // 连接级环本身已经是暂存，因此这里只需要容纳**一帧**的最大载荷。
@@ -1356,7 +1335,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
         // 新的读表项，就按位重算一次水位，把那条通知补回来。
         let mut attached_new = false;
         while let Option::Some(attach) = shared.reg_().take_read_attach_() {
-            handle_read_attach_::<C>(attach, &mut *table);
+            handle_read_attach_::<C>(attach, &mut *table, &mut *tg_table);
             attached_new = true;
         }
         if attached_new
@@ -1397,21 +1376,6 @@ pub(crate) async fn demux_loop_async_<C, K>(
             gone.clear();
             tg_live.clear();
         }
-        // 1. 先把挂起的 `Attach` / `Release` / `RxConsumed` 成批排空。
-        if let Result::Err(err) =
-            drain_read_events_::<C>(
-                &shared,
-                &mut *events,
-                &mut table.table,
-                &mut *tg_table,
-                table.shared.conn_clock_().now_millis_(),
-            )
-            .await
-        {
-            fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-            return;
-        }
-
         // 2. 问一次**传输读半边**有没有字节。本版没有再建连接级读环：字节直接从
         //    传输半边读进来（park 在这里，**同时与读事件通道、取消令牌竞争**）。
         let readable = match rx_state_(&rx_stage) {
@@ -1429,7 +1393,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
             // 唯一触发点，而它到来时传输完全可能长期为空（对端正等额度、没有新帧）。
             // 只 park 在传输上会让这条通知一直排在一条睡着的循环后面——应用读空了环却
             // 没人补发额度，两端互等（本仓库流控验收用例的死锁形态）。
-            match park_read_wake_::<C, _>(&cancel, &mut rx_stage, &mut *events, &shared).await {
+            match park_read_wake_::<C, _>(&cancel, &mut rx_stage, &shared).await {
                 // 传输里有字节：回顶部交给正式的帧头解析。
                 ReadWake_::Bytes => {}
                 // 生产端封口且已排空：与上面的 `RxState_::Eof` 同义。
@@ -1445,38 +1409,11 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     .await;
                     return;
                 }
-                // 事件已由 park **取出**（异步接收是消费语义，丢掉它就等于把这条
-                // `Attach` / `RxConsumed` 静默吞掉），因此必须在这里就地处理，不能只
-                // 回顶部等 `drain_read_events_` 再取一次。
-                ReadWake_::Event(event) => {
-                    if let Result::Err(err) = handle_read_event_::<C>(event, &mut *tg_table) {
-                        fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-                        return;
-                    }
-                }
-                // 有可重建事件被丢弃：全扫读表（水位提示在状态位里）。
-                ReadWake_::Rescan => {
-                    if let Result::Err(err) = rescan_read_::<C>(
-                        &shared,
-                        &mut table.table,
-                        table.shared.conn_clock_().now_millis_(),
-                    )
-                    .await
-                    {
-                        fail_mux_loop_(&shared, &cancel, Option::None, &err).await;
-                        return;
-                    }
-                }
-                // `Attach` inbox：插入本地读表（已释放则直接关写端）。
+                // `Attach` inbox 里来了一条新的接收环写端：插读表（telegraph 变体进
+                // 另一张表）。
                 ReadWake_::Attach(attach) => {
-                    handle_read_attach_::<C>(attach, &mut table.table);
+                    handle_read_attach_::<C>(attach, &mut table.table, &mut *tg_table);
                 }
-                // 合并提示（身份释放）：按 `RELEASED` 位摘读表并关接收环写端。
-                // 合并提示：`RELEASED` 就地摘表；**其余位回放到顶部**统一处理。
-                //
-                // 回放不可省：`poll_read_hint_` 是「取出并返回」语义，park 取走却没处理
-                // 的位就等于丢掉——`HINT_R_RX_CONSUMED` 正是这样丢的（应用读了数据、
-                // 水位永不重算，对端收不到 `WINDOW_UPDATE`，发送方额度永远不回来）。
                 ReadWake_::Hint(bits) => {
                     let mut rest = bits;
                     if rest & HINT_R_RELEASE != 0u64 {
@@ -1847,42 +1784,6 @@ fn window_report_of_(header: &FrameHeader) -> Option<WindowReport> {
 /// 投一条 `RxConsumed`），若「处理完为止」而不设上限，事件队列始终非空时本循环就
 /// 永远走不到「读一个帧头」那一步。
 ///
-/// `RxConsumed` 的处理是纯原子读改写（不取锁），但通告要经事件通道投给写循环，
-/// 因此本函数仍是 `async`。
-async fn drain_read_events_<C>(
-    shared: &MuxShared_<C>,
-    events: &mut EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
-    table: &mut ReadTable_<crate::connection::ConnAllocCfg_<C>>,
-    tg_table: &mut TgReadTable_<crate::connection::ConnAllocCfg_<C>>,
-    now_millis: u64,
-) -> Result<(), MuxError>
-where
-    C: TrConnCfg,
-{
-    const K_EVENT_BATCH: usize = 32usize;
-    for _ in 0..K_EVENT_BATCH {
-        match events.try_take_event_() {
-            EventTake_::Event(event) => {
-                handle_read_event_::<C>(event, tg_table)?;
-            }
-            // 有可重建事件被丢弃：按各子流的状态位全扫一次，然后让主循环继续。
-            EventTake_::Rescan => {
-                rescan_read_::<C>(shared, table, now_millis).await?;
-                break;
-            }
-            EventTake_::Empty | EventTake_::Closed => break,
-        }
-    }
-    Result::Ok(())
-}
-
-/// 定容读事件通道的**全扫兜底**：重建被丢弃的可重建事件。
-///
-/// 读事件里只有 `RxConsumed` 是可重建的：位在 [`ChannelState_`] 上；清位时若真的
-/// 置着，就按「环内实际积压」重算一次窗口通告。
-///
-/// `Attach` 携带环半部句柄，生产者走 [`EventSender_::try_send_durable_event_`]，
-/// 不会丢；身份释放（`Release`）已经改为 `RELEASED` 位 + `HINT_R_RELEASE` 合并提示，
 /// 由 [`scan_released_`] 按位摘表，不再经过事件通道。
 async fn rescan_read_<C>(
     shared: &MuxShared_<C>,
@@ -1922,47 +1823,6 @@ where
     }
 }
 
-///
-/// 处理**单条**读事件。
-///
-/// 单独成函数是因为同一种事件有**两个**来源：`drain_read_events_` 从队列成批取出的，
-/// 以及循环 park 时从队列里**取出**的那一条。后者不可省——异步接收是**消费**语义，
-/// park 拿到手又丢掉就等于把这条 `Attach` 静默吞掉（本仓库的
-/// `mux_min_stage_inmem` 用例正是这么挂死的：附加事件被 park 吃掉，随后到达的数据帧
-/// 在本地表里找不到表项，读循环掉进「未知子流」分支并卡在注册表锁上）。
-fn handle_read_event_<C>(
-    event: ReadEvent_<crate::connection::ConnAllocCfg_<C>>,
-    tg_table: &mut TgReadTable_<crate::connection::ConnAllocCfg_<C>>,
-) -> Result<(), MuxError>
-where
-    C: TrConnCfg,
-{
-    match event {
-        // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-        // telegraph（数据报）
-        // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-        ReadEvent_::TgAttach {
-            local_dock,
-            owner,
-            writer_,
-        } => {
-            // 与 channel 的 `Attach` 同形：重复附直接覆盖，不会留下陈旧条目。
-            tg_table.insert(local_dock, TgRecvCtx_::new_(local_dock, owner, writer_));
-        }
-    }
-    Result::Ok(())
-}
-
-/// 应用消费之后，由**持有接收环写端**的本循环核对水位并择机补发通告。
-///
-/// # 为什么判定权在这里
-///
-/// 「累计已消费量」= `RecvWindow` 记账的累计已收 `R` − 环内实际积压 `buffered`。
-/// 本循环是接收环**唯一的写入方**，两个量都在同一个任务里读，因此这个差值是**精确**
-/// 的；而应用侧只能采样 `data_size` 求差，一次并发写入就会把同一区间的读出掩盖
-/// （因果与实测终局见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
-///
-/// R9 起本循环**不组帧**：只做记账 + 判定并 raise `HINT_MAIN_WINDOW_DIRTY`，
 /// `WINDOW_UPDATE` 由 `main_loop` 在确认公共 TX 有空间后取快照并写出。
 fn recheck_recv_level_<C>(
     shared: &MuxShared_<C>,
@@ -1999,14 +1859,6 @@ where
     /// 传输读失败（不是「封口」）：连接不可用。
     Fatal,
 
-    /// 从读事件通道里**取出**了一条事件（`Attach` / `Release` / `RxConsumed`）。
-    ///
-    /// 必须由调用方处理：异步接收是**消费**语义，丢掉它就等于静默吞掉这条事件。
-    Event(ReadEvent_<C>),
-
-    /// 有可重建事件被丢弃：调用方应全扫读表，把水位提示重建出来。
-    Rescan,
-
     /// 合并提示（身份释放等）：把掩码带回调用方，按状态位推进本地表。
     Hint(u64),
 
@@ -2029,7 +1881,6 @@ where
 async fn park_read_wake_<C, K>(
     cancel: &K,
     rx_stage: &mut C::ConnRx,
-    events: &mut EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
     shared: &MuxShared_<C>,
 ) -> ReadWake_<crate::connection::ConnAllocCfg_<C>>
 where
@@ -2039,7 +1890,6 @@ where
     let demand = Demand::at_least(1usize);
     let cancel_fut = cancel.child_token().cancellation();
     let mut cancel_fut = core::pin::pin!(cancel_fut);
-    let mut event_fut = core::pin::pin!(events.take_event_async_());
     let mut ring_fut = core::pin::pin!(core::future::IntoFuture::into_future(
         rx_stage.read_async(&demand),
     ));
@@ -2047,14 +1897,7 @@ where
     let mut attach_fut = core::pin::pin!(core::future::IntoFuture::into_future(
         shared.reg_().recv_read_attach_async_()
     ));
-    // 读事件的生产端全部消失 = 连接核心已析构，取消令牌随即触发。此后不再 poll 事件
-    // 通道（它已 `Ready(None)` 且会立刻再次就绪），只等传输与取消令牌。
-    let mut events_closed = false;
     let mut cancelled = false;
-    // 从通道里**取出**的事件：必须原样带回调用方，不能在此丢掉。
-    let mut taken: Option<ReadEvent_<crate::connection::ConnAllocCfg_<C>>> = Option::None;
-    // 有可重建事件被丢弃：把「全扫」带回调用方（读表在调用方手里）。
-    let mut need_rescan = false;
     // 传输读 future 就绪时的分类（段本身借用 `ring_fut`，因此就地判、就地 drop）。
     let mut woke: Option<ReadWake_<crate::connection::ConnAllocCfg_<C>>> = Option::None;
     // 合并提示（身份释放）：把掩码带回调用方。
@@ -2066,22 +1909,6 @@ where
         if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
             cancelled = true;
             return Poll::Ready(());
-        }
-        if !events_closed {
-            match core::future::Future::poll(event_fut.as_mut(), cx) {
-                Poll::Ready(EventTake_::Event(event)) => {
-                    taken = Option::Some(event);
-                    return Poll::Ready(());
-                }
-                Poll::Ready(EventTake_::Rescan) => {
-                    need_rescan = true;
-                    return Poll::Ready(());
-                }
-                Poll::Ready(EventTake_::Closed) => events_closed = true,
-                // `take_event_async_` 不会返回 `Empty`；保守地当作「稍后再试」。
-                Poll::Ready(EventTake_::Empty) => {}
-                Poll::Pending => {}
-            }
         }
         // 传输来了数据：回顶部交给正式的帧头解析。借出的段在此 drop（**不消费**，
         // 已消费量为 0——字节仍留在传输自己的缓冲里）。
@@ -2133,18 +1960,14 @@ where
     .await;
     if cancelled {
         ReadWake_::Cancelled
-    } else if need_rescan {
-        ReadWake_::Rescan
     } else if hint_bits != 0u64 {
         ReadWake_::Hint(hint_bits)
     } else if let Option::Some(attach) = taken_attach {
         ReadWake_::Attach(attach)
-    } else if let Option::Some(event) = taken {
-        ReadWake_::Event(event)
     } else if let Option::Some(woke) = woke {
         woke
     } else {
-        // 事件通道关闭（连接核心已析构）且传输与取消都没就绪：按收尾处理。
+        // 传输与取消都没就绪（不该发生）：按收尾处理。
         ReadWake_::Cancelled
     }
 }
@@ -2284,8 +2107,10 @@ where
         }
         // `Attach` inbox 里还没取走的环半部：显式关闭，别让应用侧永久 park。
         while let Option::Some(attach) = self.shared.reg_.take_write_attach_() {
-            let (_, _, mut reader_) = attach.into_parts_();
-            reader_.close();
+            match attach {
+                WriteAttach_::Channel { mut reader_, .. }
+                | WriteAttach_::Telegraph { mut reader_, .. } => reader_.close(),
+            }
         }
         self.shared.reg_.close_write_inbox_();
     }
@@ -2344,7 +2169,7 @@ where
     C: TrConnCfg,
 {
     /// 尚未处理的事件（里面可能还压着没进表的 `Attach` 半部）。
-    events: EventReceiver_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
+    events: EventReceiver_<WriteEvent_>,
 
     /// 连接共享面（上报关闭与读时钟用）。
     shared: &'a MuxShared_<C>,
@@ -2354,7 +2179,7 @@ impl<C> core::ops::Deref for MuxEventsGuard_<'_, C>
 where
     C: TrConnCfg,
 {
-    type Target = EventReceiver_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>;
+    type Target = EventReceiver_<WriteEvent_>;
 
     fn deref(&self) -> &Self::Target {
         &self.events
@@ -2375,19 +2200,10 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        // 共享面保留给后续 telegraph 失败上报；本轮 `TgAttach` 只需关闭环半部。
+        // 事件通道里只剩 `TgReady`（可重建提示）：退出时直接丢弃即可——环半部全部
+        // 走 `Attach` inbox，已由 [`MuxLocalGuard_`] 负责关闭。
         let _ = self.shared;
-        loop {
-            let event = match self.events.try_take_event_() {
-                EventTake_::Event(event) => event,
-                // Drop 阶段不再做全扫：其余半部由循环退出时的守卫统一关闭。
-                EventTake_::Rescan | EventTake_::Empty | EventTake_::Closed => break,
-            };
-            // 通道 `Attach` 已经改走 inbox；事件里只剩 telegraph 的环半部需要显式关闭。
-            if let WriteEvent_::TgAttach { mut reader_, .. } = event {
-                reader_.close();
-            }
-        }
+        while let EventTake_::Event(_) | EventTake_::Rescan = self.events.try_take_event_() {}
     }
 }
 
@@ -2501,7 +2317,7 @@ where
 pub(crate) async fn mux_loop_async_<C, K>(
     tx_stage: C::ConnTx,
     shared: MuxShared_<C>,
-    events: EventReceiver_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
+    events: EventReceiver_<WriteEvent_>,
     mut public_tx_r: BufferedRx,
     cancel: K,
 ) where
@@ -2582,7 +2398,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
 
         // 0.05 `Attach` inbox：环半部从这里进入本地写表（不再走事件通道）。
         while let Option::Some(attach) = shared.reg_().take_write_attach_() {
-            handle_write_attach_::<C>(attach, &mut *table, &shared);
+            handle_write_attach_::<C>(attach, &mut *table, &mut tg_table, &shared);
         }
 
         // 3. 公共子流优先：先把 TX ring 里的 chunk 搬进传输，再发用户数据。
@@ -2739,7 +2555,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
         //    「别的子流刚入队的事件」一直排在一个睡着的循环后面（多子流下就是死锁）；
         //    不轮询传输写半边则「腾出空间」这条唤醒会丢（下游排空方把字节搬走之后没有
         //    任何人通知复用循环，若这里不同时 park 在它上面，drain 就再也不会被触发）。
-        let mut taken: Option<WriteEvent_<crate::connection::ConnAllocCfg_<C>>> = Option::None;
+        let mut taken: Option<WriteEvent_> = Option::None;
         // `Attach` 通道的接收 future：与事件通道一样跨 poll 持有。
         let mut attach_fut = core::pin::pin!(core::future::IntoFuture::into_future(
             shared.reg_().recv_write_attach_async_()
@@ -2846,7 +2662,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
             continue;
         }
         if let Option::Some(attach) = taken_attach {
-            handle_write_attach_::<C>(attach, &mut *table, &shared);
+            handle_write_attach_::<C>(attach, &mut *table, &mut tg_table, &shared);
             continue;
         }
         if let Option::Some(event) = taken {
@@ -2894,7 +2710,7 @@ pub(crate) async fn mux_loop_async_<C, K>(
 /// 只做**事件自身**的动作（写控制帧、置 `last_ready`、telegraph 收支）：本地表的
 /// 扫描收尾已改为提示位驱动（`HINT_W_*`），因此这里不再借用写表。
 async fn handle_write_event_<C, K>(
-    event: WriteEvent_<crate::connection::ConnAllocCfg_<C>>,
+    event: WriteEvent_,
     tx_stage: &mut C::ConnTx,
     tg_table: &mut TgWriteTable_<crate::connection::ConnAllocCfg_<C>>,
     shared: &MuxShared_<C>,
@@ -2906,24 +2722,8 @@ where
     K: TrCancellationToken,
 {
     match event {
-        // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-        // telegraph（数据报）
-        // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-        WriteEvent_::TgAttach {
-            local_dock,
-            owner,
-            reader_,
-        } => {
-            tg_table.insert(
-                local_dock,
-                TgWriteEntry_ {
-                    owner_: owner,
-                    reader_,
-                },
-            );
-        }
         WriteEvent_::TgReady { local_dock } => {
-            // 只对**已在本地表**里的端点动手：`TgAttach` 可能还在队列后面（同一轮的
+            // 只对**已在本地表**里的端点动手：`TgAttach` 可能还在 inbox 里（同一轮的
             // 事件顺序由应用侧保证不了），真正的排空在主循环第 2.7 步兜底。
             let Some(entry) = tg_table.get_mut(local_dock).map(|(_, value)| value) else {
                 return Result::Ok(());
