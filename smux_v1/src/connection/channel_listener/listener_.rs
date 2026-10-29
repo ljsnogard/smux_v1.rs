@@ -6,9 +6,11 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        Dock, MuxConnection, MuxError, TrConnCfg,
+        Dock, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError, TrConnCfg,
+        TcsAbandonGuard_, Tcs_,
         channel_handle::ChannelHandle,
         owner_::LsnOwner_,
+        session_::race_cancel_,
     },
     x_deps::{abs_cancel, abs_smux, gen_mcf2}
 };
@@ -136,17 +138,48 @@ where
             Result::Err(_) => return Result::Err(ListenerError::Cancelled),
             Result::Ok(Option::None) => {}
         }
-        // 2. 有已到达的入向请求就当场取走。
-        match conn
+        // 2. 有已到达的入向请求就当场取走。**经请求队列交给 main**：身份表槽由
+        //    `main_loop` 独占写（I3），入向请求的取出会推进 `Pending → HandedOut`。
+        let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+            Result::Ok(tcs) => tcs,
+            Result::Err(_) => return Result::Err(ListenerError::Cancelled),
+        };
+        let waiter = tcs.clone();
+        // 调用方取消 / 丢弃 future 时放弃结果；main 会在 `set_` 之前检查并回滚。
+        let _abandon = TcsAbandonGuard_::new_(&waiter);
+        if conn
             .core_()
-            .take_pending_inbound_(local, cancel.child_token())
+            .control_()
+            .submit_async_(
+                MainLoopRequest_::TakeInbound {
+                    local_dock: local,
+                    reply: tcs,
+                },
+                cancel.child_token(),
+            )
             .await
+            .is_err()
         {
-            Result::Ok(Option::Some((remote, owner, msg_))) => {
+            return Result::Err(ListenerError::Cancelled);
+        }
+        let reply = race_cancel_(
+            &cancel,
+            poll_fn(|cx| waiter.poll_wait_(cx)),
+        )
+        .await;
+        match reply {
+            Option::Some(Option::Some(Result::Ok(MainLoopReply_::Inbound(
+                Option::Some((remote, owner, msg_)),
+            )))) => {
                 return Result::Ok(ChannelHandle::new_(conn, local, remote, owner, msg_));
             }
-            Result::Err(_) => return Result::Err(ListenerError::Cancelled),
-            Result::Ok(Option::None) => {}
+            // 没有待决请求：落到下面的通知槽等待。
+            Option::Some(Option::Some(Result::Ok(MainLoopReply_::Inbound(Option::None)))) => {}
+            Option::Some(Option::Some(Result::Err(MainLoopErr_::Mux(err)))) => {
+                return Result::Err(ListenerError::Mux(err));
+            }
+            // 取消 / 放弃 / 队列关闭 / 其他结果：按取消处理（调用方会重试或退出）。
+            _ => return Result::Err(ListenerError::Cancelled),
         }
         // 3. 等一条通知（新请求或连接失败），与取消令牌竞争。
         //    槽的持久位是「先通知、后等待也不丢」的保证（协议见 `sync_::NotifySlot_`）：

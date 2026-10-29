@@ -2073,6 +2073,19 @@ connection/
   4. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
      cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
 
+- 20261030-0120：**R12：`TakeInbound` / `OpenTelegraph` 请求化（T10 完成）**。
+  1. `MainLoopRequest_::TakeInbound` + `MainLoopReply_::Inbound(..)`：`income_async` 改为
+     「请求 + TCS + 无请求时等 listener 通知槽」。放弃答复时 main 在 `set_` 前检查
+     `is_abandoned_`，并用新增的 `restore_pending_inbound_` 把 `HandedOut` 与 app 侧
+     message ring 两半原样放回。
+  2. `MainLoopRequest_::OpenTelegraph` + `MainLoopReply_::Telegraph(owner)`：main 先
+     `reserve_telegraph_` 再投两条 `TgAttach`（带环半部、不可位化），最后答复。
+     `MuxShared_` 因此持一份 `w_events_` / `r_events_` 克隆（R13 建 telegraph inbox 后删）。
+  3. 删除 `MuxCore::r_events_` / `reserve_telegraph_` / `take_pending_inbound_` 转发。
+  4. **I3 达成**：API 面（`income_async` / `open_telegraph_async`）不再直接写身份表。
+  5. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2241,7 +2254,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | **完成**（R6 FIN / R7 RESET / R8 身份释放 / R9 控制帧全走 main） |
 | T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P3.3b 完成：`OPEN/ACCEPT/REJECT/CLOSE` 全部写公共 RX，直接状态推进已删 |
-| T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | P1 完成 bind/listen/reserve；P2–P3 完成控制帧组帧与建流裁决；关闭推进 / tick 待 P5 |
+| T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | **完成**：P1–P3 建流 / 控制帧；R9 tick；R10 关闭推进 + `Close` TCS；R12 入向与 telegraph。剩余是「完全同步」（仍 `await` 注册表锁 / TX 空间） |
 | T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | **完成**（R9：`TimerSignal_` 进 `ControlState_`，决策迁 `main_loop::tick_`） |
 | T5 | 删除 `ctl_`；循环数 / 取消令牌覆盖 4 个 | P1 | 完成（`loops_[3]` = main） |
 
@@ -2258,7 +2271,7 @@ value，key 与树结构保持不变。
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | P0 完成 |
-| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | 除 `TakeInbound`/`OpenTelegraph` 外完成（`Close` 见 R10）；`SendControl` 已删。队列是 `mpmc_chan`，等待者用 Arena slab |
+| T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | **完成**（`Close` R10、`TakeInbound`/`OpenTelegraph` R12；`SendControl` 已删） |
 | T11 | `MainReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | 待做 |
 
 ### D. 建流期 message ring

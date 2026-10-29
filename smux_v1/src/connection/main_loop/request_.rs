@@ -14,7 +14,7 @@ use mm_ptr::Shared;
 use crate::connection::{
     Dock, MuxError, TrConnAllocCfg,
     mux_connection::ReserveErr_,
-    owner_::{ChannelOwner_, LsnOwner_},
+    owner_::{ChannelOwner_, LsnOwner_, TgOwner_},
     pending_msg_::PendingMsgApp_,
     tcs_::Tcs_,
 };
@@ -72,6 +72,18 @@ where
         reply: Tcs_<MainLoopResult_<C>>,
     },
 
+    /// 从 listener 的入向表里取一个待决请求（`income_async` 的一步）。
+    ///
+    /// 没有待决请求时答复 `Inbound(None)`；调用方在 `LsnOwner_` 的通知槽上等下一次
+    /// 提示后重试（槽是持久位，「先通知、后等待」也不丢）。
+    TakeInbound {
+        /// 监听 dock。
+        local_dock: Dock,
+
+        /// 完成源：`Inbound(Some(..))` 表示取到一条入向请求。
+        reply: Tcs_<MainLoopResult_<C>>,
+    },
+
     /// 最终裁决：建环已完成，main 从 message ring 读载荷并组 `OPEN` / `ACCEPT`。
     Accept {
         /// 本端 dock。
@@ -111,6 +123,24 @@ where
         reply: Tcs_<MainLoopResult_<C>>,
     },
 
+    /// 开一条 telegraph 端点：登记身份并把两个环半部交给两个中心循环。
+    ///
+    /// `TgAttach` 携带环半部（不可位化），因此由 main 在登记之后**直接投递**两条
+    /// 事件；登记本身是身份表写操作，必须由 main 做（I3）。
+    OpenTelegraph {
+        /// 本端 dock（端点独占该 dock）。
+        local_dock: Dock,
+
+        /// 发送环读端（应用写、写循环读）。
+        reader_: crate::connection::ring_::BufferedRx,
+
+        /// 接收环写端（读循环写、应用读）。
+        writer_: crate::connection::ring_::BufferedTx,
+
+        /// 完成源。
+        reply: Tcs_<MainLoopResult_<C>>,
+    },
+
     /// 优雅关闭：进入「等待关闭」并交由 `main_loop` 推进，答复里给出「是否与对端收敛」。
     ///
     /// 收尾的**判定与执行**都在 main（`tick_` 的连接级关闭动作）：活跃子流归零 ⇒
@@ -132,6 +162,8 @@ where
             MainLoopRequest_::Bind { reply, .. }
             | MainLoopRequest_::Listen { reply, .. }
             | MainLoopRequest_::ReserveChannel { reply, .. }
+            | MainLoopRequest_::TakeInbound { reply, .. }
+            | MainLoopRequest_::OpenTelegraph { reply, .. }
             | MainLoopRequest_::Accept { reply, .. }
             | MainLoopRequest_::Reject { reply, .. }
             | MainLoopRequest_::Close { reply } => Option::Some(reply),
@@ -178,6 +210,13 @@ where
 
     /// 优雅关闭的答复：`true` = 与对端双向收敛；`false` = 整体超时 / 连接失败。
     Closed(bool),
+
+    /// `TakeInbound` 的答复：`Some((remote, owner, msg_))` = 取到一条待决入向请求；
+    /// `None` = 当前没有（调用方等 listener 通知槽再请求）。
+    Inbound(Option<(Dock, ChannelOwner_<C::ChanOwnerAlloc>, PendingMsgApp_)>),
+
+    /// `OpenTelegraph` 的答复：该端点的身份节点句柄。
+    Telegraph(TgOwner_<C::ChanOwnerAlloc>),
 }
 
 /// `main_loop` 的统一错误。
