@@ -43,6 +43,11 @@ where
         }
     }
 
+    /// 身份节点句柄（`TgRec_` 的位查询 / 置位用）。
+    pub(super) fn rec_(&self) -> &TgOwner_<crate::connection::ConnChanOwnerAlloc_<C>> {
+        &self.owner_
+    }
+
     /// 发送方向的长度队列（身份节点内联）。
     pub(super) fn out_(&self) -> &TgLenQueue_ {
         self.owner_.out_()

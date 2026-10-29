@@ -145,7 +145,7 @@ use crate::{
         signal_::{
             EventReceiver_, EventTake_,
             HINT_R_RELEASE, HINT_R_RX_CONSUMED, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED,
-            HINT_W_RELEASED, HINT_W_TX_READY,
+            HINT_W_RELEASED, HINT_W_TG_TX_CLOSED, HINT_W_TX_READY,
             HINT_W_RESET_ENQUEUED, ReadAttach_, ReadEvent_, TrEventReceiver_,
             WriteAttach_, WriteEvent_,
         },
@@ -2636,6 +2636,10 @@ pub(crate) async fn mux_loop_async_<C, K>(
         if hints & HINT_W_RELEASED != 0u64 {
             scan_write_released_::<C>(&mut *table);
         }
+        // 应用丢了 telegraph 的发送半边：摘掉本地 tg 表项（位化替代 `TgTxClosed` 事件）。
+        if hints & HINT_W_TG_TX_CLOSED != 0u64 {
+            scan_tg_tx_closed_::<C>(&mut tg_table);
+        }
 
         // 1. 先把**已经到达**的事件成批处理掉（非阻塞），**但批有上限**。
         //
@@ -2930,16 +2934,35 @@ where
             )
             .await;
         }
-        WriteEvent_::TgTxClosed { local_dock } => {
-            // 应用丢掉了发送半边：摘掉表项，并把身份节点里尚未送出的长度记录一并丢弃
-            // （环里那些字节已经没有提交者，留着只会让队列永远非空）。身份本身何时
-            // 释放由两个半边的守卫共同决定，与这里无关。
-            if let Option::Some(entry) = tg_table.remove(local_dock) {
-                entry.owner_.out_().clear_();
-            }
-        }
     }
     Result::Ok(())
+}
+
+/// 摘掉「应用已丢弃发送半边」的 telegraph 表项（位化后的 `TgTxClosed`）。
+///
+/// `Sender::drop` 只置 `TgRec_::tx_closed_` + raise `HINT_W_TG_TX_CLOSED`；身份本身
+/// 何时释放由两个半边的守卫共同决定，与这里无关。环里那些字节已没有提交者，
+/// 长度队列一并清掉。
+fn scan_tg_tx_closed_<C>(table: &mut TgWriteTable_<crate::connection::ConnAllocCfg_<C>>)
+where
+    C: TrConnCfg,
+{
+    // 有界循环：每次摘一个，次数不超过初始表长（B+ 树没有 `retain`）。
+    let mut remaining = table.len();
+    while remaining > 0usize {
+        remaining -= 1usize;
+        let Some(local) = table
+            .iter()
+            .find(|(_, entry)| entry.owner_.is_tx_closed_())
+            .map(|(local, _)| *local)
+        else {
+            return;
+        };
+        let Some(entry) = table.remove(local) else {
+            return;
+        };
+        entry.owner_.out_().clear_();
+    }
 }
 
 /// 把一条 telegraph 发送端点里**已提交**的报文逐条送出。

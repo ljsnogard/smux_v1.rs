@@ -1396,6 +1396,9 @@ pub(crate) struct TgRec_ {
     /// `Telegraph` 已被丢弃：main 据此释放 telegraph 身份（P4 的 Drop 位化）。
     retired_: core::sync::atomic::AtomicBool,
 
+    /// 应用丢弃了**发送半边**：写循环据此摘掉本地 tg 表项（位化替代 `TgTxClosed` 事件）。
+    tx_closed_: core::sync::atomic::AtomicBool,
+
     /// **发送**方向：已提交、待成帧发出的条目 `(目的 dock, 长度)`
     /// （应用入队、复用循环出队）。
     ///
@@ -1426,10 +1429,23 @@ impl TgRec_ {
             .load(core::sync::atomic::Ordering::Acquire)
     }
 
+    /// 标记「应用丢弃了发送半边」。
+    pub(crate) fn set_tx_closed_(&self) {
+        self.tx_closed_
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// 应用是否已丢弃发送半边。
+    pub(crate) fn is_tx_closed_(&self) -> bool {
+        self.tx_closed_
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// 空载荷（登记 telegraph 身份时建立）。
     pub(crate) fn new_() -> Self {
         TgRec_ {
             retired_: core::sync::atomic::AtomicBool::new(false),
+            tx_closed_: core::sync::atomic::AtomicBool::new(false),
             out_: TgLenQueue_::new_(),
             in_: TgLenQueue_::new_(),
         }
