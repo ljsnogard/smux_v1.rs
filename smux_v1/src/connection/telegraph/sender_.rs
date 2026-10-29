@@ -122,13 +122,12 @@ where
         // 显式关闭：`buffex` 的环半部被 drop **不会**置位关闭标记，少了这一步，正 park
         // 在该环上的复用循环永远醒不过来。
         self.ring_tx_.close();
-        let _ = self
-            .mux_conn_
+        // 位化：只置位 + raise 合并提示（写循环据此摘本地 tg 表项）。
+        self.ctx_holder_.rec_().set_tx_closed_();
+        self.mux_conn_
             .core_()
-            .w_events_()
-            .try_send_durable_event_(WriteEvent_::TgTxClosed {
-                local_dock: self.local_dock_,
-            });
+            .reg_()
+            .raise_write_hint_(crate::connection::signal_::HINT_W_TG_TX_CLOSED);
     }
 }
 
@@ -239,6 +238,9 @@ where
         .try_push_(remote_dock, pending)
         .map_err(|_| TelegraphError::OutboxFull)?;
 
+    // 唤醒复用循环：它可能正 park 在事件通道上（也可能正在排空主循环里别的端点）。
+    // 投递失败表示循环已经不在了（连接正在收尾），此时本次提交不会被搬运——但**不必**
+    // 在这里报错：接收侧的 `recv_async` / 下一次提交会经环的关闭态看到连接已收尾。
     // 唤醒复用循环：它可能正 park 在事件通道上（也可能正在排空主循环里别的端点）。
     // 投递失败表示循环已经不在了（连接正在收尾），此时本次提交不会被搬运——但**不必**
     // 在这里报错：接收侧的 `recv_async` / 下一次提交会经环的关闭态看到连接已收尾。

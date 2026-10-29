@@ -2109,6 +2109,15 @@ connection/
      或把 flush 改成非阻塞写 + 保留队头），再位化。
   4. 已回退（`Tg*` 事件保留）。当轮无代码落地，只留这条记录。
 
+- 20261030-0300：**R15：`TgTxClosed` 位化**。
+  1. `WriteEvent_::TgTxClosed` 删除，改 `HINT_W_TG_TX_CLOSED`：`TgRec_` 加
+     `tx_closed_`，`Sender::drop` 只置位 + raise，写循环扫本地 tg 表摘除并清长度队列。
+  2. `TgReady` **仍走事件通道**：位化后 `mux_telegraph_inmem_dual_` 仍挂起（见 R14
+     记录），连「排空后自保持 raise」也没解决——阻塞点不在重试次数，下一轮需要从
+     接收侧或 `TgReady` 处理路径本身定位。
+  3. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2287,7 +2296,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | P0 原语完成（`PublicChunkIo_`，未接线） |
 | T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | 完成（P3.1b：`OPEN`/`ACCEPT`/`REJECT`/`CLOSE` 全走公共子流；timer 的 `PULSE`/`CLOSE` 待 P4/P5） |
-| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：邮箱已删（R9）、`RxConsumed` / `TxReady` 已位化（R11/R13）；`WriteEvent_` 仍承载 `Tg*`，`ReadEvent_` 只剩 `TgAttach` |
+| T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | 部分：邮箱已删（R9）；`RxConsumed` / `TxReady` / `TgTxClosed` 已位化（R11/R13/R15）；`WriteEvent_` 仍承载 `TgAttach` / `TgReady`，`ReadEvent_` 只剩 `TgAttach` |
 
 ### C. 请求 / TCS
 

@@ -284,15 +284,6 @@ where
         /// 本端 dock。
         local_dock: Dock,
     },
-
-    /// 应用丢弃了 telegraph 的发送半边：复用循环摘掉本地表项。
-    ///
-    /// 接收半边是否还在与本事件无关——它只影响发送方向是否还值得排空。真的把
-    /// **接收**环写端关掉的是身份释放（[`ReadEvent_::TgRelease`]）。
-    TgTxClosed {
-        /// 本端 dock。
-        local_dock: Dock,
-    },
 }
 
 /// 送给**读循环**的事件。
@@ -343,6 +334,9 @@ pub(crate) const HINT_W_PEER_CLOSED: u64 = 1u64 << 2usize;
 /// 事实是 `ChannelState_` 的 `RELEASED` 位；本位只负责把写循环叫醒。替换了原先的
 /// 一次性 `WriteEvent_::LocalAbort`：一条子流至多释放一次，扫描是幂等的。
 pub(crate) const HINT_W_RELEASED: u64 = 1u64 << 3usize;
+
+/// 「应用丢弃了某条 telegraph 的发送半边」：写循环据此摘本地 tg 表项。
+pub(crate) const HINT_W_TG_TX_CLOSED: u64 = 1u64 << 7usize;
 
 /// 「某条子流的发送环刚有数据入队」：写循环据此回顶部做全表排空。
 ///
