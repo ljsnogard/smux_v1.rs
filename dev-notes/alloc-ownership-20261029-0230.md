@@ -358,6 +358,27 @@ P3.3c / P4 / P5 的清理依据。
    `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
    import 格式干净。
 
+## 4.13 第 14 轮记录（`Tg*` 位化尝试后回退）
+
+1. **尝试**：把 `WriteEvent_::TgReady` / `WriteEvent_::TgTxClosed` 改成
+   `HINT_W_TG_READY` / `HINT_W_TG_TX_CLOSED`（`TgRec_` 加 `tx_closed_` 位，
+   `scan_tg_tx_closed_` 扫本地 tg 表）。
+2. **结果**：`mux_telegraph_inmem_dual_` 挂起。诊断输出（`--nocapture` + 临时
+   `eprintln`）显示：应用三次 `tg_ready raise` 之后，写循环只跑了**一轮**
+   （`tg round local=7`），随后不再有 `local=11` 的轮次——即卡在
+   `flush_tg_endpoint_(7)` 内。
+3. **定位**：`flush_tg_endpoint_` → `send_one_datagram_` → `write_frame_to_stage_`
+   → `enqueue_frame_` 在传输写半边满时 **park**。旧实现里 `TgReady` 事件除了叫醒
+   写循环，还保证「应用每次提交都会再来一条唤醒」；位化后这条唤醒变成合并提示，
+   一旦写循环停在 `enqueue_frame_` 的背压上，提示位既不能打断该等待、也不会留下
+   「稍后重试」的队列元素，报文从此不动。
+4. **回退**：两处 `Tg*` 事件保留，`TgRec_` 的 `tx_closed_` 位一并撤销；工作区回到
+   R13 的状态。
+5. **下一轮的前置**：先把「写循环在 `enqueue_frame_` 背压时如何被唤醒」钉住——要么
+   给传输写半边的排空方加一条 `raise_write_hint`，要么让 tg / 数据帧的 flush 在
+   `enqueue_frame_` 前用「非阻塞写 + 保留队头」代替 park。没有这条之前，`Tg*` 位化
+   会重复出现同一挂起。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -374,6 +395,7 @@ P3.3c / P4 / P5 的清理依据。
 | R11（已完成） | `RxConsumed` 位化（`HINT_R_RX_CONSUMED`）；修 demux park 丢位；`TxReady` 位化尝试后回退 |
 | R12（已完成） | `TakeInbound` / `OpenTelegraph` 请求化；`income_async` / `open_telegraph_async` 不再直接写身份表 |
 | R13（已完成） | `TxReady` 位化（`HINT_W_TX_READY`）；`demux` 不再持写事件生产端 |
+| R14（未落地） | `Tg*` 位化尝试后回退：写循环在 `enqueue_frame_` 背压时无法被合并提示唤醒（见 §4.13） |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：

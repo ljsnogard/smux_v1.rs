@@ -2097,6 +2097,18 @@ connection/
   4. 验收：lib 367 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
      cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
 
+- 20261030-0200：**R14：`Tg*` 位化尝试后回退**。
+  1. 把 `TgReady` / `TgTxClosed` 改成 `HINT_W_TG_READY` / `HINT_W_TG_TX_CLOSED`
+     （`TgRec_` 加 `tx_closed_`）后，`mux_telegraph_inmem_dual_` 挂起。
+  2. 诊断：应用三次 `tg_ready raise` 之后写循环只跑一轮（`tg round local=7`），随后
+     无 `local=11` —— 卡在 `flush_tg_endpoint_` → `enqueue_frame_` 的**传输写半边
+     背压 park** 上。
+  3. 结论：旧 `TgReady` 事件除了唤醒，还保证「每次提交都有一条唤醒」；位化后写循环
+     一旦停在 `enqueue_frame_`，合并提示既打不断该等待、也没有「稍后重试」的队列
+     元素。**下一轮先钉住「`enqueue_frame_` 背压时的唤醒源」**（排空方 raise hint，
+     或把 flush 改成非阻塞写 + 保留队头），再位化。
+  4. 已回退（`Tg*` 事件保留）。当轮无代码落地，只留这条记录。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
