@@ -58,7 +58,7 @@ use crate::{
         owner_::ChannelOwner_,
         session_::race_cancel_,
         signal_::{
-            HINT_W_TX_CLOSED, TrEventSender_, WriteEvent_,
+            HINT_W_TX_CLOSED,
         },
     },
     flow_ctrl::Credit,
@@ -190,19 +190,14 @@ where
                 edge,
             );
             self.backlogged_ = congested;
-            let fresh = self.owner_.mark_tx_queued_();
-            if fresh {
-                let sent = self
-                    .conn_
+            // 去重位的第一置位者 raise 合并提示：写循环据此回顶部做**全表**排空。
+            if self.owner_.mark_tx_queued_() {
+                self.conn_
                     .core_()
-                    .w_events_()
-                    .try_send_event_(WriteEvent_::TxReady {
-                        local_dock: self.local_dock_,
-                        remote_dock: self.remote_dock_});
+                    .reg_()
+                    .raise_write_hint_(crate::connection::signal_::HINT_W_TX_READY);
                 #[cfg(feature = "test-loop-probe")]
-                crate::connection::loop_probe_::event_tx_ready_result_(sent);
-                #[cfg(not(feature = "test-loop-probe"))]
-                let _ = sent;
+                crate::connection::loop_probe_::event_tx_ready_result_(true);
             } else {
                 #[cfg(feature = "test-loop-probe")]
                 crate::connection::loop_probe_::event_tx_ready_dedup_();

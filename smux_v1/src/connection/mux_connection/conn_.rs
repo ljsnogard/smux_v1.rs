@@ -228,7 +228,6 @@ where
                 rx,
                 shared_.clone(),
                 r_receiver_,
-                core_.w_events_().clone(),
                 public_rx_w_,
                 core_.loop_token_(0usize),
             ),

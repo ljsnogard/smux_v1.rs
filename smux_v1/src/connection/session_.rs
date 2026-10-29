@@ -143,11 +143,11 @@ use crate::{
         public_channel_::{ChunkReadState_, ChunkWriteErr_, PublicChannel_, PublicChunkIo_},
         ring_::{BufferedRx, BufferedTx},
         signal_::{
-            EventReceiver_, EventSender_, EventTake_,
+            EventReceiver_, EventTake_,
             HINT_R_RELEASE, HINT_R_RX_CONSUMED, HINT_W_FIN_ENQUEUED, HINT_W_PEER_CLOSED,
-            HINT_W_RELEASED,
+            HINT_W_RELEASED, HINT_W_TX_READY,
             HINT_W_RESET_ENQUEUED, ReadAttach_, ReadEvent_, TrEventReceiver_,
-            TrEventSender_, WriteAttach_, WriteEvent_,
+            WriteAttach_, WriteEvent_,
         },
         telegraph::TgRecvCtx_,
     },
@@ -1279,7 +1279,6 @@ pub(crate) async fn demux_loop_async_<C, K>(
     mut rx_stage: C::ConnRx,
     shared: MuxShared_<C>,
     events: EventReceiver_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
-    events_tx: EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
     mut public_rx_w: BufferedTx,
     cancel: K,
 ) where
@@ -1788,10 +1787,7 @@ pub(crate) async fn demux_loop_async_<C, K>(
                     //
                     // 这里**不能用「已入队」去重位**：它可能正被应用上一次写入置着
                     // （额度为 0 时写循环根本没机会清它），于是这次唤醒会被静默丢掉。
-                    let _ = events_tx.try_send_event_(WriteEvent_::TxReady {
-                        local_dock: local,
-                        remote_dock: remote,
-                    });
+                    shared.reg_().raise_write_hint_(HINT_W_TX_READY);
                 } else if let Option::Some(owner) = lock_or_exit_!(shared.reg_.channel_owner_(
                     local,
                     remote,
@@ -2672,7 +2668,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &mut tg_table,
                     &shared,
                     &cancel,
-                    &mut last_ready,
                 ),
             )
             .await
@@ -2859,7 +2854,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
                     &mut tg_table,
                     &shared,
                     &cancel,
-                    &mut last_ready,
                 ),
             )
             .await
@@ -2901,7 +2895,6 @@ async fn handle_write_event_<C, K>(
     tg_table: &mut TgWriteTable_<crate::connection::ConnAllocCfg_<C>>,
     shared: &MuxShared_<C>,
     cancel: &K,
-    last_ready: &mut Option<(Dock, Dock)>,
 ) -> Result<(), MuxError>
 where
     C: TrConnCfg,
@@ -2909,12 +2902,6 @@ where
     K: TrCancellationToken,
 {
     match event {
-        WriteEvent_::TxReady {
-            local_dock,
-            remote_dock,
-        } => {
-            *last_ready = Option::Some((local_dock, remote_dock));
-        }
         // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
         // telegraph（数据报）
         // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
