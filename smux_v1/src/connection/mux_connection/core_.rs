@@ -50,10 +50,8 @@ use crate::{
         Dock, TrConnCfg,
         control_state_::ControlState_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
-        owner_::{ChannelOwner_, TgOwner_},
-        pending_msg_::PendingMsgApp_,
         scope_::close_conn_scope_,
-        signal_::{EventSender_, ReadEvent_, WriteEvent_},
+        signal_::{EventSender_, WriteEvent_},
         sync_::CancelToken_,
     },
     metrics::{ConnCloseReason, TrMetricsSink},
@@ -129,7 +127,6 @@ where
     w_events_: EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
 
     /// 读事件发送端（接收环注册与释放）。
-    r_events_: EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
 
     /// 四个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时、`3` = 控制面）。
     ///
@@ -157,7 +154,6 @@ where
         control: ControlState_<crate::connection::ConnAllocCfg_<C>>,
         epoch: <C::Rt as TrClock>::Instant,
         w_events: EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>>,
-        r_events: EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>>,
         loops: [CancelToken_<crate::connection::ConnCoreAlloc_<C>>; 4],
     ) -> Self {
         MuxCore {
@@ -166,7 +162,6 @@ where
             reg_: reg,
             control_: control,
             w_events_: w_events,
-            r_events_: r_events,
             loops_: loops}
     }
 
@@ -196,11 +191,6 @@ where
     /// 写事件发送端。
     pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<crate::connection::ConnAllocCfg_<C>>> {
         &self.w_events_
-    }
-
-    /// 读事件发送端。
-    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<crate::connection::ConnAllocCfg_<C>>> {
-        &self.r_events_
     }
 
     /// 第 `idx` 个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时）。
@@ -241,15 +231,6 @@ where
             .raise_main_hint_(crate::connection::HINT_MAIN_TIMER);
     }
 
-    /// 登记 telegraph 身份，并交出它的**身份节点句柄**。
-    pub(crate) async fn reserve_telegraph_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        cancel: K,
-    ) -> Result<TgOwner_<crate::connection::ConnChanOwnerAlloc_<C>>, ReserveErr_> {
-        self.reg_.reserve_telegraph_(local_dock, cancel).await
-    }
-
     /// 把一条已露面的子流放进拆流宽限期。
     ///
     /// 返回值同 [`MuxCore::unreserve_channel_`]。
@@ -262,15 +243,6 @@ where
         self.reg_
             .release_channel_(local_dock, remote_dock, self.now_millis_(), cancel)
             .await
-    }
-
-    /// 取走一个待决入向请求（对端 dock + 该子流的共享状态句柄）。
-    pub(crate) async fn take_pending_inbound_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        cancel: K,
-    ) -> Result<Option<(Dock, ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>, PendingMsgApp_)>, ReserveErr_> {
-        self.reg_.take_pending_inbound_(local_dock, cancel).await
     }
 
     /// 连接级失败原因（若有）。

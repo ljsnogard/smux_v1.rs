@@ -390,6 +390,8 @@ where
             channel_timeout_millis,
             public,
             metrics.clone(),
+            w_events.clone(),
+            r_events.clone(),
         );
         // 核心自持一份三个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
         // （那会阻塞，而 `Drop` 可能在任意线程上发生）。
@@ -407,7 +409,6 @@ where
                 control.clone(),
                 conn_clock.epoch_(),
                 w_events,
-                r_events,
                 loops,
             ),
             core_alloc,

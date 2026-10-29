@@ -2205,6 +2205,34 @@ where
         Result::Ok(found)
     }
 
+    /// 把 `TakeInbound` 的答复**放回**表槽（调用方已放弃该请求时用）。
+    ///
+    /// `take_pending_inbound_` 已经把状态从 `Pending` 推进到 `HandedOut` 并取走了 app
+    /// 侧 message ring 两半；若 main 在 `set_` 之前发现 `reply.is_abandoned_()`，必须
+    /// 原样放回——否则这条入向请求既不在槽里、也没人拿到，对端会一直等 `ACCEPT`。
+    pub(crate) async fn restore_pending_inbound_<K: TrCancellationToken>(
+        &self,
+        local_dock: Dock,
+        remote_dock: Dock,
+        msg_app: PendingMsgApp_,
+        cancel: K,
+    ) -> Result<(), ReserveErr_> {
+        let mut session = self.root_.inner_.acquire_session();
+        let mut guard = acquire_write_(&mut session, cancel).await?;
+        let Some(BindingSlot_::Channel(ctx)) = guard
+            .bindings_
+            .get_mut((local_dock, remote_dock))
+            .map(|(_, slot)| slot)
+        else {
+            return Result::Ok(());
+        };
+        if let Inbound_::HandedOut(report) = ctx.inbound_ {
+            ctx.inbound_ = Inbound_::Pending(report);
+            ctx.msg_app_ = Option::Some(msg_app);
+        }
+        Result::Ok(())
+    }
+
     /// `accept_async` 取走该入向请求保存的对端窗口通告（状态归为 `None`）。
     pub(crate) async fn take_inbound_report_<K: TrCancellationToken>(
         &self,

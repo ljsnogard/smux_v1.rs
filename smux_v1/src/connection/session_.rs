@@ -200,6 +200,12 @@ where
     /// 控制面共享句柄：写循环据此 raise `HINT_MAIN_*`（例如发送环已排空）。
     control_: ControlState_<C>,
 
+    /// 两条事件通道的**生产端**：`main_loop` 组完 telegraph 的建流动作后要投
+    /// `TgAttach`（带环半部、不可位化）。channel 的通知已全部位化，这两份克隆只服务
+    /// telegraph，R13 给它建 attach inbox 后即可删除。
+    w_events_: crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_<C>>,
+    r_events_: crate::connection::signal_::EventSender_<crate::connection::signal_::ReadEvent_<C>>,
+
     /// 协商出的单帧总长上限。
     max_packet_size_: usize,
 
@@ -252,6 +258,8 @@ where
         MuxLoopShared_ {
             reg_: self.reg_.clone(),
             control_: self.control_.clone(),
+            w_events_: self.w_events_.clone(),
+            r_events_: self.r_events_.clone(),
             max_packet_size_: self.max_packet_size_,
             pending_msg_cap_: self.pending_msg_cap_,
             conn_clock_: self.conn_clock_.clone(),
@@ -282,10 +290,14 @@ where
         channel_timeout_millis: u64,
         public: PublicChannel_<C>,
         metrics: M,
+        w_events: crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_<C>>,
+        r_events: crate::connection::signal_::EventSender_<crate::connection::signal_::ReadEvent_<C>>,
     ) -> Self {
         MuxLoopShared_ {
             reg_: reg,
             control_: control,
+            w_events_: w_events,
+            r_events_: r_events,
             max_packet_size_: max_packet_size,
             pending_msg_cap_: pending_msg_cap,
             conn_clock_: conn_clock,
@@ -310,6 +322,20 @@ where
     /// 控制面共享句柄（写循环据此 raise `HINT_MAIN_*`）。
     pub(crate) fn control_(&self) -> &ControlState_<C> {
         &self.control_
+    }
+
+    /// 写侧事件通道的生产端（telegraph 的 attach 投递用；R13 后删除）。
+    pub(crate) fn w_events_(
+        &self,
+    ) -> &crate::connection::signal_::EventSender_<crate::connection::signal_::WriteEvent_<C>> {
+        &self.w_events_
+    }
+
+    /// 读侧事件通道的生产端（telegraph 的 attach 投递用；R13 后删除）。
+    pub(crate) fn r_events_(
+        &self,
+    ) -> &crate::connection::signal_::EventSender_<crate::connection::signal_::ReadEvent_<C>> {
+        &self.r_events_
     }
 
     /// 连接级时钟。

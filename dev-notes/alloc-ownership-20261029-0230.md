@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -321,6 +321,27 @@ P3.3c / P4 / P5 的清理依据。
    `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
    import 格式干净。
 
+## 4.11 第 12 轮实施记录（`TakeInbound` / `OpenTelegraph` 请求化）
+
+1. **`TakeInbound` 请求**：`MainLoopRequest_::TakeInbound { local_dock, reply }` +
+   `MainLoopReply_::Inbound(Option<(Dock, owner, msg_)>)`。`income_async` 改为
+   「提交请求 + 等 TCS + 无请求时等 listener 通知槽」，不再直接调注册表。
+2. **放弃答复的回滚**：`take_pending_inbound_` 会把表槽推进到 `HandedOut` 并取走
+   app 侧 message ring 两半。`set_` 在 `Abandoned` 上会 drop 结果（那对 ring 等于丢失、
+   对端会一直等 `ACCEPT`），因此 main 在 `set_` **之前**检查 `is_abandoned_`，并新增
+   `ChannelRegistry_::restore_pending_inbound_` 把状态与两半原样放回。
+3. **`OpenTelegraph` 请求**：`MainLoopRequest_::OpenTelegraph { local_dock, reader_,
+   writer_, reply }` + `MainLoopReply_::Telegraph(owner)`。main 先 `reserve_telegraph_`
+   登记身份，再投两条 `TgAttach`（带环半部、不可位化），最后答复。
+   `MuxShared_` 因此多持一份 `w_events_` / `r_events_` 克隆（只服务 telegraph，
+   R13 给它建 attach inbox 后删除）；`MuxCore` 的 `r_events_` / `reserve_telegraph_` /
+   `take_pending_inbound_` 转发方法删除。
+4. **I3 收口**：`income_async` 与 `open_telegraph_async` 都不再直接写身份表；除循环与
+   main 之外，身份表写入口只剩 `MuxCore` 的少量转发（`release_channel_` 等）。
+5. 验收：lib **367**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+   `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
+   import 格式干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -335,6 +356,7 @@ P3.3c / P4 / P5 的清理依据。
 | R9（已完成） | timer 收缩为纯计时；`PULSE` / 空闲拆流 `FIN`+`RESET` / 建流超时 `REJECT` / `WINDOW_UPDATE` 全部由 main 写公共 TX；删会话邮箱；`mux` 不再写身份表、不再处理控制帧 |
 | R10（已完成） | `Close` 请求 + TCS（Q8：先答 TCS 再取消）；删 `wait_for_finalize_` / `ctl_.rs` / `SendControl`；T8 位化尝试后回退 |
 | R11（已完成） | `RxConsumed` 位化（`HINT_R_RX_CONSUMED`）；修 demux park 丢位；`TxReady` 位化尝试后回退 |
+| R12（已完成） | `TakeInbound` / `OpenTelegraph` 请求化；`income_async` / `open_telegraph_async` 不再直接写身份表 |
 | R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：

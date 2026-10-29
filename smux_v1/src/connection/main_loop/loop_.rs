@@ -504,6 +504,84 @@ where
             }
             let _ = reply.set_(result.map_err(MainLoopErr_::Reserve));
         }
+        MainLoopRequest_::OpenTelegraph {
+            local_dock,
+            reader_,
+            writer_,
+            reply,
+        } => {
+            // 身份登记由 main 做（I3）：`reserve_telegraph_` 产出该端点的身份句柄。
+            let owner = match shared
+                .reg_()
+                .reserve_telegraph_(local_dock, cancel.child_token())
+                .await
+            {
+                Result::Ok(owner) => owner,
+                Result::Err(err) => {
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Reserve(err)));
+                    return;
+                }
+            };
+            // `TgAttach` 携带环半部、不可位化：两条事件都由 main 投递（channel 的
+            // `Attach` 早已走 inbox）。投递失败 = 循环已退出，撤销身份。
+            let attached = shared
+                .w_events_()
+                .try_send_durable_event_(crate::connection::signal_::WriteEvent_::TgAttach {
+                    local_dock,
+                    owner: owner.clone(),
+                    reader_,
+                })
+                && shared
+                    .r_events_()
+                    .try_send_durable_event_(crate::connection::signal_::ReadEvent_::TgAttach {
+                        local_dock,
+                        owner: owner.clone(),
+                        writer_,
+                    });
+            if !attached && !cfg!(test) {
+                // 循环已不在：撤销刚登记的身份，再如实答复 Closed。
+                let _ = shared
+                    .reg_()
+                    .release_telegraph_(local_dock, NonCancellableToken::new())
+                    .await;
+                let _ = reply.set_(Result::Err(MainLoopErr_::Mux(MuxError::Closed)));
+                return;
+            }
+            let _ = reply.set_(Result::Ok(MainLoopReply_::Telegraph(owner)));
+        }
+        MainLoopRequest_::TakeInbound { local_dock, reply } => {
+            let taken = shared
+                .reg_()
+                .take_pending_inbound_(local_dock, cancel.child_token())
+                .await;
+            match taken {
+                Result::Ok(Option::Some((remote_dock, owner, msg_))) => {
+                    // 答复**之前**先判放弃：`set_` 在 `Abandoned` 上会 drop 结果，
+                    // 那对 message ring 两半来说等于丢失（对端会一直等 `ACCEPT`）。
+                    if reply.is_abandoned_() {
+                        let _ = shared
+                            .reg_()
+                            .restore_pending_inbound_(
+                                local_dock,
+                                remote_dock,
+                                msg_,
+                                NonCancellableToken::new(),
+                            )
+                            .await;
+                        return;
+                    }
+                    let _ = reply.set_(Result::Ok(MainLoopReply_::Inbound(Option::Some((
+                        remote_dock, owner, msg_,
+                    )))));
+                }
+                Result::Ok(Option::None) => {
+                    let _ = reply.set_(Result::Ok(MainLoopReply_::Inbound(Option::None)));
+                }
+                Result::Err(err) => {
+                    let _ = reply.set_(Result::Err(MainLoopErr_::Reserve(err)));
+                }
+            }
+        }
         MainLoopRequest_::Accept {
             local_dock,
             remote_dock,
