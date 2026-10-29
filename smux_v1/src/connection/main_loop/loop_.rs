@@ -6,8 +6,7 @@
 //! - **身份表写**：所有登记 / 释放都经 [`ChannelRegistry_`] 的写锁（`main_loop`
 //!   是唯一写者；`demux_loop` 后续只读）；
 //! - **过渡期的释放落实**：P1 仍让 `DockBinding` / `ChannelListener` 的 `Drop` 投
-//!   `SessionEvent_`，由本循环 `drain_session_events_` 落实；P4 改成 retired 位 +
-//!   `HINT_MAIN_RETIRED` 后删除这条过渡路径（设计稿 §6.7）。
+//!   `HINT_MAIN_RETIRED` 位，由本循环的 retired 扫描落实（设计稿 §6.7）。
 //!
 //! 公共报文子流的 RX / TX（P2）与 tick（P5）尚未接线；park 点已经按设计稿 §6.1
 //! 的形状保留「请求 / 提示 / 取消」三类唤醒源，后续加 ring 时只需再加一个 poll 分支。

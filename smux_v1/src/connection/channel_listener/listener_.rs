@@ -72,7 +72,7 @@ where
     }
 }
 
-/// 丢弃监听器即**解除 listener 身份**（投递 `SessionEvent_::ReleaseListener`，
+/// 丢弃监听器即**解除 listener 身份**（`LsnRec_` 的 retired 位 + 合并提示，
 /// 由核心落实），使同一个 `local_dock` 之后可以再作 telegraph 使用
 /// （见 `ChannelRegistry_::release_listener_`）。
 ///
@@ -85,7 +85,7 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        // P4：只置位 + raise，由 main 扫描释放（不再投 SessionMailbox_）。
+        // 只置位 + raise，由 main 的 retired 扫描释放。
         self.rec_.set_retired_();
         self.conn_
             .core_()

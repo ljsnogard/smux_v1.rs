@@ -821,9 +821,9 @@ impl TimerScan_ {
 ///
 /// # 会话释放邮箱
 ///
-/// 会话句柄的 `Drop` **不碰注册表**，只向 [`SessionMailbox_`] 投一条
-/// [`SessionEvent_`]；真正的身份表改动由核心执行者在异步上下文里 drain 后落实
-/// （[`ChannelRegistry_::drain_session_events_`]）。因此 `Drop` 既不取锁也不阻塞。
+/// 会话句柄的 `Drop` **不碰注册表**，只置身份节点上的原子位 + raise
+/// `HINT_MAIN_RETIRED`；真正的身份表改动由 `main_loop` 的 retired 扫描落实
+/// （[`ChannelRegistry_::reap_retired_`]）。因此 `Drop` 既不取锁也不阻塞。
 ///
 /// # 分配
 ///
