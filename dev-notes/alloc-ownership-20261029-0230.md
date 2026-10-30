@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）、`feat/sw-scope-r18`（R18）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除；R18 指标计数点 + 测试壳，不涉及分配归属）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -433,6 +433,27 @@ P3.3c / P4 / P5 的清理依据。
    `smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；clippy /
    import 格式干净。
 
+## 4.17 第 18 轮记录（指标计数点 + 测试壳，**不涉及分配归属**）
+
+本轮只修两个失败测试，没有改任何对象生命周期或分配器接线；记在这里是为了保持轮次
+连续，并说明两处改动为什么**不需要**新的分配归属判定：
+
+1. **控制帧写侧补报指标**：`main_loop::try_write_control_frame_` /
+   `write_control_frame_async_` 在写成功后各补两条 `shared.metrics_().on_frame(..)` /
+   `on_transport_bytes(..)`。`C::Metrics` 是编译期选定的静态分派，`DebugMetrics` 的
+   句柄只是一个 `Arc`；补报**不产生分配**，`NoMetrics` 装配下仍被单态化消除为零指令。
+2. **`thread_safety` 测试壳**：工作线程结果改用 `futures::channel::oneshot` 回传
+   （原先用阻塞 `thread::join()`，导致主线程的 `LocalSet` 停摆）。该分配落在**测试
+   进程的全局分配器**上、只存在于测试目标里，与连接级 Scope / 注入池无关；
+   `alloc_count` 的度量区间也不包含它。
+3. **跨仓库 `sw-scope` `4d624c5`**（`WeakSlot::try_sharing` 竞态：CAS 失败后观察到
+   `Created` 时重试）：不改变分配归属，只在状态检查上加一次重试，没有新增槽位或
+   强块。
+
+验收：lib **354**；`inmem_mux` **21**（compio / tokio / smol）；`keepalive_compio` 5；
+`smoke_compio` 5；`cross_thread_compio` 1；`alloc_count` 1；doc 12；
+`metrics_e2e` 1；`thread_safety` 3；clippy / import 格式干净。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -453,7 +474,8 @@ P3.3c / P4 / P5 的清理依据。
 | R15（已完成） | `TgTxClosed` 位化（`TgRec_::tx_closed_` + `scan_tg_tx_closed_`）；`TgReady` 仍走事件通道 |
 | R16（已完成） | `TgAttach` 走 attach inbox（`WriteAttach_`/`ReadAttach_` 改枚举）；删除整条读事件通道 |
 | R17（已完成） | `TgReady` 走 inbox 信号；删除 `WriteEvent_`/`ReadEvent_` 与整条事件通道；T8 完成 |
-| R10（配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R18（已完成） | 只修指标计数点与 `thread_safety` 测试壳，**不涉及分配归属**（见 §4.17） |
+| R19（待做，配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 
@@ -467,5 +489,3 @@ P3.3c / P4 / P5 的清理依据。
    改成流式读写；后者收益更大但改动面也更大。
 5. **非空 welcome**：`accept_async` 的 `welcome: &mut W`（`TrBuffWrite`）是 sink，
    不能作为本地 welcome 的源；需要决定改签名（公开 API）还是另加入口，P3.3c 再定。
-6. **事件通道**：其满时兜底可能在任意线程 `Drop` 中发生，不能 `await`；在 P5 删除前
-   不要试图把它迁入 Scope。

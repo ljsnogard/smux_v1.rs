@@ -42,11 +42,10 @@ use buffex::x_deps::abs_buff::{
     TrBuffFlush, TrBuffRead, TrBuffWrite,
     buffer::{TrProducerState, TrConsumerState},
 };
-use mm_ptr::x_deps::abs_mm::CoreAlloc;
 use smux_v1::{
     connection::{Dock, TrConnCfg},
     flow_ctrl::DefaultPolicy,
-    metrics::{DebugMetrics, TrMetricsSink},
+    metrics::{DebugMetrics, DebugSnapshot, TrMetricsSink},
     single_runtime_test_,
 };
 
@@ -77,6 +76,39 @@ const _: fn() = || {
 fn shared_sink_() -> DebugMetrics {
     static SINK: std::sync::OnceLock<DebugMetrics> = std::sync::OnceLock::new();
     SINK.get_or_init(DebugMetrics::default).clone()
+}
+
+/// 把快照渲染成「**帧种类 × 方向**」计数表，作为帧数 / 字节数断言的失败信息。
+///
+/// 只在断言失败时求值（`assert_eq!` 的格式化参数是惰性的），通过路径零成本。
+/// 这张表是定位「两侧差额来自哪一类帧」的第一手材料：R18 修复前它一眼就能看出
+/// `Open` / `Accept` / `Close` 的发送侧全为 0、接收侧非 0。
+fn kind_table_(snap: &DebugSnapshot) -> String {
+    use core::fmt::Write as _;
+
+    use smux_v1::connection::FrameKind;
+
+    let kinds = [
+        FrameKind::Open,
+        FrameKind::Accept,
+        FrameKind::Reject,
+        FrameKind::Close,
+        FrameKind::Data,
+        FrameKind::Datagram,
+        FrameKind::WindowUpdate,
+        FrameKind::Pulse,
+    ];
+    let mut out = String::from("帧种类 × 方向（发送 / 接收）：\n");
+    for kind in kinds {
+        let _ = writeln!(
+            out,
+            "  {:<13} 发送 {:>3} / 接收 {:>3}",
+            format!("{kind:?}"),
+            snap.sent_of(kind),
+            snap.recv_of(kind)
+        );
+    }
+    out
 }
 
 /// 带 metrics 的测试配置：与 `SmokeMuxConfig` 逐字同构，**只多一个 sink 字段**。
@@ -182,7 +214,19 @@ where
 ///   场景结束后丢弃两条连接（触发核心 `Drop` 里的「连接关闭」上报），最后取快照。
 /// - 判断：连接数 2、子流数 2（两侧各一条）、四类帧计数与字节数非零、
 ///   `frame_errors` 为零、连接级原始字节非零、`conns_closed` 为 2；且发送侧
-///   帧字节数不小于两侧各 4 字节的载荷（帧总长含帧头，故用下界断言）。
+///   帧字节数不小于两侧各 4 字节的载荷（帧总长含帧头，故用下界断言）；
+///   另外**发送与接收的帧条数、帧总字节数必须逐项相等**——该断言覆盖全部帧种类
+///   （含控制帧），失败时打印「帧种类 × 方向」表。
+///
+/// Test goal: after one child stream's full lifecycle, every counter really fires.
+/// Method: build two in-memory rings, create two connections via `connect_pair_`
+/// with a process-shared `DebugMetrics` sink, then bind / open / accept / exchange
+/// 4-byte payloads in both directions and half-close; drop both connections to
+/// trigger the core `Drop` close report, then take a snapshot.
+/// Assertion: 2 connections, 2 channels, non-zero frame/byte counters, zero frame
+/// errors, non-zero transport bytes, and **sent vs received frame counts and total
+/// frame bytes must match exactly for all frame kinds** (control frames included);
+/// failures render a kind × direction table.
 async fn metrics_reports_lifecycle_() {
     let (a_tx, b_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
     let (b_tx, a_rx) = make_passive_ring_(K_NET_BUFFER_SIZE);
@@ -315,16 +359,30 @@ async fn metrics_reports_lifecycle_() {
     );
     // **口径断言**：同一批帧在两个方向的线上总长必须逐字节相等。它把「读侧帧头长度」
     // 钉死——读侧若只填载荷长度（曾经如此），这里必然不相等。
+    //
+    // 本断言曾在 R18 前失败（发送 24 / 接收 84）：**写侧只报 Data / Datagram，控制帧
+    // （OPEN / ACCEPT / CLOSE / PULSE / WINDOW_UPDATE）完全没报**，而读侧逐帧必报，
+    // 于是接收侧多出全部控制帧。修法是在控制帧的两个写点（`main_loop` 的
+    // `try_write_control_frame_` / `write_control_frame_async_`）写成功之后补报，
+    // 而不是放宽本断言；`sink_.rs` 的 `on_frame` 文档早已把「两侧口径一致、同一批帧
+    // 字节数之和相等」写成契约，漏报属于实现缺口。下方失败信息会打印「帧种类 × 方向」
+    // 表，便于再次定位是哪一类帧对不上。
     assert_eq!(
-        snap.frame_bytes_sent, snap.frame_bytes_recv,
-        "同批帧的发送总长与接收总长必须相等：发送 {} / 接收 {}",
-        snap.frame_bytes_sent, snap.frame_bytes_recv
+        snap.frame_bytes_sent,
+        snap.frame_bytes_recv,
+        "同批帧的发送总长与接收总长必须相等：发送 {} / 接收 {}\n{}",
+        snap.frame_bytes_sent,
+        snap.frame_bytes_recv,
+        kind_table_(&snap)
     );
     // 分桶也要对齐：两侧的帧种类与条数完全一致。
     assert_eq!(
-        snap.frames_sent, snap.frames_recv,
-        "同批帧的收发条数必须相等：发送 {} / 接收 {}",
-        snap.frames_sent, snap.frames_recv
+        snap.frames_sent,
+        snap.frames_recv,
+        "同批帧的收发条数必须相等：发送 {} / 接收 {}\n{}",
+        snap.frames_sent,
+        snap.frames_recv,
+        kind_table_(&snap)
     );
     assert_eq!(
         snap.frame_errors, 0u64,

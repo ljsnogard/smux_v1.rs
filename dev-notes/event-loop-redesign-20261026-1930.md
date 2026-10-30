@@ -2145,6 +2145,36 @@ connection/
   5. 验收：lib 354 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
      cross_thread 1 / `alloc_count` 1 / doc 12；clippy 干净。
 
+- 20261030-2130：**R18：修好 `metrics_e2e` 与 `thread_safety`（都只动测试壳 / 计数点，
+  不动协议与锁模型）**。
+  1. `metrics_e2e`（发送 24 / 接收 84）：按「帧种类 × 方向」定位，差额**全部来自控制帧**
+     ——写侧只报 `Data` / `Datagram`，`Open` / `Accept` / `Close` 只在读侧计入。修法是在
+     `main_loop` 的两个控制帧写点（`try_write_control_frame_` /
+     `write_control_frame_async_`）**写成功之后**补报 `on_frame(Send, ..)` 与
+     `on_transport_bytes(Send, ..)`，不放宽断言；`src/metrics/mod.rs` 新增 §5.1 计数点表。
+     修复后 2 条 `Data` + 6 条控制帧在两方向逐条、逐字节相等。
+  2. `thread_safety`（三例 >60 s 无结果）：根因是**测试壳没有宿主**——旧写法先
+     `block_on(run_until(connect_pair_))` 建连，`block_on` 返回后本地队列没人驱动，
+     工作线程的 `bind_async` 永远等不到 `main_loop`。把整段场景移进
+     `block_on(scope.run_until(..))`，并用 `futures::channel::oneshot` 取代阻塞
+     `thread::join()` 后，三例 0.11 s 通过。工作线程的 `block_on` **保留**：它是
+     「句柄可跨线程 + 各自运行时」的被测对象本身。
+  3. §19 的 T2/T6/T7/T11/T16/T24/T25/T26/T27/T29/T30 按实测状态校准；
+     `dev-notes/README.md` 索引同步。
+  4. **跨仓库依赖：`sw-scope` `4d624c5`**。壳修好、`LocalSet` 真正驱动起来之后，
+     跨线程并发访问 `Tcs_` 暴露了 `sw-scope::WeakSlot::try_sharing` 的竞态：
+     `Created -> Sharing` 的 CAS 失败后读 `data_state()` 不是原子的，若另一线程在这
+     两步之间把**最后一个** `Sharing` 放回 `Created`，升级会被误报为
+     `Err(Created)`；`Tcs_::is_abandoned_` 把它当成「等待方已放弃」，于是 `main_loop`
+     对仍在等待的 `bind` 回 `Cancelled`（实测 `[Bound, Other(Cancelled)]`，约 1/3
+     概率）。修法是在观察到 `Created` 时重试（它正是升级的成功前提），并补回归用例
+     `scope_::tests_::try_sharing_survives_concurrent_last_drop_`（旧实现 10/10
+     失败、修复后通过）。该修补在 sw-scope 仓库**单独提交**，不属于本仓的公开 API
+     或协议变更；smux_v1 只按 path 依赖使用它。
+  5. 验收：lib 354 / inmem 21（compio / tokio / smol）/ keepalive 5 / smoke 5 /
+     cross_thread 1 / `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3
+     （后者连跑 20 次全过）；`sw-scope` 全量 65 + 3 + 3；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2306,13 +2336,18 @@ value，key 与树结构保持不变。
 
 > 状态：`设计已定` = 本文已给出形状；`待做` = 实施项；`待拍板` = 依赖 Q 项。
 > 阶段对应 §13；索引项见 §18。
+>
+> **本表状态截至 R18（2026-10-30，`feat/sw-scope`）**：T1–T20、T22–T24 已完成 / 已达成，
+> T26 已有且 R18 修好 `metrics_e2e` / `thread_safety`；剩余为 T3 的「main 完全同步」、
+> T21（`reusable_docks_`）、T25（inbox 等价单测）、T27（`Drop` 路径与 chunk 数）、
+> T28（超时脚本）、T30（本仓无 CHANGELOG）。
 
 ### A. 循环与职责
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
 | T1 | `mux_loop` 只搬数据 + 先搬公共 chunk + 置 `TX_DRAINED`；不再组控制帧 / 发 FIN / 写身份表 | P2/P4 | **完成**（R6 FIN / R7 RESET / R8 身份释放 / R9 控制帧全走 main） |
-| T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | P3.3b 完成：`OPEN/ACCEPT/REJECT/CLOSE` 全部写公共 RX，直接状态推进已删 |
+| T2 | `demux_loop` 只搬数据 + 帧级/路由级合法性初审 + 写公共 RX；不再做协议决策 | P2/P4 | **已达成**（R16/R17 后两条事件通道已删：只读帧 + 帧级/路由级初审 + 写公共 RX / attach inbox + 置合并提示位） |
 | T3 | `main_loop` 接管身份表写、请求处理、控制帧组帧、关闭推进、TCS 答复 | P1/P3 | **完成**：P1–P3 建流 / 控制帧；R9 tick；R10 关闭推进 + `Close` TCS；R12 入向与 telegraph。剩余是「完全同步」（仍 `await` 注册表锁 / TX 空间） |
 | T4 | `timer_loop` 收缩为计时服务；main 收 `HINT_MAIN_TIMER` 做 tick | P1/P5 | **完成**（R9：`TimerSignal_` 进 `ControlState_`，决策迁 `main_loop::tick_`） |
 | T5 | 删除 `ctl_`；循环数 / 取消令牌覆盖 4 个 | P1 | 完成（`loops_[3]` = main） |
@@ -2321,8 +2356,8 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | P0 原语完成（`PublicChunkIo_`，未接线） |
-| T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | 完成（P3.1b：`OPEN`/`ACCEPT`/`REJECT`/`CLOSE` 全走公共子流；timer 的 `PULSE`/`CLOSE` 待 P4/P5） |
+| T6 | 公共 TX/RX 两条普通 ring + `[u16 len][frame]` chunked 协议 | P2 | **已接线**（R6/R7/R9 起一切控制帧都走公共 TX；`PublicChunkIo_` 承担 `[u16 len][frame]` 编解码与公共 RX/TX 搬运） |
+| T7 | `mux_loop` 优先搬公共 chunk；`demux_loop` 控制帧写公共 RX；背压不丢帧 | P2 | **完成**（P3.1b 起全部帧种类走公共子流；R9 后 `PULSE` / 定时 `CLOSE` 也由 main 组帧写公共 TX，背压时留在 `MainTickState_` 下一轮补写） |
 | T8 | 删除 `WriteEvent_` / `ReadEvent_` / `Overflow_` / `SessionMailbox_` | P5 | **完成**（R9 邮箱、R11/R13/R15 位化、R16 `TgAttach` inbox、R17 `TgReady` inbox + 整条通道删除） |
 
 ### C. 请求 / TCS
@@ -2331,13 +2366,13 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T9 | `Tcs_`（Shared/Box，完成源）+ 取消 / abandon 语义 | P0/P1 | P0 完成 |
 | T10 | `MainRequest_` 定容队列 + `WakerSlots_` 背压；`Bind` / `Listen` / `TakeInbound` / `Reserve` / `Accept` / `Reject` / `Close` / `OpenTelegraph` | P1 | **完成**（`Close` R10、`TakeInbound`/`OpenTelegraph` R12；`SendControl` 已删） |
-| T11 | `MainReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | 待做 |
+| T11 | `MainLoopReply_` 统一结果；`Channel` / `Inbound` 携带 app 侧 message ring | P1/P3 | **完成**（`Dock` / `Channel` / `Listener` / `Unit` / `Closed` / `Inbound` / `Telegraph` 齐全，见 `main_loop/request_.rs:182`） |
 
 ### D. 建流期 message ring
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | P3.1a 完成（登记 / 取出 / 句柄持有）；main 读 ring 组帧待 P3.1b |
+| T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | **完成**（P3.1a 登记 / 取出 / 句柄持有；P3.3b 起 main 从 ring 读出载荷组帧） |
 | T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 完成（默认实现 + 建连快照） |
 | T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | P3.3b 完成：三类载荷都经 message ring；main 写 incoming 供 `read_message_async` 读 |
 | T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | API + streaming 读取 + incoming 填充完成；`OPEN` message 集成用例已加；非空 welcome / `MessageTooLong` 错误面待 P3.3c |
@@ -2346,7 +2381,7 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T16 | `dock_index_` 适配层：degree 16、allocator、comparer、树类型别名 | P1.5 | 2 KiB chunk 配置完成；类型别名待 P1.5 |
+| T16 | `dock_index_` 适配层：degree 16、allocator、comparer、树类型别名 | P1.5 | **完成**（degree 16 + 2 KiB chunk；`DockBPlusTree_` / `DockSet_` 类型别名在 `dock_index_.rs:25`） |
 | T17 | `bindings_` / `docks_` / `remote_index_` / `wait_close_expiry_` 换 arena 树 | P1.5 | 完成（P4；上游 `d65e5ec` 补 `Send`/`Sync` 后四表全部迁移） |
 | T18 | `DockCtx_` 只加 `unbind_requested`；`range` / `range_mut` / `remote_index_.range` 直接替换；`docks_` 的 entry helper | P1.5 | 完成（P4：`DockCtx_` 内嵌 `Shared<AtomicBool>`，`unbind_requested_` 由 `reap_retired_` 落实） |
 | T19 | `take_pending_inbound` 改用 `bindings_.range_mut`；不引入侵入链表 | P1.5 | 完成（P3.1a；`bindings_` 已是 2 KiB B+ 树） |
@@ -2359,20 +2394,20 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 已删（R5）；`TX_DRAINED` + main FIN 已接（R6） |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` 已删（R2，改独立切片）；`util_` 已改有界切片（R3） |
-| T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | 部分：`session_` 已无控制帧构造 / 无邮箱 drain；`signal_` 的 `SessionEvent_`/`SessionMailbox_`/`MailboxOverflow_`/`Control` 已删（R9）；`ctl_.rs` 已删（R10）；剩余事件通道待 T8 |
+| T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | **基本完成**（事件通道 / 会话邮箱 / `ctl_.rs` 全删；`signal_.rs` 只剩 attach inbox + 合并提示位 + `ControlFrame_`；剩余是若干注释与 probe 命名，见 `handoff-20261030-0315.md` §5.2） |
 
 ### G. 测试与验收
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T25 | 单元：PublicChunk、TCS、PendingMsg、WakerSlots、TimerSignal、树等价 / range 边界 / unbind 标志 | P0/P1.5 | 待做 |
-| T26 | 集成：三后端 `inmem` / `smoke` / `cross_thread` / `keepalive` | P2–P6 | 待做 |
-| T27 | 分配：数据面稳态 0 分配、Drop 0 分配；chunk 数 / 长 churn 碎片对比 | P4/P6 | 待做 |
+| T25 | 单元：PublicChunk、TCS、PendingMsg、inbox 等价语义、TimerSignal、树等价 / range 边界 / unbind 标志 | P0/P1.5 | 大部分已有（`public_channel_::tests_` / `tcs_::tests_` / `pending_msg_` / `timer_` / `dock_index_::tests_` / `main_loop::tests_`）；`WakerSlots_` 已删、其测试随之消失；R17 删掉 13 个只测事件通道的单测，**inbox 等价语义单测仍缺**（FIFO / 关闭 / 背压 / `TgReady` 丢失后的重建） |
+| T26 | 集成：三后端 `inmem` / `smoke` / `cross_thread` / `keepalive` | P2–P6 | **已有**（`inmem` 21×3、`smoke` 5×3、`cross_thread` 1×3、`keepalive` 5；`metrics_e2e` 与 `thread_safety` 于 R18 修好） |
+| T27 | 分配：数据面稳态 0 分配、Drop 0 分配；chunk 数 / 长 churn 碎片对比 | P4/P6 | `alloc_count` 覆盖绑定+监听、建流、稳态、拆流四段；**缺** `Drop` 路径断言与 chunk 数 / 长 churn 对比 |
 | T28 | 超时：单测 ≤60 s、全量 ≤5 min；背压用例看门狗 | 全程 | 待做 |
 
 ### H. 公开 API / 决策
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T29 | 确认 Q1–Q16（OPEN 时机、message 容量、`read_message_async`、错误变体、range/Comparer、`TreeError`、degree） | 实施前 | 待拍板 |
-| T30 | 更新 CHANGELOG / README / dev-notes 状态；清理删除文档索引 | 收尾 | 待做 |
+| T29 | 确认 Q1–Q16（OPEN 时机、message 容量、`read_message_async`、错误变体、range/Comparer、`TreeError`、degree） | 实施前 | **已确认**：Q1–Q16 均按推荐值采纳（实施记录见 §17；Q8 的「先答 TCS 再取消」见 R10） |
+| T30 | 更新 CHANGELOG / README / dev-notes 状态；清理删除文档索引 | 收尾 | dev-notes 与 `dev-notes/README.md` 索引于 R18 同步；本仓无 CHANGELOG |

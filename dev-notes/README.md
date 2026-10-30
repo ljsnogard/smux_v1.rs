@@ -16,8 +16,8 @@
 
 | 文档 | 状态 | 一句话 |
 | --- | --- | --- |
-| `handoff-20261030-0315.md` | **现行（交接文档）** | P5 收口后的进度、两个失败测试（`metrics_e2e` 24/84、`thread_safety` 三例挂起）的实测与下一步、§19 任务表的实际差额、死代码与待拍板项；末尾带下一会话提示词 |
-| `event-loop-redesign-20261026-1930.md` | **设计稿（已评审；P0–P5 完成：R17 事件通道与邮箱全删、timer 只计时、mux 只搬数据；剩余 T3 的「main 全同步」、T21、T25–T30）** | 三业务循环 + 计时服务 + 公共报文子流（ring + chunked）+ 建流期 message ring + arena 索引（bplus_tree_cmp）+ 请求通道 + TCS |
+| `handoff-20261030-0315.md` | **现行（交接文档；R18 已修好两个失败测试）** | P5 收口后的进度、两个失败测试的实测与根因（`metrics_e2e` 是控制帧写侧漏报、`thread_safety` 是测试壳没有宿主）、§19 任务表的实际差额、死代码与待拍板项；末尾带下一会话提示词 |
+| `event-loop-redesign-20261026-1930.md` | **设计稿（已评审；P0–P5 完成，R18 已按实测校准 §19：T1–T20 / T22–T24 / T26 / T29 完成，剩 T3 的「main 完全同步」、T21、T25 的 inbox 单测、T27、T28、T30）** | 三业务循环 + 计时服务 + 公共报文子流（ring + chunked）+ 建流期 message ring + arena 索引（bplus_tree_cmp）+ 请求通道 + TCS |
 | `sw-scope-20261028-2130.md` | **现行（保守方案 + crate 级 `RootScope` 已实施）** | sw-scope 原理、`TrConnAllocCfg` 逐项可行性判定；`TcsAlloc` / `ScratchAlloc` 迁入连接级 Scope，删除 `EventAlloc`；crate 级 `RootScope` 显式发布 |
 | `alloc-ownership-20261029-0230.md` | **现行（R1：Scope 基座；R2：建流期 message；R3：open/reject + tg_live；R4：retired 列表；R5：删除 PendingFin；R6：main 发 FIN；R7：main 发 RESET）** | 按对象真实生命周期重分 Global / 专用池 / Scope；每循环 `LoopScope_` 基座落地（一次性 scratch 暂留连接级）；R2 清 main message 与 `ControlFrame_.payload_`；R3 清 open/reject 与 demux；R4 清 retired 扫描列表；R5 删除 `PendingFin_`；R6 增加 `TX_DRAINED` / `FIN_ENQUEUED`，main 发 FIN；R7 把 RESET 也迁到 main（`RESET_ENQUEUED`）；后续 T1 尾 / P5 的清理表 |
 | `connection-delivery-20261026-1845.md` | **现行** | 从 socket 收到什么帧、交给哪些对象、当前用什么队列/槽交付；含重复路径与待决问题 |

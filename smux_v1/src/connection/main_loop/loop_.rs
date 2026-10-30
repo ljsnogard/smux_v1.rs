@@ -43,7 +43,7 @@ use crate::{
         timer_::{K_TIMER_ACTION_BATCH, TimerAction_},
     },
     flow_ctrl::{RecvTotal, WindowReport},
-    metrics::{ChannelCloseReason, TrMetricsSink},
+    metrics::{ChannelCloseReason, FrameDir, TrMetricsSink},
     x_deps::{abs_cancel, abs_smux},
 };
 
@@ -1556,6 +1556,21 @@ where
     ) {
         Result::Ok(()) => {
             shared.public_().notify_tx_ready_();
+            // 帧已整条进入公共 TX ring：在**写成功之后**上报，口径与数据帧 / 数据报
+            // 完全一致（帧头实际编码长度 + 载荷长度；本函数无载荷）。
+            // 控制帧的写点只有本函数与 [`write_control_frame_async_`]；两处都报，
+            // 才能让「发送总长 == 接收总长」这条契约覆盖全部帧种类。
+            shared.metrics_().on_frame(
+                FrameDir::Send,
+                frame.local_dock_(),
+                frame.remote_dock_(),
+                frame.kind_(),
+                u32::try_from(head_len).unwrap_or(u32::MAX),
+            );
+            shared.metrics_().on_transport_bytes(
+                FrameDir::Send,
+                u64::try_from(head_len).unwrap_or(u64::MAX),
+            );
             Result::Ok(true)
         }
         Result::Err(ChunkWriteErr_::WouldBlock) => Result::Ok(false),
@@ -1666,6 +1681,21 @@ where
         ) {
             Result::Ok(()) => {
                 shared.public_().notify_tx_ready_();
+                // 与 [`try_write_control_frame_`] 同口径：整帧写出后立即上报。
+                // 这里带载荷（`OPEN` / `ACCEPT` / `REJECT` 的 message / welcome /
+                // reason），因此帧总长是帧头实际长度 + 载荷长度。
+                let wire_len = head_len.saturating_add(payload.len());
+                shared.metrics_().on_frame(
+                    FrameDir::Send,
+                    frame.local_dock_(),
+                    frame.remote_dock_(),
+                    frame.kind_(),
+                    u32::try_from(wire_len).unwrap_or(u32::MAX),
+                );
+                shared.metrics_().on_transport_bytes(
+                    FrameDir::Send,
+                    u64::try_from(wire_len).unwrap_or(u64::MAX),
+                );
                 return Result::Ok(());
             }
             Result::Err(ChunkWriteErr_::WouldBlock) => {
