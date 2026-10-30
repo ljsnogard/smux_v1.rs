@@ -34,11 +34,11 @@ mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2
 # - `chan-flume` feature：切回旧的 `flume` 实现，用于 A/B 对比。
 # 上游包名已从 `mpmc-chan` 改为 `mpmc_chan`（c03d41c），依赖键与包名一致，
 # 因此不再写 `package = "mpmc-chan"`；源码里的 `mpmc_chan::...` 不受影响。
-mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs", optional = true }
+mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs" }
 sw-scope = { path = "../../sw-scope" }
 
 crc = { version = "3.4.*" }
-flume = { version = "0.12.*", optional = true }
+# flume = { version = "0.12.*", optional = true }
 thiserror = { version = "2.0.*", default-features = false }
 
 [features]
@@ -52,18 +52,18 @@ thiserror = { version = "2.0.*", default-features = false }
 # 注意：门面的缺省 `rt-compio` 始终在线（本 crate 依赖它也带默认），因此非缺省装配下
 # compio 仍会被链接——这是"可选优化"而非"正确性要求"，想省掉可在决定点写
 # `default-features = false`。
-test-tokio-runtime = ["chan-mpmc", "abs_art-facade/rt-tokio", "test-mock-clock", "test-loop-probe"]
+test-tokio-runtime = ["abs_art-facade/rt-tokio", "test-mock-clock", "test-loop-probe"]
 # compio 侧：缺省的默认后端（`default = ["test-compio-runtime"]`）。共享文件按
 # 「tokio / smol feature 是否打开」分派设备类型，因此 `cargo test --all-targets`
 # 不带任何参数跑的就是这一格。
-test-compio-runtime = ["chan-mpmc", "abs_art-facade/rt-compio", "test-mock-clock", "test-loop-probe"]
+test-compio-runtime = ["abs_art-facade/rt-compio", "test-mock-clock", "test-loop-probe"]
 # smol 侧：与上面两个 feature 构成**互斥三选一**（共享文件按「smol feature 是否打开」
 # 分派设备类型与传输装配）。
 #
 # 与 tokio 的差别只在「谁驱动本地队列」：smol 没有隐式运行时上下文，作用域是本线程
 # `thread_local!` 里的 `Rc<LocalExecutor<'static>>`，因此测试壳用
 # `smol::block_on(scope.run_until(..))` 驱动（见 `tests/smoke_smol.rs`）。
-test-smol-runtime = ["chan-mpmc", "abs_art-facade/rt-smol", "test-mock-clock", "test-loop-probe"]
+test-smol-runtime = ["abs_art-facade/rt-smol", "test-mock-clock", "test-loop-probe"]
 # 虚拟时钟（`abs_art_mock_clock`）只在这些测试 feature 下被拉进来。
 test-mock-clock = ["dep:abs_art-mock_clock", "abs_art-facade/mock-clock"]
 # 循环活动探针（诊断挂起类问题）：给连接加一个只增的「解复用循环跑了几轮」计数，
@@ -89,9 +89,9 @@ metrics = []
 #
 # `chan-flume` 同时启用 `chan-mpmc`：请求队列与两条 `Attach` inbox 已固定用
 # `mpmc_chan`（等待者是 Arena slab，不再有 flume 版本），A/B 开关只影响事件通道。
-chan-mpmc = ["dep:mpmc_chan"]
-chan-flume = ["dep:flume", "chan-mpmc"]
-default = ["test-compio-runtime", "chan-mpmc"]
+# chan-mpmc = ["dep:mpmc_chan"]
+# chan-flume = ["dep:flume", "chan-mpmc"]
+default = ["test-compio-runtime"]
 
 [dev-dependencies]
 # 测试在 compio 上运行（目标 3），因此内存分配器只在 dev-dependencies 中出现
