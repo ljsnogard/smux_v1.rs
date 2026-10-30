@@ -546,8 +546,7 @@ where
         let listener = &mut listeners_b[index];
         let (opened, accepted) = join!(
             async {
-                let mut welcome: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome[..];
+                let mut welcome: &[u8] = &[];
                 handle
                     .accept_async_closure(&mut welcome, || {
                         let make = || {
@@ -562,8 +561,7 @@ where
                     .income_async()
                     .await
                     .expect("B 侧应当取到入向请求");
-                let mut welcome: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome[..];
+                let mut welcome: &[u8] = &[];
                 incoming
                     .accept_async_closure(&mut welcome, || {
                         let make = || {

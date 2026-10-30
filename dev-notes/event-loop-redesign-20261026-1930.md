@@ -2209,6 +2209,31 @@ connection/
      / keepalive 5 / smoke 5 / cross_thread 1 / `alloc_count` 1 / doc 12 / `metrics_e2e` 1 /
      `thread_safety` 3；`just all` 全绿；clippy 干净。
 
+- 20261031-0330：**R21：建流期 message 改为 chunked 格式 + 非空 welcome（T15 / P3.3c 的一半）**。
+  1. **线上格式**：`OPEN` message / `ACCEPT` welcome / `REJECT` reason 从单块
+     `[u16 len][content]` 改为 `*chunk + 0x0000`（2 字节大端长度 + 内容，`0x0000`
+     终止），与 MPTP 的分块体同形。内容由调用方解释，smux 只负责切块与重组：
+     `PublicChunkIo_` 新增 `framed_message_len_` / `try_write_chunked_message_` /
+     `try_write_raw_` / `try_read_available_into_`；message ring 容量 =
+     `framed_message_len_(cap)`。`read_message_async` 逐块读到终止块，把内容重组进
+     sink 并返回内容总字节数。
+  2. **welcome 签名**：`TrChannelHandle::accept_async` 的 `welcome` 从
+     `&mut W: TrBuffWrite` 改为 `&mut R: TrBuffRead`（用户拍板）。smux_v1 的响应方从
+     该源读出 welcome、写进 message ring；发起方的 welcome 无意义，仍忽略。
+     `mptp_smux` 的两处调用改为传空读源。
+  3. **空 message**：合法编码是 `0x0000`（2 字节）；响应方握手用的 `OPEN` 仍是 0 字节
+     载荷，接收侧跳过它（否则会占掉 incoming ring 里真正的 welcome）。
+  4. **测试**：`pending_msg_` 单测覆盖单块 / 空 / 多块（> `u16::MAX`）/ 超长 / main
+     原样搬运；`mux_message_inmem_dual_` 改为「非空 OPEN message + 非空 welcome」端到端；
+     `mptp_cs_smoke` 的 compio + UDS demo 仍跑通 11 条 RPC。
+  5. 顺带清理 R20 遗留：删除 `ChannelState_::send_available_try_` 与
+     `SendWindow::available_try_`（原 `last_ready_has_segment_` 的底层，已无调用者）。
+  6. **未做**：跨帧流（真正解除长度上限）与 `MessageTooLong` 错误面；message 总长仍受
+     `max_packet_size` 与 `pending_msg_capacity` 约束，只是线上格式统一成了 chunked。
+  7. 验收：lib **366** / inmem 21×3 / keepalive 5 / smoke 5 / cross_thread 1 /
+     `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3；`mptp_cs_smoke`
+     check 零警告、3 个测试、demo 11 条 RPC 跑通；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2371,11 +2396,11 @@ value，key 与树结构保持不变。
 > 状态：`设计已定` = 本文已给出形状；`待做` = 实施项；`待拍板` = 依赖 Q 项。
 > 阶段对应 §13；索引项见 §18。
 >
-> **本表状态截至 R20（2026-10-31，`feat/sw-scope`）**：T1–T20、T22–T24 已完成 / 已达成，
-> T26 已有且 R18 修好 `metrics_e2e` / `thread_safety`，T25 的 inbox 单测与 T28 的超时
-> 批次于 R19 落地，R20 删除 `last_ready` 死判据；剩余为 T3 的「main 完全同步」、
-> T21（`reusable_docks_`）、T24 尾的 probe 命名、T27（连接级 `Drop` 路径与 chunk 数）、
-> T30（本仓无 CHANGELOG）。
+> **本表状态截至 R21（2026-10-31，`feat/sw-scope`）**：T1–T20、T22–T24 已完成 / 已达成，
+> T26 已有，R18 修好 `metrics_e2e` / `thread_safety`，R19 补 inbox 单测与超时批次，
+> R20 删 `last_ready` 死判据，R21 把建流期 message 改为 chunked 并支持非空 welcome；
+> 剩余为 T3 的「main 完全同步」、T21（`reusable_docks_`）、T24 尾的 probe 命名、
+> T15 的 `MessageTooLong` / 跨帧流、T27（连接级 `Drop` 路径与 chunk 数）、T30（本仓无 CHANGELOG）。
 
 ### A. 循环与职责
 
@@ -2410,7 +2435,7 @@ value，key 与树结构保持不变。
 | T12 | 每个 pending channel 一对 ring；app/main 两半分持；Listener 每入向请求一对 | P3 | **完成**（P3.1a 登记 / 取出 / 句柄持有；P3.3b 起 main 从 ring 读出载荷组帧） |
 | T13 | `TrConnCfg::pending_msg_capacity` / `pending_msg_allocator`（默认 512 / `Self::Alloc`） | P3 | 完成（默认实现 + 建连快照） |
 | T14 | `open` message / `accept` welcome / `reject` reason 走 ring；删除 `CtrlCell_` / `message_` / `read_available_into_vec_` | P3 | P3.3b 完成：三类载荷都经 message ring；main 写 incoming 供 `read_message_async` 读 |
-| T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | API + streaming 读取 + incoming 填充完成；`OPEN` message 集成用例已加；非空 welcome / `MessageTooLong` 错误面待 P3.3c |
+| T15 | `read_message_async`（abs_smux 公开 API）；超长 message 策略 | P3 | API + 分块流式读取完成；R21 起 message/welcome/reason 走 chunked 格式，`accept_async` 的 welcome 改为读源、**非空 welcome 已通**；剩余 `MessageTooLong` 错误面与跨帧流（解除长度上限） |
 
 ### E. 索引（bplus_tree_cmp）
 

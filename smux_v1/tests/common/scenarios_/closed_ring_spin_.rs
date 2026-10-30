@@ -183,8 +183,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
     // （它同时就是 B 向 A 通告的接收窗口）。
     let (opened_p, accepted_p) = join!(
         async {
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             handle_p.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_RING), crate::common::make_channel_buff_with_(K_RING))).await
         },
         async {
@@ -192,15 +191,13 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到 P 的入向请求");
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             incoming.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_WINDOW), crate::common::make_channel_buff_with_(K_WINDOW))).await
         },
     );
     let (opened_q, accepted_q) = join!(
         async {
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             handle_q.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_RING), crate::common::make_channel_buff_with_(K_RING))).await
         },
         async {
@@ -208,8 +205,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到 Q 的入向请求");
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             incoming.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_WINDOW), crate::common::make_channel_buff_with_(K_WINDOW))).await
         },
     );

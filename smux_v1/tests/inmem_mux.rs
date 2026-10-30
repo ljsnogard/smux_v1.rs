@@ -118,21 +118,21 @@ async fn mux_small_inmem_dual_() {
 }
 single_runtime_test_!(mux_small_inmem_dual_);
 
-/// 测试目标：建流期 `OPEN` message 原样送达，且 `read_message_async` 能分块写进
-/// 调用方 sink；welcome 当前按空载荷送达（发送侧受 `accept_async` 的
-/// `TrBuffWrite` 形状限制，P3.3c 再补非空 welcome）。
+/// 测试目标：建流期 `OPEN` message 与 `ACCEPT` welcome 都按分块编码原样送达，且
+/// `read_message_async` 把各块重组为连贯流写进调用方 sink。
 ///
 /// - 手段：A 以 `b"hello"` 发起子流；B 在 `accept` 前用 `read_message_async` 读
-///   `OPEN` message；B 以空 welcome `accept`；A `accept` 完成后用
-///   `read_message_async` 读 welcome。整个场景由 `scope.run_until` 驱动。
-/// - 判断：B 读到 `hello`；A 读到的 welcome 长度为 0（空 message）。
+///   `OPEN` message；B 以 `b"welcome"` 作为 welcome（`accept_async` 的 `welcome`
+///   是**源**）`accept`；A `accept` 完成后用 `read_message_async` 读 welcome。整个
+///   场景由 `scope.run_until` 驱动。
+/// - 判断：B 读到 `hello`；A 读到 `welcome`（长度 7）。
 ///
-/// Test goal: the OPEN message round-trips through the pending message rings, and
-/// `read_message_async` streams into a caller sink; the welcome is currently empty
-/// because `accept_async` takes a `TrBuffWrite` (non-empty welcome is P3.3c work).
-/// Method: A opens with `b"hello"`; B reads it before accept and accepts with an
-/// empty welcome; A reads the welcome after accept.
-/// Assertion: B reads `hello`; A reads an empty welcome (length 0).
+/// Test goal: both the OPEN message and the ACCEPT welcome round-trip through the
+/// chunked message framing, and `read_message_async` reassembles the chunks into one
+/// coherent stream for the caller's sink.
+/// Method: A opens with `b"hello"`; B reads it before accept and accepts with
+/// `b"welcome"` passed as a reader; A reads the welcome after accept.
+/// Assertion: B reads `hello`; A reads `welcome` (length 7).
 async fn run_message_scenario_<RA, WA, RB, WB, S, RT>(
     rt: &RT,
     scope: &S,
@@ -180,8 +180,7 @@ async fn run_message_scenario_<RA, WA, RB, WB, S, RT>(
 
     let (opened, incoming) = futures::join!(
         async {
-            let mut empty: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut empty[..];
+            let mut welcome: &[u8] = &[];
             handle
                 .accept_async_closure(&mut welcome, || {
                     (
@@ -203,8 +202,7 @@ async fn run_message_scenario_<RA, WA, RB, WB, S, RT>(
                 .await
                 .expect("B 侧读 OPEN message 应当成功");
             assert_eq!(&got[..n], b"hello", "OPEN message 应原样送达");
-            let mut empty: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut empty[..];
+            let mut welcome: &[u8] = b"welcome";
             incoming_handle
                 .accept_async_closure(&mut welcome, || {
                     (
@@ -224,7 +222,7 @@ async fn run_message_scenario_<RA, WA, RB, WB, S, RT>(
         .read_message_async(&mut sink)
         .await
         .expect("A 侧读 welcome 应当成功");
-    assert_eq!(n, 0usize, "当前 welcome 按空载荷发出");
+    assert_eq!(&got[..n], b"welcome", "welcome 应当原样送达");
 }
 
 async fn mux_message_inmem_dual_() {
@@ -1112,12 +1110,9 @@ async fn drive_min_transport_<RA, WA, RB, WB, S, RT>(
 
     let payload_a = common::make_payload_(dock_a.value(), 0usize);
     let payload_b = common::make_payload_(dock_b.value(), 0usize);
-
-    let mut welcome_a_buf: [u8; 0] = [];
-    let mut welcome_b_buf: [u8; 0] = [];
     let (opened, incoming) = futures::join!(
         async {
-            let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+            let mut welcome_a: &[u8] = &[];
             handle
                 .accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY)))
                 .await
@@ -1127,7 +1122,7 @@ async fn drive_min_transport_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到入向建流请求");
-            let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
+            let mut welcome_b: &[u8] = &[];
             incoming_handle
                 .accept_async_closure(&mut welcome_b, || (crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(common::K_CHANNEL_CAPACITY)))
                 .await

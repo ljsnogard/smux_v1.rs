@@ -110,8 +110,8 @@ impl SendInner {
 /// - **临界区里不得 `await`、不得回调进 `ChannelState_`**：本类型方法都是同步的，
 ///   拿到守卫后纯算完即释放。
 ///
-/// 唯一不能阻塞的地方是复用循环 park 里的 `poll`：那里用
-/// `available_try_`（`try_lock`，失败按「没额度」处理）。
+/// 复用循环的 park 不再查询窗口（R13 起由合并提示唤醒），因此本类型不需要
+/// 「非阻塞查询」入口；所有方法都在锁下同步完成。
 pub struct SendWindow {
     /// 内部状态 + 自旋锁（零内部堆分配）。
     inner_: SpinningMutexOwned<SendInner>,
@@ -129,16 +129,6 @@ impl SendWindow {
             .lock()
             .wait_or(|| unreachable!("不可取消的自旋锁不会以取消告终"));
         f(&mut inner)
-    }
-
-    /// 在锁下访问内部状态；锁当场不可用时返回 `None`（**只在 `poll` 里用**）。
-    #[inline]
-    fn try_with_inner_<R>(&self, f: impl FnOnce(&mut SendInner) -> R) -> Option<R> {
-        let mut session = self.inner_.lock_session();
-        match session.try_lock() {
-            Result::Ok(mut inner) => Option::Some(f(&mut inner)),
-            Result::Err(_) => Option::None,
-        }
     }
 
     /// 建一条**尚未安装**的发送窗口：上限 0、没有任何通告。
@@ -168,16 +158,6 @@ impl SendWindow {
     /// 剩余可发送字节数：`W₀ − (S − R₀)`，下钳 `0`。
     pub fn available(&self) -> Credit {
         self.with_inner_(|inner| inner.available_())
-    }
-
-    /// [`SendWindow::available`] 的**非阻塞**形式：`try_lock` 失败返回 `None`。
-    ///
-    /// 供复用循环 park 的 `poll` 使用：那里既不能等锁，也不该因为「读不到状态」就
-    /// 唤醒自己（那会变成忙等）。**失败即按「没有额度」处理**是安全方向：唯一的额度
-    /// 来源是解复用循环收到窗口通告，而那条路径一定会投一条事件上来把 park 打断
-    /// （即旧实现里 `try_with_` 的同一契约）。
-    pub(crate) fn available_try_(&self) -> Option<Credit> {
-        self.try_with_inner_(|inner| inner.available_())
     }
 
     /// 窗口是否已经用尽（发送方应当阻塞该子流，而不是报错）。

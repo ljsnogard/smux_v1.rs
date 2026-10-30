@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）、`feat/sw-scope-r18`（R18）、`feat/sw-scope-r19`（R19）、`feat/sw-scope-r20`（R20）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除；R18 指标计数点 + 测试壳；R19 attach inbox 单测 + 超时批次；R20 删除 `last_ready` 死判据；R18–R20 均不涉及分配归属）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）、`feat/sw-scope-r18`（R18）、`feat/sw-scope-r19`（R19）、`feat/sw-scope-r20`（R20）、`feat/sw-scope-r21`（R21）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除；R18 指标计数点 + 测试壳；R19 attach inbox 单测 + 超时批次；R20 删除 `last_ready` 死判据；R21 message ring 改 chunked 容量、accept welcome 读源；R18–R20 不涉及分配归属，R21 的容量变化见 §4.20）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -482,6 +482,23 @@ R20 删掉写循环 park 里恒不执行的「最近通知过的发送环」分�
 验收：lib **365**（366 − 1 个只测死函数的单测）；`inmem_mux` 21×3（含
 `mux_drop_flush_dual_`，handoff 点名「删 `last_ready` 前先跑」）；`just all` 全绿。
 
+## 4.20 第 21 轮记录（message ring 改 chunked 容量 + accept welcome 读源）
+
+R21 把建流期 message 从单块 `[u16 len][content]` 改为 `*chunk + 0x0000`，并让
+`accept_async` 从读源取 welcome。两处都与分配有关：
+
+1. **message ring 容量**：每个 pending channel 的每个方向从 `2 + cap` 变为
+   `framed_message_len_(cap) = cap + 2 * ceil(cap / 65535) + 2`。默认 `cap = 512` 时
+   514 → **516 字节/方向**（每条 pending channel 两条方向，共 +4 字节）；`cap` 超过
+   `u16::MAX` 时每多一块再加 2 字节。分配**次数不变**（仍是一对 ring、各一次分配），
+   只是每块的字节数略增。
+2. **accept welcome**：此前 `accept_async` 忽略 welcome、不分配；现在与 `open` /
+   `reject` 同形——从连接级 Scope 借一块 `cap + 1` 的临时缓冲（Scope 池内，不用全局
+   堆），读满即判超长。它是**每次 accept 一次**的临时对象，不是每帧分配。
+
+验收：lib 366；inmem 21×3；keepalive 5；smoke 5；cross_thread 1；alloc_count 1；
+doc 12；metrics 1；thread_safety 3；mptp_cs_smoke check 零警告 / 3 测试 / demo 11 RPC。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -505,7 +522,8 @@ R20 删掉写循环 park 里恒不执行的「最近通知过的发送环」分�
 | R18（已完成） | 只修指标计数点与 `thread_safety` 测试壳，**不涉及分配归属**（见 §4.17） |
 | R19（已完成） | 补 attach inbox 等价语义单测 + 仓库根 `justfile` 超时批次，**不涉及分配归属**（见 §4.18） |
 | R20（已完成） | 删除 `last_ready` 死判据与死函数单测，**不涉及分配归属**（见 §4.19） |
-| R21（待做，配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R21（已完成） | message ring 改 chunked 容量、accept welcome 读源（见 §4.20） |
+| R22（待做，配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 

@@ -283,10 +283,10 @@ where
     type Tx = ChannelTx<C>;
     type Rx = ChannelRx<C>;
 
-    type AcceptAsync<'f, Wb, B, P> = MuxAcceptAsync<'f, 'f, C, Wb>
+    type AcceptAsync<'f, Rb, B, P> = MuxAcceptAsync<'f, 'f, C, Rb>
     where
         Self: 'f,
-        Wb: 'f + TrBuffWrite<C::Data>,
+        Rb: 'f + TrBuffRead<C::Data>,
         B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
         P: TrPrepareRing<B, C::Data>;
 
@@ -300,13 +300,13 @@ where
         Self: 'f,
         W: 'f + TrBuffWrite<C::Data>;
 
-    fn accept_async<'f, Wb, B, P>(
+    fn accept_async<'f, Rb, B, P>(
         &'f mut self,
-        welcome: &'f mut Wb,
+        welcome: &'f mut Rb,
         prepare: P,
-    ) -> Self::AcceptAsync<'f, Wb, B, P>
+    ) -> Self::AcceptAsync<'f, Rb, B, P>
     where
-        Wb: 'f + TrBuffWrite<C::Data>,
+        Rb: 'f + TrBuffRead<C::Data>,
         B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
         P: TrPrepareRing<B, C::Data>,
     {
@@ -359,16 +359,16 @@ where
 
 /// [`TrChannelHandle::accept_async`] 的 step 函数：**建流最终裁决**。
 #[gen_may_cancel_future(MuxAccept, pub, new(pub(crate)))]
-async fn mux_accept_async_<'f, C, Wb, K>(
+async fn mux_accept_async_<'f, C, Rb, K>(
     handle: &'f mut ChannelHandle<C>,
-    welcome: &'f mut Wb,
+    welcome: &'f mut Rb,
     accepted: AcceptOutcomeProj_<C>,
     cancel: K,
 ) -> AcceptOutcomeProj_<C>
 where
     C: TrConnCfg + 'f,
 
-    Wb: TrBuffWrite<u8> + 'f,
+    Rb: TrBuffRead<u8> + 'f,
     K: TrCancellationToken,
 {
     let conn = handle.conn_.clone();
@@ -402,9 +402,36 @@ where
         return Result::Err(HandleError::Cancelled);
     }
 
-    // `welcome` 的契约本轮仍按空载荷发出（`W: TrBuffWrite` 无法读出内容；设计稿
-    // §9.3 的 Q12 在 `read_message_async` 一起处理）。
-    let _ = welcome;
+    // 响应方要从 `welcome`（源）读出欢迎信息，写进 message ring；main 会在 `ACCEPT`
+    // 里把它按分块编码发出。发起方的 outgoing 已经是 `open_channel_async` 写好的
+    // 开场消息，**不能覆盖**——它的 welcome 参数没有意义，按要求忽略。
+    if !handle.is_initiator_ {
+        let cap = conn.core_().config_().pending_msg_capacity();
+        let payload_retain = crate::connection::alloc_zeroed_bytes_async_(
+            conn.core_().reg_().scope_(),
+            cap.saturating_add(1usize),
+        )
+        .await
+        .map_err(|_| HandleError::Mux(MuxError::Closed))?;
+        let mut payload = payload_retain
+            .try_owning()
+            .expect("刚分配的 welcome 缓冲应当可独占");
+        let filled =
+            read_available_into_slice_(welcome, &mut payload[..], cancel.child_token()).await;
+        // 读到 `cap + 1` 字节即超长：在写 ring 之前拒绝，避免发半条 / 超长帧。
+        if filled > cap {
+            handle.settled_ = true;
+            abort_pending_::<C>(conn.core_().control_(), &handle.accepted_owner_);
+            return Result::Err(HandleError::Mux(MuxError::FrameTooLarge));
+        }
+        if handle.msg_.write_outgoing_(&payload[..filled], cap).is_err() {
+            handle.settled_ = true;
+            abort_pending_::<C>(conn.core_().control_(), &handle.accepted_owner_);
+            return Result::Err(HandleError::Mux(MuxError::FrameTooLarge));
+        }
+    } else {
+        let _ = welcome;
+    }
     let initial = handle.accepted_initial_window_;
     let role_ = if handle.is_initiator_ {
         EstablishRole_::Initiator
@@ -879,44 +906,57 @@ where
 {
     let cap = handle.conn_.core_().config_().pending_msg_capacity();
     let mut state = ChunkReadState_::new_message_();
-    let len = loop {
+    // 线上是 `*chunk + 0x0000`：逐块取内容、立刻写进 sink，直到终止块。调用方拿到的
+    // 是一条**连贯的流**（总字节数 = 各块内容之和），内容格式由调用方解释。
+    const K_READ_MSG_CHUNK: usize = 1024usize;
+    let mut buf = [0u8; K_READ_MSG_CHUNK];
+    let mut total = 0usize;
+    loop {
         if cancel.is_cancelled() {
             return Result::Err(HandleError::Cancelled);
         }
-        match handle.msg_.read_prefix_incoming_(&mut state, cap) {
-            Result::Ok(Option::Some(len)) => break len,
-            Result::Ok(Option::None) => {
-                let _ = poll_fn(|cx| handle.msg_.poll_incoming_readable_(cx)).await;
+        let len = loop {
+            match handle.msg_.read_prefix_incoming_(&mut state, cap) {
+                Result::Ok(Option::Some(len)) => break len,
+                Result::Ok(Option::None) => {
+                    let _ = poll_fn(|cx| handle.msg_.poll_incoming_readable_(cx)).await;
+                }
+                Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::MalformedFrame)),
             }
-            Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::MalformedFrame)),
+            if cancel.is_cancelled() {
+                return Result::Err(HandleError::Cancelled);
+            }
+        };
+        // `0x0000` 是终止块（空 message 直接走到这里）。
+        if len == 0usize {
+            break;
         }
-    };
-    if len == 0usize {
-        return Result::Ok(0usize);
-    }
-    // 分块搬运到 sink：不再先分配一个 `Vec<u8>` 装整条 message。message ring 本身
-    // 已经是暂存，这里只需要一个栈上小块；每块立刻写进 sink，背压由 `enqueue_frame_`
-    // 的 `write_async` 承担。
-    const K_READ_MSG_CHUNK: usize = 1024usize;
-    let mut buf = [0u8; K_READ_MSG_CHUNK];
-    let mut filled = 0usize;
-    while filled < len {
-        let want = core::cmp::min(buf.len(), len - filled);
-        match handle
-            .msg_
-            .read_body_incoming_(&mut state, &mut buf[..want])
-        {
-            Result::Ok(n) if n > 0usize => {
-                enqueue_frame_(sink, &buf[..n], cancel.child_token()).await?;
-                filled += n;
+        if total.saturating_add(len) > cap {
+            return Result::Err(HandleError::Mux(MuxError::FrameTooLarge));
+        }
+        let mut left = len;
+        while left > 0usize {
+            let want = core::cmp::min(buf.len(), left);
+            match handle
+                .msg_
+                .read_body_incoming_(&mut state, &mut buf[..want])
+            {
+                Result::Ok(n) if n > 0usize => {
+                    enqueue_frame_(sink, &buf[..n], cancel.child_token()).await?;
+                    left -= n;
+                    total += n;
+                }
+                Result::Ok(_) => {
+                    let _ = poll_fn(|cx| handle.msg_.poll_incoming_readable_(cx)).await;
+                    if cancel.is_cancelled() {
+                        return Result::Err(HandleError::Cancelled);
+                    }
+                }
+                Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::MalformedFrame)),
             }
-            Result::Ok(_) => {
-                let _ = poll_fn(|cx| handle.msg_.poll_incoming_readable_(cx)).await;
-            }
-            Result::Err(_) => return Result::Err(HandleError::Mux(MuxError::MalformedFrame)),
         }
     }
-    Result::Ok(len)
+    Result::Ok(total)
 }
 
 /// 建流**已经发出 `OPEN` 之后**本端放弃裁决（取消）：向对端宣告 `REJECT` 并释放身份。

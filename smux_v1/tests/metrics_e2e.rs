@@ -266,8 +266,7 @@ async fn metrics_reports_lifecycle_() {
                 .open_channel_async(Dock::new(1u32), &mut message)
                 .await
                 .expect("A 侧发起子流应当成功");
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (mut tx, mut rx) = handle
                 .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
@@ -307,8 +306,7 @@ async fn metrics_reports_lifecycle_() {
                 Dock::new(1u32),
                 "被动方的 local_dock 应当是监听 dock（镜像语义）"
             );
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (mut tx, mut rx) = handle
                 .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())

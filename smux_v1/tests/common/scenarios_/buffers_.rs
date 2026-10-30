@@ -84,8 +84,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S, RT>(
         .open_channel_async(remote_b, &mut message)
         .await
         .expect("发起应当成功");
-    let mut welcome_buf: [u8; 0] = [];
-    let mut welcome: &mut [u8] = &mut welcome_buf[..];
+    let mut welcome: &[u8] = &[];
     let (verdict_a, verdict_b) = futures::join!(
         async {
             handle_a
@@ -99,8 +98,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到发起请求");
-            let mut peer_welcome_buf: [u8; 0] = [];
-            let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
+            let mut peer_welcome: &[u8] = &[];
             handle_b
                 .accept_async_closure(&mut peer_welcome, || {
                     // 容量 0 < 环下限 1 ⇒ 连接应当拒绝这两份内存。
@@ -134,8 +132,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S, RT>(
         .expect("第二次发起应当成功");
     let (a_done, b_done) = futures::join!(
         async {
-            let mut welcome2_buf: [u8; 0] = [];
-            let mut welcome2: &mut [u8] = &mut welcome2_buf[..];
+            let mut welcome2: &[u8] = &[];
             let (tx, mut rx) = handle_a2
                 .accept_async_closure(&mut welcome2, || {
                     (make_channel_buff_(), make_channel_buff_())
@@ -149,8 +146,7 @@ pub async fn run_ring_rejected_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到第二次发起");
-            let mut peer_welcome_buf: [u8; 0] = [];
-            let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
+            let mut peer_welcome: &[u8] = &[];
             let (tx, mut rx) = handle_b2
                 .accept_async_closure(&mut peer_welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
@@ -241,8 +237,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S, RT>(
                 .open_channel_async(dock_small, &mut message)
                 .await
                 .expect("发起第一条子流应当成功");
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (tx, mut rx) = handle
                 .accept_async_closure(&mut welcome, move || (make_channel_buff_with_(small), make_channel_buff_with_(small)))
                 .await
@@ -254,8 +249,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到第一条子流");
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (tx, mut rx) = handle
                 .accept_async_closure(&mut welcome, move || (make_channel_buff_with_(small), make_channel_buff_with_(small)))
                 .await
@@ -274,8 +268,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S, RT>(
                 .open_channel_async(dock_large, &mut message)
                 .await
                 .expect("发起第二条子流应当成功");
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (tx, mut rx) = handle
                 .accept_async_closure(&mut welcome, move || (make_channel_buff_with_(large), make_channel_buff_with_(large)))
                 .await
@@ -287,8 +280,7 @@ pub async fn run_per_channel_alloc_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到第二条子流");
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (tx, mut rx) = handle
                 .accept_async_closure(&mut welcome, move || (make_channel_buff_with_(large), make_channel_buff_with_(large)))
                 .await

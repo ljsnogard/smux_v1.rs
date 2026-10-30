@@ -156,7 +156,6 @@ use crate::{
             new_listener_owner_, new_owner_, new_telegraph_owner_,
         },
         pending_msg_::{PendingMsgApp_, PendingMsgMain_, new_pending_msg_},
-        public_channel_::{ChunkReadErr_, ChunkReadState_},
         scope_::new_conn_scope_,
         signal_::{ReadAttach_, WriteAttach_},
         slot_::PushErr_,
@@ -2007,14 +2006,15 @@ where
         Result::Ok(state)
     }
 
-    /// 读走 app 写在 outgoing message ring 里的载荷（**不取走** ring），写进调用方
-    /// 给的缓冲。
+    /// 读走 app 写在 outgoing message ring 里的**分块编码**（**不取走** ring），
+    /// 原样写进调用方给的缓冲。
     ///
     /// `msg_main_` 的读端读 outgoing、写端留给 incoming（`read_message_async` 用），
     /// 因此这里只借 `as_mut()`，不把整对 ring 取走。与旧的 `read_msg_outgoing_` 相比
     /// 不再返回 `Vec<u8>`：`dst` 由 `main_loop` 从每循环 Scope 借出，`dst.len()` 就是
-    /// 该方向允许的最大载荷（即 `pending_msg_capacity`）。返回 `Some(len)` 表示读到
-    /// 了 `len` 字节（`0` 表示空 message）；`None` 表示该身份 / ring 已不存在。
+    /// 该方向允许的最大**分块编码**长度（`framed_message_len_(pending_msg_capacity)`）。
+    /// 返回 `Some(len)` 表示读到了 `len` 字节分块编码（`0` 表示没有消息）；这些字节由
+    /// `main_loop` 直接作为 `OPEN` / `ACCEPT` / `REJECT` 的载荷发出。
     ///
     /// # Errors
     ///
@@ -2038,24 +2038,22 @@ where
         let Option::Some(msg) = ctx.msg_main_.as_mut() else {
             return Result::Ok(Option::None);
         };
-        let mut state = ChunkReadState_::new_message_();
-        let len = match msg.read_prefix_outgoing_(&mut state, dst.len()) {
-            Result::Ok(Option::Some(len)) => len,
-            // 没有消息 / 还没写完：按空 message 处理。
-            Result::Ok(Option::None) => return Result::Ok(Option::Some(0usize)),
-            Result::Err(ChunkReadErr_::TooLarge) => {
-                return Result::Err(ReadOutgoingErr_::TooLarge);
-            }
-            Result::Err(_) => return Result::Err(ReadOutgoingErr_::Cancelled),
-        };
+        let framed_len = msg.outgoing_framed_len_();
+        if framed_len == 0usize {
+            // 没有消息：调用方按空载荷处理（`ACCEPT` 侧会补 `0x0000`）。
+            return Result::Ok(Option::Some(0usize));
+        }
+        if framed_len > dst.len() {
+            return Result::Err(ReadOutgoingErr_::TooLarge);
+        }
         let mut filled = 0usize;
-        while filled < len {
-            match msg.read_body_outgoing_(&mut state, &mut dst[filled..len]) {
+        while filled < framed_len {
+            match msg.read_raw_outgoing_into_(&mut dst[filled..framed_len]) {
                 Result::Ok(n) if n > 0usize => filled += n,
                 _ => return Result::Err(ReadOutgoingErr_::Cancelled),
             }
         }
-        Result::Ok(Option::Some(len))
+        Result::Ok(Option::Some(framed_len))
     }
 
     /// 释放所有已被 `Drop` 置 retired 位的身份（P4 的 retired 扫描）。
@@ -2145,15 +2143,16 @@ where
         Result::Ok(retired_reject)
     }
 
-    /// 把对端 message 写进该 channel 的 incoming ring（`main_loop` 用）。
+    /// 把对端 message 的**分块编码**原样写进该 channel 的 incoming ring
+    /// （`main_loop` 用；它不解析内容，由 `read_message_async` 重组）。
     ///
     /// 每个方向至多一条；ring 满 / 超长时静默丢弃（P3.3b 的过渡，Q11 的完整策略
-    /// 在 P3.3c 补）。
+    /// 在 P3.3c 补）。`cap` 是 message **内容**上限，用于校验分块编码的总长。
     pub(crate) async fn write_msg_incoming_<K: TrCancellationToken>(
         &self,
         local_dock: Dock,
         remote_dock: Dock,
-        body: &[u8],
+        framed: &[u8],
         cap: usize,
         cancel: K,
     ) -> Result<(), ReserveErr_> {
@@ -2165,7 +2164,7 @@ where
             return Result::Ok(());
         };
         if let Option::Some(msg) = ctx.msg_main_.as_mut() {
-            let _ = msg.write_incoming_(body, cap);
+            let _ = msg.write_incoming_(framed, cap);
         }
         Result::Ok(())
     }
@@ -4462,18 +4461,18 @@ mod tests_ {
     }
     multi_art_test_!(owner_is_created_with_the_identity);
 
-    /// 测试 outgoing message 读入调用方缓冲，且超长在**读正文之前**就被拒绝。
-    /// - 手段：登记一条 channel，写入 `b"hello"`，用 64 字节缓冲读回；再写一次，
+    /// 测试 outgoing message 分块编码原样读入调用方缓冲，且超长在**读内容之前**就被拒绝。
+    /// - 手段：登记一条 channel，写入 `b"hello"`，用 64 字节缓冲读回分块编码；再写一次，
     ///   改用 2 字节缓冲读取。
-    /// - 判断：第一次返回 `Some(5)` 且内容逐字节相等；第二次返回
-    ///   `Err(ReadOutgoingErr_::TooLarge)`，不读取正文。
+    /// - 判断：第一次返回 `Some(9)` 且字节为 `00 05 hello 00 00`；第二次返回
+    ///   `Err(ReadOutgoingErr_::TooLarge)`，不读取任何字节。
     ///
-    /// Test goal: outgoing messages are copied into the caller's buffer, and an
-    /// over-long message is refused before its body is read.
-    /// Method: reserve a channel, write `b"hello"`, read it into a 64-byte buffer;
-    /// write again and read into a 2-byte buffer.
-    /// Assertion: the first read returns `Some(5)` with equal bytes; the second returns
-    /// `Err(ReadOutgoingErr_::TooLarge)`.
+    /// Test goal: the framed outgoing message is copied verbatim into the caller's
+    /// buffer, and an over-long frame is refused before reading any content.
+    /// Method: reserve a channel, write `b"hello"`, read the framed bytes into a
+    /// 64-byte buffer; write again and read into a 2-byte buffer.
+    /// Assertion: the first read returns `Some(9)` with bytes `00 05 hello 00 00`; the
+    /// second returns `Err(ReadOutgoingErr_::TooLarge)`.
     async fn read_outgoing_into_buffer_rejects_overlong() {
         let registry: ChannelRegistry_<SingleConnAllocCfg> =
             ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default());
@@ -4498,8 +4497,8 @@ mod tests_ {
             .await
             .expect("读 outgoing message 应当成功")
             .expect("应当有一条 message");
-        assert_eq!(read, 5usize);
-        assert_eq!(&big[..read], b"hello");
+        assert_eq!(read, 9usize, "2 字节前缀 + 5 字节内容 + 2 字节终止块");
+        assert_eq!(&big[..read], &[0u8, 5u8, b'h', b'e', b'l', b'l', b'o', 0u8, 0u8]);
 
         msg.write_outgoing_(b"hello", 64usize)
             .expect("再次写 outgoing message 应当成功");
