@@ -401,7 +401,7 @@ impl RecvWindow {
 /// 读写循环运行在 `abs_art` spawn 出来的任务里（`'static`），既拿不到
 /// [`TrMuxConfig`](crate::connection::TrMuxConfig) 也借不到 `TrFlowCtrlPolicy`；
 /// 因此在连接建立时把「是否该通告」用到的量**展开一次**，此后判定只用它。整条连接
-/// 共享一份即可（见 `connection/session_.rs`）。
+/// 共享一份即可（见 `connection/session_/`）。
 ///
 /// 本类型是**建流期的值**：`install_` 把它展开进 `RecvInner`，此后判定不再需要它。
 /// 用例仍用它构造出与窗口一致的分区阈值做断言。

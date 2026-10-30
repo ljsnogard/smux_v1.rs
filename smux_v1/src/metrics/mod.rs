@@ -104,10 +104,10 @@
 //!
 //! | 方向 | 帧种类 | 计数点 |
 //! | --- | --- | --- |
-//! | 发送 | `Data` | `session_::drain_one_`（`enqueue_frame_parts_` 之后） |
-//! | 发送 | `Datagram` | `session_::send_one_datagram_`（`write_frame_to_stage_` 之后） |
+//! | 发送 | `Data` | `session_::mux_data_::drain_one_`（`enqueue_frame_parts_` 之后） |
+//! | 发送 | `Datagram` | `session_::mux_tg_::send_one_datagram_`（`write_frame_to_stage_` 之后） |
 //! | 发送 | 控制帧（`Open` / `Accept` / `Reject` / `Close` / `WindowUpdate` / `Pulse`） | `main_loop::try_write_control_frame_` 与 `main_loop::write_control_frame_async_`（写成功之后） |
-//! | 接收 | 全部 | `session_::write_public_frame_async_`（帧头 + 载荷都到齐之后） |
+//! | 接收 | 全部 | `session_::demux_::write_public_frame_async_`（帧头 + 载荷都到齐之后） |
 //!
 //! 因此同一批帧的「发送条数 / 字节数」与「接收条数 / 字节数」必须**逐项相等**，
 //! `tests/metrics_e2e.rs` 直接把这条等式钉住（读侧帧头长度也曾被它钉死）。

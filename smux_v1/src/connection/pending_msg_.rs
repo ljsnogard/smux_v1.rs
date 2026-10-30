@@ -309,7 +309,7 @@ mod tests_ {
     /// Assertion: `TooLarge`; the outgoing ring stays empty.
     #[test]
     fn pending_msg_rejects_too_long_() {
-        let (mut app, mut main) = new_pending_msg_(4usize, CoreAlloc).expect("建环");
+        let (mut app, main) = new_pending_msg_(4usize, CoreAlloc).expect("建环");
 
         assert_eq!(
             app.write_outgoing_(&[1u8; 5usize], 4usize)
@@ -329,7 +329,7 @@ mod tests_ {
     /// Assertion: empty framed length is 2; the 1-byte write is `TooLarge`.
     #[test]
     fn pending_msg_zero_cap_only_empty_() {
-        let (mut app, mut main) = new_pending_msg_(0usize, CoreAlloc).expect("建环");
+        let (mut app, main) = new_pending_msg_(0usize, CoreAlloc).expect("建环");
 
         app.write_outgoing_(&[], 0usize).expect("空 message");
         assert_eq!(main.outgoing_framed_len_(), 2usize);
