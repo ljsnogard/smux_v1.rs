@@ -138,8 +138,7 @@ pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S, RT>(
     // 两侧的最终裁决必须**并发**推进（主动方的 `OPEN` 在 `accept` 里才发出）。
     let (opened, accepted) = join!(
         async {
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             handle
                 .accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await
@@ -149,8 +148,7 @@ pub async fn run_idle_small_write_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到入向请求");
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             incoming
                 .accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await

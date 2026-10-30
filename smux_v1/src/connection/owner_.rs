@@ -1096,14 +1096,6 @@ impl ChannelState_ {
         self.flow_.send_window().available()
     }
 
-    /// 发送窗口剩余额度的**非阻塞**查询：窗口锁当场不可用时返回 `None`。
-    ///
-    /// 供复用循环 park 的 `poll` 用（那里不能等锁）：`None` 按「没额度」处理，
-    /// 额度真正回来时会由窗口通告事件把 park 打断。
-    pub(crate) fn send_available_try_(&self) -> Option<Credit> {
-        self.flow_.send_window().available_try_()
-    }
-
     /// 预扣发送额度。
     pub(crate) fn send_reserve_(&self, want: Credit) -> Credit {
         self.flow_.send_window().reserve(want)

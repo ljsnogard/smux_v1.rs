@@ -2,7 +2,7 @@
 //! [`ClosurePrepare`]，并给出 `accept` / `accept_async_closure` 的扩展 trait。
 
 use core::{alloc::AllocatorClone, mem::MaybeUninit};
-use buffex::x_deps::abs_buff::TrBuffWrite;
+use buffex::x_deps::abs_buff::TrBuffRead;
 use abs_smux::{
     chan::{RingBuffAlloc, TrChannelHandle, TrPrepareRing},
     conn::TrDockBinding,
@@ -52,13 +52,13 @@ pub trait AcceptAsyncClosureExt<C>: Sized
 where
     C: TrConnCfg,
 {
-    async fn accept_async_closure<'f, W, B, F>(
+    async fn accept_async_closure<'f, R, B, F>(
         &'f mut self,
-        welcome: &'f mut W,
+        welcome: &'f mut R,
         prepare: F,
     ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
-        W: 'f + TrBuffWrite<u8>,
+        R: 'f + TrBuffRead<u8>,
         B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
         B::Alloc: AllocatorClone,
         F: FnOnce() -> (B, B);
@@ -68,18 +68,18 @@ impl<C> AcceptAsyncClosureExt<C> for ChannelHandle<C>
 where
     C: TrConnCfg,
 {
-    async fn accept_async_closure<'f, W, B, F>(
+    async fn accept_async_closure<'f, R, B, F>(
         &'f mut self,
-        welcome: &'f mut W,
+        welcome: &'f mut R,
         prepare: F,
     ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
-        W: 'f + TrBuffWrite<u8>,
+        R: 'f + TrBuffRead<u8>,
         B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
         B::Alloc: AllocatorClone,
         F: FnOnce() -> (B, B),
     {
-        self.accept_async::<W, B, _>(welcome, ClosurePrepare::new(prepare))
+        self.accept_async::<R, B, _>(welcome, ClosurePrepare::new(prepare))
             .await
     }
 }

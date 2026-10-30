@@ -199,11 +199,9 @@ where
     // 因此顺序写会互等：先 `income_async` 等一个还没发出的 `OPEN`，或先等 A 的
     // `accept_async` 完成（它要等 B 的 `OPEN` + `ACCEPT`）。这里用一个 `join!`：
     // 第一支发 A 的 `OPEN` 并等 B 的两条帧，第二支先取句柄、再发 B 的两条帧。
-    let mut welcome_a_buf: [u8; 0] = [];
-    let mut welcome_b_buf: [u8; 0] = [];
     let (accepted_a, accepted_b) = join!(
         async {
-            let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+            let mut welcome_a: &[u8] = &[];
             handle_a
                 .accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await
@@ -214,7 +212,7 @@ where
                 .income_async()
                 .await
                 .expect("B 侧应当取到入向建流请求");
-            let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
+            let mut welcome_b: &[u8] = &[];
             handle_b
                 .accept_async_closure(&mut welcome_b, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
                 .await
@@ -462,9 +460,7 @@ where
         .open_channel_async(dock_b, &mut message)
         .await
         .expect("A 侧本地登记应当成功");
-
-    let mut welcome_a_buf: [u8; 0] = [];
-    let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+    let mut welcome_a: &[u8] = &[];
     {
         let accept_fut = handle_a.accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)));
         futures::pin_mut!(accept_fut);
@@ -534,9 +530,7 @@ where
         .open_channel_async(dock_b, &mut message)
         .await
         .expect("A 侧本地登记应当成功");
-
-    let mut welcome_a_buf: [u8; 0] = [];
-    let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+    let mut welcome_a: &[u8] = &[];
     let accept_a = handle_a.accept_async_closure(&mut welcome_a, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)));
     futures::pin_mut!(accept_a);
 
@@ -571,8 +565,7 @@ where
     }
 
     // ③ B 之后才裁决：超时结果直接交给调用方。
-    let mut welcome_b_buf: [u8; 0] = [];
-    let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
+    let mut welcome_b: &[u8] = &[];
     match handle_b
         .accept_async_closure(&mut welcome_b, || (crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY), crate::common::make_channel_buff_with_(K_CHANNEL_CAPACITY)))
         .await
@@ -634,9 +627,7 @@ where
         .open_channel_async(dock_b, &mut message)
         .await
         .expect("A 侧本地登记应当成功");
-
-    let mut welcome_a_buf: [u8; 0] = [];
-    let mut welcome_a: &mut [u8] = &mut welcome_a_buf[..];
+    let mut welcome_a: &[u8] = &[];
     let (outcome_a, outcome_b) = join!(
         async {
             // A：发 `OPEN` 并等裁决（B 取消后回 `REJECT` ⇒ 这里得到 `Refused`）。
@@ -650,8 +641,7 @@ where
                 .income_async()
                 .await
                 .expect("B 侧应当取到入向建流请求");
-            let mut welcome_b_buf: [u8; 0] = [];
-            let mut welcome_b: &mut [u8] = &mut welcome_b_buf[..];
+            let mut welcome_b: &[u8] = &[];
             let tx_buff = SmokeBuff::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc);
             let rx_buff = SmokeBuff::new_uninit_slice(K_CHANNEL_CAPACITY, CoreAlloc);
             let prep = ClosurePrepare::new(move || (tx_buff, rx_buff));

@@ -36,22 +36,28 @@ where
     /// ring 存储的智能指针类型 `B` 是**方法级泛型**，不再由
     /// [`TrMuxConfig`](crate::conf::TrMuxConfig) 规定——本条子流用什么智能指针、
     /// 从哪来、多大，完全由 `prepare` 的实参决定。
-    type AcceptAsync<'f, W, B, P>: TrMayCancel<'f, MayCancelOutput =
+    type AcceptAsync<'f, R, B, P>: TrMayCancel<'f, MayCancelOutput =
         Result<(Self::Tx, Self::Rx), Self::Err>>
     where
         Self: 'f,
-        W: 'f + TrBuffWrite<C::Data>,
+        R: 'f + TrBuffRead<C::Data>,
         B: 'static + Send + Sync + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone>,
         P: TrPrepareRing<B, C::Data>;
 
-    /// 发送同意建立 channel 的消息及欢迎信息，以及
-    fn accept_async<'f, W, B, P>(
+    /// 发送同意建立 channel 的欢迎信息，并最终裁决。
+    ///
+    /// `welcome` 是**源**（不是汇）：响应方从这里读欢迎信息，smux 负责把它切成
+    /// [`read_message_async`](Self::read_message_async) 文档所写的分块编码，**内容由
+    /// 调用方自行解释**。发起方的 welcome 没有意义（开场消息已经在
+    /// [`TrDockBinding::open_channel_async`](crate::conn::TrDockBinding::open_channel_async)
+    /// 给出），实现应当忽略这个参数。
+    fn accept_async<'f, R, B, P>(
         &'f mut self,
-        welcome: &'f mut W,
+        welcome: &'f mut R,
         prepare: P,
-    ) -> Self::AcceptAsync<'f, W, B, P>
+    ) -> Self::AcceptAsync<'f, R, B, P>
     where
-        W: 'f + TrBuffWrite<C::Data>,
+        R: 'f + TrBuffRead<C::Data>,
         B: 'static + Send + Sync + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone>,
         P: TrPrepareRing<B, C::Data>;
 

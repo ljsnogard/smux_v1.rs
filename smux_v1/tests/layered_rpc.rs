@@ -312,8 +312,7 @@ where
         .await
         .expect("客户端发起子流应当成功");
     // 最终裁决：给出本条子流的两块缓冲（本端接收窗口由此容量算出），此后才发 `OPEN`。
-    let mut welcome_buf: [u8; 0] = [];
-    let mut welcome: &mut [u8] = &mut welcome_buf[..];
+    let mut welcome: &[u8] = &[];
     let (tx, rx) = handle
         .accept_async_closure(&mut welcome, || {
             (common::make_channel_buff_(), common::make_channel_buff_())
@@ -400,8 +399,7 @@ where
             let remote = handle.remote_dock();
             // `welcome` 的契约在 `abs_smux` 里是 `TrBuffWrite`（「由库写入应用
             // 缓冲」），与「把欢迎信息发给对端」方向相反，语义存疑；本轮按空载荷发出。
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (tx, rx) = handle
                 .accept_async_closure(&mut welcome, || {
                     (common::make_channel_buff_(), common::make_channel_buff_())
