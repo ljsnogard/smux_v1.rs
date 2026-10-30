@@ -16,6 +16,7 @@
 
 | 文档 | 状态 | 一句话 |
 | --- | --- | --- |
+| `perf-20261031-0630.md` | **现行（R23：控制通道自旋补丁已落地）** | 对比 `07b0e58`/`aa3e402` 与当前 HEAD：raw 不变、tokio N=2 −17%、compio N=2/4/8/16 −36%/−26%/−23%/−14%；根因是控制通道 `mpmc_chan` 的 `FAST_SPIN=512`，`perf record` 中其轮询占 30–44% 用户周期；把控制通道自旋预算降为 0 后全面反超旧版 12–30%，并给出内存/平稳性数据与持续检测方案 |
 | `handoff-20261030-0315.md` | **现行（交接文档；R18 修好两个失败测试，R19 补 inbox 单测 + `justfile` 超时批次，R20 删 `last_ready` 死判据、R21 建流期 message 改 chunked + 非空 welcome、R22 拆分 `session_`）** | P5 收口后的进度、两个失败测试的实测与根因（`metrics_e2e` 是控制帧写侧漏报、`thread_safety` 是测试壳没有宿主）、§19 任务表的实际差额、死代码与待拍板项；末尾带下一会话提示词 |
 | `event-loop-redesign-20261026-1930.md` | **设计稿（已评审；P0–P5 完成，R18 校准 §19、R19 补 inbox 单测与超时批次、R20 删 `last_ready` 死判据、R21 建流期 message 改 chunked + 非空 welcome、R22 拆分 `session_`：T1–T20 / T22–T26 / T28 / T29 完成，剩 T3 的「main 完全同步」、T21、T24 尾的 probe 命名、T27、T30）** | 三业务循环 + 计时服务 + 公共报文子流（ring + chunked）+ 建流期 message ring + arena 索引（bplus_tree_cmp）+ 请求通道 + TCS |
 | `sw-scope-20261028-2130.md` | **现行（保守方案 + crate 级 `RootScope` 已实施）** | sw-scope 原理、`TrConnAllocCfg` 逐项可行性判定；`TcsAlloc` / `ScratchAlloc` 迁入连接级 Scope，删除 `EventAlloc`；crate 级 `RootScope` 显式发布 |

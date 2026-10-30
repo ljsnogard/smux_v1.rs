@@ -103,8 +103,25 @@ python3 scripts/merge_results.py                   # 写 results/summary.md
 
 ## 4. 结果
 
-见 [`results/summary.md`](results/summary.md)（`smux_v1_uds_bench` 里不放结论快照：
-数字随机器与版本变，跑一次就有）。
+完整总表见 [`results/summary.md`](results/summary.md)（逐格 48 格、原始记录 96 条；
+数字随机器与版本变，复跑 `just bench` 就会重新生成）。
+
+**最近一次全量（2026-10-31，R23 控制通道自旋修复后）**：4 vCPU 容器、release、
+`--bytes 64M --chunk 64K --repeat 2 --runners 1,4`，三个后端 × 两种环境 × N=2/4/8/16
+全部通过。N=16（最大并发度）的摘要如下：
+
+| 后端 | 环境 | raw MiB/s | smux MiB/s | smux/raw | smux 并发因子 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| compio | 单跑器 | 112.37 | 87.28 | 0.777 | 11.45 |
+| compio | 4 跑器 | 87.08 | 74.65 | 0.857 | 11.77 |
+| smol | 单跑器 | 127.61 | 48.50 | 0.380 | 14.23 |
+| smol | 4 跑器 | 116.79 | 59.39 | 0.509 | 15.08 |
+| tokio | 单跑器 | 131.04 | 75.71 | 0.578 | 12.41 |
+| tokio | 4 跑器 | 115.66 | 69.89 | 0.604 | 12.28 |
+
+> 绝对值只用于**同机、同 session** 的横向对比（本机为共享容器，负载会漂移；
+> 例如 smol 单跑器 N=16 的两轮就分别在 31.6 / 48.5 MiB/s）。要看全部 N、方差与
+> 并发因子，以 `results/summary.md` 为准。
 
 ## 5. 实现要点（踩过的坑都在这）
 
