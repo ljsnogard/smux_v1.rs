@@ -55,6 +55,11 @@ pub(crate) const K_MAIN_REQ_BATCH: usize = 16usize;
 /// 每轮最多处理多少条公共 RX 控制帧。
 pub(crate) const K_MAIN_FRAME_BATCH: usize = 32usize;
 
+/// 空 message 的合法分块编码：只有一个终止块。
+///
+/// 0 字节载荷**不是**合法编码：它会让对端 `read_message_async` 等不到终止块。
+pub(crate) const K_EMPTY_FRAMED_MESSAGE: [u8; 2usize] = [0u8, 0u8];
+
 /// 每轮最多处理多少条接收窗口通告（栈上定长缓冲，零分配）。
 pub(crate) const K_WINDOW_REPORT_BATCH: usize = 32usize;
 
@@ -207,10 +212,14 @@ pub(crate) async fn main_loop_async_<C, K>(
     // 缓冲（整条连接只分配一次），避免每请求一个全局 `Vec`；每循环 Scope 留给
     // 后面的每轮临时对象（见 `dev-notes/alloc-ownership-20261029-0230.md`）。
     let msg_cap = shared.pending_msg_cap_();
-    // `cap == 0` 时仍分配 1 字节，避免零长度布局；实际可用切片仍是 `[..0]`。
+    // 缓冲装的是**分块编码**（`*chunk + 0x0000`）：比内容多出每块 2 字节前缀与 2
+    // 字节终止块；空 message 也占 2 字节。
+    let msg_framed_cap =
+        crate::connection::public_channel_::PublicChunkIo_::framed_message_len_(msg_cap);
+    // `cap == 0` 时仍分配 1 字节，避免零长度布局。
     let msg_retain = match crate::connection::alloc_zeroed_bytes_async_(
         shared.reg_().scope_(),
-        msg_cap.max(1usize),
+        msg_framed_cap.max(1usize),
     )
     .await
     {
@@ -248,7 +257,7 @@ pub(crate) async fn main_loop_async_<C, K>(
             &mut public_tx_w,
             &mut public_rx_r,
             &mut rx_scratch[..],
-            &mut msg_buf[..msg_cap],
+            &mut msg_buf[..msg_framed_cap],
             &mut public_read,
             &mut tick,
             &cancel,
@@ -266,7 +275,7 @@ pub(crate) async fn main_loop_async_<C, K>(
                     &mut public_tx_w,
                     &mut tick,
                     request,
-                    &mut msg_buf[..msg_cap],
+                    &mut msg_buf[..msg_framed_cap],
                     &cancel,
                 )
                 .await;
@@ -621,7 +630,13 @@ where
                     return;
                 }
             };
-            let message = &msg_buf[..msg_len];
+            // 没有消息时补 `0x0000`（空 message 的合法编码）；0 字节载荷会让对端
+            // `read_message_async` 永远等不到终止块。
+            let message: &[u8] = if msg_len == 0usize {
+                &K_EMPTY_FRAMED_MESSAGE
+            } else {
+                &msg_buf[..msg_len]
+            };
             let result = match role_ {
                 EstablishRole_::Initiator => {
                     write_control_frame_async_::<C, _>(
@@ -729,7 +744,11 @@ where
                     return;
                 }
             };
-            let reason = &msg_buf[..reason_len];
+            let reason: &[u8] = if reason_len == 0usize {
+                &K_EMPTY_FRAMED_MESSAGE
+            } else {
+                &msg_buf[..reason_len]
+            };
             let result = match role_ {
                 EstablishRole_::Responder => {
                     let sent = write_control_frame_async_::<C, _>(
@@ -979,16 +998,21 @@ async fn handle_public_frame_<C, K>(
                     owner.set_peer_opened_();
                     owner.mark_data_(now_millis);
                     owner.notify_establish_();
-                    let _ = shared
-                        .reg_()
-                        .write_msg_incoming_(
-                            local,
-                            remote,
-                            payload,
-                            shared.pending_msg_cap_(),
-                            cancel.child_token(),
-                        )
-                        .await;
+                    // 0 字节载荷是响应方握手用的 `OPEN`（只是确认），不携带消息；
+                    // 它的 welcome 在随后的 `ACCEPT` 里。真正的空 message 编码是
+                    // `0x0000`（2 字节），不会被这条判据跳过。
+                    if !payload.is_empty() {
+                        let _ = shared
+                            .reg_()
+                            .write_msg_incoming_(
+                                local,
+                                remote,
+                                payload,
+                                shared.pending_msg_cap_(),
+                                cancel.child_token(),
+                            )
+                            .await;
+                    }
                 }
                 Result::Ok(Option::None) => {
                     let cap = shared.pending_msg_cap_();
@@ -1005,16 +1029,18 @@ async fn handle_public_frame_<C, K>(
                         .await
                     {
                         Result::Ok(_) => {
-                            let _ = shared
-                                .reg_()
-                                .write_msg_incoming_(
-                                    local,
-                                    remote,
-                                    payload,
-                                    cap,
-                                    cancel.child_token(),
-                                )
-                                .await;
+                            if !payload.is_empty() {
+                                let _ = shared
+                                    .reg_()
+                                    .write_msg_incoming_(
+                                        local,
+                                        remote,
+                                        payload,
+                                        cap,
+                                        cancel.child_token(),
+                                    )
+                                    .await;
+                            }
                         }
                         Result::Err(_) => {
                             let _ = write_control_frame_async_::<C, _>(
@@ -1776,7 +1802,7 @@ mod tests_ {
         ));
         assert!(submitted.is_ok(), "Bind 请求应能入队");
         // 本辅助只驱动 Bind，不读 message；给 `main_step_` 一个足够的栈上缓冲。
-        let mut msg_buf = [0u8; 512usize];
+        let mut msg_buf = [0u8; 520usize];
         let mut tick = MainTickStateOf_::<TestMuxConfig_>::new_();
         assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
             shared,
@@ -1925,7 +1951,7 @@ mod tests_ {
         ctl.raise_main_hint_(bits);
 
         // 本用例驱动的是 retired → REJECT，不需要读 message ring；给一个栈上缓冲。
-        let mut msg_buf = [0u8; 512usize];
+        let mut msg_buf = [0u8; 520usize];
         let mut tick = MainTickStateOf_::<TestMuxConfig_>::new_();
         assert!(block_on_ready_(main_step_::<TestMuxConfig_, _>(
             &shared,
@@ -1993,7 +2019,7 @@ mod tests_ {
             new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
                 .expect("建公共 RX 环");
         let mut scratch = [0u8; 256usize];
-        let mut msg_buf = [0u8; 512usize];
+        let mut msg_buf = [0u8; 520usize];
         let mut public_read = MainPublicRead_::new_();
         let mut tick = MainTickStateOf_::<TestMuxConfig_>::new_();
         let cancel = NonCancellableToken::new();
@@ -2072,7 +2098,7 @@ mod tests_ {
             new_buffered_channel(Owned::new_uninit_slice(64usize, CoreAlloc))
                 .expect("建公共 RX 环");
         let mut scratch = [0u8; 256usize];
-        let mut msg_buf = [0u8; 512usize];
+        let mut msg_buf = [0u8; 520usize];
         let mut public_read = MainPublicRead_::new_();
         let mut tick = MainTickStateOf_::<TestMuxConfig_>::new_();
         let cancel = NonCancellableToken::new();

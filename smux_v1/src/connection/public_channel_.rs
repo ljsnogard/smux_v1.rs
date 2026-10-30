@@ -17,6 +17,22 @@
 //! - 公共子流是持续的、**没有终止块**：`0x0000` 不产生；读到 0 按协议错误处理。
 //!   结束由 ring 半部关闭表示。
 //!
+//! # 建流期 message 的格式
+//!
+//! `OPEN` message / `ACCEPT` welcome / `REJECT` reason 用**同一种 chunk 帧**，但
+//! **多一个终止块**：
+//!
+//! ```text
+//! message    = *chunk last-chunk
+//! chunk      = chunk-size(2 字节大端 u16) chunk-data
+//! last-chunk = 0x0000
+//! ```
+//!
+//! 内容对 smux **不透明**，由调用方自行解释；smux 只负责切块与重组
+//! （`read_message_async` 把各块内容依次写进调用方的 sink，返回总字节数）。整条
+//! message 一次写完、不写半条；空 message 只有终止块。单块上限
+//! [`K_MAX_CHUNK_PAYLOAD`]，超过时写入侧自动切块。
+//!
 //! # 半 chunk
 //!
 //! 写侧动笔前先确认 ring 总空闲 `>= 2 + len`，再同步写长度与内容；总空闲已判够，
@@ -197,32 +213,75 @@ impl PublicChunkIo_ {
         Result::Ok(())
     }
 
-    /// 把「2 字节大端长度 + body」写进 ring（建流期 message ring 用；允许空 body）。
+    /// 一条建流期 message 的**分块编码**在 ring 里占多少字节。
     ///
-    /// 与 [`Self::try_write_chunk_`] 共用同一套「先判总空闲、再同步写」的规则；
-    /// 差别只有两处：允许 `body` 为空（写 `0x0000`），且没有单独的 header 段。
-    pub(crate) fn try_write_message_<W>(
+    /// 格式是 `*chunk + 0x0000`：每个 chunk 是 `2 字节大端长度 + 内容`，终止块
+    /// `0x0000` 占 2 字节；空 message 只有终止块。单块上限 [`K_MAX_CHUNK_PAYLOAD`]。
+    pub(crate) fn framed_message_len_(content_len: usize) -> usize {
+        let chunks = content_len.div_ceil(K_MAX_CHUNK_PAYLOAD);
+        2usize
+            .saturating_add(content_len)
+            .saturating_add(2usize.saturating_mul(chunks))
+    }
+
+    /// 把一条 message 按 chunked 格式写进 ring（建流期 message ring 用；允许空 body）。
+    ///
+    /// 这与 `abs_mptp` 的分块体是**同一种线上格式**：`*chunk + 0x0000`（2 字节大端
+    /// 长度 + 内容，`0x0000` 表示结束）。内容对 smux 不透明，由调用方自行解释。
+    ///
+    /// 整条 message 一次写完（不写半条）：先判总空闲，再同步写。返回
+    /// [`ChunkWriteErr_::WouldBlock`] 时一个字节都没写。
+    pub(crate) fn try_write_chunked_message_<W>(
         ring: &mut W,
         body: &[u8],
+        max_content_len: usize,
+    ) -> Result<(), ChunkWriteErr_>
+    where
+        W: TrBuffWrite<u8> + TrProducerState,
+    {
+        if body.len() > max_content_len {
+            return Result::Err(ChunkWriteErr_::TooLarge);
+        }
+        let framed = Self::framed_message_len_(body.len());
+        let free = ring
+            .producer_state()
+            .map(|(free, _closed)| free)
+            .unwrap_or(0usize);
+        if free < framed {
+            return Result::Err(ChunkWriteErr_::WouldBlock);
+        }
+        for chunk in body.chunks(K_MAX_CHUNK_PAYLOAD) {
+            write_all_sync_(ring, &(chunk.len() as u16).to_be_bytes())?;
+            write_all_sync_(ring, chunk)?;
+        }
+        // 终止块：`0x0000`。空 message 也只会走到这里。
+        write_all_sync_(ring, &[0u8, 0u8])?;
+        Result::Ok(())
+    }
+
+    /// 把**已经编码好**的 message 字节原样写进 ring（`main` 写对端 message 时用）。
+    ///
+    /// 与 [`Self::try_write_chunked_message_`] 的分工：那边负责「内容 → 分块」，
+    /// 这里负责「分块 → ring」的逐字节搬运，`main` 因此完全不必理解 message 内容。
+    pub(crate) fn try_write_raw_<W>(
+        ring: &mut W,
+        bytes: &[u8],
         max_len: usize,
     ) -> Result<(), ChunkWriteErr_>
     where
         W: TrBuffWrite<u8> + TrProducerState,
     {
-        let len = body.len();
-        if len > K_MAX_CHUNK_PAYLOAD || len > max_len {
+        if bytes.len() > max_len {
             return Result::Err(ChunkWriteErr_::TooLarge);
         }
         let free = ring
             .producer_state()
             .map(|(free, _closed)| free)
             .unwrap_or(0usize);
-        if free < 2usize + len {
+        if free < bytes.len() {
             return Result::Err(ChunkWriteErr_::WouldBlock);
         }
-        write_all_sync_(ring, &(len as u16).to_be_bytes())?;
-        write_all_sync_(ring, body)?;
-        Result::Ok(())
+        write_all_sync_(ring, bytes)
     }
 
     /// 尝试读完长度前缀。
@@ -367,6 +426,61 @@ impl PublicChunkIo_ {
         state.left_ -= offset;
         if state.left_ == 0usize {
             state.has_chunk_ = false;
+        }
+        Result::Ok(offset)
+    }
+
+    /// 把 ring 里**当前可读**的字节原样读进 `dst`，返回本次读到的量。
+    ///
+    /// 与 [`Self::try_read_payload_into_`] 的区别只有一处：不理解长度前缀、不维护
+    /// chunk 状态，纯粹做字节搬运——`main` 读 app 写好的分块 message 时用它。
+    pub(crate) fn try_read_available_into_<R>(
+        ring: &mut R,
+        dst: &mut [u8],
+    ) -> Result<usize, ChunkReadErr_>
+    where
+        R: TrBuffRead<u8>,
+    {
+        if dst.is_empty() {
+            return Result::Ok(0usize);
+        }
+        let mut offset = 0usize;
+        while offset < dst.len() {
+            let demand = Demand::at_least(1usize);
+            let mut outcome = ring.try_read(&demand);
+            match outcome.as_mut().pick_left() {
+                Option::Some(segment) => {
+                    let mut child = segment.as_segm_ref();
+                    let limit = core::cmp::min(dst.len() - offset, child.least_count());
+                    if limit == 0usize {
+                        break;
+                    }
+                    let dst_part = &mut dst[offset..offset + limit];
+                    // SAFETY: 同 `try_read_prefix_` 的论证；目标切片只在本函数内使用。
+                    let uninit = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            dst_part.as_mut_ptr() as *mut MaybeUninit<u8>,
+                            dst_part.len(),
+                        )
+                    };
+                    let moved = unsafe { child.move_items_to_buff(uninit) };
+                    if moved == 0usize {
+                        break;
+                    }
+                    offset += moved;
+                }
+                Option::None => {
+                    return match outcome.pick_right() {
+                        Option::Some(err) => match err.err_tag() {
+                            ReadErrTag::Closing => Result::Err(ChunkReadErr_::Closed),
+                            // 环暂时为空：交出已读到的部分。
+                            ReadErrTag::Drained => Result::Ok(offset),
+                            _ => Result::Err(ChunkReadErr_::Other),
+                        },
+                        Option::None => Result::Ok(offset),
+                    };
+                }
+            }
         }
         Result::Ok(offset)
     }

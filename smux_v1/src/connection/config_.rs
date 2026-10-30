@@ -335,11 +335,14 @@ where
     /// ```
     fn metrics(&self) -> &Self::Metrics;
 
-    /// 建流期 message 的**每个方向**载荷上限（字节）；`0` 表示只允许空 message。
+    /// 建流期 message 的**每个方向内容**上限（字节）；`0` 表示只允许空 message。
     ///
     /// `open` 的 message、`accept` 的 welcome、`reject` 的 reason 都受它约束：
     /// 超出时按「outgoing 报 `MessageTooLong`（P3 接入）/ incoming 回 `REJECT`」处理。
-    /// ring 实际容量是 `max(2, 2 + 本值)`，因此 `0` 仍然能写一个空的 `0x0000`。
+    ///
+    /// 线上是分块编码（`*chunk + 0x0000`），本值限制的是**各块内容之和**；每块另有
+    /// 2 字节长度前缀、末尾另有 2 字节终止块，因此 ring 实际容量是
+    /// `framed_message_len_(本值)`（`0` 时为 2，仍能写空的 `0x0000`）。
     ///
     /// 默认值见 [`K_PENDING_MSG_CAP_DEFAULT`]（512 字节）。现有 `TrConnCfg` 实现不必
     /// 改：它带默认实现（设计稿 Q2）。

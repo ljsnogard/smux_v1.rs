@@ -10,15 +10,24 @@
 //! - main 侧 [`PendingMsgMain_`]：镜像的两半，由 `main_loop` 独占。
 //!
 //! ring 是单向的，所以「收发 message」实际是**两个方向各一条** ring，而不是一条双向
-//! ring。协议与公共子流相同（`[u16 大端长度][message bytes]`），只是 `0x0000` 表示
-//! **空 message**（不是错误）。每个 pending channel 的每个方向**至多一条**消息，因此
-//! ring 容量只需 `2 + cap`。
+//! ring。每条 message 用**分块格式**（与公共子流 / `abs_mptp` 的分块体一致）：
+//!
+//! ```text
+//! message    = *chunk last-chunk
+//! chunk      = chunk-size(2 字节大端 u16) chunk-data
+//! last-chunk = 0x0000
+//! ```
+//!
+//! 内容对 smux 不透明，由调用方自行解释；smux 只负责切块（写入侧）与重组（
+//! `read_message_async` 逐块写进调用方的 sink）。每个 pending channel 的每个方向
+//! **至多一条**消息，因此 ring 容量按「`cap` 字节内容 + 每块 2 字节前缀 + 2 字节终止
+//! 块」的最大值算（见 [`PublicChunkIo_::framed_message_len_`]）。
 //!
 //! # 容量
 //!
-//! `cap` 是 message 载荷上限（字节），由 `TrConnCfg::pending_msg_capacity()` 决定
-//! （默认 [`K_PENDING_MSG_CAP_DEFAULT`]）。实际 ring 容量是 `max(2, 2 + cap)`：
-//! `cap == 0` 时仍能写一个空的 `0x0000`。
+//! `cap` 是 message **内容**上限（字节），由 `TrConnCfg::pending_msg_capacity()` 决定
+//! （默认 [`K_PENDING_MSG_CAP_DEFAULT`]）。实际 ring 容量是
+//! `framed_message_len_(cap)`：`cap == 0` 时为 2（只需要一个 `0x0000`）。
 //!
 //! # 为什么不用一条共享 ring
 //!
@@ -83,7 +92,7 @@ pub(crate) fn new_pending_msg_<A>(
 where
     A: AllocatorClone + Send + Sync,
 {
-    let ring_cap = 2usize.saturating_add(cap).max(2usize);
+    let ring_cap = PublicChunkIo_::framed_message_len_(cap).max(2usize);
     let (out_tx, out_rx) = new_buffered_channel(Owned::new_uninit_slice(ring_cap, alloc.clone()))?;
     let (in_tx, in_rx) = new_buffered_channel(Owned::new_uninit_slice(ring_cap, alloc))?;
     Result::Ok((
@@ -101,18 +110,19 @@ where
 impl PendingMsgApp_ {
     /// 写 outgoing message（`open` 的 message / `accept` 的 welcome / `reject` 的 reason）。
     ///
-    /// 空 message 写 `0x0000`。返回 [`ChunkWriteErr_::WouldBlock`] 表示 ring 里已有
-    /// 一条尚未被 main 取走的消息；正常协议下每个方向至多一条，不会发生。
+    /// 内容是调用方自己的格式；本函数只做「内容 → 分块」（`*chunk + 0x0000`）。
+    /// 返回 [`ChunkWriteErr_::WouldBlock`] 表示 ring 里已有的一条消息还没被 main
+    /// 取走；正常协议下每个方向至多一条，不会发生。
     pub(crate) fn write_outgoing_(
         &mut self,
         message: &[u8],
         cap: usize,
     ) -> Result<(), ChunkWriteErr_> {
-        PublicChunkIo_::try_write_message_(&mut self.tx_, message, cap)
+        PublicChunkIo_::try_write_chunked_message_(&mut self.tx_, message, cap)
     }
 
-    /// 读 incoming message 的长度前缀；`Some(len)` 表示下一条消息有 `len` 字节
-    /// （`len == 0` 是空 message，调用方无需再读 body）。
+    /// 读 incoming message 的长度前缀；`Some(len)` 表示下一块有 `len` 字节，
+    /// `Some(0)` 是**终止块**（整条 message 结束）。
     pub(crate) fn read_prefix_incoming_(
         &mut self,
         state: &mut ChunkReadState_,
@@ -146,31 +156,33 @@ impl PendingMsgApp_ {
 }
 
 impl PendingMsgMain_ {
-    /// 读 app 写的 outgoing message 长度前缀。
-    pub(crate) fn read_prefix_outgoing_(
-        &mut self,
-        state: &mut ChunkReadState_,
-        cap: usize,
-    ) -> Result<Option<usize>, ChunkReadErr_> {
-        PublicChunkIo_::try_read_prefix_(&mut self.tx_, state, cap)
+    /// app 写好的**分块编码**在 outgoing ring 里占多少字节（0 = 没有消息）。
+    ///
+    /// app 侧一次写完、main 只在之后才读，因此 ring 的 `data_size()` 就是整条
+    /// 分块 message 的长度。
+    pub(crate) fn outgoing_framed_len_(&self) -> usize {
+        self.tx_.ring_state().data_size()
     }
 
-    /// 把 app 写的 outgoing message 内容读进 `dst`。
-    pub(crate) fn read_body_outgoing_(
+    /// 把 app 写好的分块 message **原样**读进 `dst`（不解析内容）。
+    pub(crate) fn read_raw_outgoing_into_(
         &mut self,
-        state: &mut ChunkReadState_,
         dst: &mut [u8],
     ) -> Result<usize, ChunkReadErr_> {
-        PublicChunkIo_::try_read_payload_into_(&mut self.tx_, state, dst)
+        PublicChunkIo_::try_read_available_into_(&mut self.tx_, dst)
     }
 
-    /// 写 incoming message 给 app（对端 `OPEN` message / `ACCEPT` welcome / `REJECT` reason）。
+    /// 把对端 message 的**分块编码原样**写进 incoming ring（main 不理解内容）。
     pub(crate) fn write_incoming_(
         &mut self,
-        message: &[u8],
+        framed: &[u8],
         cap: usize,
     ) -> Result<(), ChunkWriteErr_> {
-        PublicChunkIo_::try_write_message_(&mut self.rx_, message, cap)
+        PublicChunkIo_::try_write_raw_(
+            &mut self.rx_,
+            framed,
+            PublicChunkIo_::framed_message_len_(cap),
+        )
     }
 }
 
@@ -178,130 +190,188 @@ impl PendingMsgMain_ {
 mod tests_ {
     use mm_ptr::x_deps::abs_mm::CoreAlloc;
 
+    use crate::connection::public_channel_::K_MAX_CHUNK_PAYLOAD;
+
     use super::*;
 
-    /// 测试 app -> main 方向的一条消息能原样读回。
-    /// - 手段：`cap=8` 建一对 ring；app 写 `b"hi"`；main 读前缀与内容。
-    /// - 判断：前缀为 `Some(2)`；内容为 `b"hi"`；state 回到 idle。
-    ///
-    /// Test goal: an app-to-main message round-trips.
-    /// Method: build a pair with `cap=8`; app writes `b"hi"`; main reads prefix and body.
-    /// Assertion: prefix is `Some(2)`; body equals `b"hi"`; state is idle.
-    #[test]
-    fn pending_msg_outgoing_round_trip_() {
-        let (mut app, mut main) = new_pending_msg_(8usize, CoreAlloc).expect("建环");
+    /// 读一整条 incoming 分块 message 的内容：循环到终止块，逐块取内容。
+    fn drain_incoming_(app: &mut PendingMsgApp_, cap: usize) -> std::vec::Vec<u8> {
         let mut state = ChunkReadState_::new_message_();
+        let mut out = std::vec::Vec::new();
+        loop {
+            let len = app
+                .read_prefix_incoming_(&mut state, cap)
+                .expect("读前缀")
+                .expect("整条 message 已写入，前缀应当可读");
+            if len == 0usize {
+                break;
+            }
+            let mut chunk = std::vec![0u8; len];
+            let mut filled = 0usize;
+            while filled < len {
+                let n = app
+                    .read_body_incoming_(&mut state, &mut chunk[filled..])
+                    .expect("读内容");
+                assert!(n > 0usize, "整条 message 已写入，块读不应空转");
+                filled += n;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        out
+    }
+
+    /// 测试 app -> main：内容按 `*chunk + 0x0000` 编码，main 原样读出分块字节。
+    ///
+    /// - 手段：`cap=8` 建一对 ring；app 写 `b"hi"`；main 读分块长度与原样字节。
+    /// - 判断：分块长度为 `6`（`2 前缀 + 2 内容 + 2 终止`），字节为
+    ///   `00 02 h i 00 00`；读空之后 ring 长度归零。
+    ///
+    /// Test goal: app-to-main content is encoded as `*chunk + 0x0000` and copied
+    /// verbatim by `main`.
+    /// Method: build a pair with `cap=8`; app writes `b"hi"`; main reads the framed
+    /// length and the raw framed bytes.
+    /// Assertion: framed length is 6 and bytes are `00 02 h i 00 00`; after the read
+    /// the ring is empty.
+    #[test]
+    fn pending_msg_outgoing_is_chunked_() {
+        let (mut app, mut main) = new_pending_msg_(8usize, CoreAlloc).expect("建环");
 
         app.write_outgoing_(b"hi", 8usize).expect("写 outgoing");
-        assert_eq!(
-            main.read_prefix_outgoing_(&mut state, 8usize)
-                .expect("读前缀"),
-            Option::Some(2usize)
-        );
-        let mut out = [0u8; 2usize];
-        let n = main
-            .read_body_outgoing_(&mut state, &mut out)
-            .expect("读内容");
-        assert_eq!(n, 2usize);
-        assert_eq!(&out, b"hi");
-        assert!(state.is_idle_());
+        assert_eq!(main.outgoing_framed_len_(), 6usize);
+        let mut framed = [0u8; 6usize];
+        let mut filled = 0usize;
+        while filled < framed.len() {
+            let n = main
+                .read_raw_outgoing_into_(&mut framed[filled..])
+                .expect("读分块");
+            assert!(n > 0usize, "分块已写入，读不应空转");
+            filled += n;
+        }
+        assert_eq!(&framed, &[0u8, 2u8, b'h', b'i', 0u8, 0u8]);
+        assert_eq!(main.outgoing_framed_len_(), 0usize, "读空之后 ring 为空");
     }
 
-    /// 测试 main -> app 方向的一条消息能原样读回。
-    /// - 手段：`cap=8` 建一对 ring；main 写 `b"yo"`；app 读前缀与内容。
-    /// - 判断：前缀为 `Some(2)`；内容为 `b"yo"`。
+    /// 测试 main -> app：分块字节原样写入 incoming，app 重组出原内容。
     ///
-    /// Test goal: a main-to-app message round-trips.
-    /// Method: build a pair with `cap=8`; main writes `b"yo"`; app reads prefix and body.
-    /// Assertion: prefix is `Some(2)`; body equals `b"yo"`.
+    /// - 手段：`cap=8`；main 写 `00 02 y o 00 00`；app 逐块读到终止块。
+    /// - 判断：重组结果为 `b"yo"`。
+    ///
+    /// Test goal: framed bytes written verbatim by `main` are reassembled by the app.
+    /// Method: with `cap=8`, main writes `00 02 y o 00 00`; the app reads chunks until
+    /// the terminator.
+    /// Assertion: the reassembled content is `b"yo"`.
     #[test]
-    fn pending_msg_incoming_round_trip_() {
+    fn pending_msg_incoming_reassembles_() {
         let (mut app, mut main) = new_pending_msg_(8usize, CoreAlloc).expect("建环");
-        let mut state = ChunkReadState_::new_message_();
 
-        main.write_incoming_(b"yo", 8usize).expect("写 incoming");
-        assert_eq!(
-            app.read_prefix_incoming_(&mut state, 8usize)
-                .expect("读前缀"),
-            Option::Some(2usize)
-        );
-        let mut out = [0u8; 2usize];
-        let n = app
-            .read_body_incoming_(&mut state, &mut out)
-            .expect("读内容");
-        assert_eq!(n, 2usize);
-        assert_eq!(&out, b"yo");
+        main.write_incoming_(&[0u8, 2u8, b'y', b'o', 0u8, 0u8], 8usize)
+            .expect("写 incoming");
+        assert_eq!(drain_incoming_(&mut app, 8usize), b"yo");
     }
 
-    /// 测试空 message 编码为 `0x0000` 且可被识别。
-    /// - 手段：`cap=8`，app 写空切片；main 读前缀。
-    /// - 判断：前缀为 `Some(0)`；state 保持 idle；不需要读 body。
+    /// 测试空 message：分块编码只有终止块 `0x0000`，重组结果为空。
     ///
-    /// Test goal: an empty message is encoded as `0x0000` and recognized.
-    /// Method: with `cap=8`, app writes an empty slice; main reads the prefix.
-    /// Assertion: prefix is `Some(0)`; state stays idle; no body read is needed.
+    /// - 手段：`cap=8`；app 写空切片；main 读分块；再原样写回 incoming 让 app 重组。
+    /// - 判断：分块长度为 2、字节为 `00 00`；app 读到终止块即结束，内容为空。
+    ///
+    /// Test goal: an empty message is exactly the terminator block and reassembles to
+    /// empty.
+    /// Method: with `cap=8`, app writes an empty slice; main reads the framed bytes and
+    /// writes them back to incoming.
+    /// Assertion: framed length is 2 with bytes `00 00`; the app reads the terminator
+    /// immediately and yields empty content.
     #[test]
-    fn pending_msg_empty_message_() {
+    fn pending_msg_empty_is_just_terminator_() {
         let (mut app, mut main) = new_pending_msg_(8usize, CoreAlloc).expect("建环");
-        let mut state = ChunkReadState_::new_message_();
 
         app.write_outgoing_(&[], 8usize).expect("写空 message");
-        assert_eq!(
-            main.read_prefix_outgoing_(&mut state, 8usize)
-                .expect("读前缀"),
-            Option::Some(0usize)
-        );
-        assert!(state.is_idle_());
+        assert_eq!(main.outgoing_framed_len_(), 2usize);
+        let mut framed = [0u8; 2usize];
+        let mut filled = 0usize;
+        while filled < framed.len() {
+            filled += main
+                .read_raw_outgoing_into_(&mut framed[filled..])
+                .expect("读分块");
+        }
+        assert_eq!(framed, [0u8, 0u8]);
+
+        main.write_incoming_(&framed, 8usize).expect("写 incoming");
+        assert!(drain_incoming_(&mut app, 8usize).is_empty());
     }
 
-    /// 测试超过 `cap` 的 message 被拒绝。
-    /// - 手段：`cap=4`，app 写 5 字节。
-    /// - 判断：返回 `TooLarge`，ring 里没有写入任何消息。
+    /// 测试超过 `cap` 的内容被拒绝，且不写入任何字节。
     ///
-    /// Test goal: a message longer than `cap` is rejected.
+    /// - 手段：`cap=4`，app 写 5 字节。
+    /// - 判断：返回 `TooLarge`；outgoing ring 仍为空。
+    ///
+    /// Test goal: content longer than `cap` is rejected without writing anything.
     /// Method: with `cap=4`, app writes 5 bytes.
-    /// Assertion: `TooLarge`; no message is written.
+    /// Assertion: `TooLarge`; the outgoing ring stays empty.
     #[test]
     fn pending_msg_rejects_too_long_() {
         let (mut app, mut main) = new_pending_msg_(4usize, CoreAlloc).expect("建环");
-        let mut state = ChunkReadState_::new_message_();
 
         assert_eq!(
             app.write_outgoing_(&[1u8; 5usize], 4usize)
                 .expect_err("超过 cap"),
             ChunkWriteErr_::TooLarge
         );
-        assert!(
-            main.read_prefix_outgoing_(&mut state, 4usize)
-                .expect("读前缀")
-                .is_none()
-        );
+        assert_eq!(main.outgoing_framed_len_(), 0usize);
     }
 
     /// 测试 `cap == 0` 时只允许空 message。
-    /// - 手段：`cap=0` 建对（ring 容量 2）；写空消息成功；写 1 字节消息。
-    /// - 判断：空消息读回 `Some(0)`；1 字节消息因超过 `cap` 返回 `TooLarge`。
+    ///
+    /// - 手段：`cap=0` 建对（ring 容量 2）；写空消息成功；再写 1 字节。
+    /// - 判断：空消息分块长度为 2；1 字节消息因超过 `cap` 返回 `TooLarge`。
     ///
     /// Test goal: `cap == 0` admits only the empty message.
-    /// Method: build a pair with `cap=0` (ring capacity 2); write empty successfully;
-    /// then write a 1-byte message.
-    /// Assertion: empty message reads back as `Some(0)`; the 1-byte write is
-    /// `TooLarge` because it exceeds `cap`.
+    /// Method: build a pair with `cap=0` (ring capacity 2); write empty, then 1 byte.
+    /// Assertion: empty framed length is 2; the 1-byte write is `TooLarge`.
     #[test]
     fn pending_msg_zero_cap_only_empty_() {
         let (mut app, mut main) = new_pending_msg_(0usize, CoreAlloc).expect("建环");
-        let mut state = ChunkReadState_::new_message_();
 
         app.write_outgoing_(&[], 0usize).expect("空 message");
-        assert_eq!(
-            main.read_prefix_outgoing_(&mut state, 0usize)
-                .expect("读前缀"),
-            Option::Some(0usize)
-        );
+        assert_eq!(main.outgoing_framed_len_(), 2usize);
         assert_eq!(
             app.write_outgoing_(&[1u8], 0usize)
                 .expect_err("cap=0 只允许空 message"),
             ChunkWriteErr_::TooLarge
         );
+    }
+
+    /// 测试内容超过单块上限时自动切成多块，app 逐块重组得到原内容。
+    ///
+    /// - 手段：`cap = K_MAX_CHUNK_PAYLOAD + 7`；写满该长度的 `0x5A`；main 原样读出
+    ///   整条分块并写回 incoming；app 逐块重组。
+    /// - 判断：分块长度 = `2 + 65535 + 2 + 7 + 2`；重组结果逐字节等于原内容。
+    ///
+    /// Test goal: content longer than one chunk is split automatically and reassembles
+    /// byte-for-byte.
+    /// Method: `cap = K_MAX_CHUNK_PAYLOAD + 7`; write that many `0x5A`; main copies the
+    /// framed bytes to incoming; the app reassembles chunk by chunk.
+    /// Assertion: framed length is `2 + 65535 + 2 + 7 + 2`; content matches exactly.
+    #[test]
+    fn pending_msg_splits_into_multiple_chunks_() {
+        const CONTENT: usize = K_MAX_CHUNK_PAYLOAD + 7usize;
+        let (mut app, mut main) = new_pending_msg_(CONTENT, CoreAlloc).expect("建环");
+        let body = std::vec![0x5Au8; CONTENT];
+        app.write_outgoing_(&body, CONTENT).expect("写多块 message");
+
+        let framed_len = 2usize + K_MAX_CHUNK_PAYLOAD + 2usize + 7usize + 2usize;
+        assert_eq!(main.outgoing_framed_len_(), framed_len);
+        let mut framed = std::vec![0u8; framed_len];
+        let mut filled = 0usize;
+        while filled < framed.len() {
+            filled += main
+                .read_raw_outgoing_into_(&mut framed[filled..])
+                .expect("读分块");
+        }
+        assert_eq!(&framed[..2], &(K_MAX_CHUNK_PAYLOAD as u16).to_be_bytes());
+        assert_eq!(&framed[2usize + K_MAX_CHUNK_PAYLOAD..][..2], &7u16.to_be_bytes());
+        assert_eq!(&framed[framed_len - 2usize..], &[0u8, 0u8]);
+
+        main.write_incoming_(&framed, CONTENT).expect("写 incoming");
+        assert_eq!(drain_incoming_(&mut app, CONTENT), body);
     }
 }

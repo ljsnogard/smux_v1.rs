@@ -87,7 +87,25 @@ where
     /// - 响应方：在 `accept_async` 之前读对端 `OPEN` 的开场消息；
     /// - 发起方：在 `accept_async` 返回之后读对端 `ACCEPT` 的欢迎信息。
     ///
-    /// 没有 message（空 `0x0000`）时返回 `0` 且不写 `sink`。
+    /// # 线上格式
+    ///
+    /// message 是**分块编码**（与 MPTP 的分块体同形）：
+    ///
+    /// ```text
+    /// message    = *chunk last-chunk
+    /// chunk      = chunk-size(2 字节大端 u16) chunk-data
+    /// last-chunk = 0x0000
+    /// ```
+    ///
+    /// 内容对 smux **不透明**，由调用方自行解释。本方法把各块内容**依次**写进
+    /// `sink`（重组为一条连贯的流），返回**内容**总字节数；空 message 只有一个终止块，
+    /// 返回 `0` 且不写 `sink`。单块内容上限是 `u16::MAX`，更长的 message 由写入方
+    /// 自动切块。
+    ///
+    /// # Examples
+    ///
+    /// 对端发内容 `b"hi"` 时，线上字节是 `00 02 68 69 00 00`（一块内容 + 终止块）；
+    /// 本方法把 `68 69` 写进 `sink` 并返回 `2`。
     fn read_message_async<'f, W>(&'f mut self, sink: &'f mut W) -> Self::MessageAsync<'f, W>
     where
         W: 'f + TrBuffWrite<C::Data>;
