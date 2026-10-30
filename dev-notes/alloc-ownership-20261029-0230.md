@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）、`feat/sw-scope-r18`（R18）、`feat/sw-scope-r19`（R19）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除；R18 指标计数点 + 测试壳；R19 attach inbox 单测 + 超时批次；R18/R19 均不涉及分配归属）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）、`feat/sw-scope-r18`（R18）、`feat/sw-scope-r19`（R19）、`feat/sw-scope-r20`（R20）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除；R18 指标计数点 + 测试壳；R19 attach inbox 单测 + 超时批次；R20 删除 `last_ready` 死判据；R18–R20 均不涉及分配归属）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -469,6 +469,19 @@ R19 只做测试面：在 `registry_::tests_` 补 attach inbox 的 4 个等价�
 cross_thread 1 / `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3；
 `just all` 全绿。
 
+## 4.19 第 20 轮记录（删除 `last_ready` 死判据，**不涉及分配归属**）
+
+R20 删掉写循环 park 里恒不执行的「最近通知过的发送环」分支：`last_ready` 只在初始化与
+每轮结尾被赋 `None`，`last_ready_has_segment_` 永远在 `None` 上立刻返回 `false`，因此
+删除是**语义等价**的（连 waker 都不曾登记）。
+
+- 该分支只持有一个 `Option<(Dock, Dock)>` 栈变量，不分配、不持有任何句柄；删除后写循环
+  的 park 只轮询取消令牌 / 写侧合并提示 / 公共 TX / attach inbox；
+- 没有改变任何对象的生命周期域或分配器接线。
+
+验收：lib **365**（366 − 1 个只测死函数的单测）；`inmem_mux` 21×3（含
+`mux_drop_flush_dual_`，handoff 点名「删 `last_ready` 前先跑」）；`just all` 全绿。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -491,7 +504,8 @@ cross_thread 1 / `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3�
 | R17（已完成） | `TgReady` 走 inbox 信号；删除 `WriteEvent_`/`ReadEvent_` 与整条事件通道；T8 完成 |
 | R18（已完成） | 只修指标计数点与 `thread_safety` 测试壳，**不涉及分配归属**（见 §4.17） |
 | R19（已完成） | 补 attach inbox 等价语义单测 + 仓库根 `justfile` 超时批次，**不涉及分配归属**（见 §4.18） |
-| R20（待做，配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R20（已完成） | 删除 `last_ready` 死判据与死函数单测，**不涉及分配归属**（见 §4.19） |
+| R21（待做，配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 

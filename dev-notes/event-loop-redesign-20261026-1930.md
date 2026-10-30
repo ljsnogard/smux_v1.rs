@@ -2193,6 +2193,22 @@ connection/
      `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3；`just all` 全绿；
      clippy 干净。
 
+- 20261031-0300：**R20：删除恒为 `None` 的 `last_ready` 死判据（P2 清理之一）**。
+  1. R13 把 `TxReady` 位化后，写循环 park 里「最近通知过的那条发送环」分支再也不会
+     执行：`last_ready` 只在初始化与每轮结尾被赋 `None`，`last_ready_has_segment_`
+     永远在 `None` 上立刻返回 `false`（连 waker 都不登记）。R20 删除该分支、
+     `last_ready` / `ring_ready` 变量、`last_ready_has_segment_` 及其单测（该单测只测
+     这个死函数），park 现在只轮询取消令牌 / 写侧合并提示 / 公共 TX / attach inbox。
+  2. 同步修正 `ChannelTx::notify_tx_ready_` 的过时文档（仍在讲「事件通道被灌满」与
+     `last_ready` park）；现在通知就是 `HINT_W_TX_READY` + 去重位，写循环全表扫描。
+  3. 删掉的单测曾覆盖「环已关闭且空不得判为可读」的历史空转路径。该判据随分支一起
+     消失，回归网改由现行 park 设计（**不** park 在子流环上）承担；若将来重新引入
+     「按环 park」，必须带回 `contains_left` 判据（见
+     `smux_v1_sock_demo/dev-notes/intermittent-stall-20261007-0200.md`）。
+  4. 验收：lib **365**（366 − 1 个死函数单测）/ inmem 21×3（含 `mux_drop_flush_dual_`）
+     / keepalive 5 / smoke 5 / cross_thread 1 / `alloc_count` 1 / doc 12 / `metrics_e2e` 1 /
+     `thread_safety` 3；`just all` 全绿；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2355,10 +2371,11 @@ value，key 与树结构保持不变。
 > 状态：`设计已定` = 本文已给出形状；`待做` = 实施项；`待拍板` = 依赖 Q 项。
 > 阶段对应 §13；索引项见 §18。
 >
-> **本表状态截至 R19（2026-10-31，`feat/sw-scope`）**：T1–T20、T22–T24 已完成 / 已达成，
+> **本表状态截至 R20（2026-10-31，`feat/sw-scope`）**：T1–T20、T22–T24 已完成 / 已达成，
 > T26 已有且 R18 修好 `metrics_e2e` / `thread_safety`，T25 的 inbox 单测与 T28 的超时
-> 批次于 R19 落地；剩余为 T3 的「main 完全同步」、T21（`reusable_docks_`）、T27（连接级
-> `Drop` 路径与 chunk 数）、T30（本仓无 CHANGELOG）。
+> 批次于 R19 落地，R20 删除 `last_ready` 死判据；剩余为 T3 的「main 完全同步」、
+> T21（`reusable_docks_`）、T24 尾的 probe 命名、T27（连接级 `Drop` 路径与 chunk 数）、
+> T30（本仓无 CHANGELOG）。
 
 ### A. 循环与职责
 
@@ -2412,7 +2429,7 @@ value，key 与树结构保持不变。
 | --- | --- | --- | --- |
 | T22 | 删除 `HintSlot_` 死代码、`free_waiters_` 的 `Vec<Waker>`、`PendingFin_` | P1/P5 | `HintSlot_` 已用于 main 提示；Listener / Telegraph / DockBinding / ChannelHandle 的 Drop 位化、`LocalAbort` → `HINT_W_RELEASED` 完成（P4）；请求队列与两条 `Attach` inbox 已改由 `mpmc_chan` 的 Arena 等待队列承担（P5），`InlineQueue_` / `SlotRing_` / `WakerSlots_` 已删除；`PendingFin_` 已删（R5）；`TX_DRAINED` + main FIN 已接（R6） |
 | T23 | 删除 `ControlFrame_.payload_`、`ChannelHandle::message_`、`util_` 的 `Vec` 读取 | P3/P5 | `ChannelHandle::message_` 已删（P3.2）；`ControlFrame_.payload_` 已删（R2，改独立切片）；`util_` 已改有界切片（R3） |
-| T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | **基本完成**（事件通道 / 会话邮箱 / `ctl_.rs` 全删；`signal_.rs` 只剩 attach inbox + 合并提示位 + `ControlFrame_`；剩余是若干注释与 probe 命名，见 `handoff-20261030-0315.md` §5.2） |
+| T24 | `session_.rs` / `signal_.rs` / `registry_.rs` 按 §11 清理 | P4/P5 | **基本完成**（事件通道 / 会话邮箱 / `ctl_.rs` 全删；`signal_.rs` 只剩 attach inbox + 合并提示位 + `ControlFrame_`；R20 删掉 `last_ready` 死判据并修正 `notify_tx_ready_` 的过时文档；剩余是 probe 命名 `event_*` → `hint_*`，见 `handoff-20261030-0315.md` §5.2） |
 
 ### G. 测试与验收
 
