@@ -4511,5 +4511,271 @@ mod tests_ {
             Result::Err(ReadOutgoingErr_::TooLarge)
         ));
     }
+
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // Attach inbox 的等价语义（R17 删掉 13 个事件通道单测之后的补测）
+    //
+    // 两条 inbox 是 `mpmc_chan` 上的一层薄封装，但**循环依赖的是这里的语义**：
+    // FIFO 交付、满时把元素原样带回、可取消的异步等待、关闭后仍能排空已入队项。
+    // 这些用例直接钉住封装层的行为，不重复 `mpmc_chan` 自己的并发压力测试。
+    //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    /// 建一个测试用注册表；两条 attach inbox 都用默认容量 [`ATTACH_INBOX_CAP`]。
+    fn test_registry_() -> ChannelRegistry_<SingleConnAllocCfg> {
+        ChannelRegistry_::new_(BasicOpts::default(), SingleConnAllocCfg::default())
+    }
+
+    /// 从一条写侧 attach 里取出 `TgReady` 的 dock（其它变体视为用例失败）。
+    fn tg_ready_dock_(attach: WriteAttach_<SingleConnAllocCfg>) -> Dock {
+        match attach {
+            WriteAttach_::TgReady { local_dock_ } => local_dock_,
+            _ => panic!("本用例只投 TgReady 信号"),
+        }
+    }
+
+    /// 测试目标：写侧 attach inbox 按**入队顺序**交付；满时 `try_push` 把元素**原样
+    /// 带回**（不丢、不覆盖、不排队），腾出一格后立刻可以再入队。
+    /// Test goal: the write-side attach inbox delivers in FIFO order and, when full,
+    /// hands the pushed item back unchanged; one free slot makes the next push succeed.
+    ///
+    /// - 手段：投 3 条 `TgReady(dock)` 后逐条取出；再填满 `ATTACH_INBOX_CAP`，投第
+    ///   `CAP+1` 条并检查返回的元素；取走一条后重投。
+    ///   / How: push three `TgReady(dock)` markers and take them; fill the inbox, push
+    ///   one more and inspect the returned item; take one and push again.
+    /// - 判断：取出顺序与投入顺序一致；满时返回的正是本次投入的 dock；腾空后重投成功。
+    ///   / What: take order equals push order; the full-inbox error carries the very
+    ///   item that was pushed; the retry after one take succeeds.
+    async fn write_inbox_is_fifo_and_hands_back_when_full_() {
+        let registry = test_registry_();
+        for value in [0x11u32, 0x12u32, 0x13u32] {
+            assert!(
+                registry
+                    .try_push_write_attach_(WriteAttach_::new_tg_ready_(Dock::new(value)))
+                    .is_ok(),
+                "未满时应当入队成功"
+            );
+        }
+        for value in [0x11u32, 0x12u32, 0x13u32] {
+            let item = registry.take_write_attach_().expect("应当按序取到元素");
+            assert_eq!(
+                tg_ready_dock_(item),
+                Dock::new(value),
+                "inbox 必须按入队顺序交付"
+            );
+        }
+        assert!(registry.take_write_attach_().is_none(), "取空之后应当为空");
+
+        for _ in 0usize..ATTACH_INBOX_CAP {
+            assert!(
+                registry
+                    .try_push_write_attach_(WriteAttach_::new_tg_ready_(Dock::new(0x21u32)))
+                    .is_ok(),
+                "填满 inbox 的过程中不应提前失败"
+            );
+        }
+        let rejected = registry
+            .try_push_write_attach_(WriteAttach_::new_tg_ready_(Dock::new(0x22u32)))
+            .expect_err("满时 try_push 必须把元素带回");
+        assert_eq!(
+            tg_ready_dock_(rejected),
+            Dock::new(0x22u32),
+            "带回的必须是本次投入的元素"
+        );
+        assert!(
+            registry.take_write_attach_().is_some(),
+            "满时仍应能取走已入队项"
+        );
+        assert!(
+            registry
+                .try_push_write_attach_(WriteAttach_::new_tg_ready_(Dock::new(0x23u32)))
+                .is_ok(),
+            "腾出一格后应当可以再入队"
+        );
+    }
+    multi_art_test_!(write_inbox_is_fifo_and_hands_back_when_full_);
+
+    /// 测试目标：写侧 inbox 满时，异步投放会**等空位**（返回 `Pending`），空位出现后
+    /// 完成；关闭 inbox 后拒绝新元素，但**已入队的元素仍可排空**。
+    /// Test goal: when full, the async push parks (Pending) and completes once a slot
+    /// frees; after close, new pushes are rejected while already-queued items drain.
+    ///
+    /// - 手段：填满 inbox；用一个 noop waker 手动 poll 异步投放（应 `Pending`）；
+    ///   取走一条后再次 poll（应 `Ready(Ok)`）；关闭写侧 inbox 后检查拒绝与排空。
+    ///   / How: fill the inbox; poll the async push manually with a noop waker (expect
+    ///   Pending); take one and poll again (expect Ready(Ok)); close and check both
+    ///   rejection and draining.
+    /// - 判断：第一次 poll 为 `Pending`；第二次为 `Ready(Ok(()))`；关闭后 `try_push`
+    ///   失败、`is_write_inbox_closed_` 为真，且排空计数等于关闭前的元素数。
+    ///   / What: first poll Pending, second Ready(Ok(())); after close `try_push` fails,
+    ///   `is_write_inbox_closed_` is true, and the drained count equals what was queued.
+    async fn write_inbox_async_push_waits_and_close_drains_() {
+        let registry = test_registry_();
+        for _ in 0usize..ATTACH_INBOX_CAP {
+            assert!(
+                registry
+                    .try_push_write_attach_(WriteAttach_::new_tg_ready_(Dock::new(0x31u32)))
+                    .is_ok()
+            );
+        }
+        let pending = WriteAttach_::new_tg_ready_(Dock::new(0x32u32));
+        let pending_fut = registry.push_write_attach_async_(pending, NonCancellableToken::new());
+        let mut push = core::pin::pin!(pending_fut);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(
+            matches!(
+                core::future::Future::poll(push.as_mut(), &mut cx),
+                Poll::Pending
+            ),
+            "满时异步投放必须等待空位"
+        );
+        assert!(registry.take_write_attach_().is_some());
+        assert!(
+            matches!(
+                core::future::Future::poll(push.as_mut(), &mut cx),
+                Poll::Ready(Result::Ok(()))
+            ),
+            "腾出一格后异步投放应当完成"
+        );
+
+        // 此刻 inbox 又满了（取 1 补 1），关闭后仍应能排空这 `ATTACH_INBOX_CAP` 条。
+        registry.close_write_inbox_();
+        assert!(registry.is_write_inbox_closed_(), "关闭后应当报告已关闭");
+        assert!(
+            registry
+                .try_push_write_attach_(WriteAttach_::new_tg_ready_(Dock::new(0x33u32)))
+                .is_err(),
+            "关闭后不得再入队"
+        );
+        let mut drained = 0usize;
+        while registry.take_write_attach_().is_some() {
+            drained += 1usize;
+        }
+        assert_eq!(drained, ATTACH_INBOX_CAP, "关闭前已入队的元素必须仍可排空");
+        assert!(
+            registry.take_write_attach_().is_none(),
+            "排空之后应当一直为空"
+        );
+    }
+    multi_art_test_!(write_inbox_async_push_waits_and_close_drains_);
+
+    /// 测试目标：满时等待空位的异步投放必须**可取消**——取消后元素原样交回调用方
+    /// （`PushErr_::Cancelled`），不会既没入队又丢失。
+    /// Test goal: an async push parked on a full inbox is cancellable and hands the
+    /// item back untouched (`PushErr_::Cancelled`).
+    ///
+    /// - 手段：填满 inbox；用 `CancelToken_` 起一次异步投放并 poll 到 `Pending`；
+    ///   触发取消令牌后再次 poll。
+    ///   / How: fill the inbox, start a push with a `CancelToken_` and poll to Pending,
+    ///   cancel the token, then poll again.
+    /// - 判断：结果为 `Err(PushErr_::Cancelled(item))`，且 `item` 正是本次投入的
+    ///   `TgReady` dock。
+    ///   / What: the result is `Err(PushErr_::Cancelled(item))` and `item` is exactly
+    ///   the dock that was pushed.
+    async fn write_inbox_async_push_is_cancellable_() {
+        let registry = test_registry_();
+        for _ in 0usize..ATTACH_INBOX_CAP {
+            assert!(
+                registry
+                    .try_push_write_attach_(WriteAttach_::new_tg_ready_(Dock::new(0x41u32)))
+                    .is_ok()
+            );
+        }
+        let token = CancelToken_::new_(CoreAlloc);
+        let pending = WriteAttach_::new_tg_ready_(Dock::new(0x42u32));
+        let pending_fut = registry.push_write_attach_async_(pending, token.clone());
+        let mut push = core::pin::pin!(pending_fut);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(
+            matches!(
+                core::future::Future::poll(push.as_mut(), &mut cx),
+                Poll::Pending
+            ),
+            "满时异步投放必须等待空位"
+        );
+        token.cancel_();
+        match core::future::Future::poll(push.as_mut(), &mut cx) {
+            Poll::Ready(Result::Err(PushErr_::Cancelled(item))) => {
+                assert_eq!(
+                    tg_ready_dock_(item),
+                    Dock::new(0x42u32),
+                    "取消时必须把本次元素原样交回"
+                );
+            }
+            _ => panic!("取消后异步投放应当返回 PushErr_::Cancelled"),
+        }
+    }
+    multi_art_test_!(write_inbox_async_push_is_cancellable_);
+
+    /// 测试目标：读侧 attach inbox 同样按 FIFO 交付；关闭后拒绝新元素、已入队项仍可
+    /// 排空。
+    /// Test goal: the read-side attach inbox is FIFO as well; after close it rejects
+    /// new items while already-queued ones still drain.
+    ///
+    /// - 手段：先 `reserve_telegraph_` 拿两个端点身份、各配一条测试环的写端，作为两条
+    ///   `ReadAttach_::Telegraph` 投进 inbox；按序取出后关闭读侧 inbox，再投一条。
+    ///   / How: reserve two telegraph identities, pair each with a test-ring writer,
+    ///   push two `ReadAttach_::Telegraph` items, take them in order, close the read
+    ///   inbox, then push once more.
+    /// - 判断：取出顺序与 `local_dock` 一致；关闭后 `try_push` 返回 `Err`，且
+    ///   `is_read_inbox_closed_` 为真。
+    ///   / What: take order matches `local_dock`; after close `try_push` returns `Err`
+    ///   and `is_read_inbox_closed_` is true.
+    async fn read_inbox_is_fifo_and_close_rejects_() {
+        let registry = test_registry_();
+        let first = Dock::new(0x51u32);
+        let second = Dock::new(0x52u32);
+        let (writer_a, _reader_a) =
+            crate::connection::ring_::test_support_::make_test_channel_(1024usize);
+        let (writer_b, _reader_b) =
+            crate::connection::ring_::test_support_::make_test_channel_(1024usize);
+        let owner_a = registry
+            .reserve_telegraph_t_(first)
+            .await
+            .expect("登记 telegraph A 应当成功");
+        let owner_b = registry
+            .reserve_telegraph_t_(second)
+            .await
+            .expect("登记 telegraph B 应当成功");
+        assert!(
+            registry
+                .try_push_read_attach_(ReadAttach_::new_tg_(first, owner_a, writer_a))
+                .is_ok()
+        );
+        assert!(
+            registry
+                .try_push_read_attach_(ReadAttach_::new_tg_(second, owner_b, writer_b))
+                .is_ok()
+        );
+        for expected in [first, second] {
+            match registry.take_read_attach_() {
+                Option::Some(ReadAttach_::Telegraph { local_dock_, .. }) => {
+                    assert_eq!(local_dock_, expected, "读侧 inbox 必须按入队顺序交付")
+                }
+                Option::Some(_) => panic!("本用例只投 Telegraph 变体"),
+                Option::None => panic!("应当按序取到元素"),
+            }
+        }
+        assert!(registry.take_read_attach_().is_none(), "取空之后应当为空");
+
+        registry.close_read_inbox_();
+        assert!(registry.is_read_inbox_closed_(), "关闭后应当报告已关闭");
+        let third = Dock::new(0x53u32);
+        let (writer_c, _reader_c) =
+            crate::connection::ring_::test_support_::make_test_channel_(1024usize);
+        let owner_c = registry
+            .reserve_telegraph_t_(third)
+            .await
+            .expect("登记 telegraph C 应当成功");
+        assert!(
+            registry
+                .try_push_read_attach_(ReadAttach_::new_tg_(third, owner_c, writer_c))
+                .is_err(),
+            "关闭后不得再入队"
+        );
+    }
+    multi_art_test_!(read_inbox_is_fifo_and_close_rejects_);
+
     multi_art_test_!(read_outgoing_into_buffer_rejects_overlong);
 }
