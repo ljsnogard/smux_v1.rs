@@ -27,5 +27,13 @@ where
     type ChanAlloc = A;
     type ProdWaitSlab = WaitSlab4K<A>;
     type ConsWaitSlab = WaitSlab4K<A>;
-    const FAST_SPIN: usize = 512usize;
+    /// 控制通道（两条 `Attach` inbox 与 `main_loop` 请求队列）的空队列自旋预算。
+    ///
+    /// `mpmc_chan` 每次 poll 空队列时会先做 `FAST_SPIN` 次无锁尝试再注册等待。
+    /// 这三个通道都是**低频控制通道**，而 mux/demux/main 会在每轮循环重建各自的
+    /// park future；沿用数据面默认的 512 次自旋会让每次 park 都白烧 CPU。实测
+    /// （4 vCPU 容器、UDS bench、64 MiB/client）把该值降到 0 后：tokio N=2
+    /// 62→92 MiB/s、N=16 65→72；compio N=2 49→86、N=16 64→85；`task_cv` 与
+    /// 并发因子同时改善。详见 `dev-notes/perf-20261031-0630.md`。
+    const FAST_SPIN: usize = 0usize;
 }
