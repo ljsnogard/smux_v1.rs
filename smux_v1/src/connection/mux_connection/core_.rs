@@ -4,7 +4,7 @@
 //! （`ChannelRegistry_`）、两条事件通道的发送端，以及**作用域保活槽**。
 //!
 //! 注意「建流时展开的三个标量」（初始接收窗口、通告阈值快照、单帧上限）**不在**
-//! 这里，而在 [`LoopShared_`](crate::connection::session_::LoopShared_)：它们只有
+//! 这里，而在 [`LoopShared_`](crate::connection::session_::MuxLoopShared_)：它们只有
 //! 两个循环读，API 面一个都不用，放进核心只会多一份需要同步的副本。
 //!
 //! # 为什么它是「演员」而不是「连接对象」
@@ -18,7 +18,7 @@
 //!
 //! 持有强引用的只有**应用面对象**：`MuxConnection` 及其派生句柄
 //! （binding / listener / handle / telegraph / 两个半部）。两个读写循环**不**持有
-//! 它——循环只持有 [`LoopShared_`](crate::connection::session_::LoopShared_)（注册表
+//! 它——循环只持有 [`LoopShared_`](crate::connection::session_::MuxLoopShared_)（注册表
 //! 句柄 + 三个标量），因此最后一个应用面对象被丢弃时本类型确实会析构，
 //! [`Drop`](MuxCore::drop) 就在那里触发两个循环的取消令牌。
 //!

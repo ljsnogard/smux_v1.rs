@@ -176,7 +176,7 @@ where
 /// 默认协商值是 4096 字节，实际部署建议把 `max_packet_size` 定在 **64 KiB 以下**；
 /// 超过此值时应按自己的 `max_packet_size` 放大本容量——尤其**数据报**（telegraph）
 /// 一条报文的帧长上限就是 `max_packet_size`，传输环必须放得下整帧（见
-/// `session_::write_frame_to_stage_`）。
+/// `session_::mux_data_::write_frame_to_stage_`）。
 pub const K_TRANSPORT_RING_CAPACITY: usize = 64usize * 1024usize;
 
 /// 连接的配置类型。

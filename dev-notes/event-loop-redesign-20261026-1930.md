@@ -2234,6 +2234,20 @@ connection/
      `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3；`mptp_cs_smoke`
      check 零警告、3 个测试、demo 11 条 RPC 跑通；clippy 干净。
 
+- 20261031-0410：**R22：把 `session_` 拆成 9 个文件的模块（纯搬运，无行为变化）**。
+  1. `session_.rs`（3005 行）按职责拆成 `session_/{shared_, local_table_, frame_io_,
+     demux_, demux_read_, mux_, mux_tg_, mux_data_, util_}.rs`；`mod.rs` 只保留模块文档、
+     `mod` 声明与对外再导出（`MuxShared_` / `MuxLoopShared_` / 两个循环入口 /
+     `enqueue_frame_` / `race_cancel_` / `fail_mux_loop_`），模块路径 `session_::X` 不变。
+  2. 表项字段与 `MuxLoopShared_` 字段改为 `pub(super)`（跨子模块直接访问），其余不变；
+     没有新增公开 API、没有改任何函数体。
+  3. 子模块分工表写进 `session_/mod.rs` 模块文档；外部文档里的 `session_::*` 路径同步到
+     新子模块（metrics / config_ / core_ / recv_window_ / connection/mod.rs）。
+  4. 顺带修正 `core_.rs` 里一个早已失效的文档链接（`session_::LoopShared_` →
+     `MuxLoopShared_`）。
+  5. 验收：`just all` 全绿（lib 366 / inmem 21×3 / keepalive 5 / smoke 5 / cross_thread 1 /
+     `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3）；clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2398,7 +2412,8 @@ value，key 与树结构保持不变。
 >
 > **本表状态截至 R21（2026-10-31，`feat/sw-scope`）**：T1–T20、T22–T24 已完成 / 已达成，
 > T26 已有，R18 修好 `metrics_e2e` / `thread_safety`，R19 补 inbox 单测与超时批次，
-> R20 删 `last_ready` 死判据，R21 把建流期 message 改为 chunked 并支持非空 welcome；
+> R20 删 `last_ready` 死判据，R21 把建流期 message 改为 chunked 并支持非空 welcome，
+> R22 把 `session_` 拆成 9 个文件的模块（纯搬运）；
 > 剩余为 T3 的「main 完全同步」、T21（`reusable_docks_`）、T24 尾的 probe 命名、
 > T15 的 `MessageTooLong` / 跨帧流、T27（连接级 `Drop` 路径与 chunk 数）、T30（本仓无 CHANGELOG）。
 

@@ -377,7 +377,7 @@
 //! **传输缓冲也没有「必须装下整帧」的容量下限**：读侧帧头由逐字节状态机解析
 //! （`frame_parser_`，每次只要 1 字节），载荷按底层实际给出的段长分次搬入
 //! （`ReadCursor::read_async_`），写侧写入按空闲空间**分块**推进
-//! （`session_.rs` 的 `enqueue_frame_`）。因此容量取到环原语的下限（1 字节）也能跑通，
+//! （`session_/frame_io_.rs` 的 `enqueue_frame_`）。因此容量取到环原语的下限（1 字节）也能跑通，
 //! [`K_TRANSPORT_RING_CAPACITY`] 只是吞吐 / 时延上的选择。唯一的例外是**数据报**：
 //! 它的帧必须整条落进缓冲（`write_frame_to_stage_`），因此缓冲容量应当不小于协商的
 //! `max_packet_size`。

@@ -1,7 +1,7 @@
 # 临时分配归属：Global / 专用池 / Scope 的三分（20261029-0230）
 
-- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）、`feat/sw-scope-r18`（R18）、`feat/sw-scope-r19`（R19）、`feat/sw-scope-r20`（R20）、`feat/sw-scope-r21`（R21）
-- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除；R18 指标计数点 + 测试壳；R19 attach inbox 单测 + 超时批次；R20 删除 `last_ready` 死判据；R21 message ring 改 chunked 容量、accept welcome 读源；R18–R20 不涉及分配归属，R21 的容量变化见 §4.20）**
+- **分支**：`feat/sw-scope-r1`（R1）、`feat/sw-scope-r2`（R2）、`feat/sw-scope-r3`（R3）、`feat/sw-scope-r4`（R4）、`feat/sw-scope-r5`（R5）、`feat/sw-scope-r6`（R6）、`feat/sw-scope-r7`（R7）、`feat/sw-scope-r8`（R8）、`feat/sw-scope-r9`（R9）、`feat/sw-scope-r10`（R10）、`feat/sw-scope-r11`（R11）、`feat/sw-scope-r12`（R12）、`feat/sw-scope-r13`（R13）、`feat/sw-scope-r14`（R14）、`feat/sw-scope-r15`（R15）、`feat/sw-scope-r16`（R16）、`feat/sw-scope-r17`（R17）、`feat/sw-scope-r18`（R18）、`feat/sw-scope-r19`（R19）、`feat/sw-scope-r20`（R20）、`feat/sw-scope-r21`（R21）、`feat/sw-scope-r22`（R22）
+- **状态**：**现行（R1 Scope 基座；R2 建流期 message；R3 open/reject + tg_live；R4 retired 列表；R5 删除 `PendingFin_`；R6 main 发 FIN；R7 main 发 RESET；R8 身份释放迁 main；R9 timer 收缩 + 控制帧全走公共 TX；R10 Close 请求化；R11 `RxConsumed` 位化；R12 `TakeInbound`/`OpenTelegraph` 请求化；R13 `TxReady` 位化；R15 `TgTxClosed` 位化；R16 `TgAttach` 走 inbox、删读事件通道；R17 事件通道整体删除；R18 指标计数点 + 测试壳；R19 attach inbox 单测 + 超时批次；R20 删除 `last_ready` 死判据；R21 message ring 改 chunked 容量、accept welcome 读源；R22 拆分 `session_`（纯搬运）；R18–R20/R22 不涉及分配归属，R21 的容量变化见 §4.20）**
 - **相关模块**：`connection::scope_`、`connection::config_`、`connection::main_loop`、
   `connection::session_`、`connection::mux_connection::registry_`
 
@@ -499,6 +499,19 @@ R21 把建流期 message 从单块 `[u16 len][content]` 改为 `*chunk + 0x0000`
 验收：lib 366；inmem 21×3；keepalive 5；smoke 5；cross_thread 1；alloc_count 1；
 doc 12；metrics 1；thread_safety 3；mptp_cs_smoke check 零警告 / 3 测试 / demo 11 RPC。
 
+## 4.21 第 22 轮记录（拆分 `session_`，**不涉及分配归属**）
+
+R22 把 3005 行的 `session_.rs` 按职责拆成 9 个子模块（`shared_` / `local_table_` /
+`frame_io_` / `demux_` / `demux_read_` / `mux_` / `mux_tg_` / `mux_data_` / `util_`），
+`mod.rs` 只保留文档与再导出。这是**纯搬运**：
+
+- 没有移动任何分配点，也没有改变对象的生命周期域或分配器接线；
+- 表项字段与 `MuxLoopShared_` 字段改为 `pub(super)` 只是跨子模块可见性，不改变布局；
+- 循环本地表仍是每连接两张 `DockBPlusTree_`，容量与分配次数不变。
+
+验收：`just all` 全绿（lib 366 / inmem 21×3 / keepalive 5 / smoke 5 / cross_thread 1 /
+`alloc_count` 1 / doc 12 / metrics 1 / thread_safety 3）。
+
 ## 5. 后续轮次与待拍板
 
 | 轮次 | 内容 |
@@ -523,7 +536,8 @@ doc 12；metrics 1；thread_safety 3；mptp_cs_smoke check 零警告 / 3 测试 
 | R19（已完成） | 补 attach inbox 等价语义单测 + 仓库根 `justfile` 超时批次，**不涉及分配归属**（见 §4.18） |
 | R20（已完成） | 删除 `last_ready` 死判据与死函数单测，**不涉及分配归属**（见 §4.19） |
 | R21（已完成） | message ring 改 chunked 容量、accept welcome 读源（见 §4.20） |
-| R22（待做，配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
+| R22（已完成） | 拆分 `session_` 为多文件模块，**不涉及分配归属**（见 §4.21） |
+| R23（待做，配置收敛） | `pending_msg_allocator` 接线或删除；评估 `AttachAlloc` 并入 `MpmcAlloc`；池粒度定稿 |
 
 待拍板：
 
