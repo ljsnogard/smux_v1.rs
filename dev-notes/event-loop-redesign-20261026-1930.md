@@ -2178,6 +2178,21 @@ connection/
      cross_thread 1 / `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3
      （后者连跑 20 次全过）；`sw-scope` 全量 65 + 3 + 3；clippy 干净。
 
+- 20261031-0230：**R19：补 attach inbox 等价语义单测 + 落地超时批次（T25 / T28）**。
+  1. R17 删掉 13 个只测事件通道的单测后，两条 attach inbox 一直没有等价覆盖。R19 在
+     `registry_::tests_` 补 4 例：**FIFO 交付**、**满时 `try_push` 原样带回**、
+     **异步投放等空位 + 关闭后拒绝新元素但排空已入队项**、**等待空位可取消并带回
+     元素**；读侧另覆盖 FIFO 与关闭拒绝。各例都走 `multi_art_test_!`（compio / tokio /
+     smol），共 12 个运行时变体。
+  2. T28：仓库根新增 `justfile`，把验收拆成 `lib`（≤60 s）/ `inmem` / `integration` /
+     `alloc` / `doc` / `lint`（≤300 s）六批，每批自带 `timeout`；`just all` 跑全量。
+     超时以退出码 124 明确失败，不再依赖人工看挂起。
+  3. 未改生产逻辑、无分配归属变化；`TgReady` 丢失后的重建仍由
+     `mux_telegraph_inmem_dual_` 集成覆盖（单测只钉封装层语义）。
+  4. 验收：lib **366**（354 + 12）/ inmem 21×3 / keepalive 5 / smoke 5 / cross_thread 1 /
+     `alloc_count` 1 / doc 12 / `metrics_e2e` 1 / `thread_safety` 3；`just all` 全绿；
+     clippy 干净。
+
 ## 18. 索引结构：BTreeMap / BTreeSet → bplus_tree_cmp
 
 ### 18.1 动机
@@ -2340,10 +2355,10 @@ value，key 与树结构保持不变。
 > 状态：`设计已定` = 本文已给出形状；`待做` = 实施项；`待拍板` = 依赖 Q 项。
 > 阶段对应 §13；索引项见 §18。
 >
-> **本表状态截至 R18（2026-10-30，`feat/sw-scope`）**：T1–T20、T22–T24 已完成 / 已达成，
-> T26 已有且 R18 修好 `metrics_e2e` / `thread_safety`；剩余为 T3 的「main 完全同步」、
-> T21（`reusable_docks_`）、T25（inbox 等价单测）、T27（`Drop` 路径与 chunk 数）、
-> T28（超时脚本）、T30（本仓无 CHANGELOG）。
+> **本表状态截至 R19（2026-10-31，`feat/sw-scope`）**：T1–T20、T22–T24 已完成 / 已达成，
+> T26 已有且 R18 修好 `metrics_e2e` / `thread_safety`，T25 的 inbox 单测与 T28 的超时
+> 批次于 R19 落地；剩余为 T3 的「main 完全同步」、T21（`reusable_docks_`）、T27（连接级
+> `Drop` 路径与 chunk 数）、T30（本仓无 CHANGELOG）。
 
 ### A. 循环与职责
 
@@ -2403,10 +2418,10 @@ value，key 与树结构保持不变。
 
 | # | 任务 | 阶段 | 状态 |
 | --- | --- | --- | --- |
-| T25 | 单元：PublicChunk、TCS、PendingMsg、inbox 等价语义、TimerSignal、树等价 / range 边界 / unbind 标志 | P0/P1.5 | 大部分已有（`public_channel_::tests_` / `tcs_::tests_` / `pending_msg_` / `timer_` / `dock_index_::tests_` / `main_loop::tests_`）；`WakerSlots_` 已删、其测试随之消失；R17 删掉 13 个只测事件通道的单测，**inbox 等价语义单测仍缺**（FIFO / 关闭 / 背压 / `TgReady` 丢失后的重建） |
+| T25 | 单元：PublicChunk、TCS、PendingMsg、inbox 等价语义、TimerSignal、树等价 / range 边界 / unbind 标志 | P0/P1.5 | 大部分已有（`public_channel_::tests_` / `tcs_::tests_` / `pending_msg_` / `timer_` / `dock_index_::tests_` / `main_loop::tests_`）；`WakerSlots_` 已删、其测试随之消失；**R19 已补 attach inbox 等价语义 4 例**（FIFO / 满时原样带回 / 异步等待 + 关闭排空 / 取消带回，各跑三后端；`TgReady` 丢失后的重建仍由 `mux_telegraph_inmem_dual_` 集成覆盖） |
 | T26 | 集成：三后端 `inmem` / `smoke` / `cross_thread` / `keepalive` | P2–P6 | **已有**（`inmem` 21×3、`smoke` 5×3、`cross_thread` 1×3、`keepalive` 5；`metrics_e2e` 与 `thread_safety` 于 R18 修好） |
-| T27 | 分配：数据面稳态 0 分配、Drop 0 分配；chunk 数 / 长 churn 碎片对比 | P4/P6 | `alloc_count` 覆盖绑定+监听、建流、稳态、拆流四段；**缺** `Drop` 路径断言与 chunk 数 / 长 churn 对比 |
-| T28 | 超时：单测 ≤60 s、全量 ≤5 min；背压用例看门狗 | 全程 | 待做 |
+| T27 | 分配：数据面稳态 0 分配、Drop 0 分配；chunk 数 / 长 churn 碎片对比 | P4/P6 | `alloc_count` 覆盖绑定+监听、建流、稳态、拆流四段；`measure_pair_from_alloc_` 已直测「环对 `Drop` 0 分配」；**缺**连接级 `Drop` 路径与 chunk 数 / 长 churn 对比 |
+| T28 | 超时：单测 ≤60 s、全量 ≤5 min；背压用例看门狗 | 全程 | **R19 落地**：仓库根 `justfile`（`just lib` ≤60 s、`inmem` / `integration` / `alloc` / `doc` 各批 ≤120 s、`lint` ≤300 s、`just all` 全量），超时以退出码 124 明确失败 |
 
 ### H. 公开 API / 决策
 
