@@ -120,7 +120,7 @@ use core::{
     mem::MaybeUninit,
     ops::Bound,
     ptr::NonNull,
-    task::{Context, Poll},
+    task::Poll,
 };
 
 use abs_buff::{
@@ -816,50 +816,6 @@ where
             entry.writer_.close();
         }
     }
-}
-
-/// 复用循环 park 的就绪判据之一：**「最近通知过的那条发送环」此刻真的有段可借吗**。
-///
-/// 返回 `true` 表示可以回顶部交给 `drain_once_` 正式取走。判据有两处，缺一处都会
-/// 让整圈在「回到顶部 → `drain_one_` 取不到段 → 立刻又就绪」之间空转（CPU 打满、
-/// 同一条本地队列上的其它任务全被饿死）。
-///
-/// 1. 这条子流**确实还有发送额度**：用非阻塞的 `send_available_try_`，窗口锁当场取
-///    不到就按「没额度」处理（安全方向：额度真正回来时，读循环收到窗口通告会投一条
-///    事件把 park 打断）；
-/// 2. 环的读 future **真的借到了段**：环在**生产端已关闭且已排空**（应用 `drop(tx)`
-///    之后）、**消费端已关闭**、或需求不可满足时也会**立刻完成**（返回错误），
-///    而那几种完成都不意味着 `drain_one_` 有活可干。因此只认 `contains_left`。
-///
-/// 真机现场与因果链见
-/// `smux_v1_sock_demo/dev-notes/intermittent-stall-20261007-0200.md`；判据 2 的回归
-/// 用例见本文件的 `last_ready_has_segment_rejects_closed_ring_`。
-fn last_ready_has_segment_<C>(
-    table: &mut WriteTable_<crate::connection::ConnAllocCfg_<C>>,
-    last_ready: Option<(Dock, Dock)>,
-    cx: &mut Context<'_>,
-) -> bool
-where
-    C: TrConnCfg,
-{
-    let Option::Some(pair) = last_ready else {
-        return false;
-    };
-    let Option::Some((_, entry)) = table.get_mut(pair) else {
-        // 「最近通知」的那条环可能已经不存在（子流已收尾并摘掉）。
-        return false;
-    };
-    if !matches!(entry.owner_.send_available_try_(), Option::Some(credit) if credit > 0u32) {
-        return false;
-    }
-    let demand = Demand::at_least(1usize);
-    let mut ring_fut = core::pin::pin!(core::future::IntoFuture::into_future(
-        entry.reader_.read_async(&demand),
-    ));
-    matches!(
-        core::future::Future::poll(ring_fut.as_mut(), cx),
-        Poll::Ready(outcome) if outcome.contains_left()
-    )
 }
 
 /// 非阻塞地问一句：这条子流的发送环里**还有数据没发出去**吗？
@@ -2319,7 +2275,6 @@ pub(crate) async fn mux_loop_async_<C, K>(
             shared.reg_.local_table_alloc_(cancel.child_token())
         ))
         .expect("2 KiB B+ 树足以容纳一个 telegraph 端点");
-    let mut last_ready: Option<(Dock, Dock)> = Option::None;
     // 公共 TX 的 chunked 读进度。
     let mut public_read = ChunkReadState_::new_();
     // park 期间被合并提示唤醒时，把掩码带到这里、在下一轮顶部统一处理。
@@ -2458,64 +2413,31 @@ pub(crate) async fn mux_loop_async_<C, K>(
             }
         }
 
-        // 3. 没有可发数据：若「最近通知过的那条发送环」就是目标，就 park 在它上面
-        //    （Q4 裁决的兜底：应用可能在提交之前就发出了事件）。
+        // 3. 没有可发数据：park 在四类唤醒源上——取消令牌、写侧合并提示、公共 TX 的
+        //    chunk、`Attach` inbox。
         //
-        //    **必须同时轮询事件通道、传输写半边与取消令牌**：只 park 在子流环上会让
-        //    「别的子流刚入队的事件」一直排在一个睡着的循环后面（多子流下就是死锁）；
-        //    不轮询传输写半边则「腾出空间」这条唤醒会丢（下游排空方把字节搬走之后没有
-        //    任何人通知复用循环，若这里不同时 park 在它上面，drain 就再也不会被触发）。
+        //    **必须同时轮询这些源**：只 park 在某一源上会让别处刚发生的进展排在睡着的
+        //    循环后面（多子流下就是死锁）；尤其「公共 TX 腾出空间」这类进展**不会**
+        //    再额外产生事件，不在这里轮询就会丢唤醒。
+        //
+        //    这里**不再 park 在子流发送环上**：R13 把 `TxReady` 位化后写循环本来就全表
+        //    扫描，而「环可读」不等于「有进展可能」（环已关闭且空时读 future 也会立刻
+        //    完成）；把它当唤醒条件只会带回空转风险。历史上的 `last_ready_has_segment_`
+        //    判据因此随恒为 `None` 的 `last_ready` 一起删除。
         // `Attach` 通道的接收 future：跨 poll 持有。
         let mut attach_fut = core::pin::pin!(core::future::IntoFuture::into_future(
             shared.reg_().recv_write_attach_async_()
         ));
-        let mut ring_ready = false;
         let mut hint_ready = false;
         let mut public_ready = false;
         let mut taken_attach: Option<WriteAttach_<crate::connection::ConnAllocCfg_<C>>> = Option::None;
         let alive = {
             let cancel_fut = cancel.child_token().cancellation();
             let mut cancel_fut = core::pin::pin!(cancel_fut);
-            // 仅当上一轮是**因为写环没空间**停下时，才把写环的就绪作为唤醒条件。
-            // 写环有空间就说明可以重试 `drain_once_`（这一步不消费借出的段）。
-            // 若「最近通知」的那条发送环存在，还要同时 park 在它上面（Q4 兜底）。
             poll_fn(|cx| {
                 // 取消令牌优先：连接已收尾，直接退出。
                 if core::future::Future::poll(cancel_fut.as_mut(), cx).is_ready() {
                     return Poll::Ready(false);
-                }
-                // 子流发送环有新数据：回到顶部由 `drain_once_` 正式取走。
-                //
-                // 这条 park 是**可选**的（「最近通知」那条环可能已经不存在），因此
-                // 就地建出 future、就地 poll：`Demand` 与借出的段都只活在这个分支里，
-                // 不会把 `table` 的借用带出闭包。
-                //
-                // **但「环可读」不等于「有进展可能」**，判据有两处，缺一处就是纯空转：
-                //
-                // 1. **额度**：额度为 0 时 `drain_one_` 一条也发不出去，若这里照样因
-                //    「环可读」返回就绪，整圈会在「回到顶部 → drain 失败 → 立刻又
-                //    就绪」之间空转。因此就绪条件要求「这条子流确实还有发送额度」；
-                //    额度归零之后，唤醒一律来自读循环收到窗口通告时投的那条事件（见
-                //    `write_into_ring` 的对端通告分支）。这里用**非阻塞**的
-                //    `send_available_try_`：窗口锁当场取不到就按「没额度」处理，不
-                //    唤醒——那同样是安全方向。
-                // 2. **真的借到了段**：环的读 future 在**生产端已关闭**（应用
-                //    `drop(tx)` 之后环里已排空）、**消费端已关闭**、或需求不可满足时
-                //    **也会立刻完成**，而那几种完成都不意味着 `drain_one_` 有活可干
-                //    ——它 `try_read` 一样取不到段。只看 `is_ready()` 会把「环已关闭
-                //    且空」误判成「环里有数据」，同样是 CPU 打满的空转；而且此时
-                //    `continue` 之后每轮都会重新判一次「可读」，于是**永远转下去**，
-                //    把同一条本地队列上的解复用循环、两个泵与应用任务全部饿死
-                //    （跨进程表现为两端同时静止、被空闲超时兜底拆流）。因此就绪判据
-                //    取「poll 出了**段**」（`contains_left`），只有错误一律按
-                //    「无可搬运」处理。真机取证与因果链见
-                //    `smux_v1_sock_demo/dev-notes/intermittent-stall-20261007-0200.md`。
-                //
-                //    判据整体抽成 [`last_ready_has_segment_`]，好让「环已关闭且空」
-                //    这种形态能被单元用例直接钉住。
-                if last_ready_has_segment_::<C>(&mut *table, last_ready, cx) {
-                    ring_ready = true;
-                    return Poll::Ready(true);
                 }
                 // 合并提示：应用侧封口 / 关接收只置位并唤醒，这里把掩码带回顶部处理。
                 if let Poll::Ready(bits) = shared.reg_().poll_write_hint_(cx) {
@@ -2557,20 +2479,14 @@ pub(crate) async fn mux_loop_async_<C, K>(
             .await;
             continue;
         }
-        if ring_ready {
-            // 借出的段在 future 里被 drop（不消费）：回顶部由 `drain_once_` 正式取走。
-            continue;
-        }
         if hint_ready {
-            // 收尾事实变了（排空/发 FIN/RESET）：回顶部按位扫描，不清 `last_ready`
-            // ——那条环仍是下一轮值得 park 的目标。
+            // 收尾事实变了（排空 / 发 FIN / RESET）：回顶部按位扫描。
             continue;
         }
         if public_ready {
             // 公共 TX 有新 chunk：回顶部优先搬运。
             continue;
         }
-        last_ready = Option::None;
         continue;
     }
 }
@@ -3087,119 +3003,3 @@ where
     Result::Ok(true)
 }
 
-#[cfg(test)]
-mod tests_ {
-    use core::task::{Context, Waker};
-
-    use mm_ptr::x_deps::abs_mm::CoreAlloc;
-
-    use crate::{
-        connection::{
-            Dock, SingleConnAllocCfg,
-            owner_::new_owner_,
-            ring_::test_support_::make_test_channel_,
-            test_support_::TestMuxConfig_,
-        },
-        flow_ctrl::{DefaultPolicy, WindowReport},
-    };
-
-    use super::*;
-
-    /// 造一份测试用的写侧表项：发送窗口已安装并有 `credit` 字节额度、发送环取自测试环。
-    ///
-    /// `ring` 是那条子流**发送环的读端**（复用循环持有的那一端），由调用方决定它的
-    /// 状态（空 / 有数据 / 生产端已关闭）。
-    fn make_table_(
-        ring: BufferedRx,
-        credit: Credit,
-    ) -> WriteTable_<SingleConnAllocCfg> {
-        let owner = new_owner_(CoreAlloc);
-        owner.install_(&DefaultPolicy, 64usize);
-        // 通告一条「累计已收 0、窗口 `credit`」的快照：发送窗口因此有 `credit` 额度。
-        owner
-            .send_on_report_(WindowReport::new(0u64, credit))
-            .expect("测试额度远小于上限，通告应当被接受");
-        let mut table = crate::connection::dock_index_::DockBPlusTree_::new_in(CoreAlloc)
-            .expect("2 KiB B+ 树足以容纳测试表项");
-        table.insert(
-            (Dock::new(0x7501u32), Dock::new(0x7502u32)),
-            WriteEntry_ {
-                owner_: owner,
-                reader_: ring,
-                peer_fin_handled_: false,
-                fin_sent_: false,
-            },
-        );
-        table
-    }
-
-    /// 往环的写端提交 `bytes`（借段、写入、drop 提交）。
-    fn fill_ring_(tx: &mut BufferedTx, bytes: &[u8]) {
-        let demand = Demand::at_least(1usize);
-        let mut outcome = tx.try_write(&demand);
-        let segm = outcome
-            .as_mut()
-            .pick_left()
-            .expect("空环上借写段应当成功");
-        let mut child = segm.as_segm_mut();
-        let put = child.clone_items_from_buff(bytes);
-        assert_eq!(put, bytes.len(), "测试环容量应当装得下这一段");
-        drop(child);
-        drop(outcome);
-    }
-
-    /// 测试目标：复用循环 park 的「最近通知过的那条发送环」就绪判据，**只认真的借到了段**。
-    ///
-    /// - 背景：环的读 future 在**生产端已关闭且已排空**时也会立刻完成（返回
-    ///   `Closing`）。若就绪判据只看 `is_ready()`，复用循环就会把「环已关闭且空」
-    ///   误判成「环里有数据」，在「回顶部 → `drain_one_` 取不到段 → 立刻又就绪」之间
-    ///   空转（CPU 打满、同一条本地队列上的其它任务全被饿死）。
-    /// - 手段：用测试环与一份「有额度」的共享状态装出一张写侧表，分别在**四种形态**
-    ///   下调 [`last_ready_has_segment_`]：环里有数据、环空且生产端开着、环空且生产端
-    ///   已关闭（`close()` **之后**再调）、环里有数据但额度为 0。每次用 `Waker::noop()`
-    ///   造一个无操作上下文。
-    /// - 判断：只有「环里有数据且额度为正」为 `true`；其余三种必须为 `false`——它们若
-    ///   判真，就是本用例要钉住的空转路径。
-    #[test]
-    fn last_ready_has_segment_rejects_closed_ring_() {
-        let pair = (Dock::new(0x7501u32), Dock::new(0x7502u32));
-        let mut cx = Context::from_waker(Waker::noop());
-
-        // 形态一：环里有数据、额度为正 → 可读。
-        let (mut tx, rx) = make_test_channel_(64usize);
-        fill_ring_(&mut tx, &[7u8; 8usize]);
-        let mut table = make_table_(rx, 64u32);
-        assert!(
-            last_ready_has_segment_::<TestMuxConfig_>(&mut table, Option::Some(pair), &mut cx),
-            "环里有数据且额度为正时必须判为可读"
-        );
-
-        // 形态二：环空、生产端还开着 → 不可读（只是暂时没数据，靠事件唤醒）。
-        let (tx, rx) = make_test_channel_(64usize);
-        let mut table = make_table_(rx, 64u32);
-        assert!(
-            !last_ready_has_segment_::<TestMuxConfig_>(&mut table, Option::Some(pair), &mut cx),
-            "环空且生产端开着时不得判为可读（否则就是空转）"
-        );
-        drop(tx);
-
-        // 形态三（回归）：环空、生产端已关闭 → 读 future 立刻完成（`Closing`），
-        // 但那不是「有数据可发」。
-        let (mut tx, rx) = make_test_channel_(64usize);
-        tx.close();
-        let mut table = make_table_(rx, 64u32);
-        assert!(
-            !last_ready_has_segment_::<TestMuxConfig_>(&mut table, Option::Some(pair), &mut cx),
-            "环已关闭且已排空时不得判为可读——只看 `is_ready()` 会在这里空转"
-        );
-
-        // 形态四：额度为 0 → 不可读（哪怕环里有数据，`drain_one_` 也发不出去）。
-        let (mut tx, rx) = make_test_channel_(64usize);
-        fill_ring_(&mut tx, &[7u8; 8usize]);
-        let mut table = make_table_(rx, 0u32);
-        assert!(
-            !last_ready_has_segment_::<TestMuxConfig_>(&mut table, Option::Some(pair), &mut cx),
-            "额度为 0 时不得判为可读（否则也是空转）"
-        );
-    }
-}
