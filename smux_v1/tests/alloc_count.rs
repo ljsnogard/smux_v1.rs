@@ -178,6 +178,13 @@ unsafe impl Allocator for CountingAlloc {
 
 unsafe impl AllocatorClone for CountingAlloc {}
 
+/// `CountingAlloc` 的连接分配器配置：所有用途都用注入分配器。
+///
+/// 直接复用内建的 [`SingleConnAllocCfg`](smux_v1::connection::SingleConnAllocCfg)：
+/// 它的每一项关联类型都回落到同一个分配器参数，因此「所有用途共用一个注入分配器」
+/// 这条语义不必在这里手写一遍。
+type CountingAllocCfg = smux_v1::connection::SingleConnAllocCfg<CountingAlloc>;
+
 /// 子流环存储的类型（与冒烟配置同构，只换分配器）。
 ///
 /// 用[注入分配器](CountingAlloc)记账的连接配置。
@@ -246,7 +253,7 @@ where
     RT: common::TrSmokeRt,
 {
     type Rt = RT;
-    type Alloc = CountingAlloc;
+    type AllocCfg<'a> = CountingAllocCfg;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -256,8 +263,8 @@ where
         self.rt_.clone()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CountingAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        CountingAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -489,16 +496,30 @@ where
     let bind_global = Usage_::since_(global_usage_(), g0);
     let bind_injected = Usage_::since_(injected_usage_(), i0);
     report_("绑定 + 监听", bind_global, bind_injected);
-    // C3 之后：每个被监听的 dock 只用**注入**分配建一个身份节点（入向通知是内联槽），
-    // 全局侧只允许一次性初始化那种量级（实测 1 次 / 48 B）。
+    // 身份节点（`Shared<DockBinding_>`）与请求通道的等待节点都走**注入**分配器；
+    // 完成源（`Tcs_`）自 `feat/sw-scope` 起改走连接级 `sw_scope::Scope`，它在域内
+    // **按池**向注入分配器要内存，不再每请求一次。因此注入侧的线性增长项少了一项，
+    // 全局侧只钉一个量级上限。
+    //
+    // # 基线为什么是 4 / 40（旧注释写的是 1 / 11，再上一版是 11 / 33）
+    //
+    // 请求队列从内联队列换成 `mpmc_chan`（`fd3aa1c`）之后，每次请求的 park / 唤醒
+    // 会在 4 KiB 等待 chunk 里登记节点，注入分配数随之上升；旧基线（11 次）是内联
+    // 队列时代的数字。`Tcs_` 迁入 Scope 后，完成源从「每请求一次 `Shared::new_in`」
+    // 变成「Scope 强池按块分配」，注入次数从 52 降到 33。
+    //
+    // R4：`reap_retired_` 的临时列表改用连接的结构分配器（不再走全局 `Vec`），
+    // 9 个 dock 的绑定 + 监听阶段全局分配从 11 降到 4、注入从 33 升到 40（同一批
+    // 分配换了归属，字节数基本不变）。全局侧因此收紧到 8；注入侧按 40 钉住。
     assert!(
-        bind_global.allocs_ <= 2usize,
-        "绑定 + 监听阶段发生了 {} 次全局分配（9 个 dock）——listener 通知可能又回到了堆上",
+        bind_global.allocs_ <= 8usize,
+        "绑定 + 监听阶段发生了 {} 次全局分配（9 个 dock）——listener 通知或 retired 列表可能又回到了堆上",
         bind_global.allocs_
     );
     assert_eq!(
-        bind_injected.allocs_, 11usize,
-        "9 个 dock（1 binding + 8 listener）应当只发生 11 次注入分配，实际 {}",
+        bind_injected.allocs_, 40usize,
+        "9 个 dock（1 binding + 8 listener）实测 40 次注入分配（身份节点 + 请求通道\
+         等待节点 + Scope 池块 + retired 临时列表），实际 {}",
         bind_injected.allocs_
     );
 
@@ -525,8 +546,7 @@ where
         let listener = &mut listeners_b[index];
         let (opened, accepted) = join!(
             async {
-                let mut welcome: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome[..];
+                let mut welcome: &[u8] = &[];
                 handle
                     .accept_async_closure(&mut welcome, || {
                         let make = || {
@@ -541,8 +561,7 @@ where
                     .income_async()
                     .await
                     .expect("B 侧应当取到入向请求");
-                let mut welcome: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome[..];
+                let mut welcome: &[u8] = &[];
                 incoming
                     .accept_async_closure(&mut welcome, || {
                         let make = || {
@@ -649,6 +668,11 @@ where
     );
 
     // -- 阶段 5：拆流（丢弃发送半边 → 等对端 EOF）。
+    //
+    // R8 起身份释放由 `main_loop::flush_releasable_` 做：它的扫描结果列表用
+    // `C::RegistryAlloc`（空列表不分配），因此每批实际释放会多一次注入分配。本阶段
+    // 只打印、不设上限断言——这里的次数随「一批里释放了几条子流」变化，不是结构性
+    // 不变量；结构性不变量是上面「稳态搬运注入 0 / 全局 ≤ 上限」那两条。
     drop(txs_a);
     drop(txs_b);
     let g0 = global_usage_();

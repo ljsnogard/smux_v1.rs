@@ -36,6 +36,13 @@ async fn smoke_socket_compio_() {
     common::assert_runtime_is_(&rt, abs_art_facade::RuntimeTag::Compio);
     let scope = rt.local_scope();
     smoke_common::smoke_socket_body_(&rt, &scope).await;
+
+    // 诊断：单跑本测试时打印事件通道计数（`--nocapture` 可见）。
+    #[cfg(feature = "test-loop-probe")]
+    eprintln!(
+        "[event-probe] smoke_socket(1024 channels): {:?}",
+        smux_v1::connection::loop_probe_::event_probe_snapshot_()
+    );
 }
 
 /// 测试目标、手段、判断见 [`smoke_common::small_socket_body_`]。

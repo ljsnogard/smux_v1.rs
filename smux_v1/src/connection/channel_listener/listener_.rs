@@ -6,10 +6,11 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        Dock, MuxConnection, MuxError, TrConnCfg,
+        Dock, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError, TrConnCfg,
+        TcsAbandonGuard_, Tcs_,
         channel_handle::ChannelHandle,
         owner_::LsnOwner_,
-        signal_::SessionEvent_,
+        session_::race_cancel_,
     },
     x_deps::{abs_cancel, abs_smux, gen_mcf2}
 };
@@ -50,7 +51,7 @@ where
     ///
     /// 通知槽内联在节点里（零堆分配），本对象持句柄并在它上面 park——句柄同时保证
     /// 「只要 listener 还在，身份节点就还在」，因此等待期间不会被回收。
-    rec_: LsnOwner_<C::Alloc>,
+    rec_: LsnOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
 }
 
 impl<C> ChannelListener<C>
@@ -61,7 +62,7 @@ where
     pub(crate) fn new_(
         conn: MuxConnection<C>,
         local_dock: Dock,
-        rec_: LsnOwner_<C::Alloc>,
+        rec_: LsnOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
     ) -> Self {
         ChannelListener {
             conn_: conn,
@@ -71,7 +72,7 @@ where
     }
 }
 
-/// 丢弃监听器即**解除 listener 身份**（投递 `SessionEvent_::ReleaseListener`，
+/// 丢弃监听器即**解除 listener 身份**（`LsnRec_` 的 retired 位 + 合并提示，
 /// 由核心落实），使同一个 `local_dock` 之后可以再作 telegraph 使用
 /// （见 `ChannelRegistry_::release_listener_`）。
 ///
@@ -84,13 +85,12 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        let _ = self
-            .conn_
+        // 只置位 + raise，由 main 的 retired 扫描释放。
+        self.rec_.set_retired_();
+        self.conn_
             .core_()
-            .reg_()
-            .post_session_event_(SessionEvent_::ReleaseListener {
-                local_dock: self.local_dock_,
-            });
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
     }
 }
 
@@ -138,17 +138,48 @@ where
             Result::Err(_) => return Result::Err(ListenerError::Cancelled),
             Result::Ok(Option::None) => {}
         }
-        // 2. 有已到达的入向请求就当场取走。
-        match conn
-            .core_()
-            .take_pending_inbound_(local, cancel.child_token())
-            .await
-        {
-            Result::Ok(Option::Some((remote, owner))) => {
-                return Result::Ok(ChannelHandle::new_(conn, local, remote, owner));
-            }
+        // 2. 有已到达的入向请求就当场取走。**经请求队列交给 main**：身份表槽由
+        //    `main_loop` 独占写（I3），入向请求的取出会推进 `Pending → HandedOut`。
+        let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+            Result::Ok(tcs) => tcs,
             Result::Err(_) => return Result::Err(ListenerError::Cancelled),
-            Result::Ok(Option::None) => {}
+        };
+        let waiter = tcs.clone();
+        // 调用方取消 / 丢弃 future 时放弃结果；main 会在 `set_` 之前检查并回滚。
+        let _abandon = TcsAbandonGuard_::new_(&waiter);
+        if conn
+            .core_()
+            .control_()
+            .submit_async_(
+                MainLoopRequest_::TakeInbound {
+                    local_dock: local,
+                    reply: tcs,
+                },
+                cancel.child_token(),
+            )
+            .await
+            .is_err()
+        {
+            return Result::Err(ListenerError::Cancelled);
+        }
+        let reply = race_cancel_(
+            &cancel,
+            poll_fn(|cx| waiter.poll_wait_(cx)),
+        )
+        .await;
+        match reply {
+            Option::Some(Option::Some(Result::Ok(MainLoopReply_::Inbound(
+                Option::Some((remote, owner, msg_)),
+            )))) => {
+                return Result::Ok(ChannelHandle::new_(conn, local, remote, owner, msg_));
+            }
+            // 没有待决请求：落到下面的通知槽等待。
+            Option::Some(Option::Some(Result::Ok(MainLoopReply_::Inbound(Option::None)))) => {}
+            Option::Some(Option::Some(Result::Err(MainLoopErr_::Mux(err)))) => {
+                return Result::Err(ListenerError::Mux(err));
+            }
+            // 取消 / 放弃 / 队列关闭 / 其他结果：按取消处理（调用方会重试或退出）。
+            _ => return Result::Err(ListenerError::Cancelled),
         }
         // 3. 等一条通知（新请求或连接失败），与取消令牌竞争。
         //    槽的持久位是「先通知、后等待也不丢」的保证（协议见 `sync_::NotifySlot_`）：

@@ -14,7 +14,6 @@
 //! 测试覆盖。
 
 use abs_art::{TrClock, TrDelay, TrInterval, TrTime};
-use abs_mm::CoreAlloc;
 use abs_smux::conf::TrMuxConfig;
 
 use crate::{
@@ -24,7 +23,7 @@ use crate::{
     flow_ctrl::DefaultPolicy,
     handshake::opts::{BasicOpts, HandshakeOpts},
     metrics::NoMetrics,
-    x_deps::{abs_mm, abs_smux},
+    x_deps::abs_smux,
 };
 
 /// 测试用的**假运行时值**：时刻恒为 0，`delay` 永不就绪。
@@ -119,7 +118,7 @@ impl TrMuxConfig for TestMuxConfig_ {
 
 impl TrConnCfg for TestMuxConfig_ {
     type Rt = NullRt_;
-    type Alloc = CoreAlloc;
+    type AllocCfg<'a> = crate::connection::SingleConnAllocCfg;
     type Policy = DefaultPolicy;
     type ConnTx = TestWireTx_;
     type ConnRx = TestWireRx_;
@@ -129,8 +128,8 @@ impl TrConnCfg for TestMuxConfig_ {
         NullRt_
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        crate::connection::SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {

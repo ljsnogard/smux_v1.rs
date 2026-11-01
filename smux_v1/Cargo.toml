@@ -13,24 +13,32 @@ abs_smux = { path = "../abs_smux" }
 # 相同**的 git spec（同一 URL + 同一 branch），否则 Cargo 会把它们当成两个 source、
 # 检出两份代码——那时 `TrLocalScope` / `TrTime` 这些 trait 会出现「同名不同源」而
 # 对不上。跨依赖表（`[dependencies]` 与 `[dev-dependencies]`）也必须一致。
-abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+abs_art = { git = "https://gitee.com/lino_snsalias/abs_art.git" }
 # **后端门面**：本 crate 只认 `abs_art_facade::Runtime`，不再直接依赖 `abs_art-bridge`，
 # 也不再自己维护「三选一 + 具名别名」那套表。门面是全家族**唯一**决定「当前后端」的地方：
 # 下游谁点亮 `abs_art-facade/rt-tokio`，全图（含本 crate）就都是 tokio。
-abs_art-facade = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+abs_art-facade = { git = "https://gitee.com/lino_snsalias/abs_art.git" }
 # 虚拟时间（仅测试装配需要）：连接的建连路径要自己取作用域（`ScopeHost`），而
 # `ManualTime` 是外部类型，它的 `ScopeHost` 实现只能写在**拥有该 trait 的本 crate**
 # 里（孤儿规则）。因此这里开一个可选依赖 + 测试 feature，生产依赖图里不出现它。
-abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", optional = true }
+abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", optional = true }
 abs_async_iter = { git = "https://gitee.com/lino_snsalias/abs_async_iter.git" }
 atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }
 
+bplus_tree_cmp = { git = "https://gitee.com/lino_snsalias/bplus_tree_cmp.git" }
+
 buffex = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 mm_ptr = { git = "https://gitee.com/lino_snsalias/mm_ptr.git", branch = "dev/0.2.0" }
+# 通道实现二选一（见 `signal_` / `sync_` 模块文档）：
+# - 默认：`mpmc_chan`（定容 + 全扫兜底）；
+# - `chan-flume` feature：切回旧的 `flume` 实现，用于 A/B 对比。
+# 上游包名已从 `mpmc-chan` 改为 `mpmc_chan`（c03d41c），依赖键与包名一致，
+# 因此不再写 `package = "mpmc-chan"`；源码里的 `mpmc_chan::...` 不受影响。
 mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs" }
+sw-scope = { path = "../../sw-scope" }
 
 crc = { version = "3.4.*" }
-flume = { version = "0.12.*" }
+# flume = { version = "0.12.*", optional = true }
 thiserror = { version = "2.0.*", default-features = false }
 
 [features]
@@ -67,6 +75,22 @@ test-loop-probe = []
 # 上报调用点被消除为零指令——缺省 sink 是零大小的 `NoMetrics`，每个方法都是
 # `#[inline(always)]` 空实现。本 feature **不引入任何依赖**。
 metrics = []
+# **通道实现 A/B 开关**：`chan-mpmc`（默认）走 `mpmc_chan` 的定容 + 全扫/暂存
+# 兜底；`chan-flume` 切回旧的 `flume` 无界实现（`signal_` 里按 `cfg` 分派）。
+# `CancelToken_` 两种后端都使用零分配 `NotifySlot_`，不受本开关影响。它只影响内部
+# 实现，不改变任何对外 API。
+#
+# A/B 时显式选 flume：
+#   cargo test -p smux_v1 --no-default-features \
+#     --features test-tokio-runtime,chan-flume
+# 注意 `test-*` feature 会顺带启用 `chan-mpmc`（否则 `--no-default-features` 下
+# 默认通道分支没有依赖），因此两个实现都会被编译，但 `signal_` 按 `chan-flume`
+# 选择 flume 分支。
+#
+# `chan-flume` 同时启用 `chan-mpmc`：请求队列与两条 `Attach` inbox 已固定用
+# `mpmc_chan`（等待者是 Arena slab，不再有 flume 版本），A/B 开关只影响事件通道。
+# chan-mpmc = ["dep:mpmc_chan"]
+# chan-flume = ["dep:flume", "chan-mpmc"]
 default = ["test-compio-runtime"]
 
 [dev-dependencies]
@@ -98,13 +122,13 @@ buffex_tokio_adapt = { git = "https://gitee.com/lino_snsalias/buffex.rs.git" }
 # `mock-clock`：各后端的手动时钟驱动入口（`LocalScope::block_on_advancing`）。
 # keepalive 的端到端验收靠它把「等 1 秒 / 2.5 秒」变成**虚拟时间**，
 # 场景本体与设计见 `tests/common/keepalive_common.rs` 与 `dev-notes/runtime-adoption-20261006-1352.md`。
-abs_art-tokio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
-abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
-abs_art-smol = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0", features = ["mock-clock"] }
+abs_art-tokio = { git = "https://gitee.com/lino_snsalias/abs_art.git", features = ["mock-clock"] }
+abs_art-compio = { git = "https://gitee.com/lino_snsalias/abs_art.git", features = ["mock-clock"] }
+abs_art-smol = { git = "https://gitee.com/lino_snsalias/abs_art.git", features = ["mock-clock"] }
 
 # 手动（虚拟）时钟本体：`ManualClock` / `ManualTime` / `Supervisor`。
 # 它只出现在测试里（正式依赖不需要），因此留在 dev-dependencies。
-abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git", branch = "dev/0.3.0" }
+abs_art-mock_clock = { git = "https://gitee.com/lino_snsalias/abs_art.git" }
 
 # 场景并发用与运行时无关的组合子（join! / join_all / select），因此只需要
 # `futures`，不需要为两个运行时各写一份并发代码。

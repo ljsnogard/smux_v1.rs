@@ -96,8 +96,7 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S, RT>(
             .open_channel_async(listener_dock, &mut opening)
             .await
             .expect("A 侧发起子流应当成功");
-        let mut welcome_buf: [u8; 0] = [];
-        let mut welcome: &mut [u8] = &mut welcome_buf[..];
+        let mut welcome: &[u8] = &[];
         let (mut tx, rx) = handle
             .accept_async_closure(&mut welcome, || {
                 (
@@ -129,8 +128,7 @@ pub async fn run_flow_ctrl_socket_scenario_<RA, WA, RB, WB, S, RT>(
             .await
             .expect("B 侧开始监听应当成功");
         let mut incoming = listener.income_async().await.expect("B 侧应当取到入向子流");
-        let mut welcome_buf: [u8; 0] = [];
-        let mut welcome: &mut [u8] = &mut welcome_buf[..];
+        let mut welcome: &[u8] = &[];
         let (_tx, mut rx) = incoming
             .accept_async_closure(&mut welcome, || {
                 (
@@ -225,8 +223,7 @@ pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S, RT>(
             .open_channel_async(dock_blocked, &mut opening)
             .await
             .expect("A 侧发起子流 1 应当成功");
-        let mut welcome_buf: [u8; 0] = [];
-        let mut welcome: &mut [u8] = &mut welcome_buf[..];
+        let mut welcome: &[u8] = &[];
         let (mut blocked_tx, _blocked_rx) = blocked_handle
             .accept_async_closure(&mut welcome, || {
                 (
@@ -285,9 +282,7 @@ pub async fn run_flow_ctrl_isolation_scenario_<RA, WA, RB, WB, S, RT>(
             .listen_async_default()
             .await
             .expect("B 侧监听 dock 2 应当成功");
-
-        let mut welcome_buf: [u8; 0] = [];
-        let mut welcome: &mut [u8] = &mut welcome_buf[..];
+        let mut welcome: &[u8] = &[];
 
         // 先接子流 1 并**故意不读**：环保持满，窗口停在 0。
         let mut incoming_blocked = listener_blocked
@@ -407,8 +402,7 @@ pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S, RT>(
             .open_channel_async(drop_dock, &mut opening)
             .await
             .expect("A 侧发起子流 1 应当成功");
-        let mut welcome_buf: [u8; 0] = [];
-        let mut welcome: &mut [u8] = &mut welcome_buf[..];
+        let mut welcome: &[u8] = &[];
         let (mut tx, _rx) = handle
             .accept_async_closure(&mut welcome, || {
                 (
@@ -462,8 +456,7 @@ pub async fn run_recv_dropped_scenario_<RA, WA, RB, WB, S, RT>(
             .income_async()
             .await
             .expect("B 侧应当取到子流 1");
-        let mut welcome_buf: [u8; 0] = [];
-        let mut welcome: &mut [u8] = &mut welcome_buf[..];
+        let mut welcome: &[u8] = &[];
         let (_tx_drop, rx_drop) = incoming_drop
             .accept_async_closure(&mut welcome, || {
                 (

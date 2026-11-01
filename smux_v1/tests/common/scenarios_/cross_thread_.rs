@@ -166,8 +166,7 @@ where
                 dock,
                 "被动方的 local_dock 应当是监听 dock（镜像语义）"
             );
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (tx, mut rx) = handle
                 .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
@@ -227,8 +226,7 @@ pub async fn worker_body_(conn: CrossThreadConn, n: usize) -> Result<(), String>
                 .open_channel_async(remote, &mut message)
                 .await
                 .map_err(|e| format!("第 {index} 条子流 open 失败：{e:?}"))?;
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (tx, mut rx) = handle
                 .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())

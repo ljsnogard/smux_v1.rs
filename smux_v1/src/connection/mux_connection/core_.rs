@@ -4,7 +4,7 @@
 //! （`ChannelRegistry_`）、两条事件通道的发送端，以及**作用域保活槽**。
 //!
 //! 注意「建流时展开的三个标量」（初始接收窗口、通告阈值快照、单帧上限）**不在**
-//! 这里，而在 [`LoopShared_`](crate::connection::session_::LoopShared_)：它们只有
+//! 这里，而在 [`LoopShared_`](crate::connection::session_::MuxLoopShared_)：它们只有
 //! 两个循环读，API 面一个都不用，放进核心只会多一份需要同步的副本。
 //!
 //! # 为什么它是「演员」而不是「连接对象」
@@ -18,7 +18,7 @@
 //!
 //! 持有强引用的只有**应用面对象**：`MuxConnection` 及其派生句柄
 //! （binding / listener / handle / telegraph / 两个半部）。两个读写循环**不**持有
-//! 它——循环只持有 [`LoopShared_`](crate::connection::session_::LoopShared_)（注册表
+//! 它——循环只持有 [`LoopShared_`](crate::connection::session_::MuxLoopShared_)（注册表
 //! 句柄 + 三个标量），因此最后一个应用面对象被丢弃时本类型确实会析构，
 //! [`Drop`](MuxCore::drop) 就在那里触发两个循环的取消令牌。
 //!
@@ -48,13 +48,11 @@ use abs_cancel::TrCancellationToken;
 use crate::{
     connection::{
         Dock, TrConnCfg,
+        control_state_::ControlState_,
         mux_connection::{ChannelRegistry_, ReserveErr_},
-        owner_::{ChannelOwner_, LsnOwner_, TgOwner_},
-        signal_::{EventSender_, ReadEvent_, WriteEvent_},
+        scope_::close_conn_scope_,
         sync_::CancelToken_,
     },
-    flow_ctrl::WindowReport,
-    handshake::opts::HandshakeOpts,
     metrics::{ConnCloseReason, TrMetricsSink},
     x_deps::abs_cancel,
 };
@@ -112,31 +110,31 @@ where
     config_: C,
 
     /// 握手协商结果（连接级配额）。
-    opts_: HandshakeOpts,
 
     /// **建连时刻**：一切「连接内毫秒」的零点。
     ///
     /// 存的是**纯数据**（时刻类型来自运行时值），不是运行时值本身——理由见类型文档。
     epoch_: <C::Rt as TrClock>::Instant,
 
-    /// dock / 子流身份索引、失败标志与两个循环的取消令牌。
-    reg_: ChannelRegistry_<C::Alloc>,
+    /// dock / 子流身份索引、失败标志与四个循环的取消令牌。
+    reg_: ChannelRegistry_<crate::connection::ConnAllocCfg_<C>>,
+
+    /// 控制面共享状态：定容请求队列 + `main_loop` 的合并提示位。
+    control_: ControlState_<crate::connection::ConnAllocCfg_<C>>,
 
     /// 写事件发送端（控制帧、建流注册、水位与拆流通知）。
-    w_events_: EventSender_<WriteEvent_<C::Alloc>>,
 
     /// 读事件发送端（接收环注册与释放）。
-    r_events_: EventSender_<ReadEvent_<C::Alloc>>,
 
-    /// 三个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时）。
+    /// 四个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时、`3` = 控制面）。
     ///
     /// 核心自己持一份克隆，**而不是在 `Drop` 里去注册表取**：注册表取锁在跨线程
     /// 争用时是阻塞等待，而 `Drop` 必须不阻塞。令牌是可克隆的共享句柄，因此这里
     /// 持有的就是循环在用的那一个。
     ///
     /// 旧版是五个：贴传输的读 / 写泵连同连接级帧暂存环一起去掉了（见 `session_`
-    /// 模块文档）。
-    loops_: [CancelToken_<C::Alloc>; 3],
+    /// 模块文档）。控制面这一格在 P1 之前是空转的 `ctl_`，现在由 `main_loop` 承担。
+    loops_: [CancelToken_<crate::connection::ConnCoreAlloc_<C>>; 4],
 }
 
 impl<C> MuxCore<C>
@@ -145,25 +143,21 @@ where
 {
     /// 由建连路径展开后的全部量构造（成员私有，构造只能走这里）。
     ///
-    /// 参数确实多（策略 / 协商结果 / 注册表 / 建连时刻 / 两条通道 / 三个令牌）：
+    /// 参数确实多（策略 / 协商结果 / 注册表 / 控制面 / 建连时刻 / 两条通道 / 四个令牌）：
     /// 它们全部来自同一个建连路径，打成一个中间结构只会多一层壳而没有别的收益。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_(
         config: C,
-        opts: HandshakeOpts,
-        reg: ChannelRegistry_<C::Alloc>,
+        reg: ChannelRegistry_<crate::connection::ConnAllocCfg_<C>>,
+        control: ControlState_<crate::connection::ConnAllocCfg_<C>>,
         epoch: <C::Rt as TrClock>::Instant,
-        w_events: EventSender_<WriteEvent_<C::Alloc>>,
-        r_events: EventSender_<ReadEvent_<C::Alloc>>,
-        loops: [CancelToken_<C::Alloc>; 3],
+        loops: [CancelToken_<crate::connection::ConnCoreAlloc_<C>>; 4],
     ) -> Self {
         MuxCore {
             config_: config,
-            opts_: opts,
             epoch_: epoch,
             reg_: reg,
-            w_events_: w_events,
-            r_events_: r_events,
+            control_: control,
             loops_: loops}
     }
 
@@ -172,9 +166,9 @@ where
         &self.config_
     }
 
-    /// 握手协商结果（连接级配额）。
-    pub(crate) fn opts_(&self) -> &HandshakeOpts {
-        &self.opts_
+    /// 控制面共享状态（API 面提交请求用）。
+    pub(crate) fn control_(&self) -> &ControlState_<crate::connection::ConnAllocCfg_<C>> {
+        &self.control_
     }
 
     /// 「现在」的连接内毫秒（自建连 epoch 起算、向下取整、饱和）。
@@ -186,22 +180,12 @@ where
     }
 
     /// dock / 子流身份索引与失败标志。
-    pub(crate) fn reg_(&self) -> &ChannelRegistry_<C::Alloc> {
+    pub(crate) fn reg_(&self) -> &ChannelRegistry_<crate::connection::ConnAllocCfg_<C>> {
         &self.reg_
     }
 
-    /// 写事件发送端。
-    pub(crate) fn w_events_(&self) -> &EventSender_<WriteEvent_<C::Alloc>> {
-        &self.w_events_
-    }
-
-    /// 读事件发送端。
-    pub(crate) fn r_events_(&self) -> &EventSender_<ReadEvent_<C::Alloc>> {
-        &self.r_events_
-    }
-
     /// 第 `idx` 个循环的取消令牌（`0` = 解复用、`1` = 复用、`2` = 计时）。
-    pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<C::Alloc> {
+    pub(crate) fn loop_token_(&self, idx: usize) -> CancelToken_<crate::connection::ConnCoreAlloc_<C>> {
         self.loops_[idx].clone()
     }
 }
@@ -219,24 +203,6 @@ impl<C> MuxCore<C>
 where
     C: TrConnCfg,
 {
-    /// 投递一条会话释放消息（**同步、不取锁**；`Drop` 与错误清理路径用）。
-    pub(crate) fn post_session_event_(
-        &self,
-        event: crate::connection::signal_::SessionEvent_,
-    ) -> bool {
-        self.reg_.post_session_event_(event)
-    }
-
-    /// 落实积压的会话释放消息（`Drop` 只投消息，见 `signal_::SessionEvent_`）。
-    pub(crate) async fn drain_session_events_<K: TrCancellationToken>(
-        &self,
-        cancel: K,
-    ) -> Result<(), ReserveErr_> {
-        self.reg_
-            .drain_session_events_(self.now_millis_(), cancel)
-            .await
-    }
-
     /// 连接是否已经进入**优雅关闭**（锁外原子读，热路径可用）。
     ///
     /// 语义有两条：**不再接受任何新身份**；已登记的子流由连接自己推进「排空 + 发
@@ -246,90 +212,14 @@ where
         self.reg_.is_closing_()
     }
 
-    /// **进入「等待关闭」**（幂等、不取锁、不分配），返回是否首次进入。
+    /// 唤醒**控制面**立刻做一轮定时决策。
     ///
-    /// 它替代了上一版「在写锁里把活跃子流收进一个 `Vec`」的做法：排空请求改由
-    /// **计时循环**在扫描时逐条认领（见 [`ChannelRegistry_::timer_scan_`]），因此
-    /// 进入关闭这一步只是**一次 CAS**。
-    ///
-    /// 调用方在首次进入之后应当 [`MuxCore::notify_timer_`] 唤醒推进引擎。
-    pub(crate) fn enter_waiting_close_(&self) -> bool {
-        self.reg_.enter_waiting_close_(self.now_millis_())
-    }
-
-    /// 唤醒计时循环：它在等待关闭时是推进排空与收口的那台引擎。
+    /// R9 起 `timer_loop` 只做计时（只等 `TimerSignal_` 的期限），定时决策的唯一
+    /// 执行者是 `main_loop::tick_`。因此「进入等待关闭 / 关闭请求」需要的是让 main
+    /// 立刻 tick 一次，而不是唤醒 timer 重算——直接 raise `HINT_MAIN_TIMER`。
     pub(crate) fn notify_timer_(&self) {
-        self.reg_.notify_timer_()
-    }
-
-    /// 独占绑定一个 `local_dock`（[`TrConnection::bind_async`] 的登记点）。
-    ///
-    /// [`TrConnection::bind_async`]: abs_smux::conn::TrConnection::bind_async
-    pub(crate) async fn bind_dock_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        cancel: K,
-    ) -> Result<(), ReserveErr_> {
-        self.reg_.bind_dock_(local_dock, cancel).await
-    }
-
-    /// 自行安排一个空闲 `local_dock` 并独占绑定它（`bind_async(unspecified)` 的
-    /// 登记点）：实际的 dock 由注册表在同一个临界区里选出并占住，见
-    /// [`ChannelRegistry_::bind_any_dock_`]。
-    ///
-    /// [`ChannelRegistry_::bind_any_dock_`]: super::registry_::ChannelRegistry_::bind_any_dock_
-    pub(crate) async fn bind_any_dock_<K: TrCancellationToken>(
-        &self,
-        cancel: K,
-    ) -> Result<Dock, ReserveErr_> {
-        self.reg_.bind_any_dock_(cancel).await
-    }
-
-    /// 登记 listener 身份，并交出它的**身份节点句柄**（listener 在该句柄上等入向通知）。
-    pub(crate) async fn reserve_listener_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        cancel: K,
-    ) -> Result<LsnOwner_<C::Alloc>, ReserveErr_> {
-        self.reg_.reserve_listener_(local_dock, cancel).await
-    }
-
-    /// 登记 telegraph 身份，并交出它的**身份节点句柄**。
-    pub(crate) async fn reserve_telegraph_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        cancel: K,
-    ) -> Result<TgOwner_<C::Alloc>, ReserveErr_> {
-        self.reg_.reserve_telegraph_(local_dock, cancel).await
-    }
-
-    /// 为一条子流登记身份（dock 对即身份），并返回它的共享状态句柄。
-    ///
-    /// 状态与身份**一起建立**：调用方拿到句柄后，在建流最终裁决时把窗口参数安装进去。
-    pub(crate) async fn reserve_channel_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        remote_dock: Dock,
-        cancel: K,
-    ) -> Result<ChannelOwner_<C::Alloc>, ReserveErr_> {
-        self.reg_
-            .reserve_channel_(local_dock, remote_dock, self.now_millis_(), cancel)
-            .await
-    }
-
-    /// 撤销一条尚未露面的子流登记。
-    ///
-    /// 返回值：**本次撤销之后连接上是否已经没有活跃子流**——优雅关闭的收口点据此
-    /// 判断「再没有东西要排空了」（见 `session_::maybe_release_`）。
-    pub(crate) async fn unreserve_channel_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        remote_dock: Dock,
-        cancel: K,
-    ) -> Result<bool, ReserveErr_> {
-        self.reg_
-            .unreserve_channel_(local_dock, remote_dock, cancel)
-            .await
+        self.control_
+            .raise_main_hint_(crate::connection::HINT_MAIN_TIMER);
     }
 
     /// 把一条已露面的子流放进拆流宽限期。
@@ -344,27 +234,6 @@ where
         self.reg_
             .release_channel_(local_dock, remote_dock, self.now_millis_(), cancel)
             .await
-    }
-
-    /// 取走入向请求保存的对端窗口通告。
-    pub(crate) async fn take_inbound_report_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        remote_dock: Dock,
-        cancel: K,
-    ) -> Result<Option<WindowReport>, ReserveErr_> {
-        self.reg_
-            .take_inbound_report_(local_dock, remote_dock, cancel)
-            .await
-    }
-
-    /// 取走一个待决入向请求（对端 dock + 该子流的共享状态句柄）。
-    pub(crate) async fn take_pending_inbound_<K: TrCancellationToken>(
-        &self,
-        local_dock: Dock,
-        cancel: K,
-    ) -> Result<Option<(Dock, ChannelOwner_<C::Alloc>)>, ReserveErr_> {
-        self.reg_.take_pending_inbound_(local_dock, cancel).await
     }
 
     /// 连接级失败原因（若有）。
@@ -433,7 +302,16 @@ where
         if self.reg_.enter_waiting_close_(now_millis) {
             #[cfg(feature = "test-loop-probe")]
             crate::connection::loop_probe_::note_core_entered_close_();
-            self.reg_.notify_timer_();
+            // 走本核心的统一入口（raise `HINT_MAIN_TIMER`），而不是 registry 的
+            // `notify_timer_`——R9 起 timer 只做计时，不再扫描注册表。
+            self.notify_timer_();
         }
+
+        // 关闭连接级临时对象域：拒绝后续放入，并尝试清盘本域对象。`try_flush_` 用
+        // `try_write`（非阻塞），因此本函数仍满足「不取锁、不阻塞」的硬纪律；仍有
+        // `Owning` / `Sharing` 视图的对象会跳过，等视图释放后重试。
+        //
+        // 放在最后：状态推进与指标上报必须先完成，清盘只负责归还临时内存。
+        close_conn_scope_(self.reg_.scope_());
     }
 }

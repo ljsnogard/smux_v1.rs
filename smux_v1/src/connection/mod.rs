@@ -105,30 +105,29 @@
 //!
 //! | 需求 | 发起方与频率 | 本轮的投递方式 |
 //! | --- | --- | --- |
-//! | 水位置位 | [`ChannelTx`] 每次写入，**极高频** | 事件通道（`WriteEvent_::TxReady`，按子流去重） |
-//! | 水位回落 | [`ChannelRx`] 每次消费，**高频** | 事件通道（`ReadEvent_::RxConsumed`，**裸通知**，按子流去重；判定与出通告在**解复用循环**里） |
-//! | 建流 / accept / reject | 应用面，**低频** | 锁（短临界区） |
-//! | 绑定 / 解绑 / listen | 应用面，**极低频** | 锁 |
-//! | 方向收尾 | 半部被丢弃，低频 | 事件通道（`TxClosed` / `RxClosed`） |
-//! | 保活 / 空闲拆流 | 计时循环，低频（限频后每子流每空闲期一次） | 事件通道（`Control` / `PeerClosed` / `Release`） |
+//! | 水位置位 | [`ChannelTx`] 每次写入，**极高频** | 状态位 + 合并提示（`HINT_W_TX_READY`，去重位首置位者 raise） |
+//! | 水位回落 | [`ChannelRx`] 每次消费，**高频** | 状态位 + 合并提示（`HINT_R_RX_CONSUMED`；判定与出通告在**解复用循环**里） |
+//! | 建流 / accept / reject | 应用面，**低频** | 请求队列 + `Tcs_`（main 执行） |
+//! | 绑定 / 解绑 / listen | 应用面，**极低频** | 请求队列 + `Tcs_`（main 执行） |
+//! | 方向收尾 | 半部被丢弃，低频 | 状态位 + 合并提示（循环扫描） |
+//! | 保活 / 空闲拆流 | 计时循环，低频 | 合并提示 `HINT_MAIN_TIMER`（决策在 main tick） |
+//! | 环半部交接 | 建流 / 开端点，低频 | 内联 attach inbox（`WriteAttach_` / `ReadAttach_`） |
 //!
 //! **三条不变量才是纪律**：(a) 无论怎么投递，最终修改共享状态**必须串行化**；
 //! (b) 每条需求都要有**明确的顺序保证**——唤醒一律「先登记等待者、再复检需求」，
 //! 否则丢唤醒；(c) **高频路径优先免锁**，低频路径优先简单。
 //!
-//! 于是 `signal_` 模块**保留**：它是「应用面 → 写循环」的事件通道。当前形态是
-//! *无界*通道（每条子流至多一条待处理水位事件 + 协议状态机约束的控制帧，因此队列
-//! 长度天然有界）。**换成定容通道是待办的优化**：无界通道每条消息都可能分配且走
-//! 全局分配器（`flume` 不支持 `allocator_api`），换定容后只在建立时分配一次；
-//! 但定容需要「队列满 → 置连接级全扫标志」的兜底机制，且 `flume` 内部仍是全局
-//! 分配，因此**留待实测的竞争与分配数据再定**（见 dev-notes §18 的遗留项）。
+//! **事件通道已不存在（R17）**：`WriteEvent_` / `ReadEvent_`、`SessionMailbox_` 与
+//! 它们的定容环 / 溢出暂存全部删除——channel 与 telegraph 的通知不是位化（状态字 +
+//! 合并提示），就是走 attach inbox。`signal_` 模块现在只剩 attach 类型、提示位常量与
+//! 控制帧头。
 //!
 //! 锁的划分：身份索引、取消令牌与每条子流的热状态都用协作式读写锁；取锁一律
 //! `acquire_session` + **异步可取消**获取（`sync_::acquire_read_` /
 //! `acquire_write_`），争用时让出执行权，零 CPU 忙等。
 //! 两类锁的**临界区一律是短闭包，不得 `await`、不得重入**；会话句柄的 `Drop`
-//! **不取任何锁**，只向核心投一条释放消息（`signal_::SessionEvent_`），真正的身份
-//! 表改动由核心执行者 drain 后落实。
+//! **不取任何锁**，只置身份节点上的原子位 + raise 合并提示（`HINT_MAIN_RETIRED`），
+//! 真正的身份表改动由 `main_loop` 的 retired 扫描落实。
 //!
 //! ### 2.4 循环的收尾方式：取消令牌 + 当场 detach
 //!
@@ -378,7 +377,7 @@
 //! **传输缓冲也没有「必须装下整帧」的容量下限**：读侧帧头由逐字节状态机解析
 //! （`frame_parser_`，每次只要 1 字节），载荷按底层实际给出的段长分次搬入
 //! （`ReadCursor::read_async_`），写侧写入按空闲空间**分块**推进
-//! （`session_.rs` 的 `enqueue_frame_`）。因此容量取到环原语的下限（1 字节）也能跑通，
+//! （`session_/frame_io_.rs` 的 `enqueue_frame_`）。因此容量取到环原语的下限（1 字节）也能跑通，
 //! [`K_TRANSPORT_RING_CAPACITY`] 只是吞吐 / 时延上的选择。唯一的例外是**数据报**：
 //! 它的帧必须整条落进缓冲（`write_frame_to_stage_`），因此缓冲容量应当不小于协商的
 //! `max_packet_size`。
@@ -526,7 +525,7 @@
 //! ```text
 //! 1. 停止接受新子流   各登记路径在锁内复查状态 ⇒ 一律拒绝（bind / listen / open / telegraph）
 //! 2. 排空 + 关闭信号  计时循环在扫描时为每条**已裁决**子流认领一次收尾（幂等 CAS），
-//!                     复用循环据此走既有的 TxClosed 路径：发送环清空之后才发 CLOSE(FIN)；
+//!                     复用循环据此按位在发送环清空之后才发 CLOSE(FIN)；
 //!                     建流尚未裁决的则直接回 REJECT（连接不打算再等了）
 //! 3. 对端确认         对端也发 CLOSE(FIN) ⇒ 该子流双向收尾 ⇒ 身份释放
 //! 4. 收尾             最后一条子流收口（活跃数归零）⇒ 循环收尾；超时由计时循环兜底
@@ -587,6 +586,12 @@
 //! | `mux_connection::registry_` | 统一身份表（channel / telegraph / listener / 宽限态）+ 反向索引；每条 channel 记录持有它的共享状态句柄 | —（内部） |
 //! | `sync_` / `owner_` | 通用共享单元（取消令牌 / 内联通知槽 / 注册表锁）/ **身份节点**与其类型化句柄（节点内部零堆分配） | —（内部） |
 //! | `signal_` / `frame_` / `ring_` / `error_` | 控制帧队列 / 线格式 / 环别名 / 错误 | —（内部） |
+//! | `tcs_` | 请求完成源 `Tcs_`（`Pending` / `Done` / `Taken` / `Abandoned`） | —（内部，P0 已落、未接线） |
+//! | `public_channel_` | 公共子流的 chunked 读写原语（`PublicChunkIo_` / `ChunkReadState_`） | —（内部，P0 已落、未接线） |
+//! | `pending_msg_` | 建流期 message ring（`PendingMsgApp_` / `PendingMsgMain_`） | —（内部，P0 已落、未接线） |
+//! | `control_state_` | 控制面请求队列 + `HINT_MAIN_*` 提示位 | —（内部，P1 已接线） |
+//! | `main_loop` | `main_loop_async_` / `MainRequest_` / `MainReply_` | —（内部，P1 已接管 bind / listen / reserve） |
+//! | `tree_config_` | 索引树的 2 KiB chunk 配置（`TrConfig`） | —（内部，P1.5 建树时使用） |
 //!
 //! 纪律：**任何 struct / enum 成员都不得带 `pub(crate)`**；跨模块访问一律经
 //! `pub(crate)` 关联函数。同一个 `impl` 内按「`pub` → `pub(crate)` → 私有」集中排列。
@@ -594,23 +599,33 @@
 //! 注意 `signal_`：它是「应用面 → 两个循环」的事件通道（承载控制帧、水位与拆流
 //! 通知）。把无界通道换成定容通道是**待办的优化**，见 §2.3 与 dev-notes §18。
 
+mod chan_cfg_;
 mod channel_handle;
 mod channel_half;
 mod channel_listener;
 mod config_;
 mod connect_;
+mod control_state_;
 mod dock_binding;
+mod dock_index_;
 mod error_;
 mod frame_;
 mod frame_parser_;
+mod main_loop;
 mod mux_connection;
 mod owner_;
+mod pending_msg_;
+mod public_channel_;
 pub(crate) mod ring_;
+mod scope_;
 mod session_;
 mod signal_;
+mod slot_;
 mod sync_;
+mod tcs_;
 mod telegraph;
 mod timer_;
+mod tree_config_;
 #[cfg(test)]
 mod test_support_;
 
@@ -625,18 +640,48 @@ pub use channel_handle::{ChannelHandle, HandleError};
 pub use channel_half::{ChannelRx, ChannelTx};
 pub use channel_listener::{ChannelListener, ListenerError};
 pub use config_::{
-    CurrentConnCfg, DefaultConnCfg, K_TRANSPORT_RING_CAPACITY, TrConnCfg,
+    SingleConnAllocCfg, CurrentConnCfg, DefaultConnCfg, K_TRANSPORT_RING_CAPACITY, TrConnAllocCfg,
+    TrConnCfg, TrMuxAllocConfig,
 };
 pub use dock_binding::{BindingError, DockBinding};
 pub use error_::MuxError;
 pub use frame_::{FieldId, FrameHeader, FrameKind, flags};
 pub use mux_connection::{BindError, MuxConnection};
-pub(crate) use mux_connection::ReserveErr_;
 pub use ring_::{
     BufferedChannel, BufferedRx, BufferedTx, MuxChanBuff_, MuxChanBuffOwnedBy, RingBuildErr,
     new_buffered_channel,
 };
-
 pub use telegraph::{DemandErr, Receiver, RecvDatagram, Sender, Telegraph, TelegraphError};
-
 pub use types_::Dock;
+
+
+pub(crate) use chan_cfg_::MpmcChanCfg_;
+
+/// 连接配置对应的分配器配置类型。
+pub(crate) type ConnAllocCfg_<C> = <C as TrConnCfg>::AllocCfg<'static>;
+
+/// 连接内部结构（注册表 / 索引 / 事件通道）的分配器投影。
+pub(crate) type ConnAlloc_<C> =
+    <<C as TrConnCfg>::AllocCfg<'static> as TrMuxAllocConfig>::RegistryAlloc;
+
+/// 身份节点（`ChannelOwner_` / `TgOwner_` / `LsnOwner_` 里的 `Shared` 节点，以及
+/// `DockCtx_` 的 `unbind_requested_` 标志）的分配器投影。
+pub(crate) type ConnChanOwnerAlloc_<C> =
+    <ConnAllocCfg_<C> as TrMuxAllocConfig>::ChanOwnerAlloc;
+
+/// 连接核心 / 共享量 / 取消令牌的分配器投影。
+pub(crate) type ConnCoreAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::CoreAlloc;
+
+/// 公共报文子流（`PublicChannel_` 与两条 ring）的分配器投影。
+pub(crate) type ConnPublicAlloc_<C> = <ConnAllocCfg_<C> as TrConnAllocCfg>::PublicAlloc;
+pub(crate) use control_state_::{
+    ControlState_, HINT_MAIN_RELEASE, HINT_MAIN_RESET, HINT_MAIN_RETIRED, HINT_MAIN_TIMER,
+    HINT_MAIN_TX_DRAINED, HINT_MAIN_WINDOW_DIRTY,
+};
+pub(crate) use scope_::alloc_zeroed_bytes_async_;
+#[cfg(test)]
+pub(crate) use scope_::new_test_scope_;
+pub(crate) use main_loop::{EstablishRole_, MainLoopErr_, MainLoopReply_, MainLoopRequest_, main_loop_async_};
+pub(crate) use tcs_::{TcsAbandonGuard_, Tcs_};
+pub(crate) use mux_connection::{ReadOutgoingErr_, ReserveErr_};
+pub(crate) use slot_::PushErr_;

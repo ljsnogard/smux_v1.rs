@@ -29,13 +29,11 @@
 //!
 //! [`TrMetricsSink::on_datagram_dropped`]: crate::metrics::TrMetricsSink::on_datagram_dropped
 
-use core::alloc::AllocatorClone;
-
 use abs_buff::Demand;
 
 use crate::{
     connection::{
-        Dock, FrameHeader,
+        Dock, FrameHeader, TrConnAllocCfg,
         frame_::encode_header_,
         owner_::TgOwner_,
         ring_::BufferedTx,
@@ -48,27 +46,31 @@ use crate::{
 ///
 /// 字段与 `owner_.rs` 的身份节点体系同源：身份句柄给出**报文边界队列**
 /// （`TgRec_::in_`），接收环写端给出**载荷字节落点**。
-pub(crate) struct TgRecvCtx_<A>
+pub(crate) struct TgRecvCtx_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 本端 dock（丢弃上报用）。
     local_dock_: Dock,
 
     /// 该端点的身份节点句柄（含接收方向的条目队列）。
-    owner_: TgOwner_<A>,
+    owner_: TgOwner_<C::ChanOwnerAlloc>,
 
     /// 会话侧接收环写端（本循环写、应用读）。
     writer_: BufferedTx,
 }
 
-impl<A> TgRecvCtx_<A>
+impl<C> TgRecvCtx_<C>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
 {
     /// 由本端 dock、身份句柄与接收环写端构造（只允许 `ReadEvent_::TgAttach`
     /// 的落地处调用）。
-    pub(crate) fn new_(local_dock: Dock, owner: TgOwner_<A>, writer: BufferedTx) -> Self {
+    pub(crate) fn new_(
+        local_dock: Dock,
+        owner: TgOwner_<C::ChanOwnerAlloc>,
+        writer: BufferedTx,
+    ) -> Self {
         TgRecvCtx_ {
             local_dock_: local_dock,
             owner_: owner,

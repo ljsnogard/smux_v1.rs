@@ -21,14 +21,12 @@ use abs_buff::{
     TrBuffFlush, TrBuffRead, TrBuffWrite,
     buffer::{TrConsumerState, TrProducerState},
 };
-use abs_mm::CoreAlloc;
 use abs_smux::conf::TrMuxConfig;
-use mm_ptr::x_deps::abs_mm;
 use smux_v1::{
-    connection::{Dock, TrConnCfg},
+    connection::{Dock, SingleConnAllocCfg, TrConnCfg},
     flow_ctrl::DefaultPolicy,
     metrics::NoMetrics,
-    x_deps::{abs_art, abs_buff, abs_smux, mm_ptr},
+    x_deps::{abs_art, abs_buff, abs_smux},
 };
 
 use crate::Rt;
@@ -87,7 +85,7 @@ where
     Rt: TrTime + Clone + 'static,
 {
     type Rt = Rt;
-    type Alloc = CoreAlloc;
+    type AllocCfg<'a> = SingleConnAllocCfg;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -97,8 +95,8 @@ where
         self.rt_.clone()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {

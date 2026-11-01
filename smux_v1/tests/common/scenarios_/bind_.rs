@@ -186,8 +186,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
         .open_channel_async(remote_b, &mut message)
         .await
         .expect("撤销登记后，同一个 dock 对应当立刻可以再次发起");
-    let mut welcome_buf: [u8; 0] = [];
-    let mut welcome: &mut [u8] = &mut welcome_buf[..];
+    let mut welcome: &[u8] = &[];
     let (opened, incoming) = futures::join!(
         async {
             again
@@ -201,8 +200,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到第二次发起的请求");
-            let mut peer_welcome_buf: [u8; 0] = [];
-            let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
+            let mut peer_welcome: &[u8] = &[];
             handle
                 .accept_async_closure(&mut peer_welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
@@ -230,8 +228,7 @@ pub async fn run_unsettled_handle_scenario_<RA, WA, RB, WB, S, RT>(
         .open_channel_async(remote_c, &mut message2)
         .await
         .expect("第二次发起应当成功");
-    let mut welcome2_buf: [u8; 0] = [];
-    let mut welcome2: &mut [u8] = &mut welcome2_buf[..];
+    let mut welcome2: &[u8] = &[];
     let (verdict, ()) = futures::join!(
         async {
             waiter
@@ -362,8 +359,7 @@ pub async fn run_auto_dock_scenario_<RA, WA, RB, WB, S, RT>(
         .expect("向自动分配的 dock 发起应当成功");
     let (a_done, b_done) = futures::join!(
         async {
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let (tx, mut rx) = handle_a
                 .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
@@ -377,8 +373,7 @@ pub async fn run_auto_dock_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到发起请求");
-            let mut peer_welcome_buf: [u8; 0] = [];
-            let mut peer_welcome: &mut [u8] = &mut peer_welcome_buf[..];
+            let mut peer_welcome: &[u8] = &[];
             let (peer_tx, mut peer_rx) = handle_b
                 .accept_async_closure(&mut peer_welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
@@ -410,8 +405,7 @@ pub async fn run_auto_dock_scenario_<RA, WA, RB, WB, S, RT>(
         .open_channel_async(service_dock, &mut message_again)
         .await
         .expect("同一个 remote dock 上必须可以立刻再开一条子流");
-    let mut welcome_again_buf: [u8; 0] = [];
-    let mut welcome_again: &mut [u8] = &mut welcome_again_buf[..];
+    let mut welcome_again: &[u8] = &[];
     let _ = futures::join!(
         async {
             let (tx, rx) = handle_again
@@ -427,8 +421,7 @@ pub async fn run_auto_dock_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到第二次发起请求");
-            let mut peer_welcome_again_buf: [u8; 0] = [];
-            let mut peer_welcome_again: &mut [u8] = &mut peer_welcome_again_buf[..];
+            let mut peer_welcome_again: &[u8] = &[];
             let (peer_tx, peer_rx) = handle_b2
                 .accept_async_closure(&mut peer_welcome_again, || {
                     (make_channel_buff_(), make_channel_buff_())

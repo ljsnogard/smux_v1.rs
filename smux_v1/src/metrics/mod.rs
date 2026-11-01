@@ -97,6 +97,24 @@
 //! [`TrMetricsSink::on_channel_opened`] 等事件自行累加即可——这也正是「sink 的问题
 //! 交给 metrics 实现方」的一条推论。
 //!
+//! ### 5.1 逐帧上报的**计数点**（新增写路径必须同步补报）
+//!
+//! `on_frame` / `on_transport_bytes` 的**发送**方向按「帧真的写出成功」计数，**接收**
+//! 方向按「整帧到手」计数。当前只有下面这几个点：
+//!
+//! | 方向 | 帧种类 | 计数点 |
+//! | --- | --- | --- |
+//! | 发送 | `Data` | `session_::mux_data_::drain_one_`（`enqueue_frame_parts_` 之后） |
+//! | 发送 | `Datagram` | `session_::mux_tg_::send_one_datagram_`（`write_frame_to_stage_` 之后） |
+//! | 发送 | 控制帧（`Open` / `Accept` / `Reject` / `Close` / `WindowUpdate` / `Pulse`） | `main_loop::try_write_control_frame_` 与 `main_loop::write_control_frame_async_`（写成功之后） |
+//! | 接收 | 全部 | `session_::demux_::write_public_frame_async_`（帧头 + 载荷都到齐之后） |
+//!
+//! 因此同一批帧的「发送条数 / 字节数」与「接收条数 / 字节数」必须**逐项相等**，
+//! `tests/metrics_e2e.rs` 直接把这条等式钉住（读侧帧头长度也曾被它钉死）。
+//! R18 之前控制帧只在接收侧计数，端到端用例实测 **发送 24 / 接收 84**，差额全部
+//! 来自 `Open` / `Accept` / `Close`。**新增任何直接写公共 TX ring 的路径时，必须在
+//! 那条路径的成功分支补报**，否则等式会再次被打破。
+//!
 //! ## 6. 连接级失败时的逐子流回调
 //!
 //! 连接级失败（`ChannelRegistry_::mark_failed_`）**逐条**做了两件事：把失败类别写进
@@ -107,7 +125,7 @@
 //!
 //! [`ChannelCloseReason::ConnFailed`] 的逐子流回调就在这两个守卫里上报，判据是
 //! 「本次收尾伴随连接级失败」+ [`ChannelOwner_::claim_release_`] 的一次性 CAS；
-//! 后者与正常收尾路径（`maybe_release_`）共用同一把闸门，因此**每条子流恰好上报
+//! 后者与正常收尾路径（`main_loop::flush_releasable_`）共用同一把闸门，因此**每条子流恰好上报
 //! 一次**：正常收尾的那条报 `Fin`，被连接级失败牵连的那条报 `ConnFailed`，不会重复。
 //!
 //! [`ChannelOwner_::claim_release_`]: crate::connection::owner_::ChannelOwner_::claim_release_
