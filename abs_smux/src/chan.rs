@@ -36,22 +36,28 @@ where
     /// ring 存储的智能指针类型 `B` 是**方法级泛型**，不再由
     /// [`TrMuxConfig`](crate::conf::TrMuxConfig) 规定——本条子流用什么智能指针、
     /// 从哪来、多大，完全由 `prepare` 的实参决定。
-    type AcceptAsync<'f, W, B, P>: TrMayCancel<'f, MayCancelOutput =
+    type AcceptAsync<'f, R, B, P>: TrMayCancel<'f, MayCancelOutput =
         Result<(Self::Tx, Self::Rx), Self::Err>>
     where
         Self: 'f,
-        W: 'f + TrBuffWrite<C::Data>,
+        R: 'f + TrBuffRead<C::Data>,
         B: 'static + Send + Sync + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone>,
         P: TrPrepareRing<B, C::Data>;
 
-    /// 发送同意建立 channel 的消息及欢迎信息，以及
-    fn accept_async<'f, W, B, P>(
+    /// 发送同意建立 channel 的欢迎信息，并最终裁决。
+    ///
+    /// `welcome` 是**源**（不是汇）：响应方从这里读欢迎信息，smux 负责把它切成
+    /// [`read_message_async`](Self::read_message_async) 文档所写的分块编码，**内容由
+    /// 调用方自行解释**。发起方的 welcome 没有意义（开场消息已经在
+    /// [`TrDockBinding::open_channel_async`](crate::conn::TrDockBinding::open_channel_async)
+    /// 给出），实现应当忽略这个参数。
+    fn accept_async<'f, R, B, P>(
         &'f mut self,
-        welcome: &'f mut W,
+        welcome: &'f mut R,
         prepare: P,
-    ) -> Self::AcceptAsync<'f, W, B, P>
+    ) -> Self::AcceptAsync<'f, R, B, P>
     where
-        W: 'f + TrBuffWrite<C::Data>,
+        R: 'f + TrBuffRead<C::Data>,
         B: 'static + Send + Sync + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone>,
         P: TrPrepareRing<B, C::Data>;
 
@@ -71,6 +77,44 @@ where
     ) -> Self::RejectAsync<'f, R>
     where
         R: TrBuffRead<C::Data>;
+
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // Pending message
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    type MessageAsync<'f, W>: TrMayCancel<'f, MayCancelOutput =
+        Result<usize, Self::Err>>
+    where
+        Self: 'f,
+        W: 'f + TrBuffWrite<C::Data>;
+
+    /// 读对端在建流阶段随 `OPEN` / `ACCEPT` 带来的 message。
+    ///
+    /// - 响应方：在 `accept_async` 之前读对端 `OPEN` 的开场消息；
+    /// - 发起方：在 `accept_async` 返回之后读对端 `ACCEPT` 的欢迎信息。
+    ///
+    /// # 线上格式
+    ///
+    /// message 是**分块编码**（与 MPTP 的分块体同形）：
+    ///
+    /// ```text
+    /// message    = *chunk last-chunk
+    /// chunk      = chunk-size(2 字节大端 u16) chunk-data
+    /// last-chunk = 0x0000
+    /// ```
+    ///
+    /// 内容对 smux **不透明**，由调用方自行解释。本方法把各块内容**依次**写进
+    /// `sink`（重组为一条连贯的流），返回**内容**总字节数；空 message 只有一个终止块，
+    /// 返回 `0` 且不写 `sink`。单块内容上限是 `u16::MAX`，更长的 message 由写入方
+    /// 自动切块。
+    ///
+    /// # Examples
+    ///
+    /// 对端发内容 `b"hi"` 时，线上字节是 `00 02 68 69 00 00`（一块内容 + 终止块）；
+    /// 本方法把 `68 69` 写进 `sink` 并返回 `2`。
+    fn read_message_async<'f, W>(&'f mut self, sink: &'f mut W) -> Self::MessageAsync<'f, W>
+    where
+        W: 'f + TrBuffWrite<C::Data>;
 }
 
 pub trait TrChannelHalf<C>

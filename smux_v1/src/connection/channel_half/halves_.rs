@@ -57,7 +57,9 @@ use crate::{
         // config_::TrMuxAllocConfig,
         owner_::ChannelOwner_,
         session_::race_cancel_,
-        signal_::{ReadEvent_, TrEventSender_, WriteEvent_},
+        signal_::{
+            HINT_W_TX_CLOSED,
+        },
     },
     flow_ctrl::Credit,
     x_deps::{abs_buff, abs_cancel, abs_smux, anylr, buffex, gen_mcf2},
@@ -99,7 +101,7 @@ where
     ring_: BufferedTx,
 
     /// 该子流的共享状态（「已入队」去重与关闭记账）。
-    owner_: ChannelOwner_<C::Alloc>,
+    owner_: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
 
     /// 连接智能指针：通知写循环 + 保活。
     conn_: MuxConnection<C>,
@@ -138,7 +140,7 @@ where
     /// `abs_smux` 的 trait 产出。
     pub(crate) fn new_(
         ring: BufferedTx,
-        owner: ChannelOwner_<C::Alloc>,
+        owner: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
         conn: MuxConnection<C>,
         local_dock: Dock,
         remote_dock: Dock,
@@ -158,22 +160,22 @@ where
     ///
     /// # 什么时候必须通知
     ///
-    /// 通知是**提醒**而不是数据：写循环真正要的是「环里有积压、快来取」。积压不严重
-    /// 时每次写入都喊一遍没有信息量，反而会把事件通道灌满——而写循环每轮要**在排空
-    /// 与处理事件之间分时**，事件灌满会挤占排空段（本仓库真实 socket 用例撞到过）。
-    ///
-    /// 因此规则与接收侧对称：**待发积压超过 `容量 × 3/4`（即剩余不足 `容量 × 1/4`）
-    /// 时任何变化都通知**；积压不严重时只在「刚从积压状态回落」的边沿补一次。
+    /// 通知是**提醒**而不是数据：写循环每轮本来就全表扫描，一次提示只让它「回顶部重
+    /// 扫」。积压不严重时每次写入都喊一遍没有信息量，只会让合并提示位反复置位；因此
+    /// 规则与接收侧对称：**待发积压超过 `容量 × 3/4`（即剩余不足 `容量 × 1/4`）时任何
+    /// 变化都通知**；积压不严重时只在「刚从积压状态回落」的边沿补一次。
     ///
     /// 另有一条**不可省**的补充：**进入本函数时环是空的**（本次写入要让环由空变非空）
     /// 也必须通知。少了它有一个确定性的丢唤醒：一条安静的连接上，某条子流第一次写入
-    /// 若**低于临界水位**、也不构成边沿，则一条事件都不发；而写循环此时
-    /// `last_ready` 为空（或指向别的子流），于是它既收不到事件、也没有对应的环可供
-    /// park，环里的数据就此无人搬运（`tests/alloc_count.rs` 的基线用例把这条路径稳定
-    /// 复现出来：单条安静子流写 512 B < 临界水位 1024 B 直接挂死）。
+    /// 若**低于临界水位**、也不构成边沿，则合并提示不会被置位；写循环此时可能正停在
+    /// park 上，环里的数据就此无人搬运（`tests/alloc_count.rs` 的基线用例把这条路径
+    /// 稳定复现出来：单条安静子流写 512 B < 临界水位 1024 B 直接挂死）。
     ///
-    /// 「已入队」去重位仍然保留：它保证同一条子流至多一条待处理事件，因此「空环也通知」
-    /// 不会把通道灌满——写循环排空一次，至多多出一条事件。
+    /// R13 起「通知」就是一次合并提示位 [`HINT_W_TX_READY`]（不再是事件通道）：「已入队」
+    /// 去重位（`mark_tx_queued_`）保证同一条子流至多一次待处理提示，写循环取走掩码后按
+    /// 全表扫描、排空时清去重位。因此「空环也通知」不会把任何队列灌满。
+    ///
+    /// [`HINT_W_TX_READY`]: crate::connection::signal_::HINT_W_TX_READY
     fn notify_tx_ready_(&mut self) {
         let queued = self.ring_.ring_state().data_size() as u64;
         let congested = queued > self.backlog_ as u64;
@@ -181,16 +183,24 @@ where
         let edge = congested != self.backlogged_;
         // 空环也通知：见上方文档（丢唤醒）。
         if congested || edge || queued == 0u64 {
+            #[cfg(feature = "test-loop-probe")]
+            crate::connection::loop_probe_::event_tx_ready_attempt_(
+                queued == 0u64,
+                congested,
+                edge,
+            );
             self.backlogged_ = congested;
-            let fresh = self.owner_.mark_tx_queued_();
-            if fresh {
-                let _ = self
-                    .conn_
+            // 去重位的第一置位者 raise 合并提示：写循环据此回顶部做**全表**排空。
+            if self.owner_.mark_tx_queued_() {
+                self.conn_
                     .core_()
-                    .w_events_()
-                    .try_send_event_(WriteEvent_::TxReady {
-                        local_dock: self.local_dock_,
-                        remote_dock: self.remote_dock_});
+                    .reg_()
+                    .raise_write_hint_(crate::connection::signal_::HINT_W_TX_READY);
+                #[cfg(feature = "test-loop-probe")]
+                crate::connection::loop_probe_::event_tx_ready_result_(true);
+            } else {
+                #[cfg(feature = "test-loop-probe")]
+                crate::connection::loop_probe_::event_tx_ready_dedup_();
             }
         }
     }
@@ -303,18 +313,15 @@ where
     ///
     /// [`BufferedTx`] 的 `close` 本身幂等；协议侧那一次「排空 + 发 `FIN`」的**投递**
     /// 用 `ChannelState_::set_app_tx_closed_` 的首次置位去重。少了这层去重，第二条
-    /// `TxClosed` 会在写循环的表项已被摘掉之后重新登记一个「欠一条 `FIN`」的僵尸条目
-    /// （`pending_fin` 里永远查不到表项的那一条）。
+    /// 收尾提示会让写循环对已经收尾 / 摘表的条目再做一轮 `FIN` 探测。
     fn seal_tx_(&mut self) {
         self.ring_.close();
         if self.owner_.set_app_tx_closed_() {
-            let _ = self
-                .conn_
+            // 收尾事实已经在状态字上；这里只唤醒写循环，不再逐条投事件。
+            self.conn_
                 .core_()
-                .w_events_()
-                .try_send_event_(WriteEvent_::TxClosed {
-                    local_dock: self.local_dock_,
-                    remote_dock: self.remote_dock_});
+                .reg_()
+                .raise_write_hint_(HINT_W_TX_CLOSED);
         }
     }
 
@@ -467,7 +474,7 @@ where
         Result::Ok(())
     }
 
-    /// **同步封口**：等价于 [`ChannelTx::seal_tx_`]（关生产端 + 首次投递 `TxClosed`）。
+    /// **同步封口**：等价于 [`ChannelTx::seal_tx_`]（关生产端 + 首次置位并提示写循环）。
     /// 幂等，因此调用者不必区分「已经 `drop` 过」还是「第一次 `close`」。
     #[inline]
     fn close(&mut self) -> Result<(), Self::Err> {
@@ -532,7 +539,7 @@ where
 
     /// 该子流的共享状态（「已消费」去重位在锁外，见
     /// [`ChannelOwner_::mark_rx_consumed_`]）。
-    owner_: ChannelOwner_<C::Alloc>,
+    owner_: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
 
     /// 连接智能指针：通知写循环 + 保活。
     conn_: MuxConnection<C>,
@@ -551,7 +558,7 @@ where
     /// 由环消费端、共享状态、连接与 dock 对构造；可见性同 [`ChannelTx::new_`]。
     pub(crate) fn new_(
         ring: BufferedRx,
-        owner: ChannelOwner_<C::Alloc>,
+        owner: ChannelOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
         conn: MuxConnection<C>,
         local_dock: Dock,
         remote_dock: Dock,
@@ -584,16 +591,20 @@ where
     /// 再读环内积压**（见 [`ChannelOwner_::clear_rx_consumed_`]），这样清位之后发生的
     /// 消费会重新置位并投递，不会丢。
     fn notify_consumed_(&mut self) {
+        #[cfg(feature = "test-loop-probe")]
+        crate::connection::loop_probe_::event_rx_consumed_attempt_();
         if !self.owner_.mark_rx_consumed_() {
+            #[cfg(feature = "test-loop-probe")]
+            crate::connection::loop_probe_::event_rx_consumed_dedup_();
             return;
         }
-        let _ = self
-            .conn_
+        // 位化：只 raise 合并提示，读循环按全表重算水位（清位顺序保证不丢）。
+        self.conn_
             .core_()
-            .r_events_()
-            .try_send_event_(ReadEvent_::RxConsumed {
-                local_dock: self.local_dock_,
-                remote_dock: self.remote_dock_});
+            .reg_()
+            .raise_read_hint_(crate::connection::signal_::HINT_R_RX_CONSUMED);
+        #[cfg(feature = "test-loop-probe")]
+        crate::connection::loop_probe_::event_rx_consumed_result_(true);
     }
 
     /// 从接收环读满 `out`。
@@ -671,13 +682,11 @@ where
     fn seal_rx_(&mut self) {
         self.ring_.close();
         if self.owner_.set_app_rx_closed_() {
-            let _ = self
-                .conn_
+            // 位是事实；main 扫描到 `APP_RX_CLOSED` 后组 `CLOSE(RESET)`。
+            self.conn_
                 .core_()
-                .w_events_()
-                .try_send_event_(WriteEvent_::RxClosed {
-                    local_dock: self.local_dock_,
-                    remote_dock: self.remote_dock_});
+                .control_()
+                .raise_main_hint_(crate::connection::HINT_MAIN_RESET);
         }
     }
 
@@ -1258,7 +1267,7 @@ mod tests_ {
     /// - 手段：先调同步 `close`，读出状态字里的首置位（应当已经置上）；再调一次
     ///   `close`，最后丢弃发送半边。
     /// - 判断：第二次读首置位为 `false`（说明第一次已经置位、且不会重复投递
-    ///   `TxClosed`）；重复 `close` 与随后的 `drop` 都不失败。
+    ///   收尾提示）；重复 `close` 与随后的 `drop` 都不失败。
     async fn tx_close_is_idempotent_across_drop() {
         let (mut tx, _rx) = make_halves_();
 
@@ -1268,7 +1277,7 @@ mod tests_ {
             "封口位应当已经由首次 close 置上"
         );
         TrBuffTryFlush::close(&mut tx).expect("重复封口应当幂等成功");
-        // `drop` 走同一套收尾：这里只需不 panic，且不再产生第二条 `TxClosed`。
+        // `drop` 走同一套收尾：这里只需不 panic，且不再产生第二条收尾提示。
         drop(tx);
     }
     multi_art_test_!(tx_close_is_idempotent_across_drop);

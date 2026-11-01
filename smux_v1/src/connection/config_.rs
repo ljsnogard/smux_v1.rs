@@ -33,7 +33,7 @@ use abs_smux::conf::TrMuxConfig;
 use abs_mm::CoreAlloc;
 
 use crate::{
-    connection::Dock,
+    connection::{Dock, pending_msg_::K_PENDING_MSG_CAP_DEFAULT},
     flow_ctrl::{DefaultPolicy, TrFlowCtrlPolicy},
     handshake::agent::HandshakeDelivery,
     metrics::{NoMetrics, TrMetricsSink},
@@ -41,12 +41,128 @@ use crate::{
     x_deps::{abs_buff, abs_mm},
 };
 
-#[allow(unused)]
-pub trait TrMuxAllocConfig {
-    type RegistryAlloc: AllocatorClone;
 
-    /// Allocator for ChannelOwner
-    type ChanOwnerAlloc: AllocatorClone;
+pub trait TrMuxAllocConfig {
+    /// 连接内部结构的分配器。
+    type RegistryAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 身份节点的分配器。
+    type ChanOwnerAlloc: AllocatorClone + Send + Sync + 'static;
+}
+
+/// `smux_v1::connection` 内部**所有分配器用途**的聚合。
+///
+/// 每一项对应一类结构，而不是「一个全局分配器」：
+///
+/// - [`Self::RegistryAlloc`]：注册表、索引树、`ControlStateInner_` 等连接内部结构；
+/// - [`Self::ChanOwnerAlloc`]：身份节点（`ChannelOwner_` / `DockBinding_` 等）；
+/// - [`Self::MpmcAlloc`]：会话内 `mpmc_chan` 通道（外层 `Arc` + 等待 chunk）。
+///
+/// **临时对象原则上不走这里**：请求完成源（`Tcs_`）走连接级 `sw_scope::Scope`；
+/// 循环暂存目前仍借用连接级 Scope，后续按需迁入各自的每循环 `Scope`，见
+/// `connection::scope_` 与 `dev-notes/alloc-ownership-20261029-0230.md`。剩下的项
+/// 大多服务于要求 `Allocator` / `AllocatorClone` 的第三方结构，或连接级 `Shared`；
+/// 已知例外是建流期 message ring，它仍借用 `RegistryAlloc`（第三方 ring 要求
+/// `Allocator`），是否补 `MsgAlloc` 见该文档的待拍板项。
+///
+/// 本 trait **不要求 `'static`**；只有 [`Self::MpmcAlloc`] 的 GAT 在 `'a` 上带
+/// 生命周期约束——通道把分配器类型嵌进 `MpmcChan<'static, …>`，需要
+/// `MpmcAlloc<'static>: 'static`，但这条需求停在通道这一层。以后新增分配器用途时
+/// 在这里加 GAT 即可。
+pub trait TrConnAllocCfg
+where
+    Self: TrMuxAllocConfig,
+{
+    /// 会话内 `mpmc_chan` 通道的分配器（外层 `Arc` 与等待 chunk 都用它）。
+    type MpmcAlloc<'a>: AllocatorClone + Send + Sync + 'a
+    where
+        Self: 'a;
+
+    /// `Attach` 交接（`WriteAttach_` / `ReadAttach_`）的分配器。
+    type AttachAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 数据面本地表（`WriteTable_` / `ReadTable_` / telegraph 表）的分配器。
+    type LocalTableAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 连接核心 / 共享量 / 取消令牌的分配器。
+    type CoreAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 公共报文子流（`PublicChannel_` 与两条 ring）的分配器。
+    type PublicAlloc: AllocatorClone + Send + Sync + 'static;
+
+    /// 取结构分配器的一个实例。
+    fn registry_alloc(&self) -> Self::RegistryAlloc;
+
+    /// 取身份节点分配器的一个实例。
+    fn chan_owner_alloc(&self) -> Self::ChanOwnerAlloc;
+
+    /// 取通道分配器的一个实例（交给 `MpmcChan::new_in`）。
+    fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static>;
+
+    /// 取 `Attach` 分配器的实例。
+    fn attach_alloc(&self) -> Self::AttachAlloc;
+
+    /// 取本地表分配器的实例。
+    fn local_table_alloc(&self) -> Self::LocalTableAlloc;
+
+    /// 取连接核心分配器的实例。
+    fn core_alloc(&self) -> Self::CoreAlloc;
+
+    /// 取公共子流分配器的实例。
+    fn public_alloc(&self) -> Self::PublicAlloc;
+}
+
+/// 内建分配器配置：所有用途都用 [`CoreAlloc`]。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SingleConnAllocCfg<A = CoreAlloc>(PhantomData<A>)
+where
+    A: 'static + AllocatorClone + Default + Send + Sync;
+
+impl<A> TrMuxAllocConfig for SingleConnAllocCfg<A>
+where
+    A: 'static + AllocatorClone + Default + Send + Sync,
+{
+    type RegistryAlloc = A;
+    type ChanOwnerAlloc = A;
+}
+
+impl<A> TrConnAllocCfg for SingleConnAllocCfg<A>
+where
+    A: 'static + AllocatorClone + Default + Send + Sync,
+{
+    type MpmcAlloc<'a> = A;
+    type AttachAlloc = A;
+    type LocalTableAlloc = A;
+    type CoreAlloc = A;
+    type PublicAlloc = A;
+
+    fn registry_alloc(&self) -> Self::RegistryAlloc {
+        A::default()
+    }
+
+    fn chan_owner_alloc(&self) -> Self::ChanOwnerAlloc {
+        A::default()
+    }
+
+    fn mpmc_alloc(&self) -> Self::MpmcAlloc<'static> {
+        A::default()
+    }
+
+    fn attach_alloc(&self) -> Self::AttachAlloc {
+        A::default()
+    }
+
+    fn local_table_alloc(&self) -> Self::LocalTableAlloc {
+        A::default()
+    }
+
+    fn core_alloc(&self) -> Self::CoreAlloc {
+        A::default()
+    }
+
+    fn public_alloc(&self) -> Self::PublicAlloc {
+        A::default()
+    }
 }
 
 /// **连接的传输环容量**（推荐值）：调用方自己造传输环时可以参考它。
@@ -60,7 +176,7 @@ pub trait TrMuxAllocConfig {
 /// 默认协商值是 4096 字节，实际部署建议把 `max_packet_size` 定在 **64 KiB 以下**；
 /// 超过此值时应按自己的 `max_packet_size` 放大本容量——尤其**数据报**（telegraph）
 /// 一条报文的帧长上限就是 `max_packet_size`，传输环必须放得下整帧（见
-/// `session_::write_frame_to_stage_`）。
+/// `session_::mux_data_::write_frame_to_stage_`）。
 pub const K_TRANSPORT_RING_CAPACITY: usize = 64usize * 1024usize;
 
 /// 连接的配置类型。
@@ -99,8 +215,14 @@ where
     /// [`TrDelay`]: abs_art::TrDelay
     type Rt: TrTime + Clone + 'static;
 
-    /// 连接内部结构（注册表、事件通道、载荷暂存等）的分配器。
-    type Alloc: AllocatorClone + Send + Sync;
+    /// 分配器配置：由实现者选定一个 [`TrConnAllocCfg`]。
+    ///
+    /// 用 GAT 只是为了携带 `Self: 'a`；实际取 `AllocCfg<'static>` 的关联类型
+    /// （`TrConnCfg` 自身要求 `'static`）。这样连接配置**不必实现**分配器配置，
+    /// 只是通过这个关联类型引用它。
+    type AllocCfg<'a>: TrConnAllocCfg
+    where
+        Self: 'a;
 
     /// 流控策略。
     type Policy: TrFlowCtrlPolicy;
@@ -160,8 +282,16 @@ where
     /// `Runtime::current()` 要求调用点已在上下文内，做不到这一点。
     fn runtime(&self) -> Self::Rt;
 
-    /// 取连接内部结构用的分配器（按值，`buffex` 的构建器按值接收）。
-    fn allocator(&self) -> Self::Alloc;
+    /// 取分配器配置（按值；内部各结构再按用途取具体分配器）。
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static>;
+
+    /// 取连接内部结构用的分配器（`AllocCfg::RegistryAlloc` 的便捷投影）。
+    fn allocator(&self) -> crate::connection::ConnAlloc_<Self>
+    where
+        Self: Sized,
+    {
+        self.alloc_cfg().registry_alloc()
+    }
 
     /// 取流控策略。
     fn policy(&self) -> &Self::Policy;
@@ -204,6 +334,32 @@ where
     /// }
     /// ```
     fn metrics(&self) -> &Self::Metrics;
+
+    /// 建流期 message 的**每个方向内容**上限（字节）；`0` 表示只允许空 message。
+    ///
+    /// `open` 的 message、`accept` 的 welcome、`reject` 的 reason 都受它约束：
+    /// 超出时按「outgoing 报 `MessageTooLong`（P3 接入）/ incoming 回 `REJECT`」处理。
+    ///
+    /// 线上是分块编码（`*chunk + 0x0000`），本值限制的是**各块内容之和**；每块另有
+    /// 2 字节长度前缀、末尾另有 2 字节终止块，因此 ring 实际容量是
+    /// `framed_message_len_(本值)`（`0` 时为 2，仍能写空的 `0x0000`）。
+    ///
+    /// 默认值见 [`K_PENDING_MSG_CAP_DEFAULT`]（512 字节）。现有 `TrConnCfg` 实现不必
+    /// 改：它带默认实现（设计稿 Q2）。
+    fn pending_msg_capacity(&self) -> usize {
+        K_PENDING_MSG_CAP_DEFAULT
+    }
+
+    /// 建流期 message ring 的分配器；默认复用连接内部结构的分配器。
+    ///
+    /// 只有需要**不同分配器实例**时才覆盖；若要不同**类型**，需要新增关联类型
+    /// `MsgAlloc`（破坏性变更，本阶段不做，设计稿 Q10）。
+    fn pending_msg_allocator(&self) -> crate::connection::ConnAlloc_<Self>
+    where
+        Self: Sized,
+    {
+        self.allocator()
+    }
 
     /// 子流环的**建议容量**：调用方自己分配那块内存时可以参考它。
     ///
@@ -387,7 +543,7 @@ where
     Rt: TrTime + Clone + 'static,
 {
     type Rt = Rt;
-    type Alloc = CoreAlloc;
+    type AllocCfg<'a> = SingleConnAllocCfg;
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
@@ -397,8 +553,8 @@ where
         self.rt_.clone()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {
@@ -545,7 +701,7 @@ where
     Rt: TrTime + Clone + 'static + TrRtCurrent,
 {
     type Rt = Rt;
-    type Alloc = CoreAlloc;
+    type AllocCfg<'a> = SingleConnAllocCfg;
     type Policy = P;
     type ConnTx = W;
     type ConnRx = R;
@@ -561,8 +717,8 @@ where
         <Rt as TrRtCurrent>::current_rt()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {

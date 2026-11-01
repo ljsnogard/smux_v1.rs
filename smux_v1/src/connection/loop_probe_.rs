@@ -29,6 +29,7 @@
 //! 每段各有一次自增，采样它们的差值即可定位断点。
 
 use core::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 std::thread_local! {
     /// 解复用循环每跑一轮就自增。
@@ -36,10 +37,6 @@ std::thread_local! {
 
     /// 计时循环在等待关闭状态下**认领**「排空 + `FIN`」动作的次数。
     static CLOSE_FIN_CLAIMED: Cell<u64> = const { Cell::new(0) };
-
-    /// 复用循环**处理** `WriteEvent_::TxClosed` 的次数（应用丢弃发送半边，或连接
-    /// 在关闭流程里代为投递——两者同一条路径）。
-    static TX_CLOSED_HANDLED: Cell<u64> = const { Cell::new(0) };
 
     /// 复用循环**成功发出一条 `CLOSE(FIN)`** 的次数（`finalize_entry_` 走完）。
     static LOCAL_FIN_SENT: Cell<u64> = const { Cell::new(0) };
@@ -102,16 +99,6 @@ pub(crate) fn close_fin_claimed_() {
 /// 读「认领收尾动作」计数。
 pub fn close_fin_claimed_ticks_() -> u64 {
     CLOSE_FIN_CLAIMED.with(Cell::get)
-}
-
-/// 记一次「复用循环处理了 `TxClosed`」。
-pub(crate) fn tx_closed_handled_() {
-    TX_CLOSED_HANDLED.with(|c| c.set(c.get().wrapping_add(1)));
-}
-
-/// 读「处理 `TxClosed`」计数。
-pub fn tx_closed_handled_ticks_() -> u64 {
-    TX_CLOSED_HANDLED.with(Cell::get)
 }
 
 /// 记一次「本端发出 `CLOSE(FIN)`」。
@@ -199,15 +186,7 @@ pub(crate) fn timer_exit_cancel_() {
     TIMER_EXIT_CANCEL.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
-/// 记「计时循环因扫描失败退出」。
-pub(crate) fn timer_exit_scan_err_() {
-    TIMER_EXIT_SCAN_ERR.with(|c| c.set(c.get().wrapping_add(1)));
-}
 
-/// 记「计时循环因投递失败退出」。
-pub(crate) fn timer_exit_send_fail_() {
-    TIMER_EXIT_SEND_FAIL.with(|c| c.set(c.get().wrapping_add(1)));
-}
 
 /// 读三条计时循环退出计数 `(取消, 扫描失败, 投递失败)`。
 pub fn timer_exits_() -> (u64, u64, u64) {
@@ -219,16 +198,19 @@ pub fn timer_exits_() -> (u64, u64, u64) {
 }
 
 /// 记一次「`finalize_entry_` 看到环里还有数据」。
+#[allow(dead_code, reason = "R6 起 finalize_entry_ 删除；probe 保留待下一轮清理")]
 pub(crate) fn fin_see_data_() {
     FIN_SEE_DATA.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// 记一次「`finalize_entry_` 看到环已排空」。
+#[allow(dead_code, reason = "R6 起 finalize_entry_ 删除；probe 保留待下一轮清理")]
 pub(crate) fn fin_see_empty_() {
     FIN_SEE_EMPTY.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// 记一次「`finalize_entry_` 无法判定」。
+#[allow(dead_code, reason = "R6 起 finalize_entry_ 删除；probe 保留待下一轮清理")]
 pub(crate) fn fin_see_unknown_() {
     FIN_SEE_UNKNOWN.with(|c| c.set(c.get().wrapping_add(1)));
 }
@@ -240,4 +222,152 @@ pub fn fin_sees_() -> (u64, u64, u64) {
         FIN_SEE_EMPTY.with(Cell::get),
         FIN_SEE_UNKNOWN.with(Cell::get),
     )
+}
+
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 事件通道诊断（**全局原子**）
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+//
+// 事件生产者既可能跑在循环线程（读循环投写事件、写循环投读事件），也可能跑在
+// API 线程（跨线程句柄），所以这里不能用 thread-local。只在 `test-loop-probe`
+// feature 下编译，生产构建里整个消失。
+
+/// `TxReady`：满足通知条件、进入投递流程的次数。
+static TX_READY_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+/// `TxReady`：因为「进入函数时发送环为空」而通知的次数。
+static TX_READY_EMPTY_RING: AtomicU64 = AtomicU64::new(0);
+/// `TxReady`：因为「积压超过临界水位」而通知的次数。
+static TX_READY_CONGESTED: AtomicU64 = AtomicU64::new(0);
+/// `TxReady`：因为「积压状态发生边沿变化」而通知的次数。
+static TX_READY_EDGE: AtomicU64 = AtomicU64::new(0);
+/// `TxReady`：被 `mark_tx_queued_` 去重位挡下的次数（重复通知）。
+static TX_READY_DEDUP: AtomicU64 = AtomicU64::new(0);
+/// `TxReady`：真正投递成功的次数。
+static TX_READY_SENT: AtomicU64 = AtomicU64::new(0);
+/// `TxReady`：投递时环满/消费者消失的次数。
+static TX_READY_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// `RxConsumed`：进入投递流程的次数。
+static RX_CONSUMED_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+/// `RxConsumed`：被去重位挡下的次数。
+static RX_CONSUMED_DEDUP: AtomicU64 = AtomicU64::new(0);
+/// `RxConsumed`：真正投递成功的次数。
+static RX_CONSUMED_SENT: AtomicU64 = AtomicU64::new(0);
+/// `RxConsumed`：投递时环满/消费者消失的次数。
+static RX_CONSUMED_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// 可重建事件因环满被丢弃的次数。
+static EVENT_FULL_RECOVERABLE: AtomicU64 = AtomicU64::new(0);
+/// 不可重建事件成功进入 `durable_` 暂存的次数。
+static EVENT_DURABLE_STASHED: AtomicU64 = AtomicU64::new(0);
+/// 不可重建事件投递时消费者已消失的次数。
+static EVENT_DURABLE_CLOSED: AtomicU64 = AtomicU64::new(0);
+/// 消费者看到 `EventTake_::Rescan` 的次数。
+static EVENT_RESCAN: AtomicU64 = AtomicU64::new(0);
+
+/// 事件通道诊断快照（绝对值，调用方自行做前后差值）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventProbeSnapshot {
+    /// `TxReady` 进入投递流程的次数。
+    pub tx_ready_attempt: u64,
+    /// 其中「发送环为空」分支的次数。
+    pub tx_ready_empty_ring: u64,
+    /// 其中「积压超过临界水位」分支的次数。
+    pub tx_ready_congested: u64,
+    /// 其中「积压边沿变化」分支的次数。
+    pub tx_ready_edge: u64,
+    /// 被去重位挡下的重复 `TxReady` 次数。
+    pub tx_ready_dedup: u64,
+    /// 真正投递成功的 `TxReady` 次数。
+    pub tx_ready_sent: u64,
+    /// `TxReady` 投递失败（环满 / 消费者消失）次数。
+    pub tx_ready_full: u64,
+    /// `RxConsumed` 进入投递流程的次数。
+    pub rx_consumed_attempt: u64,
+    /// 被去重位挡下的重复 `RxConsumed` 次数。
+    pub rx_consumed_dedup: u64,
+    /// 真正投递成功的 `RxConsumed` 次数。
+    pub rx_consumed_sent: u64,
+    /// `RxConsumed` 投递失败（环满 / 消费者消失）次数。
+    pub rx_consumed_full: u64,
+    /// 可重建事件因环满被丢弃的次数。
+    pub event_full_recoverable: u64,
+    /// 不可重建事件进入兜底暂存的次数。
+    pub event_durable_stashed: u64,
+    /// 不可重建事件投递时消费者已消失的次数。
+    pub event_durable_closed: u64,
+    /// 消费者看到 `Rescan` 的次数。
+    pub event_rescan: u64,
+}
+
+/// 记一次 `TxReady` 通知尝试，并记下触发分支。
+pub(crate) fn event_tx_ready_attempt_(empty_ring: bool, congested: bool, edge: bool) {
+    TX_READY_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    if empty_ring {
+        TX_READY_EMPTY_RING.fetch_add(1, Ordering::Relaxed);
+    }
+    if congested {
+        TX_READY_CONGESTED.fetch_add(1, Ordering::Relaxed);
+    }
+    if edge {
+        TX_READY_EDGE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 记一次被去重位挡下的 `TxReady`。
+pub(crate) fn event_tx_ready_dedup_() {
+    TX_READY_DEDUP.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 记一次 `TxReady` 投递结果。
+pub(crate) fn event_tx_ready_result_(sent: bool) {
+    if sent {
+        TX_READY_SENT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TX_READY_FULL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 记一次 `RxConsumed` 通知尝试。
+pub(crate) fn event_rx_consumed_attempt_() {
+    RX_CONSUMED_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 记一次被去重位挡下的 `RxConsumed`。
+pub(crate) fn event_rx_consumed_dedup_() {
+    RX_CONSUMED_DEDUP.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 记一次 `RxConsumed` 投递结果。
+pub(crate) fn event_rx_consumed_result_(sent: bool) {
+    if sent {
+        RX_CONSUMED_SENT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        RX_CONSUMED_FULL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+
+
+
+
+/// 读事件通道诊断快照。
+pub fn event_probe_snapshot_() -> EventProbeSnapshot {
+    EventProbeSnapshot {
+        tx_ready_attempt: TX_READY_ATTEMPT.load(Ordering::Relaxed),
+        tx_ready_empty_ring: TX_READY_EMPTY_RING.load(Ordering::Relaxed),
+        tx_ready_congested: TX_READY_CONGESTED.load(Ordering::Relaxed),
+        tx_ready_edge: TX_READY_EDGE.load(Ordering::Relaxed),
+        tx_ready_dedup: TX_READY_DEDUP.load(Ordering::Relaxed),
+        tx_ready_sent: TX_READY_SENT.load(Ordering::Relaxed),
+        tx_ready_full: TX_READY_FULL.load(Ordering::Relaxed),
+        rx_consumed_attempt: RX_CONSUMED_ATTEMPT.load(Ordering::Relaxed),
+        rx_consumed_dedup: RX_CONSUMED_DEDUP.load(Ordering::Relaxed),
+        rx_consumed_sent: RX_CONSUMED_SENT.load(Ordering::Relaxed),
+        rx_consumed_full: RX_CONSUMED_FULL.load(Ordering::Relaxed),
+        event_full_recoverable: EVENT_FULL_RECOVERABLE.load(Ordering::Relaxed),
+        event_durable_stashed: EVENT_DURABLE_STASHED.load(Ordering::Relaxed),
+        event_durable_closed: EVENT_DURABLE_CLOSED.load(Ordering::Relaxed),
+        event_rescan: EVENT_RESCAN.load(Ordering::Relaxed),
+    }
 }

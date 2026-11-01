@@ -457,5 +457,4 @@ mod magic_;
 pub use magic_::{
     K_ACCEPT_MAGIC, K_CONFRM_MAGIC, K_INVITE_MAGIC, K_REJECT_MAGIC,
 };
-pub(crate) use magic_::MagicField;
-pub(crate) use magic_::MAGIC_FIELD_SIZE;
+pub(crate) use magic_::{MAGIC_FIELD_SIZE, MagicField};

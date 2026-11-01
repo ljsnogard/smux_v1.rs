@@ -167,7 +167,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
         .await
         .expect("A 侧绑定 Q 应当成功");
 
-    // 先按 P、Q 的顺序发起：B 侧的入向队列因此也是 P 在前（`pending_fin` 的键序同理）。
+    // 先按 P、Q 的顺序发起：B 侧的入向队列因此也是 P 在前（完成登记的键序同理）。
     let mut empty: &[u8] = &[];
     let mut handle_p = binding_p
         .open_channel_async(listener_dock, &mut empty)
@@ -183,8 +183,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
     // （它同时就是 B 向 A 通告的接收窗口）。
     let (opened_p, accepted_p) = join!(
         async {
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             handle_p.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_RING), crate::common::make_channel_buff_with_(K_RING))).await
         },
         async {
@@ -192,15 +191,13 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到 P 的入向请求");
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             incoming.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_WINDOW), crate::common::make_channel_buff_with_(K_WINDOW))).await
         },
     );
     let (opened_q, accepted_q) = join!(
         async {
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             handle_q.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_RING), crate::common::make_channel_buff_with_(K_RING))).await
         },
         async {
@@ -208,8 +205,7 @@ pub async fn run_closed_ring_spin_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到 Q 的入向请求");
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             incoming.accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_WINDOW), crate::common::make_channel_buff_with_(K_WINDOW))).await
         },
     );

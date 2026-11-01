@@ -12,8 +12,9 @@
 //!    分配。连接级帧暂存本版已经不存在（连接直接驱动传输适配器，适配器自带缓冲）。
 //!
 //! 形状与测试侧逐项对应：`Data = u8`、`Dock = Dock`、`Policy = DefaultPolicy`、
-//! `Alloc = CoreAlloc`。**缓冲类型不在配置里**：子流环内存由调用方在 `accept_async`
-//! 当场交出（见 `transport.rs` 的 `RingPrepare`）；传输两条半边自带缓冲。
+//! `AllocCfg = SingleConnAllocCfg`（内建实现，所有分配器用途都是 `CoreAlloc`）。
+//! **缓冲类型不在配置里**：子流环内存由调用方在 `accept_async` 当场交出（见
+//! `transport.rs` 的 `RingPrepare`）；传输两条半边自带缓冲。
 
 use core::marker::PhantomData;
 
@@ -22,13 +23,11 @@ use abs_buff::{
     TrBuffFlush, TrBuffRead, TrBuffWrite,
     buffer::{TrConsumerState, TrProducerState},
 };
-use abs_mm::CoreAlloc;
 use abs_smux::conf::TrMuxConfig;
-use mm_ptr::x_deps::abs_mm;
 use smux_v1::{
-    connection::{Dock, TrConnCfg},
+    connection::{Dock, SingleConnAllocCfg, TrConnCfg},
     flow_ctrl::DefaultPolicy,
-    x_deps::{abs_art, abs_buff, abs_smux, mm_ptr},
+    x_deps::{abs_art, abs_buff, abs_smux},
 };
 
 use crate::{Rt, metrics::DemoMetrics};
@@ -87,7 +86,7 @@ where
     Rt: TrTime + Clone + 'static,
 {
     type Rt = Rt;
-    type Alloc = CoreAlloc;
+    type AllocCfg<'a> = SingleConnAllocCfg;
     type Policy = DefaultPolicy;
     type ConnTx = W;
     type ConnRx = R;
@@ -97,8 +96,8 @@ where
         self.rt_.clone()
     }
 
-    fn allocator(&self) -> Self::Alloc {
-        CoreAlloc
+    fn alloc_cfg(&self) -> Self::AllocCfg<'static> {
+        SingleConnAllocCfg::default()
     }
 
     fn policy(&self) -> &Self::Policy {

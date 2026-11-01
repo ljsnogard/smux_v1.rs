@@ -1,6 +1,6 @@
-use core::task::Poll;
+use core::future::poll_fn;
 
-use abs_art::{TrClock, TrDelay, TrJoinHandle, TrLocalScope};
+use abs_art::{TrJoinHandle, TrLocalScope};
 use abs_art_facade::ScopeHost;
 use abs_cancel::TrCancellationToken;
 use abs_smux::{
@@ -9,14 +9,18 @@ use abs_smux::{
     dock::TrDock,
 };
 use gen_mcf2::gen_may_cancel_future;
-use mm_ptr::Shared;
+use mm_ptr::{Owned, Shared};
 
 use crate::{
     connection::{
-        Dock, MuxError, TrConnCfg,
+        BufferedRx, BufferedTx, ControlState_, Dock, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxError,
+        PushErr_, TrConnAllocCfg, TrConnCfg, TcsAbandonGuard_, Tcs_,
         dock_binding::DockBinding,
+        main_loop_async_,
+        public_channel_::{PublicChannel_, PublicChunkIo_},
+        ring_::new_buffered_channel,
         session_::{MuxShared_, demux_loop_async_, mux_loop_async_, race_cancel_},
-        signal_::{EventReceiver_, ReadEvent_, WriteEvent_, event_channel_},
+
         timer_::timer_loop_async_,
     },
     handshake::{agent::HandshakeDelivery, opts::HandshakeOpts},
@@ -76,7 +80,7 @@ where
     C: TrConnCfg,
 {
     /// 指向演员核心的强引用；最后一个强引用消失时核心析构（并触发收尾）。
-    core_: Shared<MuxCore<C>, C::Alloc>,
+    core_: Shared<MuxCore<C>, crate::connection::ConnCoreAlloc_<C>>,
 }
 
 impl<C> Clone for MuxConnection<C>
@@ -108,8 +112,8 @@ where
     /// | 1 | 复用 | 各子流发送环 → `C::ConnTx`（成帧、拉取写事件） |
     /// | 2 | 计时 | 不搬字节：保活 `PULSE` 与空闲超时拆流（见私有模块 `timer_`） |
     ///
-    /// 内侧两个循环（0 / 1）从事件队列拉取 `Attach` / `TxClosed` / `Control` 等事件，
-    /// 据此决定哪些子流此刻可搬；计时循环（2）在前两者都静默时仍然会醒来，把
+    /// 内侧两个循环（0 / 1）从事件队列拉取 `Attach` / `Control` 等事件、并按各子流的
+    /// 收尾状态位推进拆流，据此决定哪些子流此刻可搬；计时循环（2）在前两者都静默时仍然会醒来，把
     /// 保活与拆流的需求投进同两条事件队列。
     ///
     /// # 为什么不再有连接级帧暂存环
@@ -158,7 +162,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        C::Alloc: 'static,
+        crate::connection::ConnCoreAlloc_<C>: 'static,
         C::Rt: ScopeHost,
     {
         let rt = config.runtime();
@@ -185,7 +189,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        C::Alloc: 'static,
+        crate::connection::ConnCoreAlloc_<C>: 'static,
         S: TrLocalScope + Clone + 'static,
     {
         Self::new_with_rt_(rt, scope, delivery, config)
@@ -200,7 +204,7 @@ where
     ) -> Self
     where
         C: 'static + Clone,
-        C::Alloc: 'static,
+        crate::connection::ConnCoreAlloc_<C>: 'static,
         S: TrLocalScope + Clone + 'static,
     {
         let HandshakeDelivery { opts, tx, rx } = delivery;
@@ -208,8 +212,11 @@ where
         let CoreBundle_ {
             core_,
             shared_,
-            w_receiver_,
-            r_receiver_,
+            control_,
+            public_tx_w_,
+            public_tx_r_,
+            public_rx_w_,
+            public_rx_r_,
         } = bundle;
 
         // 解复用：**直接读传输的读半边**（没有读泵，也没有连接读环）。
@@ -218,8 +225,7 @@ where
             demux_loop_async_::<C, _>(
                 rx,
                 shared_.clone(),
-                r_receiver_,
-                core_.w_events_().clone(),
+                public_rx_w_,
                 core_.loop_token_(0usize),
             ),
         );
@@ -231,8 +237,7 @@ where
             mux_loop_async_::<C, _>(
                 tx,
                 shared_.clone(),
-                w_receiver_,
-                core_.r_events_().clone(),
+                public_tx_r_,
                 core_.loop_token_(1usize),
             ),
         );
@@ -240,14 +245,23 @@ where
 
         // 计时循环：保活（PULSE）与空闲超时拆流。它不搬字节，只按连接级时钟算
         // 期限、把保活动作投进上面两条事件通道（见 `timer_` 模块文档）。
+        //
+        // 控制面：请求队列 + 身份表写者（P1 接管 bind / listen / reserve）。
+        let main_fut = keep_queue_alive_(
+            scope.clone(),
+            main_loop_async_::<C, _>(
+                shared_.clone(),
+                control_.clone(),
+                public_tx_w_,
+                public_rx_r_,
+                core_.loop_token_(3usize),
+            ),
+        );
+        scope.spawn_local(main_fut).detach();
+
         let timer_fut = keep_queue_alive_(
             scope.clone(),
-            timer_loop_async_::<C, _>(
-                shared_,
-                core_.w_events_().clone(),
-                core_.r_events_().clone(),
-                core_.loop_token_(2usize),
-            ),
+            timer_loop_async_::<C, _>(shared_, core_.loop_token_(2usize)),
         );
         scope.spawn_local(timer_fut).detach();
 
@@ -307,10 +321,13 @@ struct CoreBundle_<C>
 where
     C: TrConnCfg,
 {
-    core_: Shared<MuxCore<C>, C::Alloc>,
+    core_: Shared<MuxCore<C>, crate::connection::ConnCoreAlloc_<C>>,
     shared_: MuxShared_<C>,
-    w_receiver_: EventReceiver_<WriteEvent_<C::Alloc>>,
-    r_receiver_: EventReceiver_<ReadEvent_<C::Alloc>>,
+    control_: ControlState_<crate::connection::ConnAllocCfg_<C>>,
+    public_tx_w_: BufferedTx,
+    public_tx_r_: BufferedRx,
+    public_rx_w_: BufferedTx,
+    public_rx_r_: BufferedRx,
 }
 
 impl<C> CoreBundle_<C>
@@ -322,13 +339,29 @@ where
     {
         let max_packet_size = opts.basic_opts.max_packet_size;
         let channel_timeout_millis = millis_of_(opts.basic_opts.max_channel_timeout);
-        let alloc = config.allocator();
+        let pending_msg_cap = config.pending_msg_capacity();
+        // 分配器配置按值交给各结构（它是「取分配器的配方」，不是可克隆的句柄）；
+        // 每处各取一次。
+        let core_alloc: crate::connection::ConnCoreAlloc_<C> = config.alloc_cfg().core_alloc();
+        let public_alloc: crate::connection::ConnPublicAlloc_<C> =
+            config.alloc_cfg().public_alloc();
         // 建连这一刻就是连接的 epoch；此后协议里的时间量一律是「自它起算的毫秒」。
         let conn_clock = ConnClock_::new_(rt.clone());
 
-        let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), alloc.clone());
-        let (w_events, w_receiver) = event_channel_();
-        let (r_events, r_receiver) = event_channel_();
+        // 注册表建连时按用途从配置取走各自的分配器实例（结构 / 身份节点 /
+        // `Attach` 通道 / 取消令牌）。
+        let reg = ChannelRegistry_::new_(opts.basic_opts.clone(), config.alloc_cfg());
+        let control = ControlState_::new_(config.alloc_cfg());
+        // 公共报文子流：两条普通 ring + 四路唤醒槽。容量下界保证一个最大控制帧的
+        // chunk 能完整写进空 ring（设计稿 §5.3）；建环失败等同连接建立失败。
+        let public_cap = PublicChunkIo_::ring_capacity_(max_packet_size);
+        let (public_tx_w_, public_tx_r_) =
+            new_buffered_channel(Owned::new_uninit_slice(public_cap, public_alloc.clone()))
+                .expect("公共 TX ring：容量由 max_packet_size 决定，失败等同分配失败");
+        let (public_rx_w_, public_rx_r_) =
+            new_buffered_channel(Owned::new_uninit_slice(public_cap, public_alloc.clone()))
+                .expect("公共 RX ring：容量由 max_packet_size 决定，失败等同分配失败");
+        let public = PublicChannel_::new_(config.alloc_cfg());
 
         // 指标接收方在**建连这一刻**从配置克隆一份：循环不持有核心，拿不到
         // `MuxCore`，只能像运行时值那样自持一份（见 `core_` 模块文档「队列保活」）。
@@ -341,9 +374,12 @@ where
 
         let shared = MuxShared_::<C>::new_(
             reg.clone(),
+            control.clone(),
             max_packet_size,
+            pending_msg_cap,
             conn_clock.clone(),
             channel_timeout_millis,
+            public,
             metrics.clone(),
         );
         // 核心自持一份三个循环的取消令牌：`MuxCore::drop` 因此不必去注册表取锁
@@ -352,26 +388,28 @@ where
             reg.loop_token_(0usize),
             reg.loop_token_(1usize),
             reg.loop_token_(2usize),
+            reg.loop_token_(3usize),
         ];
 
         let core = Shared::new(
             MuxCore::new_(
                 config,
-                opts,
                 reg,
+                control.clone(),
                 conn_clock.epoch_(),
-                w_events,
-                r_events,
                 loops,
             ),
-            alloc.clone(),
+            core_alloc,
         );
 
         CoreBundle_ {
             core_: core,
             shared_: shared,
-            w_receiver_: w_receiver,
-            r_receiver_: r_receiver,
+            control_: control,
+            public_tx_w_,
+            public_tx_r_,
+            public_rx_w_,
+            public_rx_r_,
         }
     }
 }
@@ -384,12 +422,15 @@ where
     /// 测试专用构造：只建核心与两条事件通道，**不 spawn 任何循环**。
     ///
     /// 运行时值取自 `config.runtime()`（测试配置给出的是假运行时值，时刻恒为 0）。
-    pub(crate) fn new_test_(opts: HandshakeOpts, config: C) -> Self
-    {
+    pub(crate) fn new_test_(opts: HandshakeOpts, config: C) -> Self {
+        Self::new_test_bundle_(opts, config).0
+    }
+
+    /// 测试专用：同时交出连接与循环共享面，供手动 `main_step_` 驱动。
+    pub(crate) fn new_test_bundle_(opts: HandshakeOpts, config: C) -> (Self, MuxShared_<C>) {
         let rt = config.runtime();
-        MuxConnection {
-            core_: CoreBundle_::build_(&rt, opts, config).core_,
-        }
+        let CoreBundle_ { core_, shared_, .. } = CoreBundle_::build_(&rt, opts, config);
+        (MuxConnection { core_ }, shared_)
     }
 }
 
@@ -438,181 +479,134 @@ where
     if local_dock.is_wildcard() {
         return Result::Err(BindError::ReservedDock);
     }
-    // 连接已经进入优雅关闭：不再受理新 binding。这里是**锁外快路径**（登记路径在
-    // 锁内还会复查一次，见 `ChannelRegistry_::begin_close_`），省掉一次可能很长的
-    // 等锁；关闭之后调用方本来也只能改去丢弃句柄。
+    // 连接已经进入优雅关闭：不再受理新 binding。这里是**锁外快路径**（main 的登记
+    // 路径在锁内还会复查一次，见 `ChannelRegistry_::begin_close_`），省掉一次可能
+    // 很长的等锁；关闭之后调用方本来也只能改去丢弃句柄。
     if conn.core_().is_closing_() {
         return Result::Err(BindError::Mux(MuxError::Closed));
     }
-    // 先清空释放邮箱：上一个 `DockBinding` 可能刚被丢弃（`Drop` 只投消息），
-    // 不先落实就会把「已解绑」误判成 `DockInUse`——这是「丢弃后立刻重绑」这条
-    // 既有约定的确定性来源。自动分配路径同样依赖它：「丢弃后立刻再要一个」应当能
-    // 拿回刚释放的那个 dock，而它要先进复用池（见 `ChannelRegistry_::unbind_dock_`）。
+    // 一次请求 + 完成源：登记动作由 `main_loop`（身份表唯一写者）执行。
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(BindError::Mux(MuxError::Closed)),
+    };
+    let waiter = tcs.clone();
+    // 等待方取消 / 丢弃 future 时放弃结果；`main_loop` 在登记前后都会检查
+    // `is_abandoned_()`，已放弃就回滚刚登记的身份（见 `main_loop::loop_`）。
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
-        .drain_session_events_(cancel.child_token())
+        .control_()
+        .submit_async_(
+            MainLoopRequest_::Bind {
+                local_dock,
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
         .await
-        .map_err(|_| BindError::Cancelled)?;
-    // 两条路径都只做「登记独占绑定」这一件事：显式路径绑定给定值，自动分配路径把
-    // 「找空闲 + 占位」合成一次临界区内的原子操作，并回传选中的值。
-    let bound_dock = if local_dock.is_unspecified() {
-        conn.core_()
-            .bind_any_dock_(cancel.child_token())
-            .await
-    } else {
-        conn.core_()
-            .bind_dock_(local_dock, cancel.child_token())
-            .await
-            .map(|()| local_dock)
-    }
-    .map_err(|err| match err {
-        ReserveErr_::Cancelled => BindError::Cancelled,
+        .map_err(|err| match err {
+            PushErr_::Closed(_) => BindError::Mux(MuxError::Closed),
+            PushErr_::Cancelled(_) => BindError::Cancelled,
+        })?;
+    let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
+    match reply {
+        Option::Some(Result::Ok(MainLoopReply_::Dock { dock, unbind_ })) => {
+            Result::Ok(DockBinding::new_(conn.clone(), dock, unbind_))
+        }
+        Option::Some(Result::Err(MainLoopErr_::Reserve(ReserveErr_::DockInUse))) => {
+            Result::Err(BindError::DockInUse)
+        }
         // 连接已经进入优雅关闭：不再接受任何新 binding。用连接级 `Closed` 表达——
         // 「这条连接不再提供服务」正是调用方此刻的处境，它不必区分「dock 被占」
         // 与「连接在关」这两种在关闭语义下都无法补救的情形。
-        ReserveErr_::Closing => BindError::Mux(MuxError::Closed),
-        // 显式路径是「该 dock 已被占用」，自动分配路径是「候选范围已占满」：调用方
-        // 在两种情形下能做的事没有区别，因此共用 `DockInUse`。
-        _ => BindError::DockInUse,
-    })?;
-    Result::Ok(DockBinding::new_(conn.clone(), bound_dock))
+        Option::Some(Result::Err(MainLoopErr_::Reserve(ReserveErr_::Closing))) => {
+            Result::Err(BindError::Mux(MuxError::Closed))
+        }
+        Option::Some(Result::Err(MainLoopErr_::Reserve(ReserveErr_::Cancelled))) => {
+            Result::Err(BindError::Cancelled)
+        }
+        Option::Some(Result::Err(MainLoopErr_::Mux(err))) => Result::Err(BindError::Mux(err)),
+        // 其他预留原因 / 非 Dock 结果：绑定路径不该出现，保守映射为关闭。
+        Option::Some(Result::Err(MainLoopErr_::Reserve(_)))
+        | Option::Some(Result::Ok(_))
+        | Option::None => Result::Err(BindError::Mux(MuxError::Closed)),
+    }
 }
 
 /// [`TrConnection::close_async`] 的 step 函数：**优雅关闭**。
 ///
-/// # 状态驱动，而不是「收集 + 遍历」
+/// # 形状：一次请求 + 完成源
 ///
 /// 本函数只做三件事：
 ///
-/// 1. **进入「等待关闭」**（[`MuxCore::enter_waiting_close_`]）：一次 CAS，不取锁、
-///    **不分配**（上一版要在这里把活跃子流收进一个 `Vec`），随后唤醒计时循环；
-/// 2. **等收尾发生**：判据是三个循环的取消令牌被触发——那是「连接确实收口了」的
-///    唯一信号，由**循环自己**在合适的时刻执行（见下）；
-/// 3. **超时或取消就强制收尾**（幂等）。
+/// 1. 把 `Close` 请求连同完成源交给 `main_loop`（身份表唯一写者）；
+/// 2. 等答复（可取消）；
+/// 3. 答复为「未收敛」时补一次强制收尾（幂等）。
 ///
-/// 谁在什么时候执行收尾：
-///
-/// | 时机 | 执行者 | 依据 |
-/// | --- | --- | --- |
-/// | 最后一条活跃子流与对端双向收尾 | 复用循环（`session_::maybe_release_`） | 身份释放后活跃子流归零 |
-/// | 关闭点上没有活跃子流，或关闭整体超时 | 计时循环（`timer_loop_async_`） | `TimerScan_::close_action_` |
-///
-/// 「所有正在活动的子流排空并向对端发关闭信号」这一步同样由计时循环完成：它在
-/// 等待关闭状态下为每条已裁决子流认领一次 `Finalize` 动作（复用循环据此**在发送环
-/// 排空之后**补 `CLOSE(FIN)`），为每条尚未裁决的子流直接回 `REJECT`。整条路径一次
-/// 堆分配都没有。
+/// **收尾判定与执行都在 main**：`main_loop::tick_` 的连接级关闭动作在「活跃子流
+/// 归零」时答 `Closed(true)`、整体超时答 `Closed(false)`，并且**先完成答复、再
+/// `cancel_loops_()`**（设计稿 §6.3 / Q8）。调用方因此拿到的是「收尾结果」，而不是
+/// 「被取消」——旧实现等的是取消令牌本身，分不清这两者。
 ///
 /// # 超时与取消
 ///
-/// 等待上限取协商项 `max_channel_timeout`；计时循环在**同一时刻**也用它作关闭整体
-/// 的超时兜底（`drop` 路径没有调用方，只有它兜得住）。调用方的取消令牌打断时同样
-/// 强制收尾并返回 `false`——本函数不得假定调用者一定会等到最后。
-///
-/// 两个期限**数值相同、起算点不同**（计时循环从进入等待关闭那一刻起算，比本函数算
-/// 自己的期限更早），因此谁先到是时序问题，不能当作判据。收尾由计时循环强制促成时，
-/// 它会把 [`K_STATE_FORCED_CLOSE`](super::registry_::K_STATE_FORCED_CLOSE) 记在连接
-/// 状态里；本函数据此把「超时收尾」与「与对端收敛」分开。
+/// 等待上限取协商项 `max_channel_timeout`，但**期限的判定在 main 的 `tick_`**：
+/// 计时循环按 `TimerSignal_` 醒来、raise `HINT_MAIN_TIMER`，main 比较「进入等待关闭
+/// 起算」的时长。调用方的取消令牌打断等待时本函数返回 `false` 并强制收尾——
+/// 本函数不得假定调用者一定会等到最后。
 ///
 /// # 返回值
 ///
-/// `true` = 收尾发生在**收敛之后**（最后一条子流已与对端双向收尾）；`false` = 超时
-/// （包括「计时循环先于本函数自己的期限判定超时」这一情形）、被取消、或连接此前
-/// 已经失败。
+/// `true` = 收尾发生在**收敛之后**（最后一条子流已与对端双向收尾）；`false` = 超时、
+/// 被取消、或连接此前已经失败。
 #[gen_may_cancel_future(MuxConnClose, pub, new(pub(crate)))]
-async fn mux_conn_close_async_<'f, C, K>(
-    conn: &'f mut MuxConnection<C>,
-    cancel: K,
-) -> bool
+async fn mux_conn_close_async_<'f, C, K>(conn: &'f mut MuxConnection<C>, cancel: K) -> bool
 where
     C: TrConnCfg + 'f,
     K: TrCancellationToken,
 {
     let core = conn.core_();
 
-    // 连接已经失败（传输错误 / 对端关闭）：没有「优雅」可言——已提交的字节此刻
-    // 是否送达不由本端决定。直接收尾，并如实报 `false`。
+    // 连接已经失败：没有「优雅」可言，直接收尾并如实报 `false`。
     if core.reg_().fail_kind_().is_some() {
         core.reg_().cancel_loops_();
         return false;
     }
 
-    // 第 1 步：进入「等待关闭」。只有首次进入才唤醒推进引擎（已经关闭中的连接，
-    // 引擎早就在转了）。
-    if core.enter_waiting_close_() {
-        core.notify_timer_();
+    let tcs = match Tcs_::new_(core.reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return false,
+    };
+    let waiter = tcs.clone();
+    // 调用方取消 / 丢弃 future 时放弃结果；main 在答复前检查 `is_abandoned_`。
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
+    if core
+        .control_()
+        .submit_async_(
+            MainLoopRequest_::Close { reply: tcs },
+            cancel.child_token(),
+        )
+        .await
+        .is_err()
+    {
+        // 请求队列已关闭 = 连接正在收尾：没有答复可等。
+        core.reg_().cancel_loops_();
+        return false;
     }
 
-    // 第 2 步：等收尾（令牌触发）、超时或取消。
-    let rt = core.config_().runtime();
-    let deadline = rt.now() + core.opts_().basic_opts.max_channel_timeout;
-    let closed = wait_for_finalize_(core, &rt, deadline, &cancel).await;
-
-    // 第 3 步：超时 / 取消 / 失败 ⇒ 强制收尾（幂等；收敛路径上循环已经做过）。
+    let reply = race_cancel_(
+        &cancel,
+        core::future::poll_fn(|cx| waiter.poll_wait_(cx)),
+    )
+    .await;
+    let closed = match reply {
+        Option::Some(Option::Some(Result::Ok(MainLoopReply_::Closed(closed)))) => closed,
+        // 取消 / 放弃 / 连接收尾：按未收敛处理。
+        _ => false,
+    };
     if !closed {
+        // 取消 / 超时 / 失败：强制收尾（幂等；收敛路径上 main 已经做过）。
         core.reg_().cancel_loops_();
     }
     closed
-}
-
-/// 优雅关闭的**等待步**：等「收尾已经发生」（取消令牌被触发）、`deadline` 到期或
-/// 调用方取消，三者任一先到就返回。
-///
-/// # 判据为什么是取消令牌
-///
-/// 上一版等的是「每条子流都收到对端 `FIN`」，因此必须在调用方手里攥着每条子流的
-/// 状态句柄（那正是 `Vec` 的来源）。本版把「最后一条子流」的判定下沉到**循环**里
-/// ——它们本来就在身份释放路径上（`total_` 归零）与扫描路径上（活跃子流归零）——
-/// 于是调用方只需等一个连接级的信号：令牌有没有被触发。
-///
-/// 令牌触发可能来自收尾，也可能来自连接级失败（失败也会取消循环），因此醒来之后
-/// 还要看一次 [`ChannelRegistry_::fail_kind_`]：非空 ⇒ 不是「优雅完成」，报 `false`。
-async fn wait_for_finalize_<C, K>(
-    core: &MuxCore<C>,
-    rt: &C::Rt,
-    deadline: <C::Rt as TrClock>::Instant,
-    cancel: &K,
-) -> bool
-where
-    C: TrConnCfg,
-    K: TrCancellationToken,
-{
-    // 两个句柄：一个用来**问**（`is_cancelled`），一个用来**等**（`cancellation()`
-    // 按值消费令牌）。克隆是零分配的共享句柄。
-    let probe = core.loop_token_(0usize);
-    let mut finalized = core::pin::pin!(probe.clone().cancellation());
-    loop {
-        // 复检：收尾可能就发生在进入本函数之前（或上一次醒来时）。
-        //
-        // 令牌触发只说明「连接确实收口了」，**不**说明是哪种收口：与对端收敛、计时
-        // 循环的整体超时兜底、连接级失败，三者都会取消它。因此判据要把后两者排除
-        // 掉——失败看 `fail_kind_`，超时看计时循环留下的**显式**标志
-        // （`is_forced_close_`，见 `K_STATE_FORCED_CLOSE` 的文档）。
-        if probe.is_cancelled() {
-            return core.reg_().fail_kind_().is_none() && !core.reg_().is_forced_close_();
-        }
-        // 连接级失败：收尾是失败牵连的结果，不是「优雅完成」。
-        if core.reg_().fail_kind_().is_some() {
-            return false;
-        }
-        let now = rt.now();
-        if now >= deadline {
-            return false;
-        }
-        let remaining = deadline - now;
-        let mut sleeping = core::pin::pin!(rt.delay(remaining));
-        let woke = race_cancel_(
-            cancel,
-            core::future::poll_fn(|cx| {
-                // 收尾信号：令牌一旦触发就永久保持，因此这里只需等一次。
-                if core::future::Future::poll(finalized.as_mut(), cx).is_ready() {
-                    return Poll::Ready(());
-                }
-                core::future::Future::poll(sleeping.as_mut(), cx)
-            }),
-        )
-        .await;
-        if woke.is_none() {
-            // 调用方取消：强制收尾。
-            return false;
-        }
-    }
 }

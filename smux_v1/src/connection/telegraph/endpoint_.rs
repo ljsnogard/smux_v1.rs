@@ -58,11 +58,11 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        BindingError, Dock, DockBinding, MuxConnection, MuxError, TrConnCfg,
-        dock_binding::map_reserve_err_,
+        BindingError, Dock, DockBinding, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError,
+        TcsAbandonGuard_, Tcs_, TrConnCfg,
         owner_::TgOwner_,
         ring_::{BufferedRx, BufferedTx, RingBuildErr, new_buffered_channel},
-        signal_::{ReadEvent_, SessionEvent_, TrEventSender_, WriteEvent_},
+        session_::race_cancel_,
     },
     x_deps::{abs_cancel, abs_mm, gen_mcf2},
 };
@@ -188,7 +188,7 @@ where
     pub(crate) fn new_(
         conn: MuxConnection<C>,
         local_dock: Dock,
-        rec: TgOwner_<C::Alloc>,
+        rec: TgOwner_<crate::connection::ConnChanOwnerAlloc_<C>>,
         tx_w: BufferedTx,
         rx_r: BufferedRx,
     ) -> Self {
@@ -325,44 +325,42 @@ where
     // 1. 纯本地：建两条环（结果在 `open_telegraph_async` 里已经算出）。
     let ((tx_w, tx_r), (rx_w, rx_r)) = rings.map_err(map_telegraph_err_)?;
 
-    // 2. 先落实积压的释放消息，再认领身份（与 `listen_async` 同一纪律）。
-    conn.core_()
-        .drain_session_events_(cancel.child_token())
-        .await
-        .map_err(map_reserve_err_)?;
-    let rec = conn
+    // 2. 登记身份 + 投递两个环半部：**都归 `main_loop`**（身份表唯一写者，I3）。
+    //    请求里带环半部（`TgAttach` 不可位化），main 登记后直接投两条事件。
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(BindingError::Closed),
+    };
+    let waiter = tcs.clone();
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
+    if conn
         .core_()
-        .reserve_telegraph_(local, cancel.child_token())
-        .await
-        .map_err(map_reserve_err_)?;
-
-    // 3. 把会话侧两个半部交给对应的中心循环。失败（循环已不在 = 连接正在收尾）时必须
-    //    撤销身份：否则该 `local_dock` 会被一个永远不能收发、也没有使用者的身份占住。
-    let attached = conn
-        .core_()
-        .w_events_()
-        .try_send_event_(WriteEvent_::TgAttach {
-            local_dock: local,
-            owner: rec.clone(),
-            reader_: tx_r,
-        })
-        && conn
-            .core_()
-            .r_events_()
-            .try_send_event_(ReadEvent_::TgAttach {
+        .control_()
+        .submit_async_(
+            MainLoopRequest_::OpenTelegraph {
                 local_dock: local,
-                owner: rec.clone(),
+                reader_: tx_r,
                 writer_: rx_w,
-            });
-    if !attached && !cfg!(test) {
-        let _ = conn
-            .core_()
-            .reg_()
-            .post_session_event_(SessionEvent_::ReleaseTelegraph { local_dock: local });
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
+        .await
+        .is_err()
+    {
         return Result::Err(BindingError::Closed);
     }
+    let reply = race_cancel_(
+        &cancel,
+        core::future::poll_fn(|cx| waiter.poll_wait_(cx)),
+    )
+    .await;
+    let rec = match reply {
+        Option::Some(Option::Some(Result::Ok(MainLoopReply_::Telegraph(rec)))) => rec,
+        _ => return Result::Err(BindingError::Closed),
+    };
 
-    // 4. 应用侧两个半部 + 身份句柄 → 端点工厂。
+    // 3. 应用侧两个半部 + 身份句柄 → 端点工厂。
     Result::Ok(Telegraph::new_(conn, local, rec, tx_w, rx_r))
 }
 

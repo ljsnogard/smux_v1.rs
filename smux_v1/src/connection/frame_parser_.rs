@@ -705,6 +705,27 @@ where
     }
 }
 
+/// 同步解析一段完整的帧头字节。
+///
+/// 返回 `(FrameHeader, 帧头字节数)`；载荷从返回的偏移开始。供 `main_loop` 从公共
+/// 报文子流读到整帧字节后使用：不分配、不 `async`，只跑一次已成熟的逐字节状态机。
+///
+/// # Errors
+///
+/// 与 [`FrameHeaderParser::consume_byte_`] 相同；字节不足以构成完整帧头时返回
+/// [`MuxError::MalformedFrame`]。
+pub(crate) fn decode_header_sync_(bytes: &[u8]) -> Result<(FrameHeader, usize), MuxError> {
+    let mut parser = FrameHeaderParser::new();
+    for (idx, &byte) in bytes.iter().enumerate() {
+        match parser.consume_byte_(byte) {
+            Consume_::Pending => {}
+            Consume_::Done(header) => return Result::Ok((header, idx + 1usize)),
+            Consume_::Failed(err) => return Result::Err(err),
+        }
+    }
+    Result::Err(MuxError::MalformedFrame)
+}
+
 #[cfg(test)]
 mod tests_ {
     use super::*;

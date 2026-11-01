@@ -52,4 +52,12 @@ async fn cross_thread_bind_and_channels_tokio_() {
         })),
     )
     .await;
+
+    // 诊断：单跑本测试时打印事件通道计数（`--nocapture` 可见）。
+    #[cfg(feature = "test-loop-probe")]
+    eprintln!(
+        "[event-probe] cross_thread({} channels): {:?}",
+        common::K_CROSS_THREAD_CHANNELS,
+        smux_v1::connection::loop_probe_::event_probe_snapshot_()
+    );
 }

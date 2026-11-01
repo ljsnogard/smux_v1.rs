@@ -120,8 +120,7 @@ pub(super) async fn drive_side_<C>(
                     Dock::new(dock),
                     "被动方的 local_dock 应当是监听 dock（镜像语义）"
                 );
-                let mut welcome_buf: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome_buf[..];
+                let mut welcome: &[u8] = &[];
                 let (tx, mut rx) = handle
                     .accept_async_closure(&mut welcome, || {
                         (make_channel_buff_(), make_channel_buff_())
@@ -152,8 +151,7 @@ pub(super) async fn drive_side_<C>(
                     .open_channel_async(Dock::new(dock), &mut message)
                     .await
                     .expect("向对端 dock 发起子流应当成功");
-                let mut welcome_buf: [u8; 0] = [];
-                let mut welcome: &mut [u8] = &mut welcome_buf[..];
+                let mut welcome: &[u8] = &[];
                 let (tx, mut rx) = handle
                     .accept_async_closure(&mut welcome, || {
                         (make_channel_buff_(), make_channel_buff_())

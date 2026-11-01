@@ -44,7 +44,7 @@
 //! | --- | --- | --- |
 //! | `active_millis_` | 任何 `touch_` / `mark_data_` 调用点（热路径，每帧一次） | 最近一次活动（存活时钟） |
 //! | `data_millis_` | 任何 `mark_data_` 调用点 + 计时循环发 `PULSE` 时 | 最近一次非保活活动（保活职责时钟） |
-//! | `abort_` | **只有计时循环**（一次 CAS 认领） | 中止代码，见 [`AbortCode_`] |
+//! | `flags_` 的 bit 16-17 | **只有计时循环**（一次 CAS 认领） | 中止代码，见 [`AbortCode_`] |
 //!
 //! 两个时钟分开是**保活能否收敛**的前提：收到对端 `PULSE` 只刷新存活时钟，
 //! 因此两端都会按自己的职责时钟继续发 `PULSE`（若合一，两端会互相把对方的保活
@@ -62,7 +62,7 @@
 use core::{
     alloc::AllocatorClone,
     future::poll_fn,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -73,7 +73,7 @@ use mm_ptr::Shared;
 
 use crate::{
     connection::{
-        Dock,
+        Dock, TrConnAllocCfg,
         error_::MuxError,
         mux_connection::ChannelRegistry_,
         sync_::NotifySlot_,
@@ -95,6 +95,15 @@ const APP_RX_CLOSED: usize = 1usize << 1usize;
 
 /// 本端已发出 `CLOSE(FIN)`：不再发送数据（**且发送环已排空**，`FIN` 只在排空后发）。
 const LOCAL_FIN_SENT: usize = 1usize << 2usize;
+
+/// 复用循环判定「发送环已排空、可以发 `CLOSE(FIN)`」，等待 `main_loop` 组帧。
+const TX_DRAINED: usize = 1usize << 19usize;
+
+/// `main_loop` 已把 `CLOSE(FIN)` 写进公共 TX ring，等待复用循环在刷出后确认上线。
+const FIN_ENQUEUED: usize = 1usize << 20usize;
+
+/// `main_loop` 已把 `CLOSE(RESET)` 写进公共 TX ring，等待复用循环确认上线。
+const RESET_ENQUEUED: usize = 1usize << 21usize;
 
 /// 本端已发出 `CLOSE(RESET)`：不再接收数据。
 const LOCAL_RESET_SENT: usize = 1usize << 3usize;
@@ -134,7 +143,7 @@ const GRACEFUL_FIN_REQUESTED: usize = 1usize << 14usize;
 /// 建流是否已**裁决完毕**（本端 `accept` / `reject` 收尾）。
 ///
 /// 计时循环据此区分同一根存活时钟上的两类到点（见 `TimerAction_`）：
-/// - **未裁决** ⇒ 建流超时：向对端发 `REJECT`、释放身份、把原因留在 `abort_` 上；
+/// - **未裁决** ⇒ 建流超时：向对端发 `REJECT`、释放身份、把中止代码写进状态字；
 /// - **已裁决** ⇒ 活跃子流空闲超时：`CLOSE(FIN)` + `CLOSE(RESET)` 拆流。
 const ESTABLISH_SETTLED: usize = 1usize << 13usize;
 
@@ -145,6 +154,35 @@ const ESTABLISH_SETTLED: usize = 1usize << 13usize;
 /// 成功返回之后置位，因此它是
 /// [`TrChannelRx::close_async`](abs_smux::chan::TrChannelRx::close_async) 的完成判据。
 const LOCAL_RESET_FLUSHED: usize = 1usize << 15usize;
+
+/// 本端已经发出过 `OPEN`（发起方在 `accept` 时发；响应方由 `inbound_` 区分）。
+///
+/// 它决定「未裁决就放弃」时该走哪条收尾：**没发过 `OPEN`** 只需撤销本地预留
+/// （对端不知道这条子流）；**已发出 `OPEN`** 必须回 `REJECT`，否则对端会永远悬在
+/// `wait_establish_` 上。
+const LOCAL_OPEN_SENT: usize = 1usize << 22usize;
+
+/// 应用已丢弃**尚未裁决**的 [`ChannelHandle`](super::ChannelHandle)（P4 的 Drop 位化）。
+///
+/// 只由 `ChannelHandle::Drop` 置位，不取锁；`main_loop` 在 `HINT_MAIN_RETIRED`
+/// 时扫描 `bindings_`，按角色落实「撤销预留」或「回 `REJECT` + 拆流宽限」
+/// （设计稿 §6.7）。
+///
+/// 与 [`RELEASED`] 分开：后者是**身份**已释放，本位只是「应用不要这次建流了」，
+/// 身份还要由 `main_loop` 释放。
+const HANDLE_RETIRED: usize = 1usize << 18usize;
+
+/// 中止代码在位域里的位移与掩码（2 位，够 `AbortCode_` 的 3 个取值）。
+///
+/// 它原本是一个独立的 `AtomicU8`；中止代码只由计时循环认领、只被 `is_aborted_`
+/// 读，因此并进同一个状态字，省掉每子流一个原子。
+const ABORT_SHIFT: usize = 16usize;
+const ABORT_MASK: usize = 0b11usize << ABORT_SHIFT;
+
+/// 从状态字里取出中止代码。
+fn abort_of_(value: usize) -> u8 {
+    ((value & ABORT_MASK) >> ABORT_SHIFT) as u8
+}
 
 /// 测试某个位。
 fn has_flag_(value: usize, flag: usize) -> bool {
@@ -203,7 +241,7 @@ pub(crate) enum EstablishOutcome_ {
 /// （[`ChannelState_::claim_abort_`]）并通过 [`ChannelState_::abort_reason_`] 回传给
 /// 应用侧的两个半部（[`ChannelTx::abort_reason`](super::ChannelTx::abort_reason)）。
 ///
-/// 存成 `AtomicU8` 而不是把 `MuxError` 塞进原子：`MuxError` 是普通的 `Copy` 枚举，
+/// 存成状态字里的两位而不是把 `MuxError` 塞进原子：`MuxError` 是普通的 `Copy` 枚举，
 /// 没有稳定的整数表示，直接把它的位模式存下来会随编译选项变化。这里只存一个
 /// **代码**，读出来时再映射成 [`MuxError`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,8 +280,8 @@ impl AbortCode_ {
 ///
 /// # 它与 [`AbortCode_`] 为什么是两个原子字
 ///
-/// `AbortCode_` 是**动作认领**：CAS 成功的那一方负责执行中止动作（回 `CLOSE`、投
-/// `LocalAbort` / `Release`），因此必须「首个生效、永不改写」。
+/// `AbortCode_` 是**动作认领**：CAS 成功的那一方负责执行中止动作（回 `CLOSE`、置
+/// `RELEASED` 位），因此必须「首个生效、永不改写」。
 /// 而通知是**应用要读的结论**，它的规则不同——见 [`ChannelNotice::priority_`]：
 /// 连接级失败必须**压过**此前记下的子流级原因（连接正式判死之前，往往已经发生过
 /// 大面积子流级错误；应用需要的结论是「连接没了」，而不是某一条子流为什么先停）。
@@ -403,13 +441,10 @@ pub(crate) struct ChannelState_ {
     /// 被判 `IdleTimeout` 的恰好是先发出 `PULSE` 的那一侧）。
     data_millis_: AtomicU64,
 
-    /// 中止代码：[`AbortCode_::NONE`] 表示未中止（见 [`AbortCode_`]）。
-    abort_: AtomicU8,
-
     /// **不可忽略通知**槽：`0` = 无，否则是 [`ChannelNotice`] 的编码。
     ///
-    /// 与 [`ChannelState_::abort_`] 分开的理由见 [`ChannelNotice`]；这里只补两条实现
-    /// 上的理由：
+    /// 与状态字里的中止代码（bit 16-17）分开的理由见 [`ChannelNotice`]；这里只补
+    /// 两条实现上的理由：
     ///
     /// - **无锁、零分配**：应用可能在任意线程、甚至在非异步上下文里读它（`Closing`
     ///   也能从非阻塞接口拿到），而连接级失败路径可能在 `Drop` 的调用栈里写它；
@@ -447,7 +482,6 @@ impl ChannelState_ {
             created_millis_: AtomicU64::new(0u64),
             active_millis_: AtomicU64::new(0u64),
             data_millis_: AtomicU64::new(0u64),
-            abort_: AtomicU8::new(AbortCode_::NONE),
             notice_: AtomicU32::new(K_NOTICE_NONE),
             tx_progress_: NotifySlot_::new_(),
             rx_progress_: NotifySlot_::new_(),
@@ -556,14 +590,12 @@ impl ChannelState_ {
     /// 但**原因必须在动作之前就位**——应用可能在任何一次唤醒之后立刻读它。
     pub(crate) fn claim_abort_(&self, code: AbortCode_) -> bool {
         let claimed = self
-            .abort_
-            .compare_exchange(
-                AbortCode_::NONE,
-                code.as_u8_(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
+            .flags_
+            .try_spin_compare_exchange_weak(
+                |value| abort_of_(value) == AbortCode_::NONE,
+                |value| (value & !ABORT_MASK) | ((code.as_u8_() as usize) << ABORT_SHIFT),
             )
-            .is_ok();
+            .is_succ();
         if claimed {
             let notice = match code {
                 AbortCode_::IdleTimeout => ChannelNotice::IdleTimeout,
@@ -576,7 +608,7 @@ impl ChannelState_ {
 
     /// 本子流是否已被中止（计时循环判定空闲超时后为真）。
     pub(crate) fn is_aborted_(&self) -> bool {
-        self.abort_.load(Ordering::Acquire) != AbortCode_::NONE
+        abort_of_(self.flags_.value()) != AbortCode_::NONE
     }
 
     /// 发布一条**不可忽略通知**；规则是「只升级、不降级」，同优先级首个生效。
@@ -696,8 +728,7 @@ impl ChannelState_ {
     ///
     /// 返回值给应用侧半部做**幂等去重**：`drop` 与显式
     /// [`close`](abs_buff::TrBuffTryFlush::close) 都会走到这里，而「排空 + 发 `FIN`」
-    /// 的收尾事件只能投递一次——若第二条事件在表项已被摘掉之后到达，写循环会把它
-    /// 重新登记进「欠一条 `FIN`」的集合，留下一个永远查不到表项的僵尸条目。
+    /// 的收尾提示只需发一次——重复置位虽幂等，但会让写循环多做一轮扫描。
     pub(crate) fn set_app_tx_closed_(&self) -> bool {
         self.flags_
             .try_spin_compare_exchange_weak(
@@ -705,6 +736,11 @@ impl ChannelState_ {
                 |value| value | APP_TX_CLOSED,
             )
             .is_succ()
+    }
+
+    /// 应用是否已丢弃发送半边（写循环扫描收尾事实时用）。
+    pub(crate) fn is_app_tx_closed_(&self) -> bool {
+        has_flag_(self.flags_.value(), APP_TX_CLOSED)
     }
 
     /// 认领「连接（优雅关闭）请求这条子流**排空并收尾**」：首次调用返回 `true`。
@@ -717,9 +753,9 @@ impl ChannelState_ {
     ///
     /// # 认领之后发生什么
     ///
-    /// 调用方（计时循环）投一条 [`WriteEvent_::TxClosed`](super::signal_::WriteEvent_)
-    /// 给复用循环；那条路径与应用自己 `drop(tx)` 完全同形——**排空发送环之后**才发
-    /// `CLOSE(FIN)`（`FIN` 绝不越过未上网的数据，见 `crate::connection` §7.0）。
+    /// 调用方（计时循环）置上应用侧的 `APP_TX_CLOSED` 位并唤醒复用循环；那条路径与
+    /// 应用自己 `drop(tx)` 完全同形——**排空发送环之后**才发 `CLOSE(FIN)`（`FIN` 绝不
+    /// 越过未上网的数据，见 `crate::connection` §7.0）。
     /// 本方法只置位，**不**改 `APP_TX_CLOSED`：应用手里那份 `ChannelTx` 的行为由既有
     /// 路径决定（排空完成后消费端被关闭，写入随即报「发送方向已关闭」）。
     pub(crate) fn claim_graceful_fin_(&self) -> bool {
@@ -751,6 +787,65 @@ impl ChannelState_ {
         has_flag_(self.flags_.value(), APP_RX_CLOSED)
     }
 
+    /// 标记「应用已丢弃尚未裁决的建流句柄」。
+    ///
+    /// 幂等：重复置位不产生额外语义；由 `ChannelHandle::Drop` 调用，**不取锁**。
+    pub(crate) fn set_handle_retired_(&self) {
+        let _ = self.flags_.try_spin_compare_exchange_weak(
+            |value| !has_flag_(value, HANDLE_RETIRED),
+            |value| value | HANDLE_RETIRED,
+        );
+    }
+
+    /// 尚未裁决的建流句柄是否已被应用丢弃。
+    ///
+    /// `main_loop` 的 retired 扫描据此区分「这条身份还在、但应用已放弃」。
+    pub(crate) fn is_handle_retired_(&self) -> bool {
+        has_flag_(self.flags_.value(), HANDLE_RETIRED)
+    }
+
+    /// 记录「本端已经发出过 `OPEN`」（决定未裁决放弃时是否必须回 `REJECT`）。
+    pub(crate) fn set_local_open_sent_(&self) {
+        let _ = self
+            .flags_
+            .try_spin_compare_exchange_weak(|_| true, |value| value | LOCAL_OPEN_SENT);
+    }
+
+    /// 本端是否已经发出过 `OPEN`。
+    pub(crate) fn is_local_open_sent_(&self) -> bool {
+        has_flag_(self.flags_.value(), LOCAL_OPEN_SENT)
+    }
+
+    /// 记录「复用循环已判定发送环排空」；返回是否首次置位。
+    pub(crate) fn set_tx_drained_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| !has_flag_(value, TX_DRAINED),
+                |value| value | TX_DRAINED,
+            )
+            .is_succ()
+    }
+
+    /// 发送环是否已排空、等待 `main_loop` 发 `CLOSE(FIN)`。
+    pub(crate) fn is_tx_drained_(&self) -> bool {
+        has_flag_(self.flags_.value(), TX_DRAINED)
+    }
+
+    /// 记录「`main_loop` 已把 `CLOSE(FIN)` 写进公共 TX ring」；返回是否首次置位。
+    pub(crate) fn set_fin_enqueued_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| !has_flag_(value, FIN_ENQUEUED),
+                |value| value | FIN_ENQUEUED,
+            )
+            .is_succ()
+    }
+
+    /// `main_loop` 是否已把 `CLOSE(FIN)` 写进公共 TX ring。
+    pub(crate) fn is_fin_enqueued_(&self) -> bool {
+        has_flag_(self.flags_.value(), FIN_ENQUEUED)
+    }
+
     /// 记录「本端已发出 `CLOSE(FIN)`」（调用方保证发送环已排空）。
     pub(crate) fn set_local_fin_sent_(&self) {
         let _ = self
@@ -780,6 +875,21 @@ impl ChannelState_ {
         let _ = self
             .flags_
             .try_spin_compare_exchange_weak(|_| true, |value| value | PEER_RESET);
+    }
+
+    /// 记录「main 已把 `CLOSE(RESET)` 写进公共 TX ring」；返回是否首次置位。
+    pub(crate) fn set_reset_enqueued_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| !has_flag_(value, RESET_ENQUEUED),
+                |value| value | RESET_ENQUEUED,
+            )
+            .is_succ()
+    }
+
+    /// main 是否已把 `CLOSE(RESET)` 写进公共 TX ring。
+    pub(crate) fn is_reset_enqueued_(&self) -> bool {
+        has_flag_(self.flags_.value(), RESET_ENQUEUED)
     }
 
     /// 记录「本端发出的 `CLOSE(RESET)` 已上线」（写循环在写出成功后调用）。
@@ -870,10 +980,24 @@ impl ChannelState_ {
             .is_succ()
     }
 
-    /// 身份是否已经认领释放（诊断用）。
-    #[cfg(test)]
+    /// 身份是否已经认领释放。
+    ///
+    /// 读循环按它摘掉本地读表并关闭接收环写端（释放提示只负责唤醒，事实是这个位）。
     pub(crate) fn is_released_(&self) -> bool {
         has_flag_(self.flags_.value(), RELEASED)
+    }
+
+    /// **强制**标记身份已释放（计时循环的空闲拆流路径专用）。
+    ///
+    /// 该路径直接调 `release_channel_` 把身份转成宽限态，不走 [`ChannelState_::claim_release_`]
+    /// 的「两个方向都收尾」判据（空闲超时恰恰是应用没有收尾）。读循环仍需要
+    /// `RELEASED` 这个事实来摘本地读表，因此这里补一次置位；之后任何
+    /// `claim_release_` 都会因位已置而失败，不会重复释放。
+    pub(crate) fn mark_released_(&self) {
+        let _ = self.flags_.try_spin_compare_exchange_weak(
+            |value| !has_flag_(value, RELEASED),
+            |value| value | RELEASED,
+        );
     }
 
     //-- ---- 锁外去重位 ----
@@ -912,16 +1036,21 @@ impl ChannelState_ {
 
     /// 读循环核对接收水位**之前**清去重位（同步路径，不取锁）。
     ///
+    /// 返回**本次是否真的清掉了位**：全扫兜底据此判断「`RxConsumed` 是否可能丢了」
+    /// ——置位即意味着应用消费过、水位需要重算。
+    ///
     /// # 顺序不可反
     ///
     /// 必须**先清位、再读环内积压**：这样「清位之后发生的消费」会重新置位并投递一条
     /// 新通知，而「清位之前的消费」已经体现在随后读到的积压量里。反过来（先读积压、
     /// 后清位）会丢掉清位与读之间那一次消费的唤醒。
-    pub(crate) fn clear_rx_consumed_(&self) {
-        let _ = self.flags_.try_spin_compare_exchange_weak(
-            |value| has_flag_(value, RX_CONSUMED),
-            |value| value & !RX_CONSUMED,
-        );
+    pub(crate) fn clear_rx_consumed_(&self) -> bool {
+        self.flags_
+            .try_spin_compare_exchange_weak(
+                |value| has_flag_(value, RX_CONSUMED),
+                |value| value & !RX_CONSUMED,
+            )
+            .is_succ()
     }
 
     //-- ---- 流控便捷入口（窗口内部各自一把自旋锁，见 `flow_ctrl`） ----
@@ -940,21 +1069,21 @@ impl ChannelState_ {
         self.flow_.recv_window().take_report_()
     }
 
-    /// 应用消费之后由**持有接收环写端**的解复用循环核对水位并择机补发通告。
+    /// 应用消费之后的核对：**只记账 + 判定**，不产出快照、不推进「已通告」。
     ///
-    /// `buffered` 是环内**实际积压**（已提交、应用还没取走）。本循环是接收环唯一的
-    /// 写入方，因此「已记账的累计已收 − 环内积压」就是**精确**的累计已消费量；应用侧
-    /// 采样差值会被并发写入掩盖（因果见 `dev-notes/flow-ctrl-20261005-0115.md` §3）。
-    ///
-    /// 记账与判定在同一段窗口临界区里完成；只有真的推进了消费记账才刷新**存活时钟**
-    /// （这是本端应用在消费，不构成「对端还在」以外的任何保活义务，因此不推进保活
-    /// 职责时钟）。
-    pub(crate) fn recv_recheck_(&self, buffered: Credit, now_millis: u64) -> Option<WindowReport> {
-        let (advanced, report) = self.flow_.recv_window().recheck_(buffered);
+    /// 返回「是否该通告」；产出与组帧由 `main_loop` 在确认公共 TX 有空间后做
+    /// （`should_report` 是消费式的，所以这里绝不能顺手 `take`，否则背压时会丢通告）。
+    pub(crate) fn recv_recheck_due_(&self, buffered: Credit, now_millis: u64) -> bool {
+        let (advanced, due) = self.flow_.recv_window().recheck_due_(buffered);
         if advanced {
             self.touch_(now_millis);
         }
-        report
+        due
+    }
+
+    /// 当前是否该通告（只读判定，不推进快照）。
+    pub(crate) fn window_report_due_(&self) -> bool {
+        self.flow_.recv_window().should_report_now_()
     }
 
     /// 收到对端的窗口通告。
@@ -965,14 +1094,6 @@ impl ChannelState_ {
     /// 发送窗口剩余额度。
     pub(crate) fn send_available_(&self) -> Credit {
         self.flow_.send_window().available()
-    }
-
-    /// 发送窗口剩余额度的**非阻塞**查询：窗口锁当场不可用时返回 `None`。
-    ///
-    /// 供复用循环 park 的 `poll` 用（那里不能等锁）：`None` 按「没额度」处理，
-    /// 额度真正回来时会由窗口通告事件把 park 打断。
-    pub(crate) fn send_available_try_(&self) -> Option<Credit> {
-        self.flow_.send_window().available_try_()
     }
 
     /// 预扣发送额度。
@@ -1264,6 +1385,12 @@ fn unpack_entry_(packed: usize) -> (Dock, usize) {
 /// 应用侧读走的字节数由队列项决定，而不是由环的可读量决定。
 #[derive(Debug, Default)]
 pub(crate) struct TgRec_ {
+    /// `Telegraph` 已被丢弃：main 据此释放 telegraph 身份（P4 的 Drop 位化）。
+    retired_: core::sync::atomic::AtomicBool,
+
+    /// 应用丢弃了**发送半边**：写循环据此摘掉本地 tg 表项（位化替代 `TgTxClosed` 事件）。
+    tx_closed_: core::sync::atomic::AtomicBool,
+
     /// **发送**方向：已提交、待成帧发出的条目 `(目的 dock, 长度)`
     /// （应用入队、复用循环出队）。
     ///
@@ -1282,9 +1409,35 @@ pub(crate) struct TgRec_ {
 }
 
 impl TgRec_ {
+    /// 标记 telegraph 端点已被丢弃。
+    pub(crate) fn set_retired_(&self) {
+        self.retired_
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// telegraph 端点是否已被丢弃。
+    pub(crate) fn is_retired_(&self) -> bool {
+        self.retired_
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 标记「应用丢弃了发送半边」。
+    pub(crate) fn set_tx_closed_(&self) {
+        self.tx_closed_
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// 应用是否已丢弃发送半边。
+    pub(crate) fn is_tx_closed_(&self) -> bool {
+        self.tx_closed_
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// 空载荷（登记 telegraph 身份时建立）。
     pub(crate) fn new_() -> Self {
         TgRec_ {
+            retired_: core::sync::atomic::AtomicBool::new(false),
+            tx_closed_: core::sync::atomic::AtomicBool::new(false),
             out_: TgLenQueue_::new_(),
             in_: TgLenQueue_::new_(),
         }
@@ -1310,6 +1463,9 @@ impl TgRec_ {
 pub(crate) struct LsnRec_ {
     /// 「本 dock 上可能有入向事件」的持久通知（协议见 [`NotifySlot_`]）。
     notify_: NotifySlot_,
+
+    /// `ChannelListener` 已被丢弃：main 据此释放 listener 身份（P4 的 Drop 位化）。
+    retired_: core::sync::atomic::AtomicBool,
 }
 
 impl LsnRec_ {
@@ -1317,6 +1473,7 @@ impl LsnRec_ {
     pub(crate) fn new_() -> Self {
         LsnRec_ {
             notify_: NotifySlot_::new_(),
+            retired_: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1328,6 +1485,18 @@ impl LsnRec_ {
     /// 等一次入向通知：消费已到达的提示，或登记 waker 后返回 [`Poll::Pending`]。
     pub(crate) fn poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.notify_.poll_wait_(cx)
+    }
+
+    /// 标记 listener 已被丢弃（`Drop` 只做这一次原子写）。
+    pub(crate) fn set_retired_(&self) {
+        self.retired_
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// listener 是否已被丢弃。
+    pub(crate) fn is_retired_(&self) -> bool {
+        self.retired_
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1497,13 +1666,13 @@ where
 }
 
 /// 等待建流完成：等对端的 `OPEN` + `ACCEPT` / `REJECT`，或被取消 / 连接失败打断。
-pub(crate) async fn wait_establish_<A, K>(
-    reg: &ChannelRegistry_<A>,
-    owner: &ChannelOwner_<A>,
+pub(crate) async fn wait_establish_<C, K>(
+    reg: &ChannelRegistry_<C>,
+    owner: &ChannelOwner_<C::ChanOwnerAlloc>,
     cancel: K,
 ) -> Result<EstablishOutcome_, MuxError>
 where
-    A: AllocatorClone + Send + Sync,
+    C: TrConnAllocCfg + 'static,
     K: TrCancellationToken,
 {
     loop {

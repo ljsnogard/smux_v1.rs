@@ -89,8 +89,8 @@ where
     // 两端的连接配置各自泛化：默认用例两侧都是 [`SmokeMuxConfig`]，流控用例换成
     // [`crate::common::FlowCtrlConfig`]——其余策略完全一致，避免把「容量」以外的差异
     // 带进对照。
-    CA: TrConnCfg<ConnRx = RA, ConnTx = WA, Alloc = CoreAlloc> + TestConnCfg + Clone + 'static,
-    CB: TrConnCfg<ConnRx = RB, ConnTx = WB, Alloc = CoreAlloc> + TestConnCfg + Clone + 'static,
+    CA: TrConnCfg<ConnRx = RA, ConnTx = WA> + TestConnCfg + Clone + 'static,
+    CB: TrConnCfg<ConnRx = RB, ConnTx = WB> + TestConnCfg + Clone + 'static,
     // 两端的运行时值类型必须一致（传进来的 `rt` 同时喂给两个配置），且必须能
     // 交出本地作用域（连接自己取）。
     CA::Rt: TrSmokeRt + abs_art_facade::ScopeHost,
@@ -136,8 +136,8 @@ where
     RB: TrBuffRead<u8> + TrConsumerState + 'static,
     WB: TrBuffWrite<u8> + TrBuffFlush<u8> + TrProducerState + 'static,
     S: TrSmokeScope + Clone + 'static,
-    CA: TrConnCfg<ConnRx = RA, ConnTx = WA, Alloc = CoreAlloc> + TestConnCfg + Clone + 'static,
-    CB: TrConnCfg<ConnRx = RB, ConnTx = WB, Alloc = CoreAlloc> + TestConnCfg + Clone + 'static,
+    CA: TrConnCfg<ConnRx = RA, ConnTx = WA> + TestConnCfg + Clone + 'static,
+    CB: TrConnCfg<ConnRx = RB, ConnTx = WB> + TestConnCfg + Clone + 'static,
     CA::Rt: TrSmokeRt + abs_art_facade::ScopeHost,
     CB: TrConnCfg<Rt = CA::Rt>,
 {

@@ -129,8 +129,7 @@ where
                 .income_async()
                 .await
                 .expect("B 应当取到入向建流请求");
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let halves = handle
                 .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())
@@ -156,8 +155,7 @@ where
                 .open_channel_async(Dock::new(K_CLOSE_SERVER_DOCK), &mut message)
                 .await
                 .expect("A 发起子流应当成功");
-            let mut welcome_buf: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome_buf[..];
+            let mut welcome: &[u8] = &[];
             let halves = handle
                 .accept_async_closure(&mut welcome, || {
                     (make_channel_buff_(), make_channel_buff_())

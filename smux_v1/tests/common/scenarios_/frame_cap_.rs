@@ -144,8 +144,7 @@ pub async fn run_frame_cap_scenario_<RA, WA, RB, WB, S, RT>(
     // 环容量两边都取 [`K_FRAME_CAP_RING`]：本场景钉的是**发送侧**读自己发送环时的那条路径。
     let (opened, accepted) = join!(
         async {
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             handle
                 .accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_FRAME_CAP_RING), crate::common::make_channel_buff_with_(K_FRAME_CAP_RING)))
                 .await
@@ -155,8 +154,7 @@ pub async fn run_frame_cap_scenario_<RA, WA, RB, WB, S, RT>(
                 .income_async()
                 .await
                 .expect("B 侧应当取到入向请求");
-            let mut welcome: [u8; 0] = [];
-            let mut welcome: &mut [u8] = &mut welcome[..];
+            let mut welcome: &[u8] = &[];
             incoming
                 .accept_async_closure(&mut welcome, || (crate::common::make_channel_buff_with_(K_FRAME_CAP_RING), crate::common::make_channel_buff_with_(K_FRAME_CAP_RING)))
                 .await

@@ -1,4 +1,10 @@
+use core::{
+    future::poll_fn,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
 use abs_buff::TrBuffRead;
+use mm_ptr::Shared;
 use abs_cancel::TrCancellationToken;
 use abs_smux::{
     conn::TrDockBinding,
@@ -8,10 +14,10 @@ use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     connection::{
-        ChannelHandle, Dock, MuxError, MuxConnection, ReserveErr_, TrConnCfg,
+        ChannelHandle, Dock, MainLoopErr_, MainLoopReply_, MainLoopRequest_, MuxConnection, MuxError,
+        PushErr_, ReserveErr_, TcsAbandonGuard_, Tcs_, TrConnCfg,
         channel_listener::ChannelListener,
-        signal_::SessionEvent_,
-        util_::read_available_into_vec_,
+        util_::read_available_into_slice_,
     },
     x_deps::{abs_buff, abs_cancel, abs_smux, gen_mcf2},
 };
@@ -106,6 +112,9 @@ where
 
     /// 本会话绑定的 local_dock。
     local_dock_: Dock,
+
+    /// 「绑定方已丢弃」标志；`Drop` 只置位 + raise，由 main 解绑。
+    unbind_: Shared<AtomicBool, crate::connection::ConnChanOwnerAlloc_<C>>,
 }
 
 impl<C> DockBinding<C>
@@ -113,10 +122,15 @@ where
     C: TrConnCfg,
 {
     /// 由连接与 `local_dock` 构造（只允许 `bind_async` 调用）。
-    pub(crate) fn new_(conn: MuxConnection<C>, local_dock: Dock) -> Self {
+    pub(crate) fn new_(
+        conn: MuxConnection<C>,
+        local_dock: Dock,
+        unbind_: Shared<AtomicBool, crate::connection::ConnChanOwnerAlloc_<C>>,
+    ) -> Self {
         DockBinding {
             conn_: conn,
             local_dock_: local_dock,
+            unbind_,
         }
     }
 
@@ -149,13 +163,11 @@ where
     C: TrConnCfg,
 {
     fn drop(&mut self) {
-        let _ = self
-            .conn_
+        self.unbind_.store(true, Ordering::Release);
+        self.conn_
             .core_()
-            .reg_()
-            .post_session_event_(SessionEvent_::UnbindDock {
-                local_dock: self.local_dock_,
-            });
+            .control_()
+            .raise_main_hint_(crate::connection::HINT_MAIN_RETIRED);
     }
 }
 
@@ -209,27 +221,41 @@ where
     K: TrCancellationToken,
 {
     // `reserve` 是上游新加的「入向邀请最多同时挂起多少条」的上限。当前实现还没有按它
-    // 预分配的队列（入向通知是身份节点里的**内联**槽），因此这里先显式消费掉参数；
-    // 等定容队列落地后再按它预分配（见 `crate::connection` 模块文档 §2.3 的遗留项）。
-    let _ = reserve;
+    // 预分配的队列（入向通知是身份节点里的**内联**槽），因此它只随请求带给
+    // `main_loop`，等定容队列落地后再按它预分配。
     let conn = binding.conn_.clone();
     let local = binding.local_dock_;
-    // 先清空释放邮箱：上一位持有者可能刚丢弃它的 listener（Drop 只投消息），
-    // 不先落实就会把「已释放」误判成「已被占用」。
+    // 一次请求 + 完成源：登记由 `main_loop` 执行（它是身份表唯一写者）。
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(BindingError::Closed),
+    };
+    let waiter = tcs.clone();
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
-        .drain_session_events_(cancel.child_token())
+        .control_()
+        .submit_async_(
+            MainLoopRequest_::Listen {
+                local_dock: local,
+                reserve,
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
         .await
-        .map_err(map_reserve_err_)?;
-    // 登记 listener 身份（统一身份表里的 `(local, wildcard)`）：它既是「本 dock 在
-    // 监听」的事实，也是入向等待者的落点；若该 dock 已作 telegraph 会被拒。
-    // 入向通知是身份节点里**内联的零分配通知槽**（不再是 `flume` 通道），listener
-    // 持节点句柄并在它上面等通知（协议见 `sync_::NotifySlot_`）。
-    let rec = conn
-        .core_()
-        .reserve_listener_(local, cancel.child_token())
-        .await
-        .map_err(map_reserve_err_)?;
-    Result::Ok(ChannelListener::new_(conn, local, rec))
+        .map_err(|err| match err {
+            PushErr_::Closed(_) => BindingError::Closed,
+            PushErr_::Cancelled(_) => BindingError::Cancelled,
+        })?;
+    let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
+    match reply {
+        Option::Some(Result::Ok(MainLoopReply_::Listener(rec))) => {
+            Result::Ok(ChannelListener::new_(conn, local, rec))
+        }
+        Option::Some(Result::Err(MainLoopErr_::Reserve(err))) => Result::Err(map_reserve_err_(err)),
+        Option::Some(Result::Err(MainLoopErr_::Mux(err))) => Result::Err(BindingError::Mux(err)),
+        Option::Some(Result::Ok(_)) | Option::None => Result::Err(BindingError::Closed),
+    }
 }
 
 /// [`TrDockBinding::open_channel_async`] 的 step 函数。
@@ -261,32 +287,68 @@ where
     if remote_dock.is_special() {
         return Result::Err(BindingError::ReservedDock);
     }
-    // 先落实积压的释放消息：发起方「未裁决就丢弃」的撤销（`UnreserveChannel`）与
-    // 响应方的宽限登记（`ReleaseChannel`）都可能是同一条 dock 对的上一轮残留。
+    // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）：由 `main_loop` 执行。
+    let tcs = match Tcs_::new_(conn.core_().reg_().scope_()).await {
+        Result::Ok(tcs) => tcs,
+        Result::Err(_) => return Result::Err(BindingError::Closed),
+    };
+    let waiter = tcs.clone();
+    let _abandon = TcsAbandonGuard_::new_(&waiter);
     conn.core_()
-        .drain_session_events_(cancel.child_token())
+        .control_()
+        .submit_async_(
+            MainLoopRequest_::ReserveChannel {
+                local_dock: local,
+                remote_dock,
+                reply: tcs,
+            },
+            cancel.child_token(),
+        )
         .await
-        .map_err(map_reserve_err_)?;
-    // 1. 登记身份（dock 对即身份，重复即 `Duplicate`）；共享状态随身份一起建立。
-    let owner = conn
-        .core_()
-        .reserve_channel_(local, remote_dock, cancel.child_token())
-        .await
-        .map_err(map_reserve_err_)?;
+        .map_err(|err| match err {
+            PushErr_::Closed(_) => BindingError::Closed,
+            PushErr_::Cancelled(_) => BindingError::Cancelled,
+        })?;
+    let reply = poll_fn(|cx| waiter.poll_wait_(cx)).await;
+    let (owner, mut msg_) = match reply {
+        Option::Some(Result::Ok(MainLoopReply_::Channel { owner, msg_ })) => (owner, msg_),
+        Option::Some(Result::Err(MainLoopErr_::Reserve(err))) => {
+            return Result::Err(map_reserve_err_(err));
+        }
+        Option::Some(Result::Err(MainLoopErr_::Mux(err))) => {
+            return Result::Err(BindingError::Mux(err));
+        }
+        Option::Some(Result::Ok(_)) | Option::None => {
+            return Result::Err(BindingError::Closed);
+        }
+    };
 
-    // 2. 把开场消息搬进句柄（`OPEN` 要等 `accept_async` 才发）。
-    let payload = read_available_into_vec_(
-        message,
-        conn.core_().opts_().basic_opts.max_packet_size,
-        cancel.child_token(),
+    // 2. 把开场消息搬进句柄（`OPEN` 要等 `accept_async` 才发）。缓冲来自连接级
+    // Scope，容量是 `cap + 1`：读到 `cap + 1` 字节就说明超长，在写 ring 之前拒绝。
+    let cap = conn.core_().config_().pending_msg_capacity();
+    let payload_retain = crate::connection::alloc_zeroed_bytes_async_(
+        conn.core_().reg_().scope_(),
+        cap.saturating_add(1usize),
     )
-    .await;
+    .await
+    .map_err(|_| BindingError::Closed)?;
+    let mut payload = payload_retain
+        .try_owning()
+        .expect("刚分配的 message 缓冲应当可独占");
+    let filled = read_available_into_slice_(message, &mut payload[..], cancel.child_token()).await;
+    if filled > cap {
+        return Result::Err(BindingError::Mux(MuxError::FrameTooLarge));
+    }
 
+    // 同时写进建流期 message ring：P3.1b 起由 `main_loop` 从这里读走组 `OPEN`。
+    if msg_.write_outgoing_(&payload[..filled], cap).is_err() {
+        return Result::Err(BindingError::Mux(MuxError::FrameTooLarge));
+    }
     Result::Ok(ChannelHandle::new_initiator_(
         conn,
         local,
         remote_dock,
         owner,
-        payload,
+        msg_,
     ))
 }
