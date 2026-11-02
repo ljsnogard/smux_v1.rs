@@ -40,16 +40,15 @@
 //! 那块内存，因此构建失败只会是**配置错误**，由调用方决定如何处理。
 
 use core::{
-    alloc::{AllocError, Allocator, AllocatorClone, Layout},
+    alloc::{Allocator, AllocatorClone, Layout},
     borrow::{Borrow, BorrowMut},
-    convert::Infallible,
     mem::{ManuallyDrop, MaybeUninit, offset_of},
-    ops::{ControlFlow, Deref, DerefMut, Try},
+    ops::{Deref, DerefMut},
     ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use abs_mm::res_man::{TrBoxed, TrUnique};
+use abs_mm::res_man::{TrAllocBy, TrBoxed, TrUnique};
 use buffex::ring::{Ring, RingReader, RingWriter};
 
 use crate::x_deps::abs_mm;
@@ -183,34 +182,29 @@ impl BorrowMut<[MaybeUninit<u8>]> for MuxChanBuff_ {
 
 impl TrBoxed for MuxChanBuff_ {
     type Item = [MaybeUninit<u8>];
-    type Alloc = NoAlloc_;
-
-    fn try_get_mem_alloc(&self) -> impl Try<Output = &Self::Alloc> {
-        Result::<&NoAlloc_, Infallible>::Ok(&NoAlloc_)
-    }
 }
 
-/// [`MuxChanBuff_`] 的占位分配器：它自己**不分配**（缓冲区与块都由 `P` 的分配器负责），
-/// 但上游 `TrBoxed` 要求有个 `Alloc` 关联类型。
-///
-/// 任何真正调用它的人都会 panic——这不是缺陷，而是「谁拥有谁释放」这条约定的哨兵：
-/// 需要分配器时应当去问块里那个 `P`。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoAlloc_;
-
-// SAFETY: 零大小、无状态；两个方法都是「走错门」的哨兵。
-unsafe impl Allocator for NoAlloc_ {
-    fn allocate(&self, _layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        unreachable!("MuxChanBuff_ 自己不做分配：缓冲区与块都由 P 的分配器负责")
-    }
-
-    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
-        unreachable!("MuxChanBuff_ 自己不做释放：释放 P 走它的 drop vtable")
-    }
-}
-
-// SAFETY: 零大小、可平凡克隆。
-unsafe impl AllocatorClone for NoAlloc_ {}
+// /// [`MuxChanBuff_`] 的占位分配器：它自己**不分配**（缓冲区与块都由 `P` 的分配器负责），
+// /// 但上游 `TrBoxed` 要求有个 `Alloc` 关联类型。
+// ///
+// /// 任何真正调用它的人都会 panic——这不是缺陷，而是「谁拥有谁释放」这条约定的哨兵：
+// /// 需要分配器时应当去问块里那个 `P`。
+// #[derive(Clone, Copy, Debug, Default)]
+// pub struct NoAlloc_;
+//
+// // SAFETY: 零大小、无状态；两个方法都是「走错门」的哨兵。
+// unsafe impl Allocator for NoAlloc_ {
+//     fn allocate(&self, _layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+//         unreachable!("MuxChanBuff_ 自己不做分配：缓冲区与块都由 P 的分配器负责")
+//     }
+//
+//     unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
+//         unreachable!("MuxChanBuff_ 自己不做释放：释放 P 走它的 drop vtable")
+//     }
+// }
+//
+// // SAFETY: 零大小、可平凡克隆。
+// unsafe impl AllocatorClone for NoAlloc_ {}
 
 // SAFETY: `Send`——本类型只有「指向某块缓冲区的裸指针 + 一个纯函数指针」，没有内部
 // 可变性，也不拥有任何东西；块的所有权在 `ErasedRing_` 里，那里另行约束了 `P: Send`。
@@ -235,20 +229,6 @@ where
     unsafe { owner.cast::<P>().as_ptr().drop_in_place() };
 }
 
-/// 取出智能指针自带的分配器。
-///
-/// `TrBoxed` 的契约是「一定持有自己的分配器」，因此 `Break` 分支不可达；用
-/// `unreachable!` 而不是 `unwrap` 是为了在违反契约时给出可读的原因。
-fn mem_alloc_of_<B>(boxed: &B) -> &B::Alloc
-where
-    B: TrBoxed,
-{
-    match TrBoxed::try_get_mem_alloc(boxed).branch() {
-        ControlFlow::Continue(alloc) => alloc,
-        ControlFlow::Break(_) => unreachable!("TrBoxed 的契约：智能指针一定持有其分配器"),
-    }
-}
-
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 建环入口的包装：视图 + P（零分配）
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -263,7 +243,7 @@ where
 /// 流动，因此内部签名里看不到 `P`。
 pub struct MuxChanBuffOwnedBy<P>
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]>,
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
 {
     /// 缓冲区视图。
     chan_buff_: MuxChanBuff_,
@@ -273,7 +253,7 @@ where
 
 impl<P> MuxChanBuffOwnedBy<P>
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]>,
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
 {
     /// 由智能指针 `P` 造出「视图 + 拥有者」（零堆分配）。
     pub fn new(mut owner_ptr: P) -> Self {
@@ -306,7 +286,7 @@ where
 
 impl<P> Deref for MuxChanBuffOwnedBy<P>
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]>,
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
 {
     type Target = [MaybeUninit<u8>];
 
@@ -317,7 +297,7 @@ where
 
 impl<P> DerefMut for MuxChanBuffOwnedBy<P>
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]>,
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.chan_buff_.as_mut_slice_()
@@ -326,7 +306,7 @@ where
 
 impl<P> Borrow<[MaybeUninit<u8>]> for MuxChanBuffOwnedBy<P>
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]>,
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
 {
     fn borrow(&self) -> &[MaybeUninit<u8>] {
         self.chan_buff_.as_slice_()
@@ -335,27 +315,35 @@ where
 
 impl<P> BorrowMut<[MaybeUninit<u8>]> for MuxChanBuffOwnedBy<P>
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]>,
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
 {
     fn borrow_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         self.chan_buff_.as_mut_slice_()
     }
 }
 
-impl<P> TrBoxed for MuxChanBuffOwnedBy<P>
+impl<P> TrAllocBy for MuxChanBuffOwnedBy<P>
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]>,
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
 {
-    type Item = [MaybeUninit<u8>];
-    type Alloc = P::Alloc;
+    type Alloc = <P as TrAllocBy>::Alloc;
 
-    fn try_get_mem_alloc(&self) -> impl Try<Output = &Self::Alloc> {
-        // 本类型只是在 `P` 外面包了一层视图，分配器仍归 `P` 自己回答。
-        self.owner_ptr_.try_get_mem_alloc()
+    fn mem_alloc(&self) -> &Self::Alloc {
+        self.owner_ptr_.mem_alloc()
     }
 }
 
-impl<P> TrUnique for MuxChanBuffOwnedBy<P> where P: TrUnique<Item = [MaybeUninit<u8>]> {}
+impl<P> TrBoxed for MuxChanBuffOwnedBy<P>
+where
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
+{
+    type Item = [MaybeUninit<u8>];
+}
+
+impl<P> TrUnique for MuxChanBuffOwnedBy<P>
+where
+    P: TrAllocBy + TrUnique<Item = [MaybeUninit<u8>]>,
+{}
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // 块：控制块 + 环 + P，同处一次分配
@@ -405,8 +393,8 @@ impl ErasedRing_ {
     /// 由块指针造出共享句柄（**不**增加引用计数：调用方把初始的那份交给它）。
     fn new_<P>(block: NonNull<RingBlock_<P>>) -> Self
     where
-        P: TrUnique<Item = [MaybeUninit<u8>]>,
-        P::Alloc: AllocatorClone,
+        P: TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>,
     {
         ErasedRing_ {
             block_: block.cast::<()>(),
@@ -488,8 +476,8 @@ where
 /// 同 [`ring_of_`]；且调用方必须真的持有过一份强引用。
 unsafe fn release_<P>(block: NonNull<()>)
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]>,
-    P::Alloc: AllocatorClone,
+    P: TrUnique<Item = [MaybeUninit<u8>]>
+        + TrAllocBy<Alloc: AllocatorClone>,
 {
     let block_ptr = block.cast::<RingBlock_<P>>();
     // SAFETY: 由调用方保证 `block_ptr` 有效。
@@ -507,7 +495,7 @@ where
     };
     // 释放块还得用 `P` 自己的分配器，所以先把它 clone 出来再释放 `P`。
     // SAFETY: `owner_ptr` 指向本块里那份 `P`（已初始化、尚未 drop）。
-    let alloc = mem_alloc_of_(unsafe { &*owner_ptr }).clone();
+    let alloc = (unsafe { &*owner_ptr }).mem_alloc().clone();
     // SAFETY: 由 `RingBlock_` 的契约保证只释放一次；此后不再触碰 `owner_`。
     // 释放走 `MuxChanBuff_` 记下的擦除 vtable —— 「容纳 P 的 drop」这件事的唯一落点。
     unsafe {
@@ -549,8 +537,9 @@ pub enum RingBuildErr {
 /// 返回 [`RingBuildErr::Alloc`]（此时 `P` 尚未被搬进块，随栈上作用域正常释放）。
 pub fn new_buffered_channel<P>(owner: P) -> Result<BufferedChannel, RingBuildErr>
 where
-    P: TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
-    P::Alloc: AllocatorClone,
+    P: Send + Sync
+        + TrUnique<Item = [MaybeUninit<u8>]>
+        + TrAllocBy<Alloc: AllocatorClone>,
 {
     let mut owner = owner;
     let buffer_ = NonNull::from_mut(owner.deref_mut());
@@ -558,7 +547,7 @@ where
     let view = MuxChanBuff_::new_::<P>(buffer_);
     Ring::check_buffer_size(&view).map_err(RingBuildErr::Capacity)?;
 
-    let alloc = mem_alloc_of_(&owner).clone();
+    let alloc = owner.mem_alloc().clone();
     let raw = alloc
         .allocate(Layout::new::<RingBlock_<P>>())
         .map_err(|_| RingBuildErr::Alloc)?;

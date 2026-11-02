@@ -5,7 +5,7 @@ use core::{
 
 use abs_buff::{Demand, buffer::TrBuffSegmRef};
 use abs_cancel::TrMayCancel;
-use abs_mm::res_man::TrUnique;
+use abs_mm::res_man::{TrAllocBy, TrUnique};
 
 use crate::{
     chan::TrPrepareRing,
@@ -25,7 +25,10 @@ where
         Result<Self::Telegraph, Self::Err>>
     where
         Self: 'f,
-        B: 'static + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone> + Send + Sync,
+        B: 'static
+            + TrUnique<Item = [MaybeUninit<C::Data>]>
+            + TrAllocBy<Alloc: AllocatorClone>
+            + Send + Sync,
         P: TrPrepareRing<B, C::Data>;
 
     /// 在本 binding 的 dock 上开一条数据报端点，并固定**默认对端地址**。
@@ -44,7 +47,8 @@ where
     ) -> Self::OpenTelegraphAsync<'f, B, P>
     where
         B: 'static
-            + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone>
+            + TrUnique<Item = [MaybeUninit<C::Data>]>
+            + TrAllocBy<Alloc: AllocatorClone>
             + Send
             + Sync,
         P: TrPrepareRing<B, C::Data>;

@@ -49,7 +49,7 @@ use core::{
 };
 
 use abs_cancel::TrCancellationToken;
-use abs_mm::res_man::TrUnique;
+use abs_mm::res_man::{TrAllocBy, TrUnique};
 use abs_smux::{
     chan::{RingBuffAlloc, TrPrepareRing},
     telegraph::{TrTelegraph, TrTelegraphBinding},
@@ -127,7 +127,10 @@ where
     type OpenTelegraphAsync<'f, B, P> = MuxOpenTelegraphAsync<'f, 'f, C>
     where
         Self: 'f,
-        B: 'static + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone> + Send + Sync,
+        B: 'static
+            + TrUnique<Item = [MaybeUninit<C::Data>]>
+            + TrAllocBy<Alloc: AllocatorClone>
+            + Send + Sync,
         P: TrPrepareRing<B, C::Data>;
 
     fn open_telegraph_async<'f, B, P>(
@@ -135,7 +138,10 @@ where
         prepare: P,
     ) -> Self::OpenTelegraphAsync<'f, B, P>
     where
-        B: 'static + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone> + Send + Sync,
+        B: 'static
+            + TrUnique<Item = [MaybeUninit<C::Data>]>
+            + TrAllocBy<Alloc: AllocatorClone>
+            + Send + Sync,
         P: TrPrepareRing<B, C::Data>,
     {
         // **先同步建环**：`P` 与 `B` 因此都不进 future 的类型（与 channel 的
@@ -269,7 +275,10 @@ pub(crate) fn build_telegraph_rings_<B>(
     buffs: RingBuffAlloc<B, u8>,
 ) -> Result<TelegraphRings_, TelegraphError>
 where
-    B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+    B: 'static
+        + TrUnique<Item = [MaybeUninit<u8>]>
+        + TrAllocBy<Alloc: AllocatorClone>
+        + Send + Sync,
 {
     let (tx_buff, rx_buff) = buffs.destruct();
     let tx_pair = new_buffered_channel(tx_buff).map_err(map_ring_err_)?;

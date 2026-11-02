@@ -9,7 +9,7 @@ use abs_buff::{
     buffer::{TrConsumerState, TrProducerState},
 };
 use abs_cancel::TrMayCancel;
-use abs_mm::res_man::TrUnique;
+use abs_mm::res_man::{TrAllocBy, TrUnique};
 
 use crate::{
     conf::TrMuxConfig,
@@ -41,7 +41,9 @@ where
     where
         Self: 'f,
         R: 'f + TrBuffRead<C::Data>,
-        B: 'static + Send + Sync + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone>,
+        B: 'static + Send + Sync
+            + TrUnique<Item = [MaybeUninit<C::Data>]>
+            + TrAllocBy<Alloc: AllocatorClone>,
         P: TrPrepareRing<B, C::Data>;
 
     /// 发送同意建立 channel 的欢迎信息，并最终裁决。
@@ -58,7 +60,9 @@ where
     ) -> Self::AcceptAsync<'f, R, B, P>
     where
         R: 'f + TrBuffRead<C::Data>,
-        B: 'static + Send + Sync + TrUnique<Item = [MaybeUninit<C::Data>], Alloc: AllocatorClone>,
+        B: 'static + Send + Sync
+            + TrUnique<Item = [MaybeUninit<C::Data>]>
+            + TrAllocBy<Alloc: AllocatorClone>,
         P: TrPrepareRing<B, C::Data>;
 
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -161,8 +165,9 @@ where
 #[derive(Clone, Debug, Default)]
 pub struct RingBuffAlloc<B, T>
 where
-    B: 'static + TrUnique<Item = [MaybeUninit<T>]>,
-    B::Alloc: AllocatorClone,
+    B: 'static
+        + TrUnique<Item = [MaybeUninit<T>]>
+        + TrAllocBy<Alloc: AllocatorClone>,
     T: 'static + Sized,
 {
     pub tx_buff: B,
@@ -172,8 +177,9 @@ where
 
 impl<B, T> RingBuffAlloc<B, T>
 where
-    B: 'static + TrUnique<Item = [MaybeUninit<T>]>,
-    B::Alloc: AllocatorClone,
+    B: 'static
+        + TrUnique<Item = [MaybeUninit<T>]>
+        + TrAllocBy<Alloc: AllocatorClone>,
     T: 'static + Sized,
 {
     /// 由两个方向的 ring 内存造出交付物（零堆分配）。
@@ -201,8 +207,9 @@ where
 /// 收的都是**这一个**契约，因此为其中一方写好的 prepare 类型可以直接复用到另一方。
 pub trait TrPrepareRing<B, T>
 where
-    B: 'static + TrUnique<Item = [MaybeUninit<T>]>,
-    B::Alloc: AllocatorClone,
+    B: 'static
+        + TrUnique<Item = [MaybeUninit<T>]>
+        + TrAllocBy<Alloc: AllocatorClone>,
     T: 'static + Sized,
 {
     /// 交出两个方向的 ring 内存。

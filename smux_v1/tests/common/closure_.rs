@@ -8,7 +8,7 @@ use abs_smux::{
     conn::TrDockBinding,
     telegraph::TrTelegraphBinding,
 };
-use mm_ptr::x_deps::abs_mm::res_man::TrUnique;
+use mm_ptr::x_deps::abs_mm::res_man::{TrAllocBy, TrUnique};
 use smux_v1::connection::{
     ChannelHandle, ChannelRx, ChannelTx, DockBinding, HandleError, Telegraph, TrConnCfg,
 };
@@ -29,8 +29,9 @@ impl<F> ClosurePrepare<F> {
 impl<F, B> TrPrepareRing<B, u8> for ClosurePrepare<F>
 where
     F: FnOnce() -> (B, B),
-    B: 'static + TrUnique<Item = [MaybeUninit<u8>]>,
-    B::Alloc: AllocatorClone,
+    B: 'static
+        + TrUnique<Item = [MaybeUninit<u8>]>
+        + TrAllocBy<Alloc: AllocatorClone>,
 {
     fn prepare(self) -> RingBuffAlloc<B, u8> {
         let (tx_buff, rx_buff) = (self.0)();
@@ -59,8 +60,9 @@ where
     ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
         R: 'f + TrBuffRead<u8>,
-        B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
-        B::Alloc: AllocatorClone,
+        B: 'static + Send + Sync
+            + TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>,
         F: FnOnce() -> (B, B);
 }
 
@@ -75,8 +77,9 @@ where
     ) -> Result<(ChannelTx<C>, ChannelRx<C>), HandleError>
     where
         R: 'f + TrBuffRead<u8>,
-        B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
-        B::Alloc: AllocatorClone,
+        B: 'static + Send + Sync
+            + TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>,
         F: FnOnce() -> (B, B),
     {
         self.accept_async::<R, B, _>(welcome, ClosurePrepare::new(prepare))
@@ -103,8 +106,9 @@ impl<F> TgClosurePrepare<F> {
 impl<F, B> TrPrepareRing<B, u8> for TgClosurePrepare<F>
 where
     F: FnOnce() -> (B, B),
-    B: 'static + TrUnique<Item = [MaybeUninit<u8>]>,
-    B::Alloc: AllocatorClone,
+    B: 'static + Send + Sync
+        + TrUnique<Item = [MaybeUninit<u8>]>
+        + TrAllocBy<Alloc: AllocatorClone>,
 {
     fn prepare(self) -> RingBuffAlloc<B, u8> {
         let (tx_buff, rx_buff) = (self.0)();
@@ -122,8 +126,9 @@ where
         prepare: F,
     ) -> Result<Telegraph<C>, smux_v1::connection::BindingError>
     where
-        B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
-        B::Alloc: AllocatorClone,
+        B: 'static + Send + Sync
+            + TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>,
         F: FnOnce() -> (B, B);
 }
 
@@ -136,8 +141,9 @@ where
         prepare: F,
     ) -> Result<Telegraph<C>, smux_v1::connection::BindingError>
     where
-        B: 'static + TrUnique<Item = [MaybeUninit<u8>]> + Send + Sync,
-        B::Alloc: AllocatorClone,
+        B: 'static + Send + Sync
+            + TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>,
         F: FnOnce() -> (B, B),
     {
         <DockBinding<C> as TrTelegraphBinding<C>>::open_telegraph_async(

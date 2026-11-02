@@ -38,7 +38,6 @@ mpmc_chan = { git = "https://gitee.com/lino_snsalias/mpmc-chan.rs.git" }
 sw-scope = { git = "https://gitee.com/lino_snsalias/sw-scope.rs.git" }
 
 crc = { version = "3.4.*" }
-# flume = { version = "0.12.*", optional = true }
 thiserror = { version = "2.0.*", default-features = false }
 
 [features]

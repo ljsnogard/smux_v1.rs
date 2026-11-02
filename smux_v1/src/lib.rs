@@ -6,7 +6,7 @@
 // `impl Try<Output = &Self::Alloc>` 的方法（分配器可能存在于 `Rc` 这类共享所有权里），
 // 因此**实现**该 trait 就必须能引用 `core::ops::Try`。本地不解析它的残差类型，只把
 // 结果当「一定成功」使用（见 `connection::ring_::MuxChanBuffAlloc`）。
-#![feature(try_trait_v2)]
+// #![feature(try_trait_v2)]
 
 extern crate alloc;
 

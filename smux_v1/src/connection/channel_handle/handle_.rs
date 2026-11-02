@@ -6,7 +6,7 @@ use core::{
 
 use abs_buff::{TrBuffRead, TrBuffWrite};
 use abs_cancel::TrCancellationToken;
-use abs_mm::res_man::TrUnique;
+use abs_mm::res_man::{TrAllocBy, TrUnique};
 use abs_smux::chan::{
     RingBuffAlloc, TrChannelHalf, TrChannelHandle, TrPrepareRing,
 };
@@ -216,7 +216,10 @@ where
     /// 连接上不同子流可以用不同的 `B`（见 `ring_` 模块）。
     fn accept_prepare_<B, P>(&mut self, prepare: P) -> AcceptOutcomeProj_<C>
     where
-        B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+        B: 'static
+            + TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>
+            + Send + Sync,
         P: TrPrepareRing<B, C::Data>,
     {
         self.accept_buffs_::<B>(prepare.prepare())
@@ -226,9 +229,15 @@ where
     ///
     /// **不取任何锁**：建环与注册表登记都在这里完成不了——注册表登记挪到 step 函数
     /// （那里才有可取消的异步上下文）。因此本函数只做纯本地构造。
-    fn accept_buffs_<B>(&mut self, buffs: RingBuffAlloc<B, C::Data>) -> AcceptOutcomeProj_<C>
+    fn accept_buffs_<B>(
+        &mut self,
+        buffs: RingBuffAlloc<B, C::Data>,
+    ) -> AcceptOutcomeProj_<C>
     where
-        B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+        B: 'static
+            + TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>
+            + Send + Sync,
     {
         let conn = self.conn_.clone();
         let local = self.local_dock_;
@@ -287,7 +296,10 @@ where
     where
         Self: 'f,
         Rb: 'f + TrBuffRead<C::Data>,
-        B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+        B: 'static
+            + TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>
+            + Send + Sync,
         P: TrPrepareRing<B, C::Data>;
 
     type RejectAsync<'f, Rb> = MuxRejectAsync<'f, 'f, C, Rb>
@@ -307,7 +319,10 @@ where
     ) -> Self::AcceptAsync<'f, Rb, B, P>
     where
         Rb: 'f + TrBuffRead<C::Data>,
-        B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+        B: 'static
+            + TrUnique<Item = [MaybeUninit<u8>]>
+            + TrAllocBy<Alloc: AllocatorClone>
+            + Send + Sync,
         P: TrPrepareRing<B, C::Data>,
     {
         let accept_result = self.accept_prepare_::<B, P>(prepare);
@@ -529,7 +544,10 @@ fn install_channel_<C, B>(
 ) -> Result<InstallOutcome_<C>, HandleError>
 where
     C: TrConnCfg,
-    B: 'static + TrUnique<Item = [MaybeUninit<u8>], Alloc: AllocatorClone> + Send + Sync,
+    B: 'static
+        + TrUnique<Item = [MaybeUninit<u8>]>
+        + TrAllocBy<Alloc: AllocatorClone>
+        + Send + Sync,
 {
     let core = conn.core_();
     let policy = core.config_().policy();
